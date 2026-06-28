@@ -1,0 +1,13 @@
+name: skeleton
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make manifest-check
+      - run: python3 -m compileall -q scripts

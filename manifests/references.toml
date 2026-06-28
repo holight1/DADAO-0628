@@ -1,0 +1,63 @@
+format = 1
+captured_on = "2026-06-28"
+policy = "reference-only"
+
+[[reference]]
+id = "wiki-candidate"
+path = "/home/holight/toolchain/DADAO.wiki"
+repository = "https://github.com/gxt/DADAO.wiki.git"
+head = "7ddb632ca3b56f2033b7cbf26ceebd3e62b72fc6"
+dirty = 0
+purpose = "Candidate specification baseline"
+reuse = "Specification text only; pin by commit"
+selected_paths = ["SimRISC-*.md", "DADAO-*AEE*.md", "DADAO-*ABI*.md", "DADAO-12-SEE-*.md", "DADAO-22-SBI-*.md"]
+
+[[reference]]
+id = "legacy-meta"
+path = "/home/holight/toolchain/DADAO"
+repository = "https://github.com/gxt/DADAO.git"
+head = "49e2806863a48d28821414cbbec537b2fa9fbc3b"
+dirty = 8
+purpose = "Repository orchestration and historical tests"
+reuse = "Architecture and lessons only; no implementation copy"
+selected_paths = ["Makefile", "DADAO-runtime/common.mk", "TCH-llvm/llvm.mk", "SIM-qemu-v2/qemu.mk", "ENV-linux/linux.mk", "code-agent/"]
+
+[[reference]]
+id = "legacy-llvm"
+path = "/home/holight/toolchain/llvm-unicore"
+repository = "https://github.com/llvm/llvm-project.git"
+head = "43d0e86bcd0f7e85131e0807928d01f401245280"
+dirty = 128
+purpose = "Failure archaeology and LLVM porting lessons"
+reuse = "Knowledge and test intent only; no target code copy"
+selected_paths = ["code-agent/knowledge/", "code-agent/tasks/", "llvm/lib/Target/Dadao/"]
+
+[[reference]]
+id = "legacy-linux"
+path = "/home/holight/toolchain/linux-0504"
+repository = "https://github.com/torvalds/linux.git"
+head = "cba34d39ab55ad6769bf9d6f39e6da5966810d23"
+dirty = 6
+purpose = "Kernel V1 bring-up lessons"
+reuse = "Retrospective evidence only; no arch code copy"
+selected_paths = ["arch/dadao/"]
+
+[[reference]]
+id = "legacy-musl"
+path = "/home/holight/toolchain/musl"
+repository = "https://github.com/kraj/musl.git"
+head = "7e7c478017621f90652482d792a195d4b2bc3cac"
+dirty = 0
+purpose = "ABI glue and runtime failure archaeology"
+reuse = "Interface lessons only; reimplement against frozen ABI"
+selected_paths = ["arch/dadao/"]
+
+[[reference]]
+id = "llvm-test-suite"
+path = "/home/holight/toolchain/llvm-test-suite"
+repository = "https://github.com/llvm/llvm-test-suite.git"
+head = "a3f72bf9dd1355c57dce2c8e015796c8d9998196"
+dirty = 1
+purpose = "Future workload source"
+reuse = "Upstream tests may be fetched clean; old PASS results are not inherited"
+selected_paths = ["SingleSource/", "MultiSource/"]

@@ -1,0 +1,31 @@
+format = 1
+name = "DADAO foundation candidate"
+status = "candidate"
+repository = "https://github.com/gxt/DADAO.wiki.git"
+local_reference = "/home/holight/toolchain/DADAO.wiki"
+commit = "7ddb632ca3b56f2033b7cbf26ceebd3e62b72fc6"
+simrisc_version = "0.4.0"
+aee_abi_version = "0.9.1"
+see_sbi_version = "0.7.0"
+hee_hbi_version = "0.1.1"
+
+foundation_included = [
+  "register banks and reserved registers",
+  "scalar integer and address instructions",
+  "instruction encoding and assembly syntax",
+  "big-endian data and instruction representation",
+  "aligned scalar load/store behavior",
+  "basic branch, jump, call, and RegRAS behavior",
+]
+
+foundation_excluded = [
+  "varargs",
+  "HFA/HPA and complex aggregate ABI",
+  "mixed-bank multiple returns",
+  "dynamic linking, TLS, and exception handling",
+  "SBI and HBI",
+  "cross-cfx escape and nested exception policy",
+  "PTW, TLB, and MMU",
+  "MemRAS fault handling",
+  "SMP and atomics",
+]

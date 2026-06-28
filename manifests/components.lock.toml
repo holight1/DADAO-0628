@@ -1,0 +1,37 @@
+format = 1
+work_root = ".work"
+
+# Components stay disabled until an ADR records the upstream selection and
+# exact commit. Tags and branches are not accepted as reproducible baselines.
+
+[[component]]
+name = "llvm"
+enabled = false
+repository = "https://github.com/llvm/llvm-project.git"
+commit = ""
+patch_series = "components/llvm/patches/series"
+role = "LLVM MC, Clang integration, LLD, and basic CodeGen"
+
+[[component]]
+name = "qemu"
+enabled = false
+repository = "https://github.com/qemu/qemu.git"
+commit = ""
+patch_series = "components/qemu/patches/series"
+role = "CPU core, decode, scalar execution, and bare-metal machine"
+
+[[component]]
+name = "musl"
+enabled = false
+repository = "https://git.musl-libc.org/git/musl"
+commit = ""
+patch_series = "components/musl/patches/series"
+role = "Deferred libc and runtime integration"
+
+[[component]]
+name = "linux"
+enabled = false
+repository = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+commit = ""
+patch_series = "components/linux/patches/series"
+role = "Deferred Kernel architecture port"
