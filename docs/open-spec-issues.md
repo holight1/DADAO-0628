@@ -11,13 +11,15 @@ These issues remain open after Wiki update to `13a414d` (SimRISC 0.4.1).
 | Varargs | Save area, overflow area, aggregate values, and incoming-SP base need one layout | Complete ABI, libc |
 | Cross-cfx escape | Previous cfx state and nested return policy are not fully specified | Exception nesting |
 | Multiple returns | Mixed RD/RB/RF ordering is ambiguous | Advanced CodeGen |
-| ELF/object ABI | Machine ID, flags, relocations, and formulas need a frozen table | LLD, cross-object execution |
+| ~~ELF/object ABI~~ | **Closed by ADR-0003** (2026-06-29): EM_DADAO=0x0DA0, e_flags=0x1 (M1), ELFCLASS64/ELFDATA2MSB, 10 relocation types | — |
 | Hardware reset | Power-on values for RD/RB/RF/RA beyond process-entry init | QEMU, test machine |
-| SBZ behavior | Non-zero SBZ field fault type (ILLI vs UNDI) | QEMU diagnostics |
+| ~~SBZ behavior~~ | **Closed by ADR-0004** (2026-06-29): SBZ → ILLI (exit 0x82); analogy to illegal operand in known opcode | — |
 
 **Resolved by Architecture Decision (2026-06-29):**
 - rd2ra/ra2rd scope → Excluded (M1 scope decision; ISA semantics clear per SimRISC-02)
 - Instruction fetch byte order → Included big-endian (SimRISC-00 L15)
+- ELF/object ABI → Closed by ADR-0003 (EM_DADAO=0x0DA0, e_flags=1 for M1, 10 relocation types)
+- SBZ behavior → Closed by ADR-0004 (SBZ → ILLI; see D5)
 
 **Resolved in Wiki `13a414d` (SimRISC 0.4.1):**
 - C-01 instruction big-endian
