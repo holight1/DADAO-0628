@@ -2,12 +2,12 @@ format = 1
 name = "DADAO foundation candidate"
 status = "candidate"
 repository = "https://github.com/gxt/DADAO.wiki.git"
-local_reference = "/home/holight/toolchain/DADAO.wiki"
-commit = "7ddb632ca3b56f2033b7cbf26ceebd3e62b72fc6"
-simrisc_version = "0.4.0"
-aee_abi_version = "0.9.1"
-see_sbi_version = "0.7.0"
-hee_hbi_version = "0.1.1"
+local_reference = "/home/holight/DADAO-wiki"
+commit = "13a414da158dc780ae5501c1443acbffd15cbf4a"
+simrisc_version = "0.4.1"
+aee_abi_version = "0.9.2"
+see_sbi_version = "0.7.1"
+hee_hbi_version = "0.1.2"
 
 foundation_included = [
   "register banks and reserved registers",

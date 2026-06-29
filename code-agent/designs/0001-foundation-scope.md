@@ -2,7 +2,7 @@
 
 Status: Accepted for implementation
 
-SPEC candidate: `7ddb632ca3b56f2033b7cbf26ceebd3e62b72fc6`
+SPEC candidate: `13a414da158dc780ae5501c1443acbffd15cbf4a` (SimRISC 0.4.1; supersedes original `7ddb632c`)
 
 ## Decision
 
@@ -10,7 +10,10 @@ The current Wiki is sufficient to start LLVM MC, the QEMU CPU core, and basic
 LLVM CodeGen. Open ABI and system questions do not block this work because the
 first milestone has an explicit exclusion boundary.
 
-## M1 Scope
+## Foundation Scope
+
+The total scope below spans what the detailed roadmap calls M1 (MC + QEMU, Phases 2–4)
+and M2 (Basic CodeGen, Phase 5). See `0002-detailed-roadmap.md` for the M1/M2 split.
 
 ### QEMU
 
@@ -78,9 +81,12 @@ slice. Update the SPEC lock, impact matrix, vectors, and both consumers before
 resuming. Changes to excluded areas do not invalidate M1 unless they alter an
 included encoding, register, endian, alignment, or control-flow rule.
 
-## M1 Completion
+## Foundation Completion
 
-M1 is complete when a clean checkout can fetch pinned upstreams, apply ordered
-patches, build LLVM MC/QEMU, and pass the independent MC-to-QEMU scalar suite.
-Basic CodeGen then demonstrates at least one arithmetic, load/store,
-branch, and call/return function executing with the expected result.
+Foundation (M1 + M2) is complete when a clean checkout can fetch pinned
+upstreams, apply ordered patches, build LLVM MC/QEMU, and pass the independent
+MC-to-QEMU scalar suite (M1); and Basic CodeGen demonstrates at least one
+arithmetic, load/store, branch, and call/return function executing with the
+expected result in QEMU (M2).
+
+Detailed completion gates for M1 and M2 are in `0002-detailed-roadmap.md`.
