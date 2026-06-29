@@ -1,6 +1,6 @@
 # ADR-0004: M1 Bare-Metal Test Machine
 
-Status: Candidate
+Status: Accepted
 
 ## Context
 

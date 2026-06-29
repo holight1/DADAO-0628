@@ -1,6 +1,6 @@
 # ADR-0003: ELF Object ABI for DADAO SimRISC M1
 
-Status: Candidate
+Status: Accepted
 
 ## Context
 
@@ -35,11 +35,12 @@ fetch and data access.
 
 ### e_machine
 
-`EM_DADAO = 0x0DA0`. This value is already registered in the upstream
-LLVM `ELF.h` header (line 324) and is available (not conflicting with any
-other architecture). The legacy assignment is preserved because the value
-has meaning in the ELF e_machine namespace — changing it would create a
-conflict with any existing tooling that recognises `0x0DA0` as DADAO.
+`EM_DADAO = 0x0DA0`. This value is **project-custom** — not registered in
+upstream LLVM, IANA/SysV, or any public ELF registry. It exists only in
+the legacy DADAO toolchain fork (`llvm-unicore`). The value is preserved
+because it has established meaning within the DADAO project ecosystem;
+`e_flags = 0x1` (see below) provides machine-readable ABI versioning so
+M1 consumers can distinguish themselves from any legacy tooling.
 
 ### e_flags
 
@@ -237,6 +238,7 @@ Two-tier policy:
 | `R_DADAO_ABS_W*` | No overflow check needed (16-bit slices of a 64-bit value). |
 | `R_DADAO_PCREL18` | **Link-time error** if `((S+A)-(P+4))/4` exceeds 18-bit signed range or is not a multiple of 4. |
 | `R_DADAO_PCREL24` | **Link-time error** if `((S+A)-(P+4))/4` exceeds 24-bit signed range or is not a multiple of 4. |
+| `R_DADAO_PCREL12` | **Link-time error** if `((S+A)-(P+4))/4` exceeds 12-bit signed range or is not a multiple of 4. |
 | `R_DADAO_RELA` | **Link-time error** if `((S+A)>>12) - ((P+4)>>12)` exceeds 18-bit signed range. |
 
 Rationale: DADAO hardware discards overflow silently (48-bit wrap, per

@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare check docker-image clean-work
+.PHONY: help manifest-check doctor status fetch apply-series prepare check check-wiki-drift docker-image clean-work
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -34,9 +34,12 @@ apply-series: manifest-check
 
 prepare: fetch apply-series
 
-check: manifest-check validate-encoding validate-vectors
+check: manifest-check validate-encoding validate-vectors check-wiki-drift
 	@$(PYTHON) -m compileall -q scripts
 	@echo "repository checks: PASS"
+
+check-wiki-drift:
+	@$(PYTHON) scripts/check_wiki_drift.py
 
 validate-encoding:
 	@$(PYTHON) scripts/validate_encoding.py tools/opcodes.yaml
