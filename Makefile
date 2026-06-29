@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare check check-wiki-drift docker-image clean-work
+.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift docker-image clean-work
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -13,6 +13,8 @@ help:
 	@echo "  make fetch           Fetch enabled components at exact commits"
 	@echo "  make apply-series    Apply ordered patch series to fetched sources"
 	@echo "  make prepare         Fetch and apply enabled components"
+	@echo "  make build-qemu      Configure and compile QEMU (Phase 3)"
+	@echo "  make build-mc        Build LLVM MC components for DADAO (Phase 2)"
 	@echo "  make check           Run repository-level structural checks"
 	@echo "  make docker-image    Build the reproducible development image"
 	@echo "  make clean-work      Remove generated .work content only"
@@ -37,6 +39,14 @@ prepare: fetch apply-series
 check: manifest-check validate-encoding validate-vectors check-wiki-drift
 	@$(PYTHON) -m compileall -q scripts
 	@echo "repository checks: PASS"
+
+build-qemu: manifest-check
+	@echo "build-qemu: not yet implemented (Phase 3)"
+	@exit 0
+
+build-mc: manifest-check
+	@echo "build-mc: not yet implemented (Phase 2)"
+	@exit 0
 
 check-wiki-drift:
 	@$(PYTHON) scripts/check_wiki_drift.py
