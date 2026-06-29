@@ -1,0 +1,55 @@
+# Miscellaneous instructions (swym, unimp)
+
+- mnemonic: swym
+  format: oiii
+  class: encoding
+  encoding:
+    word: "0x10000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §6.1"
+  notes: "swym 0; encoding-only test"
+
+- mnemonic: swym
+  format: oiii
+  class: semantic
+  encoding:
+    word: "0x10000000"
+  input_state:
+    rb:
+      rb0: "0x0000000000100000"
+  expected_state:
+    rb:
+      rb0: "0x0000000000100004"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §6.1"
+  notes: "swym 0; PC increments by 4, no other effect"
+
+- mnemonic: unimp
+  format: oiii
+  class: encoding
+  encoding:
+    word: "0x10FC0000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §6.2"
+  notes: "unimp 0; encoding-only test"
+
+- mnemonic: unimp
+  format: oiii
+  class: legality
+  encoding:
+    word: "0x10FC0000"
+  input_state:
+    rb:
+      rb0: "0x0000000000100000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §6.2"
+  notes: "unimp 0; triggers ILLI exception"

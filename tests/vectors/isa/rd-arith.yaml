@@ -1,0 +1,208 @@
+# RD arithmetic test vectors
+# Source: contracts/isa/spec.md §3.5–§3.7
+
+- mnemonic: add
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x1A0C4042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+      rd2: "0x0000000000000002"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000000"
+      rd4: "0x0000000000000003"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.5"
+  notes: "add rd3,rd4,rd1,rd2; 1+2=3, no overflow"
+
+- mnemonic: add
+  format: rrrr
+  class: boundary
+  encoding:
+    word: "0x1A0843FF"
+  input_state:
+    rd:
+      rd0: "0x0000000000000000"
+      rd15: "0x7FFFFFFFFFFFFFFF"
+      rd63: "0x0000000000000001"
+  expected_state:
+    rd:
+      rd0: "0x0000000000000000"
+      rd3: "0x0000000000000000"
+      rd15: "0x7FFFFFFFFFFFFFFF"
+      rd63: "0x0000000000000001"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.5"
+  notes: "add rd0,rd3,rd15,rd63; INT64_MAX+1 overflow; rd0 discards high 64"
+
+- mnemonic: add
+  format: rrrr
+  class: legality
+  encoding:
+    word: "0x1A000000"
+  input_state:
+    rd:
+      rd0: "0x0000000000000000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.1"
+  notes: "add rd0,rd0,rd0,rd0; both dst=rd0 → ILLI"
+
+- mnemonic: sub
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x1B0C4042"
+  input_state:
+    rd:
+      rd1: "0x000000000000000A"
+      rd2: "0x0000000000000003"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000000"
+      rd4: "0x0000000000000007"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.5"
+  notes: "sub rd3,rd4,rd1,rd2; 10-3=7"
+
+- mnemonic: muls
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x1C0C4042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000003"
+      rd2: "0x0000000000000005"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000000"
+      rd4: "0x000000000000000F"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "muls rd3,rd4,rd1,rd2; 3×5=15"
+
+- mnemonic: divs
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x1E0C4042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000011"
+      rd2: "0x0000000000000004"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000001"
+      rd4: "0x0000000000000004"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "divs rd3,rd4,rd1,rd2; 17÷4=4 rem 1 (trunc-toward-zero)"
+
+- mnemonic: divs
+  format: rrrr
+  class: legality
+  encoding:
+    word: "0x1E0C43FF"
+  input_state:
+    rd:
+      rd15: "0x0000000000000005"
+      rd63: "0x0000000000000000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "divs rd3,rd4,rd15,rd63; divide-by-zero → ILLI"
+
+- mnemonic: divu
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x1F0C4042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000011"
+      rd2: "0x0000000000000004"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000001"
+      rd4: "0x0000000000000004"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "divu rd3,rd4,rd1,rd2; 17÷4=4 rem 1"
+
+- mnemonic: addi
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x19042005"
+  input_state:
+    rd:
+      rd2: "0x000000000000000A"
+  expected_state:
+    rd:
+      rd1: "0x000000000000000F"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.6"
+  notes: "addi rd1,rd2,+5; 10+5=15"
+
+- mnemonic: addi
+  format: rrii
+  class: boundary
+  encoding:
+    word: "0x19042800"
+  input_state:
+    rd:
+      rd2: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFF800"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.6"
+  notes: "addi rd1,rd2,-2048; imms12=-2048, 0+(-2048)=-2048"
+
+- mnemonic: addi
+  format: rrii
+  class: legality
+  encoding:
+    word: "0x19002800"
+  input_state:
+    rd:
+      rd0: "0x0000000000000000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.1"
+  notes: "addi rd0,rd0,-2048; rdha=rd0 → ILLI"
+
+# ─── mulu (rrrr) ──────────────────────────────────────────────────────────────
+
+- mnemonic: mulu
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x1D0C4042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000003"
+      rd2: "0x0000000000000005"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000000"
+      rd4: "0x000000000000000F"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "mulu rd3,rd4,rd1,rd2; 3×5=15"

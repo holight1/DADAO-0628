@@ -1,0 +1,201 @@
+# RD wyde immediate and block copy test vectors
+
+# ─── Wyde immediate (rwii) ───────────────────────────────────────────────────
+
+- mnemonic: orw
+  format: rwii
+  class: semantic
+  encoding:
+    word: "0x14040005"
+  input_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFFFF"
+  expected_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFFFF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.13"
+  notes: "orw rd1,w0,5; OR 5 into LSW (already FF → FF)"
+
+- mnemonic: setzw
+  format: rwii
+  class: semantic
+  encoding:
+    word: "0x16040005"
+  input_state:
+    rd:
+      rd1: "0xDEADBEEFCAFEBABE"
+  expected_state:
+    rd:
+      rd1: "0xDEADBEEFCAFE0005"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.13"
+  notes: "setzw rd1,w0,5; set LSW=5, other wydes=0 → 0xDEADBEEFCAFE0005"
+
+- mnemonic: setow
+  format: rwii
+  class: semantic
+  encoding:
+    word: "0x17043000"
+  input_state:
+    rd:
+      rd1: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd1: "0x0000FFFF00000000"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.13"
+  notes: "setow rd1,w1,0; set wyde1=0, other wydes=0xFFFF → 0x0000FFFF00000000"
+
+- mnemonic: andnw
+  format: rwii
+  class: semantic
+  encoding:
+    word: "0x1504000F"
+  input_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFFFF"
+  expected_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFFF0"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.13"
+  notes: "andnw rd1,w0,15; clear low 4 bits of LSW; 0xFF→0xF0"
+
+# ─── RB wyde immediate ────────────────────────────────────────────────────────
+
+- mnemonic: setzw
+  format: rwii
+  op: 0x4E
+  class: semantic
+  encoding:
+    word: "0x4E043000"
+  input_state:
+    rb:
+      rb1: "0xDEADBEEFCAFEBABE"
+  expected_state:
+    rb:
+      rb1: "0x0000FFFF0000BABE"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.6"
+  notes: "setzw rb1,w1,0; set RB wyde1=0, other wydes=0, but w1 preserves all? RB full 64-bit overwrite"
+
+- mnemonic: orw
+  format: rwii
+  op: 0x4C
+  class: semantic
+  encoding:
+    word: "0x4C040005"
+  input_state:
+    rb:
+      rb1: "0x0000000000000000"
+  expected_state:
+    rb:
+      rb1: "0x0000000000000005"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.6"
+  notes: "orw rb1,w0,5; OR 5 into RB LSW"
+
+# ─── Block copy (orri) ────────────────────────────────────────────────────────
+
+- mnemonic: rd2rd
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10A02842"
+  input_state:
+    rd:
+      rd1: "0x1111111111111111"
+      rd2: "0x2222222222222222"
+      rd10: "0x0000000000000000"
+      rd11: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd10: "0x1111111111111111"
+      rd11: "0x2222222222222222"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.14"
+  notes: "rd2rd rd10,rd1,2; copy rd1..rd2 to rd10..rd11"
+
+- mnemonic: rd2rb
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10A42842"
+  input_state:
+    rd:
+      rd1: "0xAAAAAAAAAAAAAAAA"
+      rd2: "0xBBBBBBBBBBBBBBBB"
+    rb:
+      rb10: "0x0000000000000000"
+      rb11: "0x0000000000000000"
+  expected_state:
+    rb:
+      rb10: "0xAAAAAAAAAAAAAAAA"
+      rb11: "0xBBBBBBBBBBBBBBBB"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.7"
+  notes: "rd2rb rb10,rd1,2; copy RD block to RB"
+
+- mnemonic: rb2rd
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10A82842"
+  input_state:
+    rb:
+      rb1: "0x3333333333333333"
+      rb2: "0x4444444444444444"
+    rd:
+      rd10: "0x0000000000000000"
+      rd11: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd10: "0x3333333333333333"
+      rd11: "0x4444444444444444"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.7"
+  notes: "rb2rd rd10,rb1,2; copy RB block to RD"
+
+- mnemonic: rb2rb
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10AC2842"
+  input_state:
+    rb:
+      rb1: "0x5555555555555555"
+      rb2: "0x6666666666666666"
+      rb10: "0x0000000000000000"
+      rb11: "0x0000000000000000"
+  expected_state:
+    rb:
+      rb10: "0x5555555555555555"
+      rb11: "0x6666666666666666"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.7"
+  notes: "rb2rb rb10,rb1,2; copy RB block to RB"
+
+- mnemonic: rd2rd
+  format: orri
+  class: legality
+  encoding:
+    word: "0x10A00000"
+  input_state:
+    rd:
+      rd0: "0x0000000000000000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6"
+  notes: "rd2rd rd0,rd0,0; rdhb=rd0 + immu6=0 → ILLI"

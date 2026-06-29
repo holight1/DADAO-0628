@@ -1,9 +1,9 @@
 # DL-001c — 编码自动验证器
 
-**状态**：待执行  
+**状态**：已完成（Codex Re-review：Needs Revision，代码问题待修）  
 **执行环境**：本地 DS · DADAO-0628  
 **类型**：工具实现  
-**优先级**：阻断 DL-001b（validate_vectors.py 引用 opcodes.yaml 格式）
+**优先级**：阻断 DL-001d（validate_vectors.py 引用 opcodes.yaml 格式）
 
 ---
 
@@ -39,24 +39,19 @@
   value: 0x10200000      # 指令字 value（(op<<24)|(ha<<18) for MISC-Norm；op<<24 for 其余）
   fields:                # 操作数字段列表（按 hb→hc→hd 顺序）
     - name: rdhb         # 字段名，对应 spec §2.2 field label
-      bits: "[23:18]"    # 在 32 位指令字中的 bit 位置
+      bits: "[17:12]"    # 在 32 位指令字中的 bit 位置
       role: dst          # dst / src / imm / fixed / sbz
       bank: rd           # rd / rb / ra / rf / imm（imm 表示立即数）
       signed: null       # true / false / null（null 表示 N/A）
     - name: rdhc
-      bits: "[17:12]"
-      role: src
-      bank: rd
-      signed: null
-    - name: rdhd
       bits: "[11:6]"
       role: src
       bank: rd
       signed: null
-    - name: sbz
+    - name: rdhd
       bits: "[5:0]"
-      role: sbz
-      bank: null
+      role: src
+      bank: rd
       signed: null
   legality:              # 静态合法性约束（ILLI）
     - "rdhb != rd0"
@@ -79,8 +74,8 @@
 
 1. **mask/value 算术一致性**：`(value & mask) == value`；MISC-Norm 的 mask 必须是 `0xFFFC0000`，其余必须是 `0xFF000000`
 2. **字段不重叠**：所有 fields[].bits 区间不得相互 overlap
-3. **字段覆盖完整**：fields 覆盖的 bit 加上 mask 覆盖的 fixed bit，总和 ≤ 32 bit
-4. **助记符唯一**：同一 mnemonic+format 组合在文件中唯一（允许同 mnemonic 有 r/i 两种 format）
+3. **字段覆盖完整**：fields 不得覆盖 mask fixed bits，且两者并集必须恰好覆盖 32 bit
+4. **opcode identity 唯一**：同一 `(op, ha)` 只能对应一条记录；允许 RD/RB 变体共享 mnemonic+format
 5. **op 编码无冲突**：不同记录的 `(mask, value)` 解码空间不得相交（即不存在一个 32-bit word 同时匹配两条记录）
 6. **role 合法值**：每个 field.role ∈ {dst, src, imm, fixed, sbz}
 7. **bank 合法值**：每个 field.bank ∈ {rd, rb, ra, rf, imm, null}
@@ -96,16 +91,16 @@
 | 表格 | 内容 |
 |------|------|
 | A.1.1 | MISC-Norm（op=0x10），含 swym/and/orr/xor/xnor/shift/extend/rd2rd/rd2rb/rb2rd/rb2rb/cmp-rb/add-rb/sub-rb/unimp 等所有 ha variant |
-| A.1.2 | MISC-Imm（op=0x18）|
-| A.1.3 | RD 算术（add/sub/mul/divs/divu/muls/mulu） |
+| A.1.2 | RD 算术（addi/add/sub/mul/div） |
+| A.1.3 | RD immediate compare 与 wyde immediate |
 | A.1.4 | 条件赋值（csn/csz/csp/cseq/csne） |
-| A.1.5 | RD 比较（cmps/cmpu） |
-| A.1.6 | RD 访存 load |
-| A.1.7 | RD 访存 store |
-| A.1.8 | RD 多寄存器访存（ldmo/stmo） |
+| A.1.5 | 条件分支（brn…brne） |
+| A.1.6 | RD signed load 与 multi-load |
+| A.1.7 | RD store 与 multi-store |
+| A.1.8 | RD unsigned load 与 RB load |
 | A.1.9 | RB 操作（rb 算术/赋值/立即数） |
-| A.1.10 | 控制流（branch/jump/call/ret/RegRAS） |
-| A.1.11 | 系统（swym/unimp） |
+| A.1.10 | jump（relative/absolute） |
+| A.1.11 | call（relative/absolute）与 ret |
 
 Appendix A 每行的 `mask` 和 `value` 列值（本轮已填入 spec.md）是直接来源，
 复制时需验证与计算公式吻合。
@@ -134,7 +129,7 @@ ERROR: foo(orrr): duplicate mnemonic+format
 ## 约束
 
 1. `tools/opcodes.yaml` 的数据来源**只能是** `contracts/isa/spec.md` Appendix A；不读 wiki 源文件，不查 LLVM/QEMU 实现
-2. `validate_encoding.py` **不依赖任何外部包**（只用 Python 3 stdlib：`yaml`、`sys`、`re`）；如果没有 `pyyaml` 则用 `json` 格式备选
+2. `validate_encoding.py` 依赖 PyYAML 读取 YAML；缺少依赖时必须给出明确安装提示，不得以 traceback 退出
 3. 完成后**不自行 commit**，等待 Claude review
 4. 如发现 Appendix A 有错误（如 mask/value 计算与 op/ha 字段不符），在任务完成区列出，不自行修改 spec.md
 
@@ -285,5 +280,17 @@ opcodes.yaml 编码数据正确，验证器逻辑可靠。P1 修正（16 条 leg
 accept。
 
 **复审通过条件**：
-- [ ] 16 条 orrr/orri 记录的 legality 补 `"rdhb != rd0"`
-- [ ] `validate_encoding.py` 增加 pyyaml 缺失时的友好报错或 JSON fallback
+- [x] 16 条 orrr/orri 记录的 legality 补 `"rdhb != rd0"`（已执行，含 N2 rb2rd）
+- [x] `validate_encoding.py` 增加 pyyaml 缺失时的友好报错（ImportError → sys.exit）
+
+---
+
+## Architecture Review — 第二轮（2026-06-29）
+
+**评审结论**：**Accepted — P1 fixes 已确认到位，make check PASS。**
+
+P1.1：16 条 orrr/orri legality 补 `"rdhb != rd0"` ✅（and/orr/xor/xnor/shlu/shrs/shru/exts/extz×2 + cmps/cmpu）
+N2：rb2rd 同步补 `"rdhb != rd0"` ✅（spec §2.6.1 L187 明确列出）
+P1.2：PyYAML 缺失时 sys.exit 友好报错 ✅
+
+**残余 N 级**：RB-cmp（op=0x10, orrr）legality 为空，hb=rdhb（rd 目标），可能需补 `rdhb != rd0`。需 spec 作者确认 MISC-Norm ha 子操作是否受 §2.6.1 约束，不阻断当前 Accepted。

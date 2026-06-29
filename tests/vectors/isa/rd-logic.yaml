@@ -1,0 +1,70 @@
+# RD logical test vectors
+# Source: contracts/isa/spec.md §3.10
+
+- mnemonic: and
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10203042"
+  input_state:
+    rd:
+      rd1: "0x00000000000000FF"
+      rd2: "0x000000000000000F"
+  expected_state:
+    rd:
+      rd3: "0x000000000000000F"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.10"
+  notes: "and rd3,rd1,rd2; 0xFF & 0x0F = 0x0F"
+
+- mnemonic: orr
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10243042"
+  input_state:
+    rd:
+      rd1: "0x00000000000000F0"
+      rd2: "0x000000000000000F"
+  expected_state:
+    rd:
+      rd3: "0x00000000000000FF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.10"
+  notes: "orr rd3,rd1,rd2; 0xF0 | 0x0F = 0xFF"
+
+- mnemonic: xor
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10283042"
+  input_state:
+    rd:
+      rd1: "0x00000000000000FF"
+      rd2: "0x000000000000000F"
+  expected_state:
+    rd:
+      rd3: "0x00000000000000F0"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.10"
+  notes: "xor rd3,rd1,rd2; 0xFF ^ 0x0F = 0xF0"
+
+- mnemonic: xnor
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x102C3042"
+  input_state:
+    rd:
+      rd1: "0x00000000000000FF"
+      rd2: "0x000000000000000F"
+  expected_state:
+    rd:
+      rd3: "0xFFFFFFFFFFFFFF0F"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.10"
+  notes: "xnor rd3,rd1,rd2; ~(0xFF ^ 0x0F) = ~0xF0 = 0xFFFF...FF0F"

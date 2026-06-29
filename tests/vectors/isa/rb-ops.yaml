@@ -1,0 +1,203 @@
+# RB operation test vectors
+
+- mnemonic: add
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10BA0842"
+  input_state:
+    rb:
+      rb33: "0x0000000000000001"
+      rb32: "0x0000000000000000"
+    rd:
+      rd2: "0x0000000000000002"
+  expected_state:
+    rb:
+      rb32: "0x0000000000000003"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.3"
+  notes: "add rbhb,rbhc,rd2; RB 48-bit: 1+2=3"
+  # ha=0x2E=46, hb=rbhb, hc=rbhc, hd=rd2
+  # word=0x10B80000 | (rbhb<<12) | (rbhc<<6) | rd2
+
+- mnemonic: sub
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10BE0842"
+  input_state:
+    rb:
+      rb33: "0x000000000000000A"
+      rb32: "0x0000000000000000"
+    rd:
+      rd2: "0x0000000000000003"
+  expected_state:
+    rb:
+      rb32: "0x0000000000000007"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.3"
+  notes: "sub rbhb,rbhc,rd2; RB 48-bit: 10-3=7"
+
+- mnemonic: addi
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x49042008"
+  input_state:
+    rb:
+      rb2: "0x000000000000000A"
+      rb1: "0x0000000000000000"
+  expected_state:
+    rb:
+      rb1: "0x0000000000000012"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.4"
+  notes: "addi rb1,rb2,+8; 10+8=18=0x12"
+
+- mnemonic: cmp
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10B43042"
+  input_state:
+    rb:
+      rb1: "0x0000000000000005"
+      rb2: "0x0000000000000008"
+    rd:
+      rd3: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd3: "0xFFFFFFFFFFFFFFFF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.5"
+  notes: "cmp rdhb,rbhc,rbhd; RB 48-bit: 5<8 → rdhb=-1"
+
+- mnemonic: rela
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x48040001"
+  input_state:
+    rb:
+      rb0: "0x0000000000100000"
+      rb1: "0x0000000000000000"
+  expected_state:
+    rb:
+      rb1: "0x0000000000101000"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.8"
+  notes: "rela rb1,imms18=1; base=0x100000&~0xFFF=0x100000, offset=1<<12=0x1000, target=0x101000"
+
+- mnemonic: ldo
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x43042008"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+      rb1: "0x0000000000000000"
+    memory:
+      - address: "0x0000000000100008"
+        value: "0xFEDCBA9876543210"
+        width: 8
+  expected_state:
+    rb:
+      rb1: "0xFEDCBA9876543210"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.1"
+  notes: "ldo rb1,rb2,+8; RB load: full 64-bit overwrite"
+
+- mnemonic: sto
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x4B042000"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+      rb1: "0xDEADBEEFCAFEBABE"
+  expected_state:
+    memory:
+      - address: "0x0000000000100000"
+        value: "0xDEADBEEFCAFEBABE"
+        width: 8
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.1"
+  notes: "sto rb1,rb2,+0; RB store: full 64-bit"
+
+- mnemonic: ldo
+  format: rrii
+  class: legality
+  encoding:
+    word: "0x43002008"
+  input_state:
+    rb:
+      rb0: "0x0000000000100000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.2"
+  notes: "ldo rb0,rb0,+8; rbha=rb0 → ILLI"
+
+- mnemonic: addi
+  format: rrii
+  class: boundary
+  encoding:
+    word: "0x49042800"
+  input_state:
+    rb:
+      rb2: "0x0000000000000000"
+      rb1: "0x0000000000000000"
+  expected_state:
+    rb:
+      rb1: "0x0000FFFFFFFFF800"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.4"
+  notes: "addi rb1,rb2,-2048; rb1[47:0]=(-2048 mod 2^48)=0xFFFFFFFFFFF800, rb1[63:48] preserved=0"
+
+# ─── RB stmo multi-store ──────────────────────────────────────────────────────
+
+- mnemonic: stmo
+  format: rrri
+  op: 0x4F
+  class: semantic
+  encoding:
+    word: "0x4F042041"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+      rb1: "0xAAAAAAAAAAAAAAAA"
+    rd:
+      rd1: "0x0000000000000000"
+  expected_state:
+    memory:
+      - address: "0x0000000000100000"
+        value: "0xAAAAAAAAAAAAAAAA"
+        width: 8
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.2"
+  notes: "stmo rb1,rb2,rd1,1; RB multi-store 1 octa"
+
+- mnemonic: stmo
+  format: rrri
+  class: legality
+  encoding:
+    word: "0x4F042000"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.3"
+  notes: "stmo rb1,rb2,rdhc,0; immu6=0 → ILLI"

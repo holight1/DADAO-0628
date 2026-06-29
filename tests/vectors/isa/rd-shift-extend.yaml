@@ -1,0 +1,183 @@
+# RD shift/extend test vectors
+
+- mnemonic: shlu
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10643044"
+  input_state:
+    rd:
+      rd1: "0x00000000000000FF"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000FF0"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "shlu rd3,rd1,4; 0xFF << 4 = 0xFF0"
+
+- mnemonic: shrs
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10683044"
+  input_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFF00"
+  expected_state:
+    rd:
+      rd3: "0xFFFFFFFFFFFFF0F0"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "shrs rd3,rd1,4; arithmetic right shift of negative value"
+
+- mnemonic: shru
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x106C3044"
+  input_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFF00"
+  expected_state:
+    rd:
+      rd3: "0x0FFFFFFFFFFFFFF0"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "shru rd3,rd1,4; logical right shift"
+
+- mnemonic: exts
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10703078"
+  input_state:
+    rd:
+      rd1: "0x0000000000000080"
+  expected_state:
+    rd:
+      rd3: "0xFFFFFFFFFFFFFF80"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "exts rd3,rd1,56; sign-extend byte 0x80 → 0xFFFF...FF80"
+
+- mnemonic: extz
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10743078"
+  input_state:
+    rd:
+      rd1: "0x00000000000000FF"
+  expected_state:
+    rd:
+      rd3: "0x00000000000000FF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "extz rd3,rd1,56; zero-extend byte 0xFF"
+
+- mnemonic: shlu
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10443042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+      rd2: "0x0000000000000004"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000010"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "shlu rd3,rd1,rd2; 1 << rd2[5:0]=4 → 0x10"
+
+# ─── Missing register-form variants ──────────────────────────────────────────
+
+- mnemonic: shrs
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10483042"
+  input_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFF00"
+      rd2: "0x0000000000000004"
+  expected_state:
+    rd:
+      rd3: "0xFFFFFFFFFFFFF0F0"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "shrs rd3,rd1,rd2; arithmetic right shift by rd2"
+
+- mnemonic: shru
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x104C3042"
+  input_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFF00"
+      rd2: "0x0000000000000004"
+  expected_state:
+    rd:
+      rd3: "0x0FFFFFFFFFFFFFF0"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "shru rd3,rd1,rd2; logical right shift by rd2"
+
+- mnemonic: exts
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10503042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000080"
+      rd2: "0x0000000000000038"
+  expected_state:
+    rd:
+      rd3: "0xFFFFFFFFFFFFFF80"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "exts rd3,rd1,rd2; sign-extend byte by rd2=56 (64-8)"
+
+- mnemonic: extz
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10543042"
+  input_state:
+    rd:
+      rd1: "0x00000000000000FF"
+      rd2: "0x0000000000000038"
+  expected_state:
+    rd:
+      rd3: "0x00000000000000FF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "extz rd3,rd1,rd2; zero-extend byte by rd2=56"
+
+- mnemonic: shlu
+  format: orrr
+  class: legality
+  encoding:
+    word: "0x10443000"
+  input_state:
+    rd:
+      rd0: "0x0000000000000000"
+      rd1: "0x0000000000000001"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.1"
+  notes: "shlu rd0,rd1,rd0; rdhb=rd0 → ILLI"

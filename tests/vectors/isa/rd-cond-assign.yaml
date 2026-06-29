@@ -1,0 +1,181 @@
+# RD conditional assign test vectors
+
+- mnemonic: csn
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x20043102"
+  input_state:
+    rd:
+      rd1: "0x8000000000000000"
+      rd4: "0x00000000000000AA"
+      rd2: "0x00000000000000BB"
+  expected_state:
+    rd:
+      rd3: "0x00000000000000AA"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "csn rd1,rd3,rd4,rd2; rd1[63]=1 (neg) → rd3=rd4=0xAA"
+
+- mnemonic: csz
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x22043102"
+  input_state:
+    rd:
+      rd1: "0x0000000000000000"
+      rd4: "0x00000000000000AA"
+      rd2: "0x00000000000000BB"
+  expected_state:
+    rd:
+      rd3: "0x00000000000000AA"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "csz rd1,rd3,rd4,rd2; rd1=0 (zero) → rd3=rd4=0xAA"
+
+- mnemonic: csp
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x24043102"
+  input_state:
+    rd:
+      rd1: "0x0000000000000010"
+      rd4: "0x00000000000000AA"
+      rd2: "0x00000000000000BB"
+  expected_state:
+    rd:
+      rd3: "0x00000000000000AA"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "csp rd1,rd3,rd4,rd2; rd1>0 (pos) → rd3=rd4=0xAA"
+
+- mnemonic: cseq
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x26043102"
+  input_state:
+    rd:
+      rd1: "0x0000000000000010"
+      rd3: "0x0000000000000010"
+      rd4: "0x00000000000000AA"
+      rd2: "0x00000000000000BB"
+  expected_state:
+    rd:
+      rd4: "0x00000000000000BB"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "cseq rd1,rd3,rd4,rd2; rd1==rd3 → rd4=rd2=0xBB"
+
+- mnemonic: csne
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x27043102"
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+      rd3: "0x0000000000000002"
+      rd4: "0x00000000000000AA"
+      rd2: "0x00000000000000BB"
+  expected_state:
+    rd:
+      rd4: "0x00000000000000BB"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "csne rd1,rd3,rd4,rd2; rd1!=rd3 → rd4=rd2=0xBB"
+
+- mnemonic: csn
+  format: rrrr
+  class: overlap
+  encoding:
+    word: "0x20043102"
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+      rd4: "0x00000000000000AA"
+      rd2: "0x00000000000000BB"
+      rd3: "0x0000000000000000"
+  expected_state: null
+  expected_fault: null
+  status: deferred
+  deferred_reason: "C-27"
+  wiki_cite: "spec.md §3.12"
+  notes: "csn rd1,rd3,rd4,rd2; rd1>0 (not neg) → rd3=rd2=0xBB; overlap deferred"
+
+- mnemonic: csz
+  format: rrrr
+  class: overlap
+  encoding:
+    word: "0x22043102"
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+      rd4: "0x00000000000000AA"
+      rd2: "0x00000000000000BB"
+      rd3: "0x0000000000000000"
+  expected_state: null
+  expected_fault: null
+  status: deferred
+  deferred_reason: "C-27"
+  wiki_cite: "spec.md §3.12"
+  notes: "csz rd1,rd3,rd4,rd2; rd1=1 (not zero) → condition false; deferred C-27"
+
+- mnemonic: csp
+  format: rrrr
+  class: overlap
+  encoding:
+    word: "0x24043102"
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+      rd4: "0x00000000000000AA"
+      rd2: "0x00000000000000BB"
+      rd3: "0x0000000000000000"
+  expected_state: null
+  expected_fault: null
+  status: deferred
+  deferred_reason: "C-27"
+  wiki_cite: "spec.md §3.12"
+  notes: "csp rd1,rd3,rd4,rd2; rd1=1 (pos, true) → condition true; deferred C-27"
+
+- mnemonic: cseq
+  format: rrrr
+  class: overlap
+  encoding:
+    word: "0x26042104"
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+      rd2: "0x0000000000000002"
+      rd4: "0x00000000000000AA"
+  expected_state: null
+  expected_fault: null
+  status: deferred
+  deferred_reason: "C-27"
+  wiki_cite: "spec.md §3.12"
+  notes: "cseq rd1,rd2,rd4,rd4; rdhc=rdhd=rd4 → dest=src overlap deferred C-27"
+
+- mnemonic: csne
+  format: rrrr
+  class: overlap
+  encoding:
+    word: "0x27042104"
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+      rd2: "0x0000000000000002"
+      rd4: "0x00000000000000AA"
+  expected_state: null
+  expected_fault: null
+  status: deferred
+  deferred_reason: "C-27"
+  wiki_cite: "spec.md §3.12"
+  notes: "csne rd1,rd2,rd4,rd4; rdhc=rdhd=rd4 → dest=src overlap deferred C-27"

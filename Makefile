@@ -34,12 +34,15 @@ apply-series: manifest-check
 
 prepare: fetch apply-series
 
-check: manifest-check validate-encoding
+check: manifest-check validate-encoding validate-vectors
 	@$(PYTHON) -m compileall -q scripts
 	@echo "repository checks: PASS"
 
 validate-encoding:
 	@$(PYTHON) scripts/validate_encoding.py tools/opcodes.yaml
+
+validate-vectors:
+	@$(PYTHON) scripts/validate_vectors.py
 
 docker-image:
 	docker build -t dadao-0628-dev:local containers/dev

@@ -1,0 +1,99 @@
+# RD compare test vectors
+
+- mnemonic: cmps
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x12282F85"
+  input_state:
+    rd:
+      rd2: "0x0000000000000005"
+      rd10: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd10: "0x0000000000000001"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.8"
+  notes: "cmps rd10,rd2,-2043; 5 > -2043 → rd10 = 1"
+
+- mnemonic: cmpu
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x13282005"
+  input_state:
+    rd:
+      rd2: "0x0000000000000005"
+      rd10: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd10: "0x0000000000000000"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.8"
+  notes: "cmpu rd10,rd2,+5; 5 == 5 → rd10 = 0"
+
+- mnemonic: cmps
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10903042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000005"
+      rd2: "0x0000000000000008"
+  expected_state:
+    rd:
+      rd3: "0xFFFFFFFFFFFFFFFF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.9"
+  notes: "cmps rd3,rd1,rd2; 5 < 8 → rd3 = -1"
+
+- mnemonic: cmpu
+  format: orrr
+  class: semantic
+  encoding:
+    word: "0x10943042"
+  input_state:
+    rd:
+      rd1: "0x000000000000000A"
+      rd2: "0x0000000000000005"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000001"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.9"
+  notes: "cmpu rd3,rd1,rd2; 10 > 5 → rd3 = 1"
+
+- mnemonic: cmps
+  format: orrr
+  class: boundary
+  encoding:
+    word: "0x10903040"
+  input_state:
+    rd:
+      rd1: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd3: "0x0000000000000000"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.9"
+  notes: "cmps rd3,rd1,rd0; 0 == 0 → rd3 = 0"
+
+- mnemonic: cmps
+  format: rrii
+  class: legality
+  encoding:
+    word: "0x12000000"
+  input_state:
+    rd:
+      rd0: "0x0000000000000000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.1"
+  notes: "cmps rd0,rd0,imm; rdha=rd0 → ILLI"

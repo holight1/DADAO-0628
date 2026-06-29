@@ -1,0 +1,547 @@
+# RD load/store test vectors
+
+- mnemonic: ldbs
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x30042008"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+      rb0: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100008"
+        value: "0x80"
+        width: 1
+  expected_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFF80"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldbs rd1,rb2,+8; load byte 0x80 → sign-ext to 0xFFFF...FF80"
+
+- mnemonic: ldbu
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x40042008"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100008"
+        value: "0x80"
+        width: 1
+  expected_state:
+    rd:
+      rd1: "0x0000000000000080"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldbu rd1,rb2,+8; load byte 0x80 → zero-ext to 0x0000...0080"
+
+- mnemonic: ldo
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x330420FF"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x00000000001000FF"
+        value: "0x1234567890ABCDEF"
+        width: 8
+  expected_state:
+    rd:
+      rd1: "0x1234567890ABCDEF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldo rd1,rb2,+255; load octa = 0x1234567890ABCDEF"
+
+- mnemonic: stb
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x38042FFC"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0x00000000000000FF"
+  expected_state:
+    memory:
+      - address: "0x0000000000100FFC"
+        value: "0xFF"
+        width: 1
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.2"
+  notes: "stb rd1,rb2,-4; store byte 0xFF at 0x100FFC"
+
+- mnemonic: sto
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x3B042000"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0xDEADBEEFCAFEBABE"
+  expected_state:
+    memory:
+      - address: "0x0000000000100000"
+        value: "0xDEADBEEFCAFEBABE"
+        width: 8
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.2"
+  notes: "sto rd1,rb2,+0; store octa 0xDEADBEEFCAFEBABE"
+
+- mnemonic: ldbs
+  format: rrii
+  class: legality
+  encoding:
+    word: "0x30002008"
+  input_state:
+    rb:
+      rb0: "0x0000000000100000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.1"
+  notes: "ldbs rd0,rb0,+8; rdha=rd0 → ILLI"
+
+- mnemonic: ldo
+  format: rrii
+  class: boundary
+  encoding:
+    word: "0x33042FFF"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100FFF"
+        value: "0x0000000000000001"
+        width: 8
+  expected_state:
+    rd:
+      rd1: "0x0000000000000001"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldo rd1,rb2,+4095; max offset (0xFFF)"
+
+# ─── Missing width variants ──────────────────────────────────────────────────
+
+- mnemonic: ldws
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x31042008"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100008"
+        value: "0x7FFF"
+        width: 2
+  expected_state:
+    rd:
+      rd1: "0x0000000000007FFF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldws rd1,rb2,+8; sign-extend 0x7FFF → 0x7FFF"
+
+- mnemonic: ldwu
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x41042008"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100008"
+        value: "0xFFFF"
+        width: 2
+  expected_state:
+    rd:
+      rd1: "0x000000000000FFFF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldwu rd1,rb2,+8; zero-extend 0xFFFF → 0xFFFF"
+
+- mnemonic: ldts
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x32042008"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100008"
+        value: "0x80000000"
+        width: 4
+  expected_state:
+    rd:
+      rd1: "0xFFFFFFFF80000000"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldts rd1,rb2,+8; sign-extend 0x80000000 → 0xFFFF...80000000"
+
+- mnemonic: ldtu
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x42042008"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100008"
+        value: "0x80000000"
+        width: 4
+  expected_state:
+    rd:
+      rd1: "0x0000000080000000"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldtu rd1,rb2,+8; zero-extend 0x80000000 → 0x80000000"
+
+- mnemonic: stw
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x39042008"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0x000000000000ABCD"
+  expected_state:
+    memory:
+      - address: "0x0000000000100008"
+        value: "0xABCD"
+        width: 2
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.2"
+  notes: "stw rd1,rb2,+8; store wyde 0xABCD"
+
+- mnemonic: stt
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x3A042000"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0xDEADBEEF12345678"
+  expected_state:
+    memory:
+      - address: "0x0000000000100000"
+        value: "0x12345678"
+        width: 4
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.2"
+  notes: "stt rd1,rb2,+0; store tetra 0x12345678"
+
+# ─── Multi load/store (rrri) ─────────────────────────────────────────────────
+
+- mnemonic: ldmo
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x37042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0x0000000000000000"
+    memory:
+      - address: "0x0000000000100000"
+        value: "0x1111111111111111"
+        width: 8
+      - address: "0x0000000000100008"
+        value: "0x2222222222222222"
+        width: 8
+  expected_state:
+    rd:
+      rd1: "0x1111111111111111"
+      rd2: "0x2222222222222222"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.3"
+  notes: "ldmo rd1,rb2,rd0,2; multi-load 2 octas from mem"
+
+- mnemonic: stmo
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x3F042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0xAAAAAAAAAAAAAAAA"
+      rd2: "0xBBBBBBBBBBBBBBBB"
+  expected_state:
+    memory:
+      - address: "0x0000000000100000"
+        value: "0xAAAAAAAAAAAAAAAA"
+        width: 8
+      - address: "0x0000000000100008"
+        value: "0xBBBBBBBBBBBBBBBB"
+        width: 8
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.4"
+  notes: "stmo rd1,rb2,rd0,2; multi-store 2 octas to mem"
+
+- mnemonic: ldmbs
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x34042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0x0000000000000000"
+    memory:
+      - address: "0x0000000000100000"
+        value: "0x80"
+        width: 1
+      - address: "0x0000000000100001"
+        value: "0x7F"
+        width: 1
+  expected_state:
+    rd:
+      rd1: "0xFFFFFFFFFFFFFF80"
+      rd2: "0x000000000000007F"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.3"
+  notes: "ldmbs rd1,rb2,rd0,2; multi load bytes: 0x80 sign-ext, 0x7F sign-ext"
+
+- mnemonic: stmb
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x3C042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0x00000000000000AB"
+      rd2: "0x00000000000000CD"
+  expected_state:
+    memory:
+      - address: "0x0000000000100000"
+        value: "0xAB"
+        width: 1
+      - address: "0x0000000000100001"
+        value: "0xCD"
+        width: 1
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.4"
+  notes: "stmb rd1,rb2,rd0,2; multi store bytes"
+
+- mnemonic: ldmbs
+  format: rrri
+  class: legality
+  encoding:
+    word: "0x34042000"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.3"
+  notes: "ldmbs rd1,rb2,rd0,0; immu6=0 → ILLI"
+
+# ─── Remaining multi load/store width variants ───────────────────────────────
+
+- mnemonic: ldmws
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x35042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100000"
+        value: "0x7F00"
+        width: 2
+      - address: "0x0000000000100002"
+        value: "0x8000"
+        width: 2
+  expected_state:
+    rd:
+      rd1: "0x0000000000007F00"
+      rd2: "0xFFFFFFFFFFFF8000"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.3"
+  notes: "ldmws rd1,rb2,rd0,2; multi load wydes, 0x8000 sign-ext"
+
+- mnemonic: ldmts
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x36042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100000"
+        value: "0x7FFFFFFF"
+        width: 4
+      - address: "0x0000000000100004"
+        value: "0x80000000"
+        width: 4
+  expected_state:
+    rd:
+      rd1: "0x000000007FFFFFFF"
+      rd2: "0xFFFFFFFF80000000"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.3"
+  notes: "ldmts rd1,rb2,rd0,2; multi load tetras, 0x80000000 sign-ext"
+
+- mnemonic: stmw
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x3D042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0x000000000000ABCD"
+      rd2: "0x0000000000001234"
+  expected_state:
+    memory:
+      - address: "0x0000000000100000"
+        value: "0xABCD"
+        width: 2
+      - address: "0x0000000000100002"
+        value: "0x1234"
+        width: 2
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.4"
+  notes: "stmw rd1,rb2,rd0,2; multi store wydes"
+
+- mnemonic: stmt
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x3E042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    rd:
+      rd1: "0x00000000DEADBEEF"
+      rd2: "0x00000000CAFEBABE"
+  expected_state:
+    memory:
+      - address: "0x0000000000100000"
+        value: "0xDEADBEEF"
+        width: 4
+      - address: "0x0000000000100004"
+        value: "0xCAFEBABE"
+        width: 4
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.4"
+  notes: "stmt rd1,rb2,rd0,2; multi store tetras"
+
+# ─── Unsigned multi load variants ─────────────────────────────────────────────
+
+- mnemonic: ldmbu
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x44042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100000"
+        value: "0x80"
+        width: 1
+      - address: "0x0000000000100001"
+        value: "0xFF"
+        width: 1
+  expected_state:
+    rd:
+      rd1: "0x0000000000000080"
+      rd2: "0x00000000000000FF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.3"
+  notes: "ldmbu rd1,rb2,rd0,2; multi load unsigned bytes"
+
+- mnemonic: ldmwu
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x45042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100000"
+        value: "0x8000"
+        width: 2
+      - address: "0x0000000000100002"
+        value: "0xFFFF"
+        width: 2
+  expected_state:
+    rd:
+      rd1: "0x0000000000008000"
+      rd2: "0x000000000000FFFF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.3"
+  notes: "ldmwu rd1,rb2,rd0,2; multi load unsigned wydes"
+
+- mnemonic: ldmtu
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x46042002"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+    memory:
+      - address: "0x0000000000100000"
+        value: "0x80000000"
+        width: 4
+      - address: "0x0000000000100004"
+        value: "0xFFFFFFFF"
+        width: 4
+  expected_state:
+    rd:
+      rd1: "0x0000000080000000"
+      rd2: "0x00000000FFFFFFFF"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.3"
+  notes: "ldmtu rd1,rb2,rd0,2; multi load unsigned tetras"
+

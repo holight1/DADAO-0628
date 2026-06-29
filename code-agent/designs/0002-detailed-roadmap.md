@@ -51,8 +51,8 @@ spec.md Appendix A (mask/value)
     ├─→ DL-001c: tools/opcodes.yaml + validate_encoding.py
     │        (machine-readable oracle; make check catches Appendix A errors)
     │
-    ├─→ DL-001d: tests/vectors/schema.md + tests/vectors/inventory.md
-    │        (human-readable schema and per-opcode coverage matrix)
+    ├─→ DL-001d: schema + inventory + isa/*.yaml + validate_vectors.py
+    │        (actual vector data, coverage matrix, and schema validator)
     │
     └─→ Phase 2: llvm-lit tests use encoding vectors as CHECK patterns
         Phase 3: QEMU semantic tests diff against semantic vectors
@@ -111,7 +111,7 @@ no-op, host abort, or timeout.
 
 ```
 Phase 0    Foundation               DONE
-Phase 0.5A Spec Normalization       CURRENT  ← DL-001a✓, 001c, 001b, 002a
+Phase 0.5A Spec Normalization       CURRENT  ← DL-001a✓, 001c, 001d, 002a
 Phase 0.5B Architecture Decisions            ← DL-003a, 003b
 Phase 0.5C Spec Freeze                       ← DL-004a + freeze action
 Phase 1    Component Baseline                ← DL-005a, 006a
@@ -313,8 +313,8 @@ written.
 
 - All encoding vectors authored independently (not from LLVM output) pass
   `llvm-mc` encoding and `llvm-objdump` disassembly.
-- Encoding tests are generated from `tools/opcodes.yaml` (DL-001c output) or
-  `tests/vectors/inventory.md`; never bootstrapped from LLVM output.
+- Encoding tests consume concrete cases from `tests/vectors/isa/*.yaml`, checked
+  against `tools/opcodes.yaml`; they are never bootstrapped from LLVM output.
 - Negative tests cover all legality-class vectors: invalid register fields,
   immediate overflow, reserved encodings, immutable-register writes.
 - Boundary vectors (signed-min, signed-max, zero, overflow) are included.
@@ -353,7 +353,8 @@ written.
 - Compare, branch, jump, call, ret (RegRAS only).
 - Bare-metal machine per ADR-0004: ROM/RAM map, exit port, pass/fail signature.
 - State-dump facility (register file snapshot) callable by test harness.
-- `make build-qemu` target builds QEMU and runs encoding-vector tests.
+- `make build-qemu` target builds QEMU and runs semantic, legality, boundary,
+  overlap, and fault vectors applicable to QEMU.
 
 ### Exit Gates
 
