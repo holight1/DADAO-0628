@@ -1,0 +1,596 @@
+From 064c3d17051ec6a2b9d6acdee3a0dfcc08ee8a83 Mon Sep 17 00:00:00 2001
+From: DADAO <dadao@dev>
+Date: Mon, 29 Jun 2026 17:35:17 +0800
+Subject: [PATCH 2/2] DADAO target skeleton
+
+Add minimal DADAO target skeleton with TargetMachine,
+TargetInfo, MCAsmInfo, MCInstPrinter, and ELFObjectWriter.
+---
+ llvm/lib/Target/DADAO/CMakeLists.txt          | 19 ++++++
+ llvm/lib/Target/DADAO/DADAO.h                 | 25 +++++++
+ llvm/lib/Target/DADAO/DADAOTargetMachine.cpp  | 41 +++++++++++
+ llvm/lib/Target/DADAO/DADAOTargetMachine.h    | 33 +++++++++
+ .../Target/DADAO/MCTargetDesc/CMakeLists.txt  | 16 +++++
+ .../DADAO/MCTargetDesc/DADAOAsmInfo.cpp       | 24 +++++++
+ .../Target/DADAO/MCTargetDesc/DADAOAsmInfo.h  | 31 +++++++++
+ .../MCTargetDesc/DADAOELFObjectWriter.cpp     | 43 ++++++++++++
+ .../DADAO/MCTargetDesc/DADAOInstPrinter.cpp   | 33 +++++++++
+ .../DADAO/MCTargetDesc/DADAOInstPrinter.h     | 35 ++++++++++
+ .../DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp  | 68 +++++++++++++++++++
+ .../DADAO/MCTargetDesc/DADAOMCTargetDesc.h    | 41 +++++++++++
+ .../Target/DADAO/TargetInfo/CMakeLists.txt    | 10 +++
+ .../DADAO/TargetInfo/DADAOTargetInfo.cpp      | 24 +++++++
+ .../Target/DADAO/TargetInfo/DADAOTargetInfo.h | 20 ++++++
+ 15 files changed, 463 insertions(+)
+ create mode 100644 llvm/lib/Target/DADAO/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/DADAO/DADAO.h
+ create mode 100644 llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+ create mode 100644 llvm/lib/Target/DADAO/DADAOTargetMachine.h
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.cpp
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.h
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+ create mode 100644 llvm/lib/Target/DADAO/TargetInfo/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/DADAO/TargetInfo/DADAOTargetInfo.cpp
+ create mode 100644 llvm/lib/Target/DADAO/TargetInfo/DADAOTargetInfo.h
+
+diff --git a/llvm/lib/Target/DADAO/CMakeLists.txt b/llvm/lib/Target/DADAO/CMakeLists.txt
+new file mode 100644
+index 000000000000..54ec398e1f46
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/CMakeLists.txt
+@@ -0,0 +1,19 @@
++add_llvm_component_group(DADAO)
++
++add_llvm_target(DADAOCodeGen
++  DADAOTargetMachine.cpp
++
++  LINK_COMPONENTS
++  Core
++  DADAODesc
++  MC
++  Support
++  Target
++  TargetParser
++
++  ADD_TO_COMPONENT
++  DADAO
++  )
++
++add_subdirectory(MCTargetDesc)
++add_subdirectory(TargetInfo)
+diff --git a/llvm/lib/Target/DADAO/DADAO.h b/llvm/lib/Target/DADAO/DADAO.h
+new file mode 100644
+index 000000000000..a5d4263f2624
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAO.h
+@@ -0,0 +1,25 @@
++//===-- DADAO.h - Top-level interface for DADAO representation --*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the entry points for global functions defined in the LLVM
++// DADAO back-end.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_DADAO_DADAO_H
++#define LLVM_LIB_TARGET_DADAO_DADAO_H
++
++#include "llvm/Pass.h"
++
++namespace llvm {
++class DADAOTargetMachine;
++class PassRegistry;
++
++} // namespace llvm
++
++#endif // LLVM_LIB_TARGET_DADAO_DADAO_H
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+new file mode 100644
+index 000000000000..e27f4126d3ab
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+@@ -0,0 +1,41 @@
++//===-- DADAOTargetMachine.cpp - Define TargetMachine for DADAO ---------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Implements the info about DADAO target spec.
++//
++//===----------------------------------------------------------------------===//
++
++#include "DADAOTargetMachine.h"
++#include "TargetInfo/DADAOTargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/Compiler.h"
++#include "llvm/Target/TargetOptions.h"
++#include <optional>
++
++using namespace llvm;
++
++extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeDADAOTarget() {
++  RegisterTargetMachine<DADAOTargetMachine> X(getTheDADAOTarget());
++}
++
++static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {
++  return RM.value_or(Reloc::Static);
++}
++
++DADAOTargetMachine::DADAOTargetMachine(
++    const Target &T, const Triple &TT, StringRef Cpu, StringRef FeatureString,
++    const TargetOptions &Options, std::optional<Reloc::Model> RM,
++    std::optional<CodeModel::Model> CodeModel, CodeGenOptLevel OptLevel,
++    bool JIT)
++    : CodeGenTargetMachineImpl(T, TT.computeDataLayout(), TT, Cpu,
++                               FeatureString, Options,
++                               getEffectiveRelocModel(RM),
++                               getEffectiveCodeModel(CodeModel, CodeModel::Small),
++                               OptLevel) {
++  initAsmInfo();
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.h b/llvm/lib/Target/DADAO/DADAOTargetMachine.h
+new file mode 100644
+index 000000000000..3b63f61cae98
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.h
+@@ -0,0 +1,33 @@
++//===-- DADAOTargetMachine.h - Define TargetMachine for DADAO ---*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file declares the DADAO specific subclass of TargetMachine.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_DADAO_DADAOTARGETMACHINE_H
++#define LLVM_LIB_TARGET_DADAO_DADAOTARGETMACHINE_H
++
++#include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
++#include <optional>
++
++namespace llvm {
++
++class DADAOTargetMachine : public CodeGenTargetMachineImpl {
++public:
++  DADAOTargetMachine(const Target &TheTarget, const Triple &TargetTriple,
++                     StringRef Cpu, StringRef FeatureString,
++                     const TargetOptions &Options,
++                     std::optional<Reloc::Model> RM,
++                     std::optional<CodeModel::Model> CodeModel,
++                     CodeGenOptLevel OptLevel, bool JIT);
++};
++
++} // namespace llvm
++
++#endif // LLVM_LIB_TARGET_DADAO_DADAOTARGETMACHINE_H
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt b/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
+new file mode 100644
+index 000000000000..a63416eaed67
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
+@@ -0,0 +1,16 @@
++add_llvm_component_library(LLVMDADAODesc
++  DADAOInstPrinter.cpp
++  DADAOMCTargetDesc.cpp
++  DADAOAsmInfo.cpp
++  DADAOELFObjectWriter.cpp
++
++  LINK_COMPONENTS
++  DADAOInfo
++  MC
++  MCDisassembler
++  Support
++  TargetParser
++
++  ADD_TO_COMPONENT
++  DADAO
++  )
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.cpp
+new file mode 100644
+index 000000000000..802de00dab25
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.cpp
+@@ -0,0 +1,24 @@
++//===-- DADAOAsmInfo.cpp - DADAO asm properties ---------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the declarations of the DADAOAsmInfo properties.
++//
++//===----------------------------------------------------------------------===//
++
++#include "DADAOAsmInfo.h"
++#include "llvm/TargetParser/Triple.h"
++
++using namespace llvm;
++
++void DADAOAsmInfo::anchor() {}
++
++DADAOAsmInfo::DADAOAsmInfo(const Triple & /*TheTriple*/,
++                           const MCTargetOptions &Options) {
++  IsLittleEndian = false;
++  CommentString = "#";
++}
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.h
+new file mode 100644
+index 000000000000..8cd9eca0b21b
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.h
+@@ -0,0 +1,31 @@
++//===-- DADAOAsmInfo.h - DADAO asm properties -----------------*- C++ -*--===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the declaration of the DADAOAsmInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOASMINFO_H
++#define LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOASMINFO_H
++
++#include "llvm/MC/MCAsmInfoELF.h"
++
++namespace llvm {
++class Triple;
++
++class DADAOAsmInfo : public MCAsmInfoELF {
++  void anchor() override;
++
++public:
++  explicit DADAOAsmInfo(const Triple &TheTriple,
++                        const MCTargetOptions &Options);
++};
++
++} // namespace llvm
++
++#endif // LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOASMINFO_H
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+new file mode 100644
+index 000000000000..4fdf0a569cc8
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+@@ -0,0 +1,43 @@
++//===-- DADAOELFObjectWriter.cpp - DADAO ELF Writer -----------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "DADAOMCTargetDesc.h"
++#include "llvm/BinaryFormat/ELF.h"
++#include "llvm/MC/MCELFObjectWriter.h"
++#include "llvm/MC/MCObjectWriter.h"
++#include "llvm/Support/ErrorHandling.h"
++
++using namespace llvm;
++
++namespace {
++
++class DADAOELFObjectWriter : public MCELFObjectTargetWriter {
++public:
++  explicit DADAOELFObjectWriter(uint8_t OSABI)
++      : MCELFObjectTargetWriter(/*Is64Bit_=*/true, OSABI, 0x0DA0,
++                                /*HasRelocationAddend_=*/true) {}
++
++  ~DADAOELFObjectWriter() override = default;
++
++protected:
++  unsigned getRelocType(const MCFixup &, const MCValue &,
++                        bool IsPCRel) const override {
++    return 0;
++  }
++
++  bool needsRelocateWithSymbol(const MCValue &, unsigned Type) const override {
++    return false;
++  }
++};
++
++} // end anonymous namespace
++
++std::unique_ptr<MCObjectTargetWriter>
++llvm::createDADAOELFObjectWriter(uint8_t OSABI) {
++  return std::make_unique<DADAOELFObjectWriter>(OSABI);
++}
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
+new file mode 100644
+index 000000000000..84e9f3f99b07
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
+@@ -0,0 +1,33 @@
++//===-- DADAOInstPrinter.cpp - Convert DADAO MCInst to asm syntax ---------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This class prints a DADAO MCInst to a .s file.
++//
++//===----------------------------------------------------------------------===//
++
++#include "DADAOInstPrinter.h"
++#include "llvm/MC/MCAsmInfo.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/Support/raw_ostream.h"
++
++using namespace llvm;
++
++void DADAOInstPrinter::printInst(const MCInst *MI, uint64_t Address,
++                                 StringRef Annot, const MCSubtargetInfo &STI,
++                                 raw_ostream &O) {
++  printAnnotation(O, Annot);
++}
++
++std::pair<const char *, uint64_t>
++DADAOInstPrinter::getMnemonic(const MCInst &MI) const {
++  return {"<unknown>", 0};
++}
++
++void DADAOInstPrinter::printRegName(raw_ostream &OS, MCRegister Reg) {
++  OS << "<unknown>";
++}
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
+new file mode 100644
+index 000000000000..425c81478a83
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
+@@ -0,0 +1,35 @@
++//===-- DADAOInstPrinter.h - Convert DADAO MCInst to asm syntax -*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This class prints a DADAO MCInst to a .s file.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOINSTPRINTER_H
++#define LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOINSTPRINTER_H
++
++#include "llvm/MC/MCInstPrinter.h"
++
++namespace llvm {
++
++class DADAOInstPrinter : public MCInstPrinter {
++public:
++  DADAOInstPrinter(const MCAsmInfo &MAI, const MCInstrInfo &MII,
++                   const MCRegisterInfo &MRI)
++      : MCInstPrinter(MAI, MII, MRI) {}
++
++  void printInst(const MCInst *MI, uint64_t Address, StringRef Annot,
++                 const MCSubtargetInfo &STI, raw_ostream &O) override;
++  std::pair<const char *, uint64_t>
++  getMnemonic(const MCInst &MI) const override;
++  void printRegName(raw_ostream &OS, MCRegister Reg) override;
++};
++
++} // end namespace llvm
++
++#endif // LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOINSTPRINTER_H
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
+new file mode 100644
+index 000000000000..aee8830fe5f8
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
+@@ -0,0 +1,68 @@
++//===-- DADAOMCTargetDesc.cpp - DADAO Target Descriptions -----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file provides DADAO specific target descriptions.
++//
++//===----------------------------------------------------------------------===//
++
++#include "DADAOMCTargetDesc.h"
++#include "DADAOAsmInfo.h"
++#include "DADAOInstPrinter.h"
++#include "TargetInfo/DADAOTargetInfo.h"
++#include "llvm/MC/MCInstPrinter.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/MC/MCRegisterInfo.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/Compiler.h"
++#include "llvm/TargetParser/Triple.h"
++
++using namespace llvm;
++
++static MCInstrInfo *createDADAOMCInstrInfo() {
++  MCInstrInfo *X = new MCInstrInfo();
++  return X;
++}
++
++static MCRegisterInfo *createDADAOMCRegisterInfo(const Triple & /*TT*/) {
++  MCRegisterInfo *X = new MCRegisterInfo();
++  return X;
++}
++
++static MCSubtargetInfo *
++createDADAOMCSubtargetInfo(const Triple &TT, StringRef CPU, StringRef FS) {
++  return new MCSubtargetInfo(TT, CPU, /*TuneCPU*/ CPU, FS, {}, {}, {}, nullptr,
++                             nullptr, nullptr, nullptr, nullptr, nullptr);
++}
++
++static MCInstPrinter *createDADAOMCInstPrinter(const Triple & /*T*/,
++                                                unsigned SyntaxVariant,
++                                                const MCAsmInfo &MAI,
++                                                const MCInstrInfo &MII,
++                                                const MCRegisterInfo &MRI) {
++  if (SyntaxVariant == 0)
++    return new DADAOInstPrinter(MAI, MII, MRI);
++  return nullptr;
++}
++
++extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void
++LLVMInitializeDADAOTargetMC() {
++  RegisterMCAsmInfo<DADAOAsmInfo> X(getTheDADAOTarget());
++
++  TargetRegistry::RegisterMCInstrInfo(getTheDADAOTarget(),
++                                      createDADAOMCInstrInfo);
++
++  TargetRegistry::RegisterMCRegInfo(getTheDADAOTarget(),
++                                    createDADAOMCRegisterInfo);
++
++  TargetRegistry::RegisterMCSubtargetInfo(getTheDADAOTarget(),
++                                          createDADAOMCSubtargetInfo);
++
++  TargetRegistry::RegisterMCInstPrinter(getTheDADAOTarget(),
++                                        createDADAOMCInstPrinter);
++}
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+new file mode 100644
+index 000000000000..4fb8a7715650
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+@@ -0,0 +1,41 @@
++//===-- DADAOMCTargetDesc.h - DADAO Target Descriptions ---------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file provides DADAO specific target descriptions.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOMCTARGETDESC_H
++#define LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOMCTARGETDESC_H
++
++#include "llvm/MC/MCTargetOptions.h"
++#include "llvm/Support/DataTypes.h"
++#include <memory>
++
++namespace llvm {
++class MCAsmBackend;
++class MCCodeEmitter;
++class MCContext;
++class MCInstrInfo;
++class MCObjectTargetWriter;
++class MCRegisterInfo;
++class MCSubtargetInfo;
++class Target;
++
++MCCodeEmitter *createDADAOMCCodeEmitter(const MCInstrInfo &MCII,
++                                        MCContext &Ctx);
++
++MCAsmBackend *createDADAOAsmBackend(const Target &T, const MCSubtargetInfo &STI,
++                                    const MCRegisterInfo &MRI,
++                                    const MCTargetOptions &Options);
++
++std::unique_ptr<MCObjectTargetWriter>
++createDADAOELFObjectWriter(uint8_t OSABI);
++} // namespace llvm
++
++#endif // LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOMCTARGETDESC_H
+diff --git a/llvm/lib/Target/DADAO/TargetInfo/CMakeLists.txt b/llvm/lib/Target/DADAO/TargetInfo/CMakeLists.txt
+new file mode 100644
+index 000000000000..99a0a5ba1783
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/TargetInfo/CMakeLists.txt
+@@ -0,0 +1,10 @@
++add_llvm_component_library(LLVMDADAOInfo
++  DADAOTargetInfo.cpp
++
++  LINK_COMPONENTS
++  MC
++  Support
++
++  ADD_TO_COMPONENT
++  DADAO
++  )
+diff --git a/llvm/lib/Target/DADAO/TargetInfo/DADAOTargetInfo.cpp b/llvm/lib/Target/DADAO/TargetInfo/DADAOTargetInfo.cpp
+new file mode 100644
+index 000000000000..38bb5a857076
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/TargetInfo/DADAOTargetInfo.cpp
+@@ -0,0 +1,24 @@
++//===-- DADAOTargetInfo.cpp - DADAO Target Implementation -----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "TargetInfo/DADAOTargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/Compiler.h"
++
++using namespace llvm;
++
++Target &llvm::getTheDADAOTarget() {
++  static Target TheDADAOTarget;
++  return TheDADAOTarget;
++}
++
++extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void
++LLVMInitializeDADAOTargetInfo() {
++  RegisterTarget<Triple::dadao> X(getTheDADAOTarget(), "dadao", "DADAO",
++                                  "DADAO");
++}
+diff --git a/llvm/lib/Target/DADAO/TargetInfo/DADAOTargetInfo.h b/llvm/lib/Target/DADAO/TargetInfo/DADAOTargetInfo.h
+new file mode 100644
+index 000000000000..7519ea52a518
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/TargetInfo/DADAOTargetInfo.h
+@@ -0,0 +1,20 @@
++//===-- DADAOTargetInfo.h - DADAO Target Implementation ---------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_DADAO_TARGETINFO_DADAOTARGETINFO_H
++#define LLVM_LIB_TARGET_DADAO_TARGETINFO_DADAOTARGETINFO_H
++
++namespace llvm {
++
++class Target;
++
++Target &getTheDADAOTarget();
++
++} // namespace llvm
++
++#endif // LLVM_LIB_TARGET_DADAO_TARGETINFO_DADAOTARGETINFO_H
+-- 
+2.43.0
+

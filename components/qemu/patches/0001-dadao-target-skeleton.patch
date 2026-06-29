@@ -1,0 +1,674 @@
+From f90c64532c833852bf57c1f50554508d4541b6ee Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Mon, 29 Jun 2026 17:20:53 +0800
+Subject: [PATCH] target/dadao: add DADAO SimRISC target skeleton
+
+Add initial QEMU target skeleton for DADAO SimRISC:
+- target/dadao/: CPU state, QOM registration, TCG translation skeleton
+- configs/targets/dadao-softmmu.mak: Default target config (big-endian)
+- hw/dadao/: M1 test machine with ROM, RAM, exit port MMIO
+- Update target/meson.build, target/Kconfig, hw/Kconfig to register
+---
+ configs/devices/dadao-softmmu/default.mak |   2 +
+ configs/targets/dadao-softmmu.mak         |   5 +
+ hw/Kconfig                                |   1 +
+ hw/dadao/Kconfig                          |   4 +
+ hw/dadao/dadao-machine.c                  | 105 ++++++++++++++++
+ hw/dadao/meson.build                      |   4 +
+ include/system/arch_init.h                |   1 +
+ target/Kconfig                            |   1 +
+ target/dadao/Kconfig                      |   3 +
+ target/dadao/cpu-param.h                  |  11 ++
+ target/dadao/cpu.c                        | 133 ++++++++++++++++++++
+ target/dadao/cpu.h                        |  62 ++++++++++
+ target/dadao/helper.c                     |  19 +++
+ target/dadao/helper.h                     |   1 +
+ target/dadao/meson.build                  |  11 ++
+ target/dadao/translate.c                  | 144 ++++++++++++++++++++++
+ target/meson.build                        |   1 +
+ 17 files changed, 508 insertions(+)
+ create mode 100644 configs/devices/dadao-softmmu/default.mak
+ create mode 100644 configs/targets/dadao-softmmu.mak
+ create mode 100644 hw/dadao/Kconfig
+ create mode 100644 hw/dadao/dadao-machine.c
+ create mode 100644 hw/dadao/meson.build
+ create mode 100644 target/dadao/Kconfig
+ create mode 100644 target/dadao/cpu-param.h
+ create mode 100644 target/dadao/cpu.c
+ create mode 100644 target/dadao/cpu.h
+ create mode 100644 target/dadao/helper.c
+ create mode 100644 target/dadao/helper.h
+ create mode 100644 target/dadao/meson.build
+ create mode 100644 target/dadao/translate.c
+
+diff --git a/configs/devices/dadao-softmmu/default.mak b/configs/devices/dadao-softmmu/default.mak
+new file mode 100644
+index 0000000..6c445ef
+--- /dev/null
++++ b/configs/devices/dadao-softmmu/default.mak
+@@ -0,0 +1,2 @@
++# Default configuration for dadao-softmmu
++CONFIG_DADAO_M1=y
+diff --git a/configs/targets/dadao-softmmu.mak b/configs/targets/dadao-softmmu.mak
+new file mode 100644
+index 0000000..6dd3129
+--- /dev/null
++++ b/configs/targets/dadao-softmmu.mak
+@@ -0,0 +1,5 @@
++TARGET_ARCH=dadao
++TARGET_BASE_ARCH=dadao
++TARGET_SUPPORTS_MTTCG=y
++TARGET_BIG_ENDIAN=y
++TARGET_LONG_BITS=64
+diff --git a/hw/Kconfig b/hw/Kconfig
+index 9a86a6a..1028e3a 100644
+--- a/hw/Kconfig
++++ b/hw/Kconfig
+@@ -48,6 +48,7 @@ source watchdog/Kconfig
+ 
+ # arch Kconfig
+ source arm/Kconfig
++source dadao/Kconfig
+ source cpu/Kconfig
+ source alpha/Kconfig
+ source avr/Kconfig
+diff --git a/hw/dadao/Kconfig b/hw/dadao/Kconfig
+new file mode 100644
+index 0000000..3ccd665
+--- /dev/null
++++ b/hw/dadao/Kconfig
+@@ -0,0 +1,4 @@
++config DADAO_M1
++    bool
++    default y
++    depends on DADAO
+diff --git a/hw/dadao/dadao-machine.c b/hw/dadao/dadao-machine.c
+new file mode 100644
+index 0000000..2fb17da
+--- /dev/null
++++ b/hw/dadao/dadao-machine.c
+@@ -0,0 +1,105 @@
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qemu/error-report.h"
++#include "qapi/error.h"
++#include "hw/boards.h"
++#include "hw/loader.h"
++#include "hw/qdev-properties.h"
++#include "system/runstate.h"
++#include "system/system.h"
++#include "target/dadao/cpu.h"
++
++#define TYPE_DADAO_M1 "dadao-m1"
++
++static const uint64_t rom_base   = 0x00100000;
++static const uint64_t rom_size   = 64 * KiB;
++static const uint64_t exit_base  = 0x10000000;
++static const uint64_t exit_size  = 8;
++static const uint64_t ram_base   = 0x80000000;
++static const uint64_t ram_size   = 128 * MiB;
++
++static uint64_t exit_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    return 0;
++}
++
++static void exit_write(void *opaque, hwaddr addr,
++                       uint64_t val64, unsigned int size)
++{
++    if (addr == 0 && size == 8) {
++        int code = val64 & 0xff;
++        qemu_system_shutdown_request_with_code(
++            code == 0 ? SHUTDOWN_CAUSE_GUEST_SHUTDOWN
++                      : SHUTDOWN_CAUSE_GUEST_PANIC,
++            code);
++    }
++}
++
++static const MemoryRegionOps exit_ops = {
++    .read = exit_read,
++    .write = exit_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid = {
++        .min_access_size = 8,
++        .max_access_size = 8,
++    },
++};
++
++static void dadao_machine_init(MachineState *machine)
++{
++    MemoryRegion *sys_mem = get_system_memory();
++    MemoryRegion *rom = g_new(MemoryRegion, 1);
++    MemoryRegion *exit_mmio = g_new(MemoryRegion, 1);
++
++    memory_region_init_ram(rom, NULL, "dadao.rom", rom_size, &error_fatal);
++    memory_region_set_readonly(rom, true);
++    memory_region_add_subregion(sys_mem, rom_base, rom);
++
++    memory_region_init_io(exit_mmio, NULL, &exit_ops, NULL,
++                          "dadao.exit", exit_size);
++    memory_region_add_subregion(sys_mem, exit_base, exit_mmio);
++
++    if (machine->ram_size == 0) {
++        machine->ram_size = ram_size;
++    }
++    if (machine->ram_size != ram_size) {
++        error_report("Invalid RAM size, must be %" PRIu64, (uint64_t)ram_size);
++        exit(EXIT_FAILURE);
++    }
++    memory_region_add_subregion(sys_mem, ram_base, machine->ram);
++
++    if (machine->firmware) {
++        load_image_targphys(machine->firmware, rom_base, rom_size);
++    }
++    if (machine->kernel_filename) {
++        load_image_targphys(machine->kernel_filename, ram_base, ram_size);
++    }
++}
++
++static void dadao_machine_class_init(ObjectClass *oc, void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++
++    mc->desc = "DADAO M1 test machine";
++    mc->init = dadao_machine_init;
++    mc->max_cpus = 1;
++    mc->min_cpus = 1;
++    mc->default_cpus = 1;
++    mc->is_default = true;
++    mc->default_cpu_type = TYPE_DADAO_CPU;
++    mc->default_ram_size = ram_size;
++    mc->default_ram_id = "dadao.ram";
++}
++
++static const TypeInfo dadao_machine_type = {
++    .name = TYPE_DADAO_M1,
++    .parent = TYPE_MACHINE,
++    .class_init = dadao_machine_class_init,
++};
++
++static void dadao_machine_register_types(void)
++{
++    type_register_static(&dadao_machine_type);
++}
++
++type_init(dadao_machine_register_types)
+diff --git a/hw/dadao/meson.build b/hw/dadao/meson.build
+new file mode 100644
+index 0000000..8ef4150
+--- /dev/null
++++ b/hw/dadao/meson.build
+@@ -0,0 +1,4 @@
++dadao_ss = ss.source_set()
++dadao_ss.add(when: 'CONFIG_DADAO_M1', if_true: files('dadao-machine.c'))
++
++hw_arch += {'dadao': dadao_ss}
+diff --git a/include/system/arch_init.h b/include/system/arch_init.h
+index 51e24c3..4380f4b 100644
+--- a/include/system/arch_init.h
++++ b/include/system/arch_init.h
+@@ -23,6 +23,7 @@ enum {
+     QEMU_ARCH_AVR = (1 << 21),
+     QEMU_ARCH_HEXAGON = (1 << 22),
+     QEMU_ARCH_LOONGARCH = (1 << 23),
++    QEMU_ARCH_DADAO = (1 << 24),
+ };
+ 
+ bool qemu_arch_available(unsigned qemu_arch_mask);
+diff --git a/target/Kconfig b/target/Kconfig
+index d0c7b59..9d6928f 100644
+--- a/target/Kconfig
++++ b/target/Kconfig
+@@ -1,4 +1,5 @@
+ source alpha/Kconfig
++source dadao/Kconfig
+ source arm/Kconfig
+ source avr/Kconfig
+ source hppa/Kconfig
+diff --git a/target/dadao/Kconfig b/target/dadao/Kconfig
+new file mode 100644
+index 0000000..746e0a6
+--- /dev/null
++++ b/target/dadao/Kconfig
+@@ -0,0 +1,3 @@
++config DADAO
++    bool
++    select TARGET_BIG_ENDIAN
+diff --git a/target/dadao/cpu-param.h b/target/dadao/cpu-param.h
+new file mode 100644
+index 0000000..e5b4a5b
+--- /dev/null
++++ b/target/dadao/cpu-param.h
+@@ -0,0 +1,11 @@
++#ifndef DADAO_CPU_PARAM_H
++#define DADAO_CPU_PARAM_H
++
++#define TARGET_LONG_BITS 64
++#define TARGET_PAGE_BITS 12
++#define TARGET_PHYS_ADDR_SPACE_BITS 48
++#define TARGET_VIRT_ADDR_SPACE_BITS 48
++
++#define TCG_GUEST_DEFAULT_MO 0
++
++#endif
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+new file mode 100644
+index 0000000..e437632
+--- /dev/null
++++ b/target/dadao/cpu.c
+@@ -0,0 +1,133 @@
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "cpu.h"
++#include "exec/exec-all.h"
++#include "qapi/error.h"
++#include "migration/vmstate.h"
++#include "system/runstate.h"
++#include "system/system.h"
++#include "hw/qdev-properties.h"
++#include "accel/tcg/cpu-ops.h"
++
++extern const TCGCPUOps dadao_tcg_ops;
++
++void cpu_get_tb_cpu_state(CPUDADAOState *env, vaddr *pc,
++                          uint64_t *cs_base, uint32_t *pflags)
++{
++    *pc = env->pc;
++    *cs_base = 0;
++    *pflags = 0;
++}
++
++static void dadao_cpu_set_pc(CPUState *cs, vaddr value)
++{
++    DADAOCPU *cpu = DADAO_CPU(cs);
++    cpu->env.pc = value;
++}
++
++static vaddr dadao_cpu_get_pc(CPUState *cs)
++{
++    DADAOCPU *cpu = DADAO_CPU(cs);
++    return cpu->env.pc;
++}
++
++static void dadao_cpu_reset_hold(Object *obj, ResetType type)
++{
++    CPUState *cs = CPU(obj);
++    DADAOCPU *cpu = DADAO_CPU(cs);
++    CPUDADAOState *env = &cpu->env;
++    int i;
++
++    for (i = 0; i < 64; i++) {
++        env->rd[i] = 0;
++        env->rb[i] = 0;
++        env->rf[i] = 0;
++        env->ra[i] = 0;
++    }
++    /* rf[0] reset = QNaN per ISA spec §1.2 (contracts/isa/spec.md) */
++    env->rf[0] = UINT64_C(0x7FF800007FC00000);
++    env->pc = 0;
++    cs->exception_index = -1;
++}
++
++static void dadao_cpu_realize(DeviceState *dev, Error **errp)
++{
++    CPUState *cs = CPU(dev);
++    DADAOCPUClass *dcc = DADAO_CPU_GET_CLASS(dev);
++    Error *local_err = NULL;
++
++    cpu_exec_realizefn(cs, &local_err);
++    if (local_err != NULL) {
++        error_propagate(errp, local_err);
++        return;
++    }
++
++    qemu_init_vcpu(cs);
++    cpu_reset(cs);
++    dcc->parent_realize(dev, errp);
++}
++
++static void dadao_cpu_init(Object *obj)
++{
++}
++
++static ObjectClass *dadao_cpu_class_by_name(const char *cpu_model)
++{
++    ObjectClass *oc;
++    char *typename;
++    char **cpuname;
++
++    cpuname = g_strsplit(cpu_model, ",", 1);
++    typename = g_strdup_printf(DADAO_CPU_TYPE_NAME("%s"), cpuname[0]);
++    oc = object_class_by_name(typename);
++    g_strfreev(cpuname);
++    g_free(typename);
++    return oc;
++}
++
++#ifndef CONFIG_USER_ONLY
++void dadao_cpu_do_interrupt(CPUState *cs)
++{
++    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
++}
++
++bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
++                        MMUAccessType access_type, int mmu_idx,
++                        bool probe, uintptr_t retaddr)
++{
++    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x8F);
++    return true;
++}
++#endif
++
++static void dadao_cpu_class_init(ObjectClass *oc, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    CPUClass *cc = CPU_CLASS(oc);
++    DADAOCPUClass *dcc = DADAO_CPU_CLASS(oc);
++    ResettableClass *rc = RESETTABLE_CLASS(oc);
++
++    device_class_set_parent_realize(dc, dadao_cpu_realize,
++                                    &dcc->parent_realize);
++    rc->phases.hold = dadao_cpu_reset_hold;
++
++    cc->class_by_name = dadao_cpu_class_by_name;
++    cc->get_pc = dadao_cpu_get_pc;
++    cc->set_pc = dadao_cpu_set_pc;
++    cc->tcg_ops = &dadao_tcg_ops;
++}
++
++static const TypeInfo dadao_cpu_type_info = {
++    .name = TYPE_DADAO_CPU,
++    .parent = TYPE_CPU,
++    .instance_size = sizeof(DADAOCPU),
++    .instance_init = dadao_cpu_init,
++    .abstract = false,
++    .class_size = sizeof(DADAOCPUClass),
++    .class_init = dadao_cpu_class_init,
++};
++
++static void dadao_cpu_register_types(void)
++{
++    type_register_static(&dadao_cpu_type_info);
++}
++
++type_init(dadao_cpu_register_types)
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+new file mode 100644
+index 0000000..b8ab68a
+--- /dev/null
++++ b/target/dadao/cpu.h
+@@ -0,0 +1,62 @@
++#ifndef DADAO_CPU_H
++#define DADAO_CPU_H
++
++#include "hw/core/cpu.h"
++#include "exec/cpu-defs.h"
++#include "qom/object.h"
++
++#define EXCP_ILLI  1
++#define EXCP_UNDI  2
++
++#define CPU_RESOLVING_TYPE TYPE_DADAO_CPU
++
++#define DADAO_CPU_TYPE_SUFFIX "-" TYPE_DADAO_CPU
++#define DADAO_CPU_TYPE_NAME(name) (name DADAO_CPU_TYPE_SUFFIX)
++
++#define TARGET_INSN_START_EXTRA_WORDS 1
++
++typedef struct CPUArchState CPUDADAOState;
++typedef struct ArchCPU DADAOCPU;
++typedef struct DADAOCPUClass DADAOCPUClass;
++
++#define TYPE_DADAO_CPU "dadao-cpu"
++#define DADAO_CPU_CLASS(klass) \
++    OBJECT_CLASS_CHECK(DADAOCPUClass, (klass), TYPE_DADAO_CPU)
++#define DADAO_CPU(obj) \
++    OBJECT_CHECK(DADAOCPU, (obj), TYPE_DADAO_CPU)
++#define DADAO_CPU_GET_CLASS(obj) \
++    OBJECT_GET_CLASS(DADAOCPUClass, (obj), TYPE_DADAO_CPU)
++
++struct CPUArchState {
++    target_ulong rd[64];
++    target_ulong rb[64];
++    target_ulong rf[64];
++    target_ulong ra[64];
++    target_ulong pc;
++};
++
++struct ArchCPU {
++    CPUState parent_obj;
++    CPUDADAOState env;
++};
++
++struct DADAOCPUClass {
++    CPUClass parent_class;
++    DeviceRealize parent_realize;
++    ResettablePhases parent_phases;
++};
++
++void dadao_cpu_do_interrupt(CPUState *cpu);
++bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
++                        MMUAccessType access_type, int mmu_idx,
++                        bool probe, uintptr_t retaddr);
++G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
++                                      uint32_t exception,
++                                      uintptr_t pc);
++void dadao_translate_init(void);
++void dadao_translate_code(CPUState *cs, TranslationBlock *tb,
++                          int *max_insns, vaddr pc, void *host_pc);
++
++#include "exec/cpu-all.h"
++
++#endif
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+new file mode 100644
+index 0000000..54d200a
+--- /dev/null
++++ b/target/dadao/helper.c
+@@ -0,0 +1,19 @@
++#include "qemu/osdep.h"
++#include "cpu.h"
++#include "exec/exec-all.h"
++#include "exec/helper-proto.h"
++#include "exec/cpu_ldst.h"
++
++G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
++                                      uint32_t exception,
++                                      uintptr_t pc)
++{
++    CPUState *cs = env_cpu(env);
++    cs->exception_index = exception;
++    cpu_loop_exit(cs);
++}
++
++void helper_raise_exception(CPUDADAOState *env, uint32_t exception)
++{
++    dadao_raise_exception(env, exception, 0);
++}
+diff --git a/target/dadao/helper.h b/target/dadao/helper.h
+new file mode 100644
+index 0000000..1cbf27d
+--- /dev/null
++++ b/target/dadao/helper.h
+@@ -0,0 +1 @@
++DEF_HELPER_2(raise_exception, noreturn, env, i32)
+diff --git a/target/dadao/meson.build b/target/dadao/meson.build
+new file mode 100644
+index 0000000..ae4dfbd
+--- /dev/null
++++ b/target/dadao/meson.build
+@@ -0,0 +1,11 @@
++dadao_ss = ss.source_set()
++dadao_ss.add(files(
++  'cpu.c',
++  'translate.c',
++  'helper.c',
++))
++
++dadao_system_ss = ss.source_set()
++
++target_arch += {'dadao': dadao_ss}
++target_system_arch += {'dadao': dadao_system_ss}
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+new file mode 100644
+index 0000000..872ce72
+--- /dev/null
++++ b/target/dadao/translate.c
+@@ -0,0 +1,144 @@
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "cpu.h"
++#include "tcg/tcg-op.h"
++#include "exec/exec-all.h"
++#include "exec/helper-proto.h"
++#include "exec/helper-gen.h"
++#include "exec/translator.h"
++#include "exec/translation-block.h"
++#include "exec/log.h"
++#include "accel/tcg/cpu-ops.h"
++
++#define HELPER_H "helper.h"
++#include "exec/helper-info.c.inc"
++#undef  HELPER_H
++
++static TCGv cpu_rd[64];
++static TCGv cpu_rb[64];
++static TCGv cpu_ra[64];
++static TCGv cpu_pc;
++
++typedef struct DisasContext {
++    DisasContextBase base;
++    target_ulong pc_save;
++    uint32_t opcode;
++    CPUState *cs;
++} DisasContext;
++
++static void gen_exception_illegal(DisasContext *ctx)
++{
++    gen_helper_raise_exception(tcg_env, tcg_constant_i32(EXCP_ILLI));
++    ctx->base.is_jmp = DISAS_NORETURN;
++}
++
++static void decode_opc(CPUDADAOState *env, DisasContext *ctx)
++{
++    ctx->opcode = translator_ldl_swap(env, &ctx->base, ctx->base.pc_next, true);
++    gen_exception_illegal(ctx);
++}
++
++static void dadao_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
++{
++    DisasContext *ctx = container_of(dcbase, DisasContext, base);
++    ctx->pc_save = ctx->base.pc_first;
++    ctx->cs = cs;
++}
++
++static void dadao_tr_tb_start(DisasContextBase *db, CPUState *cpu)
++{
++}
++
++static void dadao_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
++{
++    DisasContext *ctx = container_of(dcbase, DisasContext, base);
++    tcg_gen_insn_start(ctx->base.pc_next, 0);
++}
++
++static void dadao_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
++{
++    DisasContext *ctx = container_of(dcbase, DisasContext, base);
++    CPUDADAOState *env = cpu_env(cpu);
++
++    decode_opc(env, ctx);
++    ctx->base.pc_next += 4;
++
++    if (ctx->base.is_jmp == DISAS_NEXT) {
++        if (!translator_is_same_page(&ctx->base, ctx->base.pc_next)) {
++            ctx->base.is_jmp = DISAS_TOO_MANY;
++        }
++    }
++}
++
++static void dadao_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
++{
++    DisasContext *ctx = container_of(dcbase, DisasContext, base);
++
++    switch (ctx->base.is_jmp) {
++    case DISAS_TOO_MANY:
++        tcg_gen_lookup_and_goto_ptr();
++        break;
++    case DISAS_NORETURN:
++        break;
++    default:
++        g_assert_not_reached();
++    }
++}
++
++static const TranslatorOps dadao_tr_ops = {
++    .init_disas_context = dadao_tr_init_disas_context,
++    .tb_start           = dadao_tr_tb_start,
++    .insn_start         = dadao_tr_insn_start,
++    .translate_insn     = dadao_tr_translate_insn,
++    .tb_stop            = dadao_tr_tb_stop,
++};
++
++void dadao_translate_code(CPUState *cs, TranslationBlock *tb,
++                          int *max_insns, vaddr pc, void *host_pc)
++{
++    DisasContext ctx;
++
++    translator_loop(cs, tb, max_insns, pc, host_pc, &dadao_tr_ops, &ctx.base);
++}
++
++static void dadao_tcg_init(void)
++{
++    dadao_translate_init();
++}
++
++static void dadao_restore_state_to_opc(CPUState *cs,
++                                        const TranslationBlock *tb,
++                                        const uint64_t *data)
++{
++    DADAOCPU *cpu = DADAO_CPU(cs);
++    cpu->env.pc = data[0];
++}
++
++const TCGCPUOps dadao_tcg_ops = {
++    .initialize = dadao_tcg_init,
++    .translate_code = dadao_translate_code,
++    .restore_state_to_opc = dadao_restore_state_to_opc,
++#ifndef CONFIG_USER_ONLY
++    .tlb_fill = dadao_cpu_tlb_fill,
++    .do_interrupt = dadao_cpu_do_interrupt,
++#endif
++};
++
++void dadao_translate_init(void)
++{
++    int i;
++
++    for (i = 0; i < 64; i++) {
++        cpu_rd[i] = tcg_global_mem_new(tcg_env,
++            offsetof(CPUDADAOState, rd[i]),
++            NULL);
++        cpu_rb[i] = tcg_global_mem_new(tcg_env,
++            offsetof(CPUDADAOState, rb[i]),
++            NULL);
++        cpu_ra[i] = tcg_global_mem_new(tcg_env,
++            offsetof(CPUDADAOState, ra[i]),
++            NULL);
++    }
++    cpu_pc = tcg_global_mem_new(tcg_env,
++                                offsetof(CPUDADAOState, pc), "pc");
++}
+diff --git a/target/meson.build b/target/meson.build
+index b29598e..130297a 100644
+--- a/target/meson.build
++++ b/target/meson.build
+@@ -1,4 +1,5 @@
+ subdir('alpha')
++subdir('dadao')
+ subdir('arm')
+ subdir('avr')
+ subdir('hexagon')
+-- 
+2.43.0
+

@@ -40,13 +40,28 @@ check: manifest-check validate-encoding validate-vectors check-wiki-drift
 	@$(PYTHON) -m compileall -q scripts
 	@echo "repository checks: PASS"
 
+QEMU_SRC   ?= .work/qemu
+QEMU_BUILD ?= .work/build/qemu
+
 build-qemu: manifest-check
-	@echo "build-qemu: not yet implemented (Phase 3)"
-	@exit 0
+	cd $(QEMU_SRC) && ./configure \
+	  --target-list=dadao-softmmu \
+	  --enable-tcg \
+	  --disable-werror
+	$(MAKE) -C $(QEMU_SRC) -j$$(nproc)
+	@echo "build-qemu: PASS"
+
+LLVM_BUILD ?= .work/build/llvm
+LLVM_SRC   ?= .work/llvm/llvm
 
 build-mc: manifest-check
-	@echo "build-mc: not yet implemented (Phase 2)"
-	@exit 0
+	cmake -G Ninja -B $(LLVM_BUILD) -S $(LLVM_SRC) \
+	  -DLLVM_TARGETS_TO_BUILD=DADAO \
+	  -DLLVM_ENABLE_PROJECTS="" \
+	  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+	  -DLLVM_ENABLE_ASSERTIONS=ON
+	ninja -C $(LLVM_BUILD) llvm-mc llvm-objdump
+	@echo "build-mc: PASS"
 
 check-wiki-drift:
 	@$(PYTHON) scripts/check_wiki_drift.py

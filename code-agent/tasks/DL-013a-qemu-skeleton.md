@@ -191,4 +191,118 @@ smoke-boot.sh          →  启动不崩溃（exit 0 或预期的 exit code）
 
 ## 完成区
 
-<!-- DS 在此填写 -->
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `components/qemu/patches/0001-dadao-target-skeleton.patch` — 新增（17 文件，672 行）
+- `components/qemu/patches/series` — 更新
+- `Makefile` — build-qemu 替换为真实 configure+make
+
+**验证结果**：
+```
+$ make build-qemu
+... configure + make ...
+build-qemu: PASS
+
+$ .work/qemu/build/qemu-system-dadao --version
+QEMU emulator version 10.0.0 (v10.0.0-1-gf90c645)
+```
+
+**关键实现内容**：
+- CPU: rd[64]/rb[64]/rf[64]/ra[64]/pc, 复位全零
+- TCG: 大端 32-bit fetch, 全部指令→ILLI
+- 机器: ROM @0x100000 (64KB), RAM @0x80000000 (128MB), Exit @0x10000000
+- 构建: `target/dadao/` + `hw/dadao/`, Kconfig, meson.build
+
+---
+
+## Architecture Review (2026-06-29)
+
+**评审结论**：**Needs Revision — Machine 骨架未编译，`dadao-m1` 不可用。**
+
+### 运行验证
+
+```
+$ qemu-system-dadao --version
+QEMU emulator version 10.0.0 (v10.0.0-1-gf90c645)
+
+$ qemu-system-dadao -M ?
+Supported machines are:
+none                 empty machine
+```
+
+`dadao-m1` 不在机器列表中。
+
+### 根因分析
+
+patch 修改了 `hw/Kconfig` 添加 `source dadao/Kconfig`，创建了
+`hw/dadao/meson.build` 和 `hw/dadao/dadao-machine.c`，但**未修改
+`hw/meson.build`** 添加 `subdir('dadao')`。
+
+QEMU 10.0 的 `hw/meson.build` 按字母顺序逐个 `subdir()` 所有子目录
+（9pfs, acpi, adc, ...）。缺少 `subdir('dadao')` 导致：
+- `hw/dadao/meson.build` 从未被执行
+- `hw_arch += {'dadao': dadao_ss}` 从未注册
+- `dadao-machine.c` 从未编译或链接
+
+构建输出确认：`.work/qemu/build/` 中有 `target_dadao_cpu.c.o` ✅
+但没有 `hw_dadao_dadao-machine.c.o` ❌
+
+### 修正
+
+在 patch 的 `hw/meson.build` diff 中添加一行 `subdir('dadao')`，
+按字母顺序插入到 `subdir('cxl')` 之后。
+
+---
+
+### 其他逐项检查
+
+| 需求 | 状态 |
+|------|------|
+| CPU state (rd[64]/rb[64]/rf[64]/ra[64]/pc) | ✅ |
+| cpu_reset() 全零 | ✅ |
+| TCG translate 骨架 (32-bit 大端 fetch) | ✅ |
+| 全部指令 → gen_exception_illegal() | ✅ |
+| Helper 骨架 (ILLI/UNDI) | ✅ |
+| ROM/RAM/Exit port 映射定义 | ✅ patch 中有 |
+| configs/targets/dadao-softmmu.mak | ✅ |
+| target/meson.build + Kconfig | ✅ |
+| `build-qemu` = 真实 configure+make | ✅ 编译通过 |
+| `qemu-system-dadao` 存在 | ✅ |
+
+---
+
+### 复审通过条件
+
+- [ ] `hw/meson.build` 添加 `subdir('dadao')`
+- [ ] re-build 后 `qemu-system-dadao -M ?` 显示 `dadao-m1`
+
+---
+
+## Architecture Review 2nd Round (2026-06-29)
+
+**评审结论**：**Accepted（两处 P0 已由架构师直接修复）**
+
+### 直接修复清单
+
+| 修复项 | 文件 | 说明 |
+|--------|------|------|
+| rf[0] 复位值 0→0x7FF800007FC00000 | `components/qemu/patches/0001-dadao-target-skeleton.patch` L303–306 | 任务约束明确要求 QNaN（ISA spec §1.2），DS 全置 0 是遗漏 |
+| hw/meson.build `subdir('dadao')` | `components/qemu/patches/0002-dadao-hw-meson-subdir.patch`（新建）；`series` 更新 | 缺失此行导致 hw/dadao/ 从未编译，机器不在 `-M ?` 列表中 |
+
+### 其余逐项核查
+
+| 需求 | 状态 |
+|------|------|
+| CPUState: rd[64]/rb[64]/rf[64]/ra[64]/pc | ✅ |
+| rf[0] 复位 = 0x7FF800007FC00000 | ✅（修复后）|
+| TCG translate 骨架（32-bit 大端 fetch，全部→ILLI）| ✅ |
+| Helper 骨架（EXCP_ILLI=0, EXCP_UNDI=1）| ✅ |
+| ROM@0x0/RAM@0x80000000/ExitPort@0x10000000 | ✅（per ADR-0004 §D1）|
+| `-bios` / `-kernel` 均必须提供，否则报错 | ✅ |
+| Exit port 写非 8 字节 → ILLI | ✅ |
+| `build-qemu` = 真实 configure+make | ✅ |
+| hw/meson.build + 0002 patch 修复 | ✅（修复后）|
+
+机器名为 `dadao-m1`（TYPE_DADAO_M1）而非任务 spec 的 `dadao-baremetal` — 偏差合理，`dadao-m1` 与里程碑命名一致，接受。
+
+`make check` 全链 PASS（frozen spec / encoding / vectors / wiki-drift）。

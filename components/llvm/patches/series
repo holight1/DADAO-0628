@@ -1,1 +1,2 @@
-# One repository-relative patch path per line, in application order.
+0001-dadao-triple-registration.patch
+0002-dadao-target-skeleton.patch
