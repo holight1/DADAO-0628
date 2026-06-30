@@ -12,10 +12,10 @@
 
 - id: C-18
   title: "Hardware reset values (RD, RB[1-63], RF, RA power-on)"
-  status: open
+  status: closed
   scope: [M1]
-  blocks: [M1-gate]
-  resolved_by: null
+  blocks: null
+  resolved_by: "ADR-0004 D2 (all reset values frozen for M1; full-system remains open)"
 
 - id: C-27
   title: "csn/csz/csp/cseq/csne src=dst overlap snapshot rule"
@@ -26,10 +26,10 @@
 
 - id: C-SBZ
   title: "SBZ fault semantics (ILLI vs UNDI for non-zero SBZ fields)"
-  status: open
+  status: closed
   scope: [M1]
-  blocks: [M1-gate]
-  resolved_by: null
+  blocks: null
+  resolved_by: "ADR-0004 D5 (SBZ → ILLI exit 0x82)"
 
 # ── Open issues (non-C-numbered, from open-spec-issues.md) ────────────────────
 
