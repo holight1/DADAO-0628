@@ -1,0 +1,373 @@
+From 097e35cac4b7231383a012f9c8bf275cce9b64f9 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Mon, 29 Jun 2026 19:06:00 +0800
+Subject: [PATCH] target/dadao: add decodetree instruction decode skeleton
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the QEMU decodetree-based instruction decoder for DADAO SimRISC M1:
+
+- insn.decode: defines all 87 M1 instructions with field/format/pattern
+  declarations matching spec.md §2.3 and §2.8 opcode map
+- translate.c: replaces manual decode_opc with decode() call, adds
+  trans_ stubs for all instructions (swym as NOP, rest as ILLI)
+- meson.build: integrates decodetree generation via decodetree.process()
+
+MISC-Norm (op=0x10) uses a grouped sub-decode block by ha[5:0].
+All other opcodes decode by the full 8-bit op value.
+Reserved encodings fall through to UNDI exception.
+---
+ target/dadao/insn.decode | 190 +++++++++++++++++++++++++++++++++++++++
+ target/dadao/meson.build |   4 +
+ target/dadao/translate.c | 115 +++++++++++++++++++++++-
+ 3 files changed, 308 insertions(+), 1 deletion(-)
+ create mode 100644 target/dadao/insn.decode
+
+diff --git a/target/dadao/insn.decode b/target/dadao/insn.decode
+new file mode 100644
+index 0000000..fc76f57
+--- /dev/null
++++ b/target/dadao/insn.decode
+@@ -0,0 +1,190 @@
++#
++# DADAO SimRISC M1 instruction decode
++#
++# Copyright (c) 2026 DADAO Project
++#
++# This program is free software; you can redistribute it and/or modify it
++# under the terms and conditions of the GNU General Public License,
++# version 2 or later, as published by the Free Software Foundation.
++#
++# This program is distributed in the hope it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++# more details.
++#
++# You should have received a copy of the GNU General Public License along with
++# this program.  If not, see <http://www.gnu.org/licenses/>.
++#
++
++# Field declarations (32-bit big-endian instruction word)
++%op    24:8
++%ha    18:6
++%hb    12:6
++%hc    6:6
++%hd    0:6
++
++# Immediate composition fields (contiguous from bit 0)
++%imm12  0:s12
++%imm18  0:s18
++%imm24  0:s24
++%immu6  0:6
++
++# Argument definitions per format type (spec §2.3)
++&rrii   ha hb imm12
++&rrrr   ha hb hc hd
++&rrri   ha hb hc hd
++&riii   ha imm18
++&rwii   ha hb hc hd
++&oiii   ha imm18
++&orrr   ha hb hc hd
++&orri   ha hb hc hd
++&iiii   imm24
++
++# Format templates (32-character patterns, MSB→LSB)
++# All fields are variable; each instruction fills in its fixed op bits
++@rrii   ................................ &rrii ha=%ha hb=%hb imm12=%imm12
++@rrrr   ................................ &rrrr ha=%ha hb=%hb hc=%hc hd=%hd
++@rrri   ................................ &rrri ha=%ha hb=%hb hc=%hc hd=%hd
++@riii   ................................ &riii ha=%ha imm18=%imm18
++@rwii   ................................ &rwii ha=%ha hb=%hb hc=%hc hd=%hd
++@iiii   ................................ &iiii imm24=%imm24
++
++# MISC-Norm format variants (ha is fixed in the pattern, not extracted)
++&m_oiii   imm18
++&m_orrr   hb hc hd
++&m_orri   hb hc hd
++
++@m_oiii  ................................ &m_oiii imm18=%imm18
++@m_orrr  ................................ &m_orrr hb=%hb hc=%hc hd=%hd
++@m_orri  ................................ &m_orri hb=%hb hc=%hc hd=%hd
++
++# *** Non-MISC-Norm Instructions (op != 0x10) ***
++
++# op=0x12: cmps immediate (rrii)
++cmps_i     00010010 ...... ...... ...... ...... @rrii
++# op=0x13: cmpu immediate (rrii)
++cmpu_i     00010011 ...... ...... ...... ...... @rrii
++
++# op=0x14-0x17: Wyde Immediate RD (rwii)
++orw        00010100 ...... ...... ...... ...... @rwii
++andnw      00010101 ...... ...... ...... ...... @rwii
++setzw      00010110 ...... ...... ...... ...... @rwii
++setow      00010111 ...... ...... ...... ...... @rwii
++
++# op=0x19: addi RD (rrii)
++addi       00011001 ...... ...... ...... ...... @rrii
++
++# op=0x1A-0x1F: Dual-destination arithmetic RD (rrrr)
++add        00011010 ...... ...... ...... ...... @rrrr
++sub        00011011 ...... ...... ...... ...... @rrrr
++muls       00011100 ...... ...... ...... ...... @rrrr
++mulu       00011101 ...... ...... ...... ...... @rrrr
++divs       00011110 ...... ...... ...... ...... @rrrr
++divu       00011111 ...... ...... ...... ...... @rrrr
++
++# op=0x20-0x27: Conditional assign (rrrr)
++csn        00100000 ...... ...... ...... ...... @rrrr
++csz        00100010 ...... ...... ...... ...... @rrrr
++csp        00100100 ...... ...... ...... ...... @rrrr
++cseq       00100110 ...... ...... ...... ...... @rrrr
++csne       00100111 ...... ...... ...... ...... @rrrr
++
++# op=0x28-0x2D: Single-register branches (riii)
++brn        00101000 ...... ...... ...... ...... @riii
++brnn       00101001 ...... ...... ...... ...... @riii
++brz        00101010 ...... ...... ...... ...... @riii
++brnz       00101011 ...... ...... ...... ...... @riii
++brp        00101100 ...... ...... ...... ...... @riii
++brnp       00101101 ...... ...... ...... ...... @riii
++# op=0x2E-0x2F: Dual-register branches (rrii)
++breq       00101110 ...... ...... ...... ...... @rrii
++brne       00101111 ...... ...... ...... ...... @rrii
++
++# op=0x30-0x33: RD single load signed (rrii)
++ldbs       00110000 ...... ...... ...... ...... @rrii
++ldws       00110001 ...... ...... ...... ...... @rrii
++ldts       00110010 ...... ...... ...... ...... @rrii
++ldo        00110011 ...... ...... ...... ...... @rrii
++# op=0x34-0x37: RD multi load signed (rrri)
++ldmbs      00110100 ...... ...... ...... ...... @rrri
++ldmws      00110101 ...... ...... ...... ...... @rrri
++ldmts      00110110 ...... ...... ...... ...... @rrri
++ldmo       00110111 ...... ...... ...... ...... @rrri
++
++# op=0x38-0x3B: RD single store (rrii)
++stb        00111000 ...... ...... ...... ...... @rrii
++stw        00111001 ...... ...... ...... ...... @rrii
++stt        00111010 ...... ...... ...... ...... @rrii
++sto        00111011 ...... ...... ...... ...... @rrii
++# op=0x3C-0x3F: RD multi store (rrri)
++stmb       00111100 ...... ...... ...... ...... @rrri
++stmw       00111101 ...... ...... ...... ...... @rrri
++stmt       00111110 ...... ...... ...... ...... @rrri
++stmo       00111111 ...... ...... ...... ...... @rrri
++
++# op=0x40-0x42: RD single load unsigned (rrii)
++ldbu       01000000 ...... ...... ...... ...... @rrii
++ldwu       01000001 ...... ...... ...... ...... @rrii
++ldtu       01000010 ...... ...... ...... ...... @rrii
++# op=0x43: RB single load (rrii)
++ldo_rb     01000011 ...... ...... ...... ...... @rrii
++# op=0x44-0x47: RD/RB multi load unsigned (rrri)
++ldmbu      01000100 ...... ...... ...... ...... @rrri
++ldmwu      01000101 ...... ...... ...... ...... @rrri
++ldmtu      01000110 ...... ...... ...... ...... @rrri
++ldmo_rb    01000111 ...... ...... ...... ...... @rrri
++
++# op=0x48: rela (riii)
++rela       01001000 ...... ...... ...... ...... @riii
++# op=0x49: addi RB (rrii)
++addi_rb    01001001 ...... ...... ...... ...... @rrii
++# op=0x4B: sto RB (rrii)
++sto_rb     01001011 ...... ...... ...... ...... @rrii
++# op=0x4C-0x4E: Wyde Immediate RB (rwii)
++orw_rb     01001100 ...... ...... ...... ...... @rwii
++andnw_rb   01001101 ...... ...... ...... ...... @rwii
++setzw_rb   01001110 ...... ...... ...... ...... @rwii
++# op=0x4F: RB multi store (rrri)
++stmo_rb    01001111 ...... ...... ...... ...... @rrri
++
++# op=0x64: jump immediate (iiii)
++jump_i     01100100 ...... ...... ...... ...... @iiii
++# op=0x65: jump register (rrii)
++jump_r     01100101 ...... ...... ...... ...... @rrii
++
++# op=0x6C: call immediate (iiii)
++call_i     01101100 ...... ...... ...... ...... @iiii
++# op=0x6D: call register (rrii)
++call_r     01101101 ...... ...... ...... ...... @rrii
++# op=0x6E: return (riii)
++ret        01101110 ...... ...... ...... ...... @riii
++
++# *** MISC-Norm (op=0x10, sub-decode by ha[5:0]) ***
++# ha is encoded in the fixed pattern, not extracted as a field
++{
++  swym      00010000 000000 ...... ...... ...... @m_oiii
++  and_log   00010000 001000 ...... ...... ...... @m_orrr
++  orr       00010000 001001 ...... ...... ...... @m_orrr
++  xor_bit   00010000 001010 ...... ...... ...... @m_orrr
++  xnor      00010000 001011 ...... ...... ...... @m_orrr
++  shlu_r    00010000 010001 ...... ...... ...... @m_orrr
++  shrs_r    00010000 010010 ...... ...... ...... @m_orrr
++  shru_r    00010000 010011 ...... ...... ...... @m_orrr
++  exts_r    00010000 010100 ...... ...... ...... @m_orrr
++  extz_r    00010000 010101 ...... ...... ...... @m_orrr
++  shlu_i    00010000 011001 ...... ...... ...... @m_orri
++  shrs_i    00010000 011010 ...... ...... ...... @m_orri
++  shru_i    00010000 011011 ...... ...... ...... @m_orri
++  exts_i    00010000 011100 ...... ...... ...... @m_orri
++  extz_i    00010000 011101 ...... ...... ...... @m_orri
++  cmps_r    00010000 100100 ...... ...... ...... @m_orrr
++  cmpu_r    00010000 100101 ...... ...... ...... @m_orrr
++  rd2rd     00010000 101000 ...... ...... ...... @m_orri
++  rd2rb     00010000 101001 ...... ...... ...... @m_orri
++  rb2rd     00010000 101010 ...... ...... ...... @m_orri
++  rb2rb     00010000 101011 ...... ...... ...... @m_orri
++  cmp_rb    00010000 101101 ...... ...... ...... @m_orrr
++  add_rb    00010000 101110 ...... ...... ...... @m_orrr
++  sub_rb    00010000 101111 ...... ...... ...... @m_orrr
++  unimp     00010000 111111 ...... ...... ...... @m_oiii
++}
+diff --git a/target/dadao/meson.build b/target/dadao/meson.build
+index ae4dfbd..65964ae 100644
+--- a/target/dadao/meson.build
++++ b/target/dadao/meson.build
+@@ -1,4 +1,8 @@
++dadao_decodetree = decodetree.process('insn.decode',
++  extra_args: '--static-decode=decode')
++
+ dadao_ss = ss.source_set()
++dadao_ss.add(dadao_decodetree)
+ dadao_ss.add(files(
+   'cpu.c',
+   'translate.c',
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 872ce72..9bd3d5b 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -26,16 +26,129 @@ typedef struct DisasContext {
+     CPUState *cs;
+ } DisasContext;
+ 
++#include "decode-insn.c.inc"
++
+ static void gen_exception_illegal(DisasContext *ctx)
+ {
+     gen_helper_raise_exception(tcg_env, tcg_constant_i32(EXCP_ILLI));
+     ctx->base.is_jmp = DISAS_NORETURN;
+ }
+ 
++static void gen_exception_undi(DisasContext *ctx)
++{
++    gen_helper_raise_exception(tcg_env, tcg_constant_i32(EXCP_UNDI));
++    ctx->base.is_jmp = DISAS_NORETURN;
++}
++
++/* swym is a NOP */
++static bool trans_swym(DisasContext *ctx, arg_swym *a)
++{
++    return true;
++}
++
++#define GEN_ILLEGAL_INSN(NAME) \
++static bool trans_##NAME(DisasContext *ctx, arg_##NAME *a) \
++{ \
++    gen_exception_illegal(ctx); \
++    return true; \
++}
++
++/* MISC-Norm subtable */
++GEN_ILLEGAL_INSN(and_log)
++GEN_ILLEGAL_INSN(orr)
++GEN_ILLEGAL_INSN(xor_bit)
++GEN_ILLEGAL_INSN(xnor)
++GEN_ILLEGAL_INSN(shlu_r)
++GEN_ILLEGAL_INSN(shrs_r)
++GEN_ILLEGAL_INSN(shru_r)
++GEN_ILLEGAL_INSN(exts_r)
++GEN_ILLEGAL_INSN(extz_r)
++GEN_ILLEGAL_INSN(shlu_i)
++GEN_ILLEGAL_INSN(shrs_i)
++GEN_ILLEGAL_INSN(shru_i)
++GEN_ILLEGAL_INSN(exts_i)
++GEN_ILLEGAL_INSN(extz_i)
++GEN_ILLEGAL_INSN(cmps_r)
++GEN_ILLEGAL_INSN(cmpu_r)
++GEN_ILLEGAL_INSN(rd2rd)
++GEN_ILLEGAL_INSN(rd2rb)
++GEN_ILLEGAL_INSN(rb2rd)
++GEN_ILLEGAL_INSN(rb2rb)
++GEN_ILLEGAL_INSN(cmp_rb)
++GEN_ILLEGAL_INSN(add_rb)
++GEN_ILLEGAL_INSN(sub_rb)
++GEN_ILLEGAL_INSN(unimp)
++
++/* Non-MISC-Norm instructions */
++GEN_ILLEGAL_INSN(cmps_i)
++GEN_ILLEGAL_INSN(cmpu_i)
++GEN_ILLEGAL_INSN(orw)
++GEN_ILLEGAL_INSN(andnw)
++GEN_ILLEGAL_INSN(setzw)
++GEN_ILLEGAL_INSN(setow)
++GEN_ILLEGAL_INSN(addi)
++GEN_ILLEGAL_INSN(add)
++GEN_ILLEGAL_INSN(sub)
++GEN_ILLEGAL_INSN(muls)
++GEN_ILLEGAL_INSN(mulu)
++GEN_ILLEGAL_INSN(divs)
++GEN_ILLEGAL_INSN(divu)
++GEN_ILLEGAL_INSN(csn)
++GEN_ILLEGAL_INSN(csz)
++GEN_ILLEGAL_INSN(csp)
++GEN_ILLEGAL_INSN(cseq)
++GEN_ILLEGAL_INSN(csne)
++GEN_ILLEGAL_INSN(brn)
++GEN_ILLEGAL_INSN(brnn)
++GEN_ILLEGAL_INSN(brz)
++GEN_ILLEGAL_INSN(brnz)
++GEN_ILLEGAL_INSN(brp)
++GEN_ILLEGAL_INSN(brnp)
++GEN_ILLEGAL_INSN(breq)
++GEN_ILLEGAL_INSN(brne)
++GEN_ILLEGAL_INSN(ldbs)
++GEN_ILLEGAL_INSN(ldws)
++GEN_ILLEGAL_INSN(ldts)
++GEN_ILLEGAL_INSN(ldo)
++GEN_ILLEGAL_INSN(ldmbs)
++GEN_ILLEGAL_INSN(ldmws)
++GEN_ILLEGAL_INSN(ldmts)
++GEN_ILLEGAL_INSN(ldmo)
++GEN_ILLEGAL_INSN(stb)
++GEN_ILLEGAL_INSN(stw)
++GEN_ILLEGAL_INSN(stt)
++GEN_ILLEGAL_INSN(sto)
++GEN_ILLEGAL_INSN(stmb)
++GEN_ILLEGAL_INSN(stmw)
++GEN_ILLEGAL_INSN(stmt)
++GEN_ILLEGAL_INSN(stmo)
++GEN_ILLEGAL_INSN(ldbu)
++GEN_ILLEGAL_INSN(ldwu)
++GEN_ILLEGAL_INSN(ldtu)
++GEN_ILLEGAL_INSN(ldo_rb)
++GEN_ILLEGAL_INSN(ldmbu)
++GEN_ILLEGAL_INSN(ldmwu)
++GEN_ILLEGAL_INSN(ldmtu)
++GEN_ILLEGAL_INSN(ldmo_rb)
++GEN_ILLEGAL_INSN(rela)
++GEN_ILLEGAL_INSN(addi_rb)
++GEN_ILLEGAL_INSN(sto_rb)
++GEN_ILLEGAL_INSN(orw_rb)
++GEN_ILLEGAL_INSN(andnw_rb)
++GEN_ILLEGAL_INSN(setzw_rb)
++GEN_ILLEGAL_INSN(stmo_rb)
++GEN_ILLEGAL_INSN(jump_i)
++GEN_ILLEGAL_INSN(jump_r)
++GEN_ILLEGAL_INSN(call_i)
++GEN_ILLEGAL_INSN(call_r)
++GEN_ILLEGAL_INSN(ret)
++
+ static void decode_opc(CPUDADAOState *env, DisasContext *ctx)
+ {
+     ctx->opcode = translator_ldl_swap(env, &ctx->base, ctx->base.pc_next, true);
+-    gen_exception_illegal(ctx);
++    if (!decode(ctx, ctx->opcode)) {
++        gen_exception_undi(ctx);
++    }
+ }
+ 
+ static void dadao_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
+-- 
+2.43.0
+

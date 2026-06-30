@@ -1,0 +1,267 @@
+diff --git a/llvm/lib/Target/DADAO/CMakeLists.txt b/llvm/lib/Target/DADAO/CMakeLists.txt
+index 54ec398e1f46..6b54b9cc6271 100644
+--- a/llvm/lib/Target/DADAO/CMakeLists.txt
++++ b/llvm/lib/Target/DADAO/CMakeLists.txt
+@@ -1,6 +1,13 @@
+ add_llvm_component_group(DADAO)
+ 
++set(LLVM_TARGET_DEFINITIONS DADAO.td)
++
++tablegen(LLVM DADAOGenRegisterInfo.inc -gen-register-info)
++
++add_public_tablegen_target(DADAOCommonTableGen)
++
+ add_llvm_target(DADAOCodeGen
++  DADAORegisterInfo.cpp
+   DADAOTargetMachine.cpp
+ 
+   LINK_COMPONENTS
+diff --git a/llvm/lib/Target/DADAO/DADAO.td b/llvm/lib/Target/DADAO/DADAO.td
+new file mode 100644
+index 000000000000..0bbe4f8174d2
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAO.td
+@@ -0,0 +1,41 @@
++//===- DADAO.td - Describe the DADAO Target Machine ----------*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++//===----------------------------------------------------------------------===//
++// Target-independent interfaces which we are implementing
++//===----------------------------------------------------------------------===//
++
++include "llvm/Target/Target.td"
++
++//===----------------------------------------------------------------------===//
++// Register File, Calling Conv, Instruction Descriptions
++//===----------------------------------------------------------------------===//
++
++include "DADAORegisterInfo.td"
++
++def DADAOInstrInfo : InstrInfo;
++
++//===----------------------------------------------------------------------===//
++// DADAO processors supported.
++//===----------------------------------------------------------------------===//
++
++def : ProcessorModel<"generic", NoSchedModel, []>;
++
++def DADAOInstPrinter : AsmWriter {
++  string AsmWriterClassName  = "InstPrinter";
++  bit isMCAsmWriter = 1;
++}
++
++//===----------------------------------------------------------------------===//
++// Declare the target which we are implementing
++//===----------------------------------------------------------------------===//
++
++def DADAO : Target {
++  let InstructionSet = DADAOInstrInfo;
++  let AssemblyWriters = [DADAOInstPrinter];
++}
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+new file mode 100644
+index 000000000000..afb7df5a788d
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+@@ -0,0 +1,61 @@
++//===-- DADAORegisterInfo.cpp - DADAO Register Information ------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the DADAO implementation of the TargetRegisterInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#include "DADAORegisterInfo.h"
++#include "llvm/ADT/BitVector.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/Support/ErrorHandling.h"
++
++#define GET_REGINFO_TARGET_DESC
++#include "DADAOGenRegisterInfo.inc"
++
++using namespace llvm;
++
++DADAORegisterInfo::DADAORegisterInfo() : DADAOGenRegisterInfo(0) {}
++
++const uint16_t *
++DADAORegisterInfo::getCalleeSavedRegs(const MachineFunction * /*MF*/) const {
++  return nullptr;
++}
++
++BitVector DADAORegisterInfo::getReservedRegs(const MachineFunction &MF) const {
++  BitVector Reserved(getNumRegs());
++
++  Reserved.set(DADAO::RD0);
++  Reserved.set(DADAO::RD1);
++  Reserved.set(DADAO::RD2);
++  Reserved.set(DADAO::RD3);
++  Reserved.set(DADAO::RD4);
++  Reserved.set(DADAO::RD5);
++  Reserved.set(DADAO::RD6);
++  Reserved.set(DADAO::RD7);
++  Reserved.set(DADAO::RB0);
++  Reserved.set(DADAO::RB1);
++  Reserved.set(DADAO::RB2);
++  Reserved.set(DADAO::RB3);
++  Reserved.set(DADAO::RB4);
++  Reserved.set(DADAO::RB5);
++  Reserved.set(DADAO::RB6);
++  Reserved.set(DADAO::RB7);
++
++  return Reserved;
++}
++
++bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
++                                            int SPAdj, unsigned FIOperandNum,
++                                            RegScavenger *RS) const {
++  llvm_unreachable("Not yet implemented");
++}
++
++Register DADAORegisterInfo::getFrameRegister(const MachineFunction &MF) const {
++  return DADAO::RBSP;
++}
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.h b/llvm/lib/Target/DADAO/DADAORegisterInfo.h
+new file mode 100644
+index 000000000000..ab81ce1ee5da
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.h
+@@ -0,0 +1,40 @@
++//===- DADAORegisterInfo.h - DADAO Register Information Impl ----*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the DADAO implementation of the TargetRegisterInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_DADAO_DADAOREGISTERINFO_H
++#define LLVM_LIB_TARGET_DADAO_DADAOREGISTERINFO_H
++
++#include "llvm/CodeGen/TargetRegisterInfo.h"
++
++#define GET_REGINFO_HEADER
++#include "DADAOGenRegisterInfo.inc"
++
++namespace llvm {
++
++struct DADAORegisterInfo : public DADAOGenRegisterInfo {
++  DADAORegisterInfo();
++
++  const uint16_t *
++  getCalleeSavedRegs(const MachineFunction *MF = nullptr) const override;
++
++  BitVector getReservedRegs(const MachineFunction &MF) const override;
++
++  bool eliminateFrameIndex(MachineBasicBlock::iterator II, int SPAdj,
++                           unsigned FIOperandNum,
++                           RegScavenger *RS = nullptr) const override;
++
++  Register getFrameRegister(const MachineFunction &MF) const override;
++};
++
++} // end namespace llvm
++
++#endif // LLVM_LIB_TARGET_DADAO_DADAOREGISTERINFO_H
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.td b/llvm/lib/Target/DADAO/DADAORegisterInfo.td
+new file mode 100644
+index 000000000000..d570895f9330
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.td
+@@ -0,0 +1,71 @@
++//===- DADAORegisterInfo.td - DADAO Register definitions -----*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//  Declarations that describe the DADAO register file
++//===----------------------------------------------------------------------===//
++
++let Namespace = "DADAO" in {
++  class DADAOReg<bits<16> num, string n> : Register<n> {
++    let HWEncoding = num;
++  }
++}
++
++// RD bank: 64 data registers
++foreach i = 0-63 in {
++  def RD#i : DADAOReg<i, "rd"#i>;
++}
++
++// RB bank: 64 base registers
++foreach i = 0-63 in {
++  def RB#i : DADAOReg<i, "rb"#i>;
++}
++
++// RF bank: 64 float registers
++foreach i = 0-63 in {
++  def RF#i : DADAOReg<i, "rf"#i>;
++}
++
++// RA bank: 64 return address registers
++foreach i = 0-63 in {
++  def RA#i : DADAOReg<i, "ra"#i>;
++}
++
++// Register aliases
++def RBSP : DADAOReg<1, "rbsp">;
++def RBFP : DADAOReg<2, "rbfp">;
++
++// Register classes - RD bank
++def GPRD : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RD%u", 0, 63)
++)>;
++
++def GPRD_Allocatable : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RD%u", 8, 63)
++)>;
++
++// Register classes - RB bank
++def GPRB : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RB%u", 0, 63)
++)>;
++
++def GPRB_Allocatable : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RB%u", 8, 63)
++)>;
++
++// Register classes - RF bank (all non-allocatable)
++def GPRF : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RF%u", 0, 63)
++)> {
++  let isAllocatable = 0;
++}
++
++// Register classes - RA bank (not used by register allocator)
++def GPRA : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RA%u", 0, 63)
++)> {
++  let isAllocatable = 0;
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+index e27f4126d3ab..814a8c4049fe 100644
+--- a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+@@ -10,6 +10,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "DADAORegisterInfo.h"
+ #include "DADAOTargetMachine.h"
+ #include "TargetInfo/DADAOTargetInfo.h"
+ #include "llvm/MC/TargetRegistry.h"
