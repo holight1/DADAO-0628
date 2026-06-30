@@ -83,15 +83,85 @@ def emit_register_loader(out, case):
         load_reg(out, 'rb', reg_num, val)
 
 
-def emit_state_dumper(out):
-    pass
-
-
 def emit_exit(out, code=0):
     # Load exit code into register, then halt rd
     load_reg(out, 'rd', EXIT_RD, code)
     w = (OP_HALT << 24) | (EXIT_RD << 18)
     out.extend(struct.pack('>I', w))
+
+
+BINARY_BASE = 0x80000000
+SWYM_ENCODING = 0x10000000
+UNIMP_ENCODING = 0x10FC0000
+
+
+def emit_state_compare(out, expected_state):
+    """Generate inline comparison code via accumulation and self-modifying guard.
+
+    After the test instruction, for each expected register:
+      XOR expected ^ actual → 0 if match, ORR into accumulator rd29.
+    Then patch a guard instruction at a forward address:
+      If all match (rd29==0): patch with swym (NOP) → fall through to halt → PASS
+      If mismatch (rd29!=0):  patch with unimp → ILLI (exit 0x82) → FAIL
+    """
+    rd = expected_state.get('rd', {}) if expected_state else {}
+    rb = expected_state.get('rb', {}) if expected_state else {}
+
+    if not rd and not rb:
+        emit_exit(out, 0)
+        return
+
+    # Initialize mismatch accumulator
+    load_reg(out, 'rd', 29, 0)
+
+    # Emit comparison: xor each actual reg with expected, OR into rd29
+    for name, value_str in sorted(rd.items()):
+        reg_num = int(name.replace('rd', ''))
+        val = int(value_str, 16)
+        load_reg(out, 'rd', 31, val)
+        # xor rd31, rd31, reg
+        w = 0x10280000 | (31 << 12) | (31 << 6) | reg_num
+        out.extend(struct.pack('>I', w))
+        # or rd29, rd29, rd31
+        w = 0x10240000 | (29 << 12) | (29 << 6) | 31
+        out.extend(struct.pack('>I', w))
+
+    for name, value_str in sorted(rb.items()):
+        reg_num = int(name.replace('rb', ''))
+        val = int(value_str, 16)
+        # rb2rd rd30, rb_reg  (copy actual rb value to rd30)
+        w = 0x10A80000 | (30 << 12) | (reg_num << 6) | 0
+        out.extend(struct.pack('>I', w))
+        load_reg(out, 'rd', 31, val)
+        w = 0x10280000 | (31 << 12) | (31 << 6) | 30
+        out.extend(struct.pack('>I', w))
+        w = 0x10240000 | (29 << 12) | (29 << 6) | 31
+        out.extend(struct.pack('>I', w))
+
+    # --- Self-modifying guard patching ---
+    # Count instructions emitted so far (before patching) to locate guard
+    n_before = len(out) // 4
+    n_patch = 4 + 4 + 1 + 3 + 1 + 3 + 1  # rd1+rd2+csz+rb1+sto+rb2+sto2
+    guard_offset = (n_before + n_patch) * 4
+    guard_addr = BINARY_BASE + guard_offset
+
+    load_reg(out, 'rd', 1, UNIMP_ENCODING)   # rd1 = unimp (FAIL)
+    load_reg(out, 'rd', 2, SWYM_ENCODING)    # rd2 = swym (PASS)
+    # csz rd1, rd29, rd2, rd1  →  rd1 = (rd29 == 0) ? rd2 : rd1
+    # QEMU maps: ha=cond, hb=dest, hc=true_val, hd=false_val
+    w = (0x22 << 24) | (29 << 18) | (1 << 12) | (2 << 6) | 1
+    out.extend(struct.pack('>I', w))
+    load_reg(out, 'rb', 1, guard_addr)
+    # Force TB exit by storing to a different page BEFORE patching guard
+    load_reg(out, 'rb', 2, 0x80001000)         # rb2 = scratch page
+    write_rrii(out, 0x3B, 29, 2, 0)            # sto rd29, rb2, 0  → force TB exit
+    write_rrii(out, 0x3B, 1, 1, 0)             # sto rd1, rb1, 0  → patch guard
+
+    # Guard instruction (initially swym, patched to unimp on mismatch)
+    out.extend(struct.pack('>I', SWYM_ENCODING))
+
+    # PASS path — reached after swym NOP if all comparisons matched
+    emit_exit(out, 0)
 
 
 def build_test_binary(case):
@@ -105,9 +175,11 @@ def build_test_binary(case):
     word = int(case['encoding']['word'], 16)
     buf.extend(struct.pack('>I', word))
 
-    emit_state_dumper(buf)
-
-    emit_exit(buf)
+    expected_state = case.get('expected_state')
+    if expected_state:
+        emit_state_compare(buf, expected_state)
+    else:
+        emit_exit(buf)
 
     return bytes(buf)
 

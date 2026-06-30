@@ -217,3 +217,99 @@ make check
 | `tests/vectors/isa/rd-arith.yaml` | 主要验收向量（含 semantic + legality）|
 | `contracts/isa/spec.md §5.1` | breq/brne 格式（用于 emit_state_compare）|
 | `tools/opcodes.yaml` | breq op/ha 值（生成比较指令需要）|
+
+## 完成区
+
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `tests/scripts/build_test_binary.py` — 重写（state compare + self-modifying guard）
+- `tests/scripts/run_qemu_test.py` — 重写（fault 路由 + CLI exit 1）
+
+**实现**：
+- `emit_state_compare`：guest 内联比较 expected vs actual，自修改代码动态 patching guard
+- FAULT_CODES 映射：ILLI→0x82, MALIGN→0x81, UNDI→0x83
+- `_classify` 按 expected_fault 正确路由
+- CLI 任意 FAIL → `sys.exit(1)`
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted with P1 Note — 语义比较引擎正确，缺 fail-closed 总断言。**
+
+### 代码级逐函数验证
+
+#### 1. `emit_state_compare` (L98-L164)
+
+```python
+# XOR comparison: rd31 = expected ^ actual
+load_reg(out, 'rd', 31, val)                           # rd31 = expected
+w = 0x10280000 | (31 << 12) | (31 << 6) | reg_num      # xor rd31, rd31, reg
+# ORR accumulate: rd29 |= rd31
+w = 0x10240000 | (29 << 12) | (29 << 6) | 31           # or rd29, rd29, rd31
+```
+
+| 检查项 | 验证 |
+|--------|------|
+| xor/ORR op 编码正确 | xor=ha=0x0A(0x10280000), orr=ha=0x09(0x10240000) ✅ |
+| RB 比较通过 rb2rd 中转 | `rb2rd rd30,rb_reg` + xor rd31, rd30 ✅ |
+| rd0 skip | L119 `if reg_num==0: continue`（rd0 硬连接 0，无需比较）✅ |
+| 全匹配→rd29=0, 部分失配→rd29≠0 | 所有 XOR=0 则 ORR 累加器保持 0 ✅ |
+
+#### 2. csz 选择分支
+
+```python
+# rd1 = (rd29 == 0) ? rd2(swym) : rd1(unimp)
+w = (0x22 << 24) | (29 << 18) | (1 << 12) | (2 << 6) | 1
+```
+
+- csz: ha=29(条件), hb=1(dest), hc=2(true), hd=1(false) ✅
+- 条件: rd29==0 → True → rd1=rd2(swym) → PASS
+- 条件: rd29≠0 → False → rd1=rd1(unimp) → ILLI → FAIL ✅
+
+#### 3. `_classify` 故障路由 (run_qemu_test.py L40-L59)
+
+| 场景 | exit | expected_fault | 判定 |
+|------|------|----------------|------|
+| semantic PASS | 0 | null | `('PASS','exit=0')` ✅ |
+| state mismatch | 1 | null | `('FAIL','state mismatch')` ✅ |
+| ILLI expected | 130 | ILLI | `('PASS','ILLI (expected)')` ✅ |
+| ILLI expected but clean exit | 0 | ILLI | `('FAIL','expected ILLI, got exit=0')` ✅ |
+| wrong fault type | 0x83 | ILLI | `('FAIL','expected ILLI exit=0x82, got 0x83')` ✅ |
+
+#### 4. Self-modifying guard (L141-L164)
+
+```
+rd1=unimp, rd2=swym → csz selects → sto to scratch page (TB flush)
+→ sto to guard addr (patch instruction) → guard (swym/unimp)
+```
+
+- TB flush 通过跨页 store 触发 ✅
+- 单次测试路径有效（无循环重入）✅
+- **脆弱点**：`n_patch = 4+4+1+3+1+3+1` 硬编码，修改中间指令会破坏偏移  ⚠️
+
+### P1 — Note
+
+#### N1. 0-case / all-SKIP fail-closed 未实现
+
+任务 L137-L142 要求 `total==0 → exit(2)`, `skip==total → exit(2)`。
+当前 `main()` 仅跟踪 `any_fail`（L104, L112-113, L122），无全部 SKIP 或零
+case 检测。修正：在循环后增加计数和 fail-closed 检查。
+
+#### N2. 保留寄存器冲突风险
+
+Harness 使用 rd29/30/31、rb1/2 作为临时/累加器，与测试向量 `input_state`
+和 `expected_state` 可能冲突。任务 L173-L174 建议用 rd62/63/rb62/63。
+建议在测试向量 convention 中标注保留寄存器范围。
+
+#### N3. expected_state.memory 静默跳过（10 条 store 向量）
+
+`emit_state_compare` 只处理 rd/rb，当 `expected_state` 只含 `memory` key 时（stb/sto/stw/stt/stmb/stmw/stmt/stmo 8 个 RD + 2 个 RB = 10 条 semantic 向量），走 `if not rd and not rb: emit_exit(0)` 分支，直接 PASS，无实际验证。
+→ **任务范围外**，记 DL-022b 债（harness 侧 QEMU memory dump 验证）。
+
+### 最终判断
+
+**Accepted（N1 直接修复，N2 寄存器记文档，N3 记 DL-022b 债）**
+
+XOR+ORR 比较引擎正确；csz 选择 swym/unimp → exit=0 或 ILLI 路由正确；fault 分类全正确。
+N1（fail-closed 计数）架构师已直接修入 `run_qemu_test.py`。
