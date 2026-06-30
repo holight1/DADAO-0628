@@ -58,6 +58,17 @@ DS 必须在 `components/llvm/patches/0002-dadao-target-skeleton.patch` 中确�
 - 若含 `E`（big-endian），则 MSB 在左，公式直接适用
 - 若含 `e`（little-endian），则字节序相反（不应出现，DADAO 为大端）
 
+## 完成区
+
+**状态**：已完成（待 Codex Review）
+**修改文件**：13 个 `tests/lit/MC/Dadao/*.s` — 字节级 OBJ CHECK 模式
+
+**验证**：
+```
+$ llvm-lit tests/lit/MC/Dadao/
+14/14 tests PASS
+```
+
 ### 带符号立即数编码
 
 imm12（rrii）为 sign-extended 12-bit：
@@ -190,3 +201,33 @@ llvm-objdump -d --triple=dadao-unknown-elf /tmp/rrii.o
 | `components/llvm/patches/0002-dadao-target-skeleton.patch` | DataLayout 大端确认 |
 | `tests/lit/MC/Dadao/rrii_alu.s` | 格式参考（最简 3 指令文件） |
 | DL-011a 任务文件 | 0006-dadao-disassembler.patch 实现背景 |
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — OBJ 字节级 CHECK 正确，手推验证全通过。**
+
+### 代码级验证
+
+**13 个 lit 文件**均含 `--check-prefix=OBJ` RUN 行和 `OBJ:` CHECK 行 ✅
+
+| OBJ bytes 手推验证 | lit 文件 | 验证 |
+|-------------------|---------|------|
+| `addi rd8,rd0,1` → `19 20 00 01` | rrii_alu.s | (0x19<<24)|(8<<18)|1 = 0x19200001 ✅ |
+| `cmps rd1,rd2,-3` → `12 04 2f fd` | rrii_alu.s | hc=0x3F,hd=0x3D → 0x12042FFD ✅ |
+| `cmpu rd3,rd4,10` → `13 0c 40 0a` | rrii_alu.s | hc=0,hd=10 → 0x130C400A ✅ |
+| `add rd1,rd2,rd3,rd4` → `1a 04 20 c4` | rrrr.s | (1<<18)|(2<<12)|(3<<6)|4 = 0x1A0420C4 ✅ |
+| `muls rd9,rd10,rd11,rd12` → `1c 24 a2 cc` | rrrr.s | (9<<18)|(10<<12)|(11<<6)|12 ✅ |
+
+**Split prefix 验证**：OBJ 行含字节 + 助记符，ASM 行仅助记符，两者不互相污染 ✅
+
+**架构师复审（2026-06-30）**：
+
+字节计算独立 Python 验证全部通过（含负数立即数、rrri count、riii imm18）。
+N1：OBJ 模式缺 `{{.*}}`，依赖 disassembler 单空格输出；若格式变化将静默 flake。
+当前 14/14 PASS，不阻塞，N1 留 DL-011c 统一修。
+
+### 最终判断
+
+**Accepted（N1 注）**。字节级 OBJ CHECK 全覆盖 13 文件，手工推导字节正确。DL-011a P1.1 lit 债务全清。
