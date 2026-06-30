@@ -83,15 +83,15 @@
     word: "0x48040001"
   input_state:
     rb:
-      rb0: "0x0000000000100000"
+      rb0: "0x0000000087FF0000"
       rb1: "0x0000000000000000"
   expected_state:
     rb:
-      rb1: "0x0000000000101000"
+      rb1: "0x0000000087FF1000"
   expected_fault: null
   status: active
   wiki_cite: "spec.md §4.8"
-  notes: "rela rb1,imms18=1; base=0x100000&~0xFFF=0x100000, offset=1<<12=0x1000, target=0x101000"
+  notes: "rela rb1,imms18=1; base=0x87FF0000&~0xFFF=0x87FF0000, offset=1<<12=0x1000, target=0x87FF1000"
 
 - mnemonic: ldo
   format: rrii
@@ -100,10 +100,10 @@
     word: "0x43042008"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
       rb1: "0x0000000000000000"
     memory:
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0xFEDCBA9876543210"
         width: 8
   expected_state:
@@ -121,11 +121,11 @@
     word: "0x4B042000"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
       rb1: "0xDEADBEEFCAFEBABE"
   expected_state:
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0xDEADBEEFCAFEBABE"
         width: 8
   expected_fault: null
@@ -140,7 +140,7 @@
     word: "0x43002008"
   input_state:
     rb:
-      rb0: "0x0000000000100000"
+      rb0: "0x0000000087FF0000"
   expected_state: null
   expected_fault: ILLI
   status: active
@@ -174,13 +174,13 @@
     word: "0x4F042041"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
       rb1: "0xAAAAAAAAAAAAAAAA"
     rd:
       rd1: "0x0000000000000000"
   expected_state:
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0xAAAAAAAAAAAAAAAA"
         width: 8
   expected_fault: null
@@ -195,7 +195,7 @@
     word: "0x4F042000"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
   expected_state: null
   expected_fault: ILLI
   status: active

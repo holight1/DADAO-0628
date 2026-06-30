@@ -7,10 +7,10 @@
     word: "0x30042008"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
-      rb0: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
+      rb0: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0x80"
         width: 1
   expected_state:
@@ -28,9 +28,9 @@
     word: "0x40042008"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0x80"
         width: 1
   expected_state:
@@ -48,9 +48,9 @@
     word: "0x330420FF"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x00000000001000FF"
+      - address: "0x0000000087FF00FF"
         value: "0x1234567890ABCDEF"
         width: 8
   expected_state:
@@ -68,18 +68,18 @@
     word: "0x38042FFC"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0x00000000000000FF"
   expected_state:
     memory:
-      - address: "0x0000000000100FFC"
+      - address: "0x0000000087FEFFFC"
         value: "0xFF"
         width: 1
   expected_fault: null
   status: active
   wiki_cite: "spec.md §3.2"
-  notes: "stb rd1,rb2,-4; store byte 0xFF at 0x100FFC"
+  notes: "stb rd1,rb2,-4; store byte 0xFF at 0x87FEFFFC"
 
 - mnemonic: sto
   format: rrii
@@ -88,12 +88,12 @@
     word: "0x3B042000"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0xDEADBEEFCAFEBABE"
   expected_state:
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0xDEADBEEFCAFEBABE"
         width: 8
   expected_fault: null
@@ -108,7 +108,7 @@
     word: "0x30002008"
   input_state:
     rb:
-      rb0: "0x0000000000100000"
+      rb0: "0x0000000087FF0000"
   expected_state: null
   expected_fault: ILLI
   status: active
@@ -122,9 +122,9 @@
     word: "0x33042FFF"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100FFF"
+      - address: "0x0000000087FF0FFF"
         value: "0x0000000000000001"
         width: 8
   expected_state:
@@ -144,9 +144,9 @@
     word: "0x31042008"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0x7FFF"
         width: 2
   expected_state:
@@ -164,9 +164,9 @@
     word: "0x41042008"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0xFFFF"
         width: 2
   expected_state:
@@ -184,9 +184,9 @@
     word: "0x32042008"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0x80000000"
         width: 4
   expected_state:
@@ -204,9 +204,9 @@
     word: "0x42042008"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0x80000000"
         width: 4
   expected_state:
@@ -224,12 +224,12 @@
     word: "0x39042008"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0x000000000000ABCD"
   expected_state:
     memory:
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0xABCD"
         width: 2
   expected_fault: null
@@ -244,12 +244,12 @@
     word: "0x3A042000"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0xDEADBEEF12345678"
   expected_state:
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0x12345678"
         width: 4
   expected_fault: null
@@ -266,14 +266,14 @@
     word: "0x37042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0x0000000000000000"
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0x1111111111111111"
         width: 8
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0x2222222222222222"
         width: 8
   expected_state:
@@ -292,16 +292,16 @@
     word: "0x3F042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0xAAAAAAAAAAAAAAAA"
       rd2: "0xBBBBBBBBBBBBBBBB"
   expected_state:
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0xAAAAAAAAAAAAAAAA"
         width: 8
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0xBBBBBBBBBBBBBBBB"
         width: 8
   expected_fault: null
@@ -316,14 +316,14 @@
     word: "0x34042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0x0000000000000000"
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0x80"
         width: 1
-      - address: "0x0000000000100001"
+      - address: "0x0000000087FF0001"
         value: "0x7F"
         width: 1
   expected_state:
@@ -342,16 +342,16 @@
     word: "0x3C042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0x00000000000000AB"
       rd2: "0x00000000000000CD"
   expected_state:
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0xAB"
         width: 1
-      - address: "0x0000000000100001"
+      - address: "0x0000000087FF0001"
         value: "0xCD"
         width: 1
   expected_fault: null
@@ -366,7 +366,7 @@
     word: "0x34042000"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
   expected_state: null
   expected_fault: ILLI
   status: active
@@ -382,12 +382,12 @@
     word: "0x35042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0x7F00"
         width: 2
-      - address: "0x0000000000100002"
+      - address: "0x0000000087FF0002"
         value: "0x8000"
         width: 2
   expected_state:
@@ -406,12 +406,12 @@
     word: "0x36042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0x7FFFFFFF"
         width: 4
-      - address: "0x0000000000100004"
+      - address: "0x0000000087FF0004"
         value: "0x80000000"
         width: 4
   expected_state:
@@ -430,16 +430,16 @@
     word: "0x3D042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0x000000000000ABCD"
       rd2: "0x0000000000001234"
   expected_state:
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0xABCD"
         width: 2
-      - address: "0x0000000000100002"
+      - address: "0x0000000087FF0002"
         value: "0x1234"
         width: 2
   expected_fault: null
@@ -454,16 +454,16 @@
     word: "0x3E042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     rd:
       rd1: "0x00000000DEADBEEF"
       rd2: "0x00000000CAFEBABE"
   expected_state:
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0xDEADBEEF"
         width: 4
-      - address: "0x0000000000100004"
+      - address: "0x0000000087FF0004"
         value: "0xCAFEBABE"
         width: 4
   expected_fault: null
@@ -480,12 +480,12 @@
     word: "0x44042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0x80"
         width: 1
-      - address: "0x0000000000100001"
+      - address: "0x0000000087FF0001"
         value: "0xFF"
         width: 1
   expected_state:
@@ -504,12 +504,12 @@
     word: "0x45042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0x8000"
         width: 2
-      - address: "0x0000000000100002"
+      - address: "0x0000000087FF0002"
         value: "0xFFFF"
         width: 2
   expected_state:
@@ -528,12 +528,12 @@
     word: "0x46042002"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0x80000000"
         width: 4
-      - address: "0x0000000000100004"
+      - address: "0x0000000087FF0004"
         value: "0xFFFFFFFF"
         width: 4
   expected_state:
@@ -554,15 +554,15 @@
     word: "0x47042042"
   input_state:
     rb:
-      rb2: "0x0000000000100000"
+      rb2: "0x0000000087FF0000"
       rb1: "0x0000000000000000"
     rd:
       rd1: "0x0000000000000000"
     memory:
-      - address: "0x0000000000100000"
+      - address: "0x0000000087FF0000"
         value: "0xAAAAAAAAAAAAAAAA"
         width: 8
-      - address: "0x0000000000100008"
+      - address: "0x0000000087FF0008"
         value: "0xBBBBBBBBBBBBBBBB"
         width: 8
   expected_state:
