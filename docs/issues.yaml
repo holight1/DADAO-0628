@@ -1,0 +1,106 @@
+# DADAO issue registry
+# Status: open | closed
+# Scope: M1 milestone or component domains
+# Blocks: milestone gates or deliverables that depend on resolution
+#
+# Sources:
+#   - docs/open-spec-issues.md
+#   - contracts/isa/spec.md §Appendix C
+#   - docs/wiki-questions.md
+
+# ── Open issues (C-numbered) ──────────────────────────────────────────────────
+
+- id: C-18
+  title: "Hardware reset values (RD, RB[1-63], RF, RA power-on)"
+  status: open
+  scope: [M1]
+  blocks: [M1-gate]
+  resolved_by: null
+
+- id: C-27
+  title: "csn/csz/csp/cseq/csne src=dst overlap snapshot rule"
+  status: open
+  scope: [M1]
+  blocks: [overlap-vectors]
+  resolved_by: null
+
+- id: C-SBZ
+  title: "SBZ fault semantics (ILLI vs UNDI for non-zero SBZ fields)"
+  status: open
+  scope: [M1]
+  blocks: [M1-gate]
+  resolved_by: null
+
+# ── Open issues (non-C-numbered, from open-spec-issues.md) ────────────────────
+
+- id: TLB-fault-retry
+  title: "TLB fault return: repair success skips instead of retrying faulting instruction"
+  status: open
+  scope: [System QEMU, Kernel]
+  blocks: null
+  resolved_by: null
+
+- id: PTW-SBI-ABI
+  title: "PTW PTE/PTHI/PAHI register-bank classification inconsistent with scalar ABI"
+  status: open
+  scope: [SBI, Kernel]
+  blocks: null
+  resolved_by: null
+
+- id: VA2PA-result
+  title: "VA2PA signed error encoding conflicts with full 64-bit physical addresses"
+  status: open
+  scope: [SBI, MMU tools]
+  blocks: null
+  resolved_by: null
+
+- id: Varargs
+  title: "Varargs save area, overflow area, aggregate values, and incoming-SP base layout"
+  status: open
+  scope: [ABI, libc]
+  blocks: null
+  resolved_by: null
+
+- id: Cross-cfx-escape
+  title: "Cross-cfx escape: previous cfx state and nested return policy"
+  status: open
+  scope: [Exception nesting]
+  blocks: null
+  resolved_by: null
+
+- id: Multiple-returns
+  title: "Multiple returns: mixed RD/RB/RF ordering ambiguity"
+  status: open
+  scope: [Advanced CodeGen]
+  blocks: null
+  resolved_by: null
+
+# ── Closed items ──────────────────────────────────────────────────────────────
+
+- id: C-14
+  title: "rd2ra/ra2rd M1 inclusion (RA file move, not RAS)"
+  status: closed
+  scope: [M1]
+  blocks: null
+  resolved_by: architecture-decision-2026-06-29
+
+- id: ADR-0003
+  title: "ELF/object ABI (EM_DADAO=0x0DA0, e_flags=0x1 for M1, 10 relocation types)"
+  status: closed
+  scope: [M1]
+  blocks: null
+  resolved_by: ADR-0003
+
+- id: ADR-0004
+  title: "SBZ behavior (SBZ → ILLI exit 0x82; analogy to illegal operand in known opcode)"
+  status: closed
+  scope: [M1]
+  blocks: null
+  resolved_by: ADR-0004
+
+- id: Wiki-13a414d
+  title: "C-01–C-13, C-15–C-17, C-19–C-26 resolved by Wiki commit 13a414d (SimRISC 0.4.1)"
+  status: closed
+  scope: [M1]
+  blocks: null
+  resolved_by: wiki-13a414d

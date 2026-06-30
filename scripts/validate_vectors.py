@@ -102,21 +102,29 @@ def validate_file(filepath, opcodes_by_mnem_fmt):
             if err:
                 errors.append(err)
 
-        # Check encoding.word matches mask/value (at least one rec)
+        # Unified: match encoding.word → find exact opcode record → mark covered
         if word and mnem != "?" and fmt != "?":
             recs = opcodes_by_mnem_fmt.get((mnem, fmt), [])
             if recs:
                 wval = int(word, 16)
+                matched_rec = None
                 for rec in recs:
                     mask_val = int(rec["mask"], 16) if isinstance(rec["mask"], str) else rec["mask"]
                     value_val = int(rec["value"], 16) if isinstance(rec["value"], str) else rec["value"]
                     if (wval & mask_val) == value_val:
+                        matched_rec = rec
                         break
-                else:
-                    rec = recs[0]
-                    errors.append(
-                        f"{tag}: encoding.word {word} does not match "
-                        f"mask={rec['mask']} value={rec['value']}")
+                if matched_rec is None:
+                    errors.append(f"{tag}: encoding.word {word} does not match "
+                                  f"any {mnem}({fmt}) record in opcodes.yaml")
+                elif status == "active":
+                    opid = (matched_rec["op"], str(matched_rec.get("ha")))
+                    covered_opids.add(opid)
+        elif mnem != "?" and fmt != "?":
+            key = (mnem, fmt)
+            if key not in opcodes_by_mnem_fmt:
+                errors.append(f"{tag}: unknown mnemonic+format: "
+                              f"{mnem}({fmt})")
 
         # Check deferred consistency
         if status == "deferred":
@@ -126,17 +134,6 @@ def validate_file(filepath, opcodes_by_mnem_fmt):
             if not case.get("deferred_reason"):
                 errors.append(f"{tag}: status=deferred but "
                               f"deferred_reason is empty/missing")
-
-        # Check mnemonic+format in opcodes
-        if mnem != "?" and fmt != "?":
-            key = (mnem, fmt)
-            if key not in opcodes_by_mnem_fmt:
-                errors.append(f"{tag}: unknown mnemonic+format: "
-                              f"{mnem}({fmt})")
-            elif status == "active":
-                for rec in opcodes_by_mnem_fmt[key]:
-                    opid = (rec["op"], str(rec.get("ha")))
-                    covered_opids.add(opid)
 
         # Check active semantic/boundary has expected_state
         if status == "active" and cls in ("semantic", "boundary"):

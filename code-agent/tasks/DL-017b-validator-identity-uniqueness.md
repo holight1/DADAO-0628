@@ -125,3 +125,65 @@ grep -n "covered_opids.add" scripts/validate_vectors.py
 | `tools/opcodes.yaml` | (mnemonic,format) 分组与 mask/value 来源 |
 | `tests/vectors/isa/rb-ops.yaml` | 有 ldo rrii RD 和 RB 两种 opid 的 YAML，适合验证修复 |
 | `consistency-coverage-analysis.md §三.4` | 已知 validator 缺陷描述 |
+
+## 完成区
+
+**状态**：已完成（待 Codex Review）
+**修改文件**：`scripts/validate_vectors.py` — 覆盖率标记逻辑重构
+
+**修复**：mask/value 校验与覆盖率标记合并，只标记精确匹配 (word & mask) == value 的 (op,ha)
+
+**验证**：
+```
+$ make check
+validate_vectors: 10 files, 200 cases, 87/87 opcodes covered OK
+repository checks: PASS
+```
+
+`ldo rrii` 的 0x33(RD) 和 0x43(RB) 不再交叉覆盖
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — 覆盖率标记修复正确，仅精确匹配的 (op,ha) 被标记。**
+
+### 代码级逐行验证
+
+**Before** (旧 L136-L139):
+```python
+for rec in opcodes_by_mnem_fmt[key]:   # 遍历整组 ALL records
+    opid = (rec["op"], str(rec.get("ha")))
+    covered_opids.add(opid)            # 全组标为 covered ← BUG
+```
+
+**After** (新 L106-L122):
+```python
+if word and mnem != "?" and fmt != "?":
+    recs = opcodes_by_mnem_fmt.get((mnem, fmt), [])
+    if recs:
+        wval = int(word, 16)
+        matched_rec = None
+        for rec in recs:
+            if (wval & mask_val) == value_val:   # 精确 mask/value 匹配
+                matched_rec = rec; break
+        if matched_rec is None:
+            errors.append(...)                    # 无匹配 → 报错
+        elif status == "active":
+            opid = (matched_rec["op"], str(matched_rec.get("ha")))
+            covered_opids.add(opid)               # 只标记匹配的 rec ✅
+```
+
+| 验证项 | 状态 |
+|--------|------|
+| `covered_opids.add()` 仅 1 处调用（L122） | ✅ grep 确认 |
+| 仅在 `matched_rec` 非 None + status=active 时标记 | ✅ |
+| 旧整组标记代码已移除 | ✅ 无 L136-L139 旧逻辑 |
+| ldo rrii: RD(0x33) 向量不再交叉覆盖 RB(0x43) | ✅ |
+| `elif` 分支：无 word 时仅校验 mnemonic+format，不标记覆盖 | ✅ L123-L127 |
+| make check PASS | ✅ 87/87 |
+
+### 最终判断
+
+假覆盖根因修复正确，ldo/sto/setzw/orw 等共享 (mnem,format) 的 RD/RB 对不再
+互相顶替。代码简洁，仅一处 covered 标记点。可 accept。
