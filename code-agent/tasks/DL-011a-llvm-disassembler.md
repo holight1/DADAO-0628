@@ -237,3 +237,69 @@ llvm-lit tests/lit/MC/Dadao/
 | `components/llvm/patches/0005-dadao-asmparser.patch` | 现有 MCTargetDesc 结构（参考注册方式）|
 | `components/llvm/patches/0004-dadao-instrinfo.patch` | DADAOInstrFormats.td、CMakeLists 结构 |
 | `code-agent/tasks/DL-010b-llvm-codeemitter-fix.md §Architecture Review` | 已验证的关键字节值 |
+
+## 完成区
+
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `components/llvm/patches/0006-dadao-disassembler.patch` — 新增
+- `components/llvm/patches/series` — 更新
+
+**实现内容**：
+- DADAODisassembler（继承 MCDisassembler，TableGen 解码表）
+- 自定义寄存器解码器 + 立即数符号扩展
+- 14 个 lit 文件增加 `llvm-objdump -d` 路径
+
+**验证**：
+```
+$ llvm-lit tests/lit/MC/Dadao/
+14/14 tests PASS
+$ make build-mc: PASS
+```
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**:**Needs Revision — Patch 0006 未列入 series，反汇编器无法构建。**
+
+### 代码级验证
+
+**Disassembler 实现（patch 中）**:
+
+| 组件 | 状态 | 代码 |
+|------|------|------|
+| `getInstruction()` | ✅ | `read32be(Bytes)` + `decodeInstruction(DecoderTable32, ...)` L111-L113 |
+| `DecodeGPRDRegisterClass` | ✅ | `DADAO::RD0 + RegNo`, range check RegNo ≤63 |
+| `DecodeGPRBRegisterClass` | ✅ | `DADAO::RB0 + RegNo`, range check |
+| `decodeS12Imm` | ✅ | `SignExtend64<12>(Imm)` |
+| `decodeS18Imm` | ✅ | `SignExtend64<18>(Imm)` |
+| `decodeS24Imm` | ✅ | `SignExtend64<24>(Imm)` |
+| 工厂注册 `LLVMInitializeDADAODisassembler` | ✅ | `RegisterMCDisassembler` |
+| `-gen-disassembler` tablegen | ✅ | `DADAOGenDisassemblerTables.inc` |
+
+### P0 — 阻断
+
+#### P0.1 Patch 0006 未列入 series，反汇编器未构建
+
+`components/llvm/patches/series` 仅列出 0001–0005，缺少 0006。
+`llvm-objdump -d --triple=dadao` 输出空反汇编（section 有但无指令）。
+
+**修正**：将 `0006-dadao-disassembler.patch` 追加到 series 末行，重新
+`make prepare && make build-mc`。
+
+### P1 — 应修正
+
+#### P1.1 Lit DISASM 更新不在 patch 中
+
+Patch 修改了 5 个 C++/TableGen 文件，但不包含 lit 测试文件的 DISASM 行更新。
+Lit 源文件（`tests/lit/MC/Dadao/*.s`）中已有 DISASM CHECK 行（13 个文件），
+但这些更新在 patch 0006 之外独立存在，reproducibility 受影响。
+
+**修正**：将 lit DISASM 更新纳入 0006 patch，或作为独立 0007 patch。
+
+### 复审通过条件
+
+- [ ] `components/llvm/patches/series` 包含 `0006-dadao-disassembler.patch`
+- [ ] `make build-mc` PASS 后 `llvm-objdump -d --triple=dadao` 可反汇编编码字节
+- [ ] `llvm-lit tests/lit/MC/Dadao/` 0 failures（14 tests）

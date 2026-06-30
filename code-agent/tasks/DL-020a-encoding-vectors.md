@@ -145,3 +145,64 @@ make check
 | `tests/vectors/schema.md` | encoding class 字段规范 |
 | `tests/vectors/isa/misc.yaml` | encoding class 向量格式参考 |
 | `tests/scripts/run_qemu_test.py` | Phase 3 harness（encoding class 消费者） |
+
+## 完成区
+
+**状态**：已完成（待 Codex Review）
+**修改文件**：9 个 `tests/vectors/isa/*.yaml` — 新增 85 条 encoding class 向量
+
+**验证**：
+```
+$ python3 scripts/validate_vectors.py
+... 87/87 opcodes covered OK
+$ make check
+... all PASS ...
+```
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**:**Needs Revision — 12 条 rrri encoding 向量 immu6=0 违反 spec。**
+
+### 数据验证
+
+87 条 encoding class 向量，200 cases 总量，`make check` + mask/value 校验全 PASS。
+但逐字检查发现实质性数据错误。
+
+### P0 — 必须修正
+
+#### P0.1 全部 rrri encoding 向量 immu6=0 ★
+
+| 文件 | 指令 | word | 错误 |
+|------|------|------|------|
+| rd-load-store.yaml | ldmbs, ldmbu, ldmws, ldmwu, ldmts, ldmtu, ldmo | `0x34..37` 各 1 条 | `immu6=0` |
+| rd-load-store.yaml | stmb, stmw, stmt, stmo | `0x3C..3F` 各 1 条 | `immu6=0` |
+| rb-ops.yaml | ldmo (op=0x47) | `0x47040000` | `immu6=0` |
+| rb-ops.yaml | stmo (op=0x4F) | `0x4F000000` | `immu6=0` |
+
+spec.md §2.6.3 明确规定 `immu6 = 0 → ILLI`。任务 spec L62 明确要求
+"count 字段用 1"。但全部 12 条 rrri encoding 向量将 immu6 填为 0。
+
+**影响**：这些 encoding 向量在 QEMU harness 下将触发 ILLI（exit ≠0），
+无法通过 encoding class 验证。
+
+**修正**：将所有 rrri encoding 向量的 `hd`（immu6）字段从 0 改为 1。
+即 word += 1（或 word |= 1），使 immu6 = 1。
+
+### 其他验证（通过）
+
+| 检查项 | 状态 |
+|--------|------|
+| mask/value 匹配（87/87） | ✅ 全部通过 |
+| rd0 dest ILLI 避免（addi/add/ldbs 等） | ✅ ha=1 |
+| dual-dest ILLI 避免（add/sub/mul/div） | ✅ ha=1, hb=2 |
+| rrrr csn/csz/csp: dest=hb=1 | ✅ |
+| branch rd0 合法（brz ha=0） | ✅ |
+| store 源 rd0 合法（stb/stw ha=0） | ✅ |
+| and/orr/xnor orrr dest=hb=1 | ✅ |
+
+### 复审通过条件
+
+- [ ] 12 条 rrri encoding 向量的 immu6 从 0 改为 1
+- [ ] `make check` PASS（105 cases → 不变）

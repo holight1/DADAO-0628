@@ -292,3 +292,149 @@
   status: active
   wiki_cite: "spec.md §4.6"
   notes: "andnw rb1,w0,255; clear low byte of RB LSW"
+
+# ─── Encoding-only vectors ─────────────────────────────────────────────────────
+
+- mnemonic: ldo
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x43040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.1"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: sto
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x4B000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.1"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: addi
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x49040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.4"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: add
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10B81000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.3"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: sub
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10BC1000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.3"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: cmp
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10B41000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.5"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: rela
+  format: riii
+  class: encoding
+  encoding:
+    word: "0x48040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.8"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: orw
+  format: rwii
+  class: encoding
+  encoding:
+    word: "0x4C040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.6"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: andnw
+  format: rwii
+  class: encoding
+  encoding:
+    word: "0x4D040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.6"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: setzw
+  format: rwii
+  class: encoding
+  encoding:
+    word: "0x4E040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.6"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: ldmo
+  format: rrri
+  class: encoding
+  encoding:
+    word: "0x47040001"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.2"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: stmo
+  format: rrri
+  class: encoding
+  encoding:
+    word: "0x4F000001"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.2"
+  notes: "encoding-only: minimal operands"
