@@ -142,3 +142,110 @@ python3 tests/scripts/run_qemu_test.py --filter-class semantic \
 | `tools/opcodes.yaml` | ldbu=0x40/ldwu=0x41/ldtu=0x42/ldo=0x33 op 确认 |
 | `tests/scripts/run_qemu_test.py` | 执行框架（不修改） |
 | `code-agent/tasks/DL-021a-harness-semantic.md` | emit_state_compare 设计文档 |
+
+## 完成区
+
+**状态**：已完成（待 Codex Review）
+**修改文件**：`tests/scripts/build_test_binary.py` — `emit_state_compare()` 新增 memory 验证
+
+**实现**：
+- early-return 条件：`and not memory`
+- memory 比对循环：ldb/ldw/ldt/ldo 读实际值 → XOR vs expected → OR 入 rd29
+
+**验证**：`import ok`
+
+---
+
+## Architecture Review — 代码级 (2026-07-01)
+
+**评审结论**：**代码逻辑 Accepted；P0 阻断——测试向量使用 ROM 地址，须 DL-022c 修复后才能完整验收。**
+
+#### P0 — 测试向量使用 ROM 地址（架构师补充）
+
+QEMU patch 0001:
+```c
+memory_region_set_readonly(rom, true);  // ROM 0x100000-0x10FFFF 只读
+```
+
+10 条 store 向量 rb_base = `0x0000000000100000`（ROM 区域）。
+QEMU 静默丢弃写入，DL-022b readback 得到原始 ROM 内容 → XOR ≠ 0 → 全部 FAIL。
+需 DL-022c 将 rb_base 改为 RAM 地址（`0x0000000087FF0000`）并同步更新
+expected_state.memory.address。DL-022b 代码先提交，DL-022c 完成 + QEMU 构建后补验。
+
+### 代码级逐行验证
+
+#### 1. early-return 修正 (L110-L111)
+
+```python
+memory = expected_state.get('memory', []) if expected_state else []
+if not rd and not rb and not memory:    # was: if not rd and not rb
+```
+
+- 纯 memory 向量（store 验证）不再被静默跳过 ✅
+
+#### 2. memory 比对循环 (L142-L179)
+
+**地址加载** (L150)：
+```python
+load_reg(out, 'rb', 30, addr)  # rb30 = memory address, 48-bit via RB 3-wyde load
+```
+
+**宽度选择 + 无符号 load** (L153-L168)：
+
+| width | op = ldbu/ldwu/ldtu/ldo | 验证 |
+|-------|------------------------|------|
+| 1 | `(0x40<<24)\|(30<<18)\|(30<<12)` | ldbu rd30,rb30,0 ✅ |
+| 2 | `(0x41<<24)\|(30<<18)\|(30<<12)` | ldwu rd30,rb30,0 ✅ |
+| 4 | `(0x42<<24)\|(30<<18)\|(30<<12)` | ldtu rd30,rb30,0 ✅ |
+| 8 | `(0x33<<24)\|(30<<18)\|(30<<12)` | ldo  rd30,rb30,0 ✅ |
+
+**期望值加载** (L171)：
+```python
+load_reg(out, 'rd', 31, expected_val)   # rd31 = expected
+```
+
+**XOR 比对** (L174)：
+```python
+# xor rd31, rd31, rd30  →  rd31 = expected XOR actual
+word = (0x10 << 24) | (0x0A << 18) | (31 << 12) | (31 << 6) | 30
+# = 0x10000000 | 0x00280000 | 0x1F000 | 0x7C0 | 0x1E = 0x1029F7DE
+# mask 0xFFFC0000 → value 0x10280000 ✅
+```
+
+- operand encoding: hb=31(dest), hc=31(rd31), hd=30(rd30) ✅
+- 匹配则 rd31=0, 失配则 rd31≠0 ✅
+
+**ORR 累加** (L178)：
+```python
+# or rd29, rd29, rd31  →  rd29 |= (expected XOR actual)
+word = (0x10 << 24) | (0x09 << 18) | (29 << 12) | (29 << 6) | 31
+```
+- hb=29(dest), hc=29(rd29), hd=31(rd31) → rd29 |= rd31 ✅
+- 全部匹配 → rd29 stays 0 → csz selects swym → PASS ✅
+
+#### 3. XOR bit-field 编码验证
+
+| 字段 | 预期 | XOR word L174 | ORR word L178 |
+|------|------|--------------|---------------|
+| op[7:0] | 0x10 | 0x10 ✅ | 0x10 ✅ |
+| ha (minor-op) | 0x0A / 0x09 | 0x0A ✅ | 0x09 ✅ |
+| hb (dest) | 31 / 29 | 31 ✅ | 29 ✅ |
+| hc (src1) | 31 / 29 | 31 ✅ | 29 ✅ |
+| hd (src2) | 30 / 31 | 30 ✅ | 31 ✅ |
+
+#### 4. `n_patch` 常量
+
+n_before 在 memory 比对循环之后采样（L182，guard patching 节开头），
+新增 memory 指令数量不影响 n_patch 计算。任务确认 L77 ✅
+
+#### P2 — Note
+
+##### N1. memory 重复提取
+
+L110 和 L143 各自执行了一次 `expected_state.get('memory', [])`。
+L110 仅用于 early-return 判断，L143 用于实际比对循环。冗余但不影响功能。
+
+### 最终判断
+
+Memory 比对路径完整：width→op 映射正确，XOR/ORR 编码逐字段验证通过，
+early-return 修正防止静默 PASS。可 accept。

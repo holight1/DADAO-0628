@@ -107,7 +107,8 @@ def emit_state_compare(out, expected_state):
     rd = expected_state.get('rd', {}) if expected_state else {}
     rb = expected_state.get('rb', {}) if expected_state else {}
 
-    if not rd and not rb:
+    memory = expected_state.get('memory', []) if expected_state else []
+    if not rd and not rb and not memory:
         emit_exit(out, 0)
         return
 
@@ -137,6 +138,45 @@ def emit_state_compare(out, expected_state):
         out.extend(struct.pack('>I', w))
         w = 0x10240000 | (29 << 12) | (29 << 6) | 31
         out.extend(struct.pack('>I', w))
+
+    # Memory comparison
+    memory = expected_state.get('memory', []) if expected_state else []
+    for entry in memory:
+        addr = int(entry['address'], 16)
+        expected_val = int(entry['value'], 16)
+        width = entry.get('width', 8)
+
+        # Load address into rb30
+        load_reg(out, 'rb', 30, addr)
+
+        # Load memory value into rd30 using appropriate unsigned load
+        if width == 1:
+            # ldbu rd30, rb30, 0 → op=0x40, ha=30, hb=30, hc:hd=0
+            word = (0x40 << 24) | (30 << 18) | (30 << 12)
+            out.extend(struct.pack('>I', word))
+        elif width == 2:
+            # ldwu rd30, rb30, 0 → op=0x41
+            word = (0x41 << 24) | (30 << 18) | (30 << 12)
+            out.extend(struct.pack('>I', word))
+        elif width == 4:
+            # ldtu rd30, rb30, 0 → op=0x42
+            word = (0x42 << 24) | (30 << 18) | (30 << 12)
+            out.extend(struct.pack('>I', word))
+        else:
+            # ldo rd30, rb30, 0 → op=0x33
+            word = (0x33 << 24) | (30 << 18) | (30 << 12)
+            out.extend(struct.pack('>I', word))
+
+        # Load expected value into rd31
+        load_reg(out, 'rd', 31, expected_val)
+
+        # XOR: rd31 = rd31 ^ rd30
+        word = (0x10 << 24) | (0x0A << 18) | (31 << 12) | (31 << 6) | 30
+        out.extend(struct.pack('>I', word))
+
+        # OR: rd29 = rd29 | rd31
+        word = (0x10 << 24) | (0x09 << 18) | (29 << 12) | (29 << 6) | 31
+        out.extend(struct.pack('>I', word))
 
     # --- Self-modifying guard patching ---
     # Count instructions emitted so far (before patching) to locate guard
