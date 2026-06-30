@@ -1,0 +1,623 @@
+From b6ce101d7ec31cad3dc46fd4cb868d94d9202f48 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 30 Jun 2026 09:03:45 +0800
+Subject: [PATCH] target/dadao: implement RD integer arithmetic TCG translation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace ILLI stubs with real TCG code for all RD scalar integer
+instruction groups covered by ISA spec §3.5–§3.14:
+
+  - §3.5  add/sub 128-bit (tcg_gen_add2_i64/sub2_i64)
+  - §3.6  addi (tcg_gen_addi_i64)
+  - §3.7  muls/mulu/divs/divu (muls2/mulu2/div/rem)
+  - §3.8  cmps/cmpu immediate (3-way result via movcond)
+  - §3.9  cmps/cmpu register form
+  - §3.10 and/or/xor/xnor logical
+  - §3.11 shift/extend register & immediate forms
+  - §3.12 conditional assign csn/csz/csp/cseq/csne
+  - §3.13 wyde immediate orw/andnw/setzw/setow
+  - §3.14 rd2rd block copy
+
+Adds load_rd/store_rd helper functions with rd0=0 hardening.
+Dual-destination legality checks per §2.6.1.
+---
+ target/dadao/translate.c | 554 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 517 insertions(+), 37 deletions(-)
+
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 9bd3d5b..733008d 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -40,12 +40,36 @@ static void gen_exception_undi(DisasContext *ctx)
+     ctx->base.is_jmp = DISAS_NORETURN;
+ }
+ 
++/* Helper: load rd[reg] into a new temp */
++static TCGv_i64 load_rd(DisasContext *ctx, int reg)
++{
++    TCGv_i64 t = tcg_temp_new_i64();
++    tcg_gen_ld_i64(t, tcg_env, offsetof(CPUDADAOState, rd[reg]));
++    return t;
++}
++
++/* Helper: store val to rd[reg]; rd0 is hardwired zero */
++static void store_rd(DisasContext *ctx, int reg, TCGv_i64 val)
++{
++    if (reg == 0) return;
++    tcg_gen_st_i64(val, tcg_env, offsetof(CPUDADAOState, rd[reg]));
++}
++
++/* Helper: sign-extend 64-bit to 128-bit (high part) */
++static TCGv_i64 sext64h(TCGv_i64 src)
++{
++    TCGv_i64 h = tcg_temp_new_i64();
++    tcg_gen_sari_i64(h, src, 63);
++    return h;
++}
++
+ /* swym is a NOP */
+ static bool trans_swym(DisasContext *ctx, arg_swym *a)
+ {
+     return true;
+ }
+ 
++/* Retained ILLI stub macro for non-RD-integer instructions */
+ #define GEN_ILLEGAL_INSN(NAME) \
+ static bool trans_##NAME(DisasContext *ctx, arg_##NAME *a) \
+ { \
+@@ -53,24 +77,7 @@ static bool trans_##NAME(DisasContext *ctx, arg_##NAME *a) \
+     return true; \
+ }
+ 
+-/* MISC-Norm subtable */
+-GEN_ILLEGAL_INSN(and_log)
+-GEN_ILLEGAL_INSN(orr)
+-GEN_ILLEGAL_INSN(xor_bit)
+-GEN_ILLEGAL_INSN(xnor)
+-GEN_ILLEGAL_INSN(shlu_r)
+-GEN_ILLEGAL_INSN(shrs_r)
+-GEN_ILLEGAL_INSN(shru_r)
+-GEN_ILLEGAL_INSN(exts_r)
+-GEN_ILLEGAL_INSN(extz_r)
+-GEN_ILLEGAL_INSN(shlu_i)
+-GEN_ILLEGAL_INSN(shrs_i)
+-GEN_ILLEGAL_INSN(shru_i)
+-GEN_ILLEGAL_INSN(exts_i)
+-GEN_ILLEGAL_INSN(extz_i)
+-GEN_ILLEGAL_INSN(cmps_r)
+-GEN_ILLEGAL_INSN(cmpu_r)
+-GEN_ILLEGAL_INSN(rd2rd)
++/* MISC-Norm subtable — RB / other stubs */
+ GEN_ILLEGAL_INSN(rd2rb)
+ GEN_ILLEGAL_INSN(rb2rd)
+ GEN_ILLEGAL_INSN(rb2rb)
+@@ -79,25 +86,7 @@ GEN_ILLEGAL_INSN(add_rb)
+ GEN_ILLEGAL_INSN(sub_rb)
+ GEN_ILLEGAL_INSN(unimp)
+ 
+-/* Non-MISC-Norm instructions */
+-GEN_ILLEGAL_INSN(cmps_i)
+-GEN_ILLEGAL_INSN(cmpu_i)
+-GEN_ILLEGAL_INSN(orw)
+-GEN_ILLEGAL_INSN(andnw)
+-GEN_ILLEGAL_INSN(setzw)
+-GEN_ILLEGAL_INSN(setow)
+-GEN_ILLEGAL_INSN(addi)
+-GEN_ILLEGAL_INSN(add)
+-GEN_ILLEGAL_INSN(sub)
+-GEN_ILLEGAL_INSN(muls)
+-GEN_ILLEGAL_INSN(mulu)
+-GEN_ILLEGAL_INSN(divs)
+-GEN_ILLEGAL_INSN(divu)
+-GEN_ILLEGAL_INSN(csn)
+-GEN_ILLEGAL_INSN(csz)
+-GEN_ILLEGAL_INSN(csp)
+-GEN_ILLEGAL_INSN(cseq)
+-GEN_ILLEGAL_INSN(csne)
++/* Non-RD-integer stubs */
+ GEN_ILLEGAL_INSN(brn)
+ GEN_ILLEGAL_INSN(brnn)
+ GEN_ILLEGAL_INSN(brz)
+@@ -143,6 +132,497 @@ GEN_ILLEGAL_INSN(call_i)
+ GEN_ILLEGAL_INSN(call_r)
+ GEN_ILLEGAL_INSN(ret)
+ 
++/* === §3.10 RD Logical (orrr) — hb=dest, hc=src1, hd=src2 === */
++
++static bool trans_and_log(DisasContext *ctx, arg_and_log *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_and_i64(d, s1, s2);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_orr(DisasContext *ctx, arg_orr *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_or_i64(d, s1, s2);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_xor_bit(DisasContext *ctx, arg_xor_bit *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_xor_i64(d, s1, s2);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_xnor(DisasContext *ctx, arg_xnor *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_xor_i64(d, s1, s2);
++    tcg_gen_not_i64(d, d);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++/* === §3.11 RD Shift/Extend — Register Form (orrr) === */
++
++static bool trans_shlu_r(DisasContext *ctx, arg_shlu_r *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 amt = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_andi_i64(amt, amt, 0x3F);
++    tcg_gen_shl_i64(d, src, amt);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_shrs_r(DisasContext *ctx, arg_shrs_r *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 amt = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_andi_i64(amt, amt, 0x3F);
++    tcg_gen_sar_i64(d, src, amt);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_shru_r(DisasContext *ctx, arg_shru_r *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 amt = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_andi_i64(amt, amt, 0x3F);
++    tcg_gen_shr_i64(d, src, amt);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_exts_r(DisasContext *ctx, arg_exts_r *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 amt = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_andi_i64(amt, amt, 0x3F);
++    tcg_gen_shl_i64(d, src, amt);
++    tcg_gen_sar_i64(d, d, amt);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_extz_r(DisasContext *ctx, arg_extz_r *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 amt = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_andi_i64(amt, amt, 0x3F);
++    tcg_gen_shl_i64(d, src, amt);
++    tcg_gen_shr_i64(d, d, amt);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++/* === §3.11 RD Shift/Extend — Immediate Form (orri) === */
++
++static bool trans_shlu_i(DisasContext *ctx, arg_shlu_i *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_shli_i64(d, src, a->hd);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_shrs_i(DisasContext *ctx, arg_shrs_i *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_sari_i64(d, src, a->hd);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_shru_i(DisasContext *ctx, arg_shru_i *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_shri_i64(d, src, a->hd);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_exts_i(DisasContext *ctx, arg_exts_i *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_shli_i64(d, src, a->hd);
++    tcg_gen_sari_i64(d, d, a->hd);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_extz_i(DisasContext *ctx, arg_extz_i *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hc);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_shli_i64(d, src, a->hd);
++    tcg_gen_shri_i64(d, d, a->hd);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++/* === §3.9 RD Compare — Register Form (orrr) hb=dest, hc=a, hd=b === */
++
++static bool do_cmps_r(DisasContext *ctx, arg_cmps_r *a, bool is_unsigned)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    TCGv_i64 zero = tcg_constant_i64(0);
++    TCGv_i64 mone = tcg_constant_i64(-1);
++    TCGCond cond_lt = is_unsigned ? TCG_COND_LTU : TCG_COND_LT;
++    tcg_gen_movi_i64(d, 1);
++    tcg_gen_movcond_i64(TCG_COND_EQ, d, s1, s2, zero, d);
++    tcg_gen_movcond_i64(cond_lt, d, s1, s2, mone, d);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_cmps_r(DisasContext *ctx, arg_cmps_r *a)
++{
++    return do_cmps_r(ctx, a, false);
++}
++
++static bool trans_cmpu_r(DisasContext *ctx, arg_cmpu_r *a)
++{
++    return do_cmps_r(ctx, a, true);
++}
++
++/* === §3.14 RD Block Copy — rd2rd (orri) hb=dest, hc=src, hd=count === */
++
++static bool trans_rd2rd(DisasContext *ctx, arg_rd2rd *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->hd == 0 || a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    if (a->hb + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    if (a->hc + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    for (int i = 0; i < a->hd; i++) {
++        TCGv_i64 v = load_rd(ctx, a->hc + i);
++        store_rd(ctx, a->hb + i, v);
++    }
++    return true;
++}
++
++/* === §3.8 RD Compare — Immediate Form (rrii) ha=dest, hb=src, imm12=imm === */
++
++static bool do_cmps_i(DisasContext *ctx, int ha, int hb, int64_t imm, bool is_unsigned)
++{
++    if (ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, hb);
++    TCGv_i64 imm_tmp = tcg_constant_i64(imm);
++    TCGv_i64 d = tcg_temp_new_i64();
++    TCGv_i64 zero = tcg_constant_i64(0);
++    TCGv_i64 mone = tcg_constant_i64(-1);
++    TCGCond cond_lt = is_unsigned ? TCG_COND_LTU : TCG_COND_LT;
++    tcg_gen_movi_i64(d, 1);
++    tcg_gen_movcond_i64(TCG_COND_EQ, d, src, imm_tmp, zero, d);
++    tcg_gen_movcond_i64(cond_lt, d, src, imm_tmp, mone, d);
++    store_rd(ctx, ha, d);
++    return true;
++}
++
++static bool trans_cmps_i(DisasContext *ctx, arg_cmps_i *a)
++{
++    return do_cmps_i(ctx, a->ha, a->hb, a->imm12, false);
++}
++
++static bool trans_cmpu_i(DisasContext *ctx, arg_cmpu_i *a)
++{
++    uint64_t imm = (uint64_t)(a->imm12) & 0xFFF;
++    return do_cmps_i(ctx, a->ha, a->hb, imm, true);
++}
++
++/* === §3.13 RD Wyde Immediate (rwii) ha=dest, hb[5:4]=ww, hb[3:0]=imm[15:12], hc=imm[11:6], hd=imm[5:0] === */
++
++static void gen_wyde_op(DisasContext *ctx, arg_rwii *a,
++                         void (*fn)(TCGv_i64, TCGv_i64, int64_t))
++{
++    int ww = (a->hb >> 4) & 3;
++    unsigned shift = ww * 16;
++    uint64_t imm16 = ((uint64_t)(a->hb & 0xF) << 12) | ((uint64_t)a->hc << 6) | (uint64_t)a->hd;
++    TCGv_i64 src = load_rd(ctx, a->ha);
++    TCGv_i64 d = tcg_temp_new_i64();
++    fn(d, src, imm16 << shift);
++    store_rd(ctx, a->ha, d);
++}
++
++static bool trans_orw(DisasContext *ctx, arg_orw *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    gen_wyde_op(ctx, a, tcg_gen_ori_i64);
++    return true;
++}
++
++static bool trans_andnw(DisasContext *ctx, arg_andnw *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    int ww = (a->hb >> 4) & 3;
++    unsigned shift = ww * 16;
++    uint64_t imm16 = ((uint64_t)(a->hb & 0xF) << 12) | ((uint64_t)a->hc << 6) | (uint64_t)a->hd;
++    uint64_t mask = ~(imm16 << shift);
++    TCGv_i64 src = load_rd(ctx, a->ha);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_andi_i64(d, src, mask);
++    store_rd(ctx, a->ha, d);
++    return true;
++}
++
++static bool trans_setzw(DisasContext *ctx, arg_setzw *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    int ww = (a->hb >> 4) & 3;
++    unsigned shift = ww * 16;
++    uint64_t imm16 = ((uint64_t)(a->hb & 0xF) << 12) | ((uint64_t)a->hc << 6) | (uint64_t)a->hd;
++    TCGv_i64 d = tcg_constant_i64(imm16 << shift);
++    store_rd(ctx, a->ha, d);
++    return true;
++}
++
++static bool trans_setow(DisasContext *ctx, arg_setow *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    int ww = (a->hb >> 4) & 3;
++    unsigned shift = ww * 16;
++    uint64_t imm16 = ((uint64_t)(a->hb & 0xF) << 12) | ((uint64_t)a->hc << 6) | (uint64_t)a->hd;
++    uint64_t ones = ~(0xFFFFULL << shift);
++    TCGv_i64 d = tcg_constant_i64(ones | (imm16 << shift));
++    store_rd(ctx, a->ha, d);
++    return true;
++}
++
++/* === §3.6 RD addi (rrii) ha=dest, hb=src, imm12=imm === */
++
++static bool trans_addi(DisasContext *ctx, arg_addi *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src = load_rd(ctx, a->hb);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_addi_i64(d, src, a->imm12);
++    store_rd(ctx, a->ha, d);
++    return true;
++}
++
++/* === §3.5 RD 128-bit add/sub (rrrr) ha=hi, hb=lo, hc=src1, hd=src2 === */
++
++static bool trans_add(DisasContext *ctx, arg_add *a)
++{
++    if (a->ha == 0 && a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->ha != 0 && a->hb != 0 && a->ha == a->hb) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 s1h = sext64h(s1);
++    TCGv_i64 s2h = sext64h(s2);
++    TCGv_i64 lo = tcg_temp_new_i64();
++    TCGv_i64 hi = tcg_temp_new_i64();
++    tcg_gen_add2_i64(lo, hi, s1, s1h, s2, s2h);
++    store_rd(ctx, a->hb, lo);
++    store_rd(ctx, a->ha, hi);
++    return true;
++}
++
++static bool trans_sub(DisasContext *ctx, arg_sub *a)
++{
++    if (a->ha == 0 && a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->ha != 0 && a->hb != 0 && a->ha == a->hb) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 s1h = sext64h(s1);
++    TCGv_i64 s2h = sext64h(s2);
++    TCGv_i64 lo = tcg_temp_new_i64();
++    TCGv_i64 hi = tcg_temp_new_i64();
++    tcg_gen_sub2_i64(lo, hi, s1, s1h, s2, s2h);
++    store_rd(ctx, a->hb, lo);
++    store_rd(ctx, a->ha, hi);
++    return true;
++}
++
++/* === §3.7 RD Multiply/Divide (rrrr) === */
++
++static bool trans_muls(DisasContext *ctx, arg_muls *a)
++{
++    if (a->ha == 0 && a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->ha != 0 && a->hb != 0 && a->ha == a->hb) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 lo = tcg_temp_new_i64();
++    TCGv_i64 hi = tcg_temp_new_i64();
++    tcg_gen_muls2_i64(lo, hi, s1, s2);
++    store_rd(ctx, a->hb, lo);
++    store_rd(ctx, a->ha, hi);
++    return true;
++}
++
++static bool trans_mulu(DisasContext *ctx, arg_mulu *a)
++{
++    if (a->ha == 0 && a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->ha != 0 && a->hb != 0 && a->ha == a->hb) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = load_rd(ctx, a->hc);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    TCGv_i64 lo = tcg_temp_new_i64();
++    TCGv_i64 hi = tcg_temp_new_i64();
++    tcg_gen_mulu2_i64(lo, hi, s1, s2);
++    store_rd(ctx, a->hb, lo);
++    store_rd(ctx, a->ha, hi);
++    return true;
++}
++
++static bool trans_divs(DisasContext *ctx, arg_divs *a)
++{
++    if (a->ha == 0 && a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->ha != 0 && a->hb != 0 && a->ha == a->hb) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 dividend = load_rd(ctx, a->hc);
++    TCGv_i64 divisor = load_rd(ctx, a->hd);
++    TCGv_i64 zero = tcg_constant_i64(0);
++    TCGv_i64 min64 = tcg_constant_i64(INT64_MIN);
++    TCGv_i64 mone = tcg_constant_i64(-1);
++    /* divisor == 0 → ILLI */
++    TCGLabel *l1 = gen_new_label();
++    tcg_gen_brcond_i64(TCG_COND_NE, divisor, zero, l1);
++    gen_exception_illegal(ctx);
++    return true;
++    gen_set_label(l1);
++    /* INT64_MIN / -1 → ILLI */
++    TCGLabel *l2 = gen_new_label();
++    tcg_gen_brcond_i64(TCG_COND_NE, dividend, min64, l2);
++    tcg_gen_brcond_i64(TCG_COND_NE, divisor, mone, l2);
++    gen_exception_illegal(ctx);
++    return true;
++    gen_set_label(l2);
++    TCGv_i64 quot = tcg_temp_new_i64();
++    TCGv_i64 rem = tcg_temp_new_i64();
++    tcg_gen_div_i64(quot, dividend, divisor);
++    tcg_gen_rem_i64(rem, dividend, divisor);
++    store_rd(ctx, a->ha, rem);
++    store_rd(ctx, a->hb, quot);
++    return true;
++}
++
++static bool trans_divu(DisasContext *ctx, arg_divu *a)
++{
++    if (a->ha == 0 && a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->ha != 0 && a->hb != 0 && a->ha == a->hb) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 dividend = load_rd(ctx, a->hc);
++    TCGv_i64 divisor = load_rd(ctx, a->hd);
++    TCGv_i64 zero = tcg_constant_i64(0);
++    /* divisor == 0 → ILLI */
++    TCGLabel *l1 = gen_new_label();
++    tcg_gen_brcond_i64(TCG_COND_NE, divisor, zero, l1);
++    gen_exception_illegal(ctx);
++    return true;
++    gen_set_label(l1);
++    TCGv_i64 quot = tcg_temp_new_i64();
++    TCGv_i64 rem = tcg_temp_new_i64();
++    tcg_gen_divu_i64(quot, dividend, divisor);
++    tcg_gen_remu_i64(rem, dividend, divisor);
++    store_rd(ctx, a->ha, rem);
++    store_rd(ctx, a->hb, quot);
++    return true;
++}
++
++/* === §3.12 RD Conditional Assign (rrrr) === */
++
++static bool trans_csn(DisasContext *ctx, arg_csn *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGv_i64 tval = load_rd(ctx, a->hc);
++    TCGv_i64 fval = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    TCGv_i64 zero = tcg_constant_i64(0);
++    tcg_gen_movcond_i64(TCG_COND_LT, d, cond, zero, tval, fval);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_csz(DisasContext *ctx, arg_csz *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGv_i64 tval = load_rd(ctx, a->hc);
++    TCGv_i64 fval = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    TCGv_i64 zero = tcg_constant_i64(0);
++    tcg_gen_movcond_i64(TCG_COND_EQ, d, cond, zero, tval, fval);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_csp(DisasContext *ctx, arg_csp *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGv_i64 tval = load_rd(ctx, a->hc);
++    TCGv_i64 fval = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    TCGv_i64 zero = tcg_constant_i64(0);
++    tcg_gen_movcond_i64(TCG_COND_GT, d, cond, zero, tval, fval);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++static bool trans_cseq(DisasContext *ctx, arg_cseq *a)
++{
++    if (a->hc == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src1 = load_rd(ctx, a->ha);
++    TCGv_i64 src2 = load_rd(ctx, a->hb);
++    TCGv_i64 cur = load_rd(ctx, a->hc);
++    TCGv_i64 val = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_movcond_i64(TCG_COND_EQ, d, src1, src2, val, cur);
++    store_rd(ctx, a->hc, d);
++    return true;
++}
++
++static bool trans_csne(DisasContext *ctx, arg_csne *a)
++{
++    if (a->hc == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 src1 = load_rd(ctx, a->ha);
++    TCGv_i64 src2 = load_rd(ctx, a->hb);
++    TCGv_i64 cur = load_rd(ctx, a->hc);
++    TCGv_i64 val = load_rd(ctx, a->hd);
++    TCGv_i64 d = tcg_temp_new_i64();
++    tcg_gen_movcond_i64(TCG_COND_NE, d, src1, src2, val, cur);
++    store_rd(ctx, a->hc, d);
++    return true;
++}
++
+ static void decode_opc(CPUDADAOState *env, DisasContext *ctx)
+ {
+     ctx->opcode = translator_ldl_swap(env, &ctx->base, ctx->base.pc_next, true);
+-- 
+2.43.0
+

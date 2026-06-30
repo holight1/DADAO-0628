@@ -1,0 +1,587 @@
+diff --git a/llvm/lib/Target/DADAO/CMakeLists.txt b/llvm/lib/Target/DADAO/CMakeLists.txt
+index 54ec398e1f46..22b4303be235 100644
+--- a/llvm/lib/Target/DADAO/CMakeLists.txt
++++ b/llvm/lib/Target/DADAO/CMakeLists.txt
+@@ -1,6 +1,15 @@
+ add_llvm_component_group(DADAO)
+ 
++set(LLVM_TARGET_DEFINITIONS DADAO.td)
++
++tablegen(LLVM DADAOGenRegisterInfo.inc -gen-register-info)
++
++add_public_tablegen_target(DADAOCommonTableGen)
++
++tablegen(LLVM DADAOGenInstrInfo.inc -gen-instr-info)
++
+ add_llvm_target(DADAOCodeGen
++  DADAORegisterInfo.cpp
+   DADAOTargetMachine.cpp
+ 
+   LINK_COMPONENTS
+diff --git a/llvm/lib/Target/DADAO/DADAO.td b/llvm/lib/Target/DADAO/DADAO.td
+new file mode 100644
+index 000000000000..d55c4d456780
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAO.td
+@@ -0,0 +1,43 @@
++//===- DADAO.td - Describe the DADAO Target Machine ----------*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++//===----------------------------------------------------------------------===//
++// Target-independent interfaces which we are implementing
++//===----------------------------------------------------------------------===//
++
++include "llvm/Target/Target.td"
++
++//===----------------------------------------------------------------------===//
++// Register File, Calling Conv, Instruction Descriptions
++//===----------------------------------------------------------------------===//
++
++include "DADAORegisterInfo.td"
++
++include "DADAOInstrInfo.td"
++
++def DADAOInstrInfo : InstrInfo;
++
++//===----------------------------------------------------------------------===//
++// DADAO processors supported.
++//===----------------------------------------------------------------------===//
++
++def : ProcessorModel<"generic", NoSchedModel, []>;
++
++def DADAOInstPrinter : AsmWriter {
++  string AsmWriterClassName  = "InstPrinter";
++  bit isMCAsmWriter = 1;
++}
++
++//===----------------------------------------------------------------------===//
++// Declare the target which we are implementing
++//===----------------------------------------------------------------------===//
++
++def DADAO : Target {
++  let InstructionSet = DADAOInstrInfo;
++  let AssemblyWriters = [DADAOInstPrinter];
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrFormats.td b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
+new file mode 100644
+index 000000000000..10ebcdd254b0
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
+@@ -0,0 +1,148 @@
++//===- DADAOInstrFormats.td - DADAO Instruction Formats ----*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++class InstDADAO<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : Instruction {
++  field bits<32> Inst;
++  let Size = 4;
++  let Namespace = "DADAO";
++
++  bits<8> op;
++  bits<6> ha;
++  bits<6> hb;
++  bits<6> hc;
++  bits<6> hd;
++
++  let Inst{31-24} = op;
++  let Inst{23-18} = ha;
++  let Inst{17-12} = hb;
++  let Inst{11-6}  = hc;
++  let Inst{5-0}   = hd;
++
++  dag OutOperandList = outs;
++  dag InOperandList  = ins;
++  let AsmString = asmstr;
++  let Pattern = pattern;
++}
++
++// 24-bit immediate (iiii)
++class F_IIII<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<24> imm24;
++  let ha = imm24{23-18};
++  let hb = imm24{17-12};
++  let hc = imm24{11-6};
++  let hd = imm24{5-0};
++}
++
++// minor-op + 18-bit immediate (oiii)
++class F_OIII<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<18> imm18;
++  let ha = minor_op;
++  let hb = imm18{17-12};
++  let hc = imm18{11-6};
++  let hd = imm18{5-0};
++}
++
++// minor-op + reg + 12-bit immediate (orii)
++class F_ORII<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg;
++  bits<12> imm12;
++  let ha = minor_op;
++  let hb = reg;
++  let hc = imm12{11-6};
++  let hd = imm12{5-0};
++}
++
++// minor-op + 2 regs + 6-bit immediate (orri)
++class F_ORRI<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg1;
++  bits<6> reg2;
++  bits<6> imm6;
++  let ha = minor_op;
++  let hb = reg1;
++  let hc = reg2;
++  let hd = imm6;
++}
++
++// minor-op + 3 regs (orrr)
++class F_ORRR<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg1;
++  bits<6> reg2;
++  bits<6> reg3;
++  let ha = minor_op;
++  let hb = reg1;
++  let hc = reg2;
++  let hd = reg3;
++}
++
++// 4 regs (rrrr)
++class F_RRRR<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg1;
++  bits<6> reg2;
++  bits<6> reg3;
++  bits<6> reg4;
++  let ha = reg1;
++  let hb = reg2;
++  let hc = reg3;
++  let hd = reg4;
++}
++
++// 3 regs + 6-bit immediate (rrri)
++class F_RRRI<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg1;
++  bits<6> reg2;
++  bits<6> reg3;
++  bits<6> imm6;
++  let ha = reg1;
++  let hb = reg2;
++  let hc = reg3;
++  let hd = imm6;
++}
++
++// 2 regs + 12-bit immediate (rrii)
++class F_RRII<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg1;
++  bits<6> reg2;
++  bits<12> imm12;
++  let ha = reg1;
++  let hb = reg2;
++  let hc = imm12{11-6};
++  let hd = imm12{5-0};
++}
++
++// 1 reg + 18-bit immediate (riii)
++class F_RIII<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg;
++  bits<18> imm18;
++  let ha = reg;
++  let hb = imm18{17-12};
++  let hc = imm18{11-6};
++  let hd = imm18{5-0};
++}
++
++// reg + wyde-pos + 16-bit unsigned immediate (rwii)
++class F_RWII<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg;
++  bits<2> ww;
++  bits<16> imm16;
++  let ha = reg;
++  let hb{5-4} = ww;
++  let hb{3-0} = imm16{15-12};
++  let hc = imm16{11-6};
++  let hd = imm16{5-0};
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+new file mode 100644
+index 000000000000..db600d7a70d9
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -0,0 +1,156 @@
++//===- DADAOInstrInfo.td - DADAO Instruction Definitions --*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++include "DADAOInstrFormats.td"
++
++// Immediate operand types
++def imms12 : Operand<i64>;
++def immu12 : Operand<i64>;
++def imms18 : Operand<i64>;
++def immu16 : Operand<i64>;
++def immu6  : Operand<i64>;
++def imms24 : Operand<i64>;
++def wydepos : Operand<i64>;
++
++//===----------------------------------------------------------------------===//
++// MISC-Norm (op=0x10)
++//===----------------------------------------------------------------------===//
++def SWYM_OIII  : F_OIII<0x00, (outs), (ins imms18:$imm18), "swym $imm18", []>;
++def UNIMP_OIII : F_OIII<0x3F, (outs), (ins imms18:$imm18), "unimp $imm18", []>;
++
++let op = 0x10 in {
++def AND_ORRR   : F_ORRR<0x08, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "and $rdhb, $rdhc, $rdhd", []>;
++def ORR_ORRR   : F_ORRR<0x09, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "orr $rdhb, $rdhc, $rdhd", []>;
++def XOR_ORRR   : F_ORRR<0x0A, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "xor $rdhb, $rdhc, $rdhd", []>;
++def XNOR_ORRR  : F_ORRR<0x0B, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "xnor $rdhb, $rdhc, $rdhd", []>;
++
++def SHLU_ORRR  : F_ORRR<0x11, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "shlu $rdhb, $rdhc, $rdhd", []>;
++def SHRS_ORRR  : F_ORRR<0x12, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "shrs $rdhb, $rdhc, $rdhd", []>;
++def SHRU_ORRR  : F_ORRR<0x13, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "shru $rdhb, $rdhc, $rdhd", []>;
++def EXTS_ORRR  : F_ORRR<0x14, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "exts $rdhb, $rdhc, $rdhd", []>;
++def EXTZ_ORRR  : F_ORRR<0x15, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "extz $rdhb, $rdhc, $rdhd", []>;
++
++def SHLU_ORRI  : F_ORRI<0x19, (outs GPRD:$rdhb), (ins GPRD:$rdhc, immu6:$imm6), "shlu $rdhb, $rdhc, $imm6", []>;
++def SHRS_ORRI  : F_ORRI<0x1A, (outs GPRD:$rdhb), (ins GPRD:$rdhc, immu6:$imm6), "shrs $rdhb, $rdhc, $imm6", []>;
++def SHRU_ORRI  : F_ORRI<0x1B, (outs GPRD:$rdhb), (ins GPRD:$rdhc, immu6:$imm6), "shru $rdhb, $rdhc, $imm6", []>;
++def EXTS_ORRI  : F_ORRI<0x1C, (outs GPRD:$rdhb), (ins GPRD:$rdhc, immu6:$imm6), "exts $rdhb, $rdhc, $imm6", []>;
++def EXTZ_ORRI  : F_ORRI<0x1D, (outs GPRD:$rdhb), (ins GPRD:$rdhc, immu6:$imm6), "extz $rdhb, $rdhc, $imm6", []>;
++
++def CMPS_ORRR  : F_ORRR<0x24, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "cmps $rdhb, $rdhc, $rdhd", []>;
++def CMPU_ORRR  : F_ORRR<0x25, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "cmpu $rdhb, $rdhc, $rdhd", []>;
++
++def RD2RD_ORRI : F_ORRI<0x28, (outs GPRD:$rdhb), (ins GPRD:$rdhc, immu6:$imm6), "rd2rd $rdhb, $rdhc, $imm6", []>;
++def RD2RB_ORRI : F_ORRI<0x29, (outs GPRB:$rbhb), (ins GPRD:$rdhc, immu6:$imm6), "rd2rb $rbhb, $rdhc, $imm6", []>;
++def RB2RD_ORRI : F_ORRI<0x2A, (outs GPRD:$rdhb), (ins GPRB:$rbhc, immu6:$imm6), "rb2rd $rdhb, $rbhc, $imm6", []>;
++def RB2RB_ORRI : F_ORRI<0x2B, (outs GPRB:$rbhb), (ins GPRB:$rbhc, immu6:$imm6), "rb2rb $rbhb, $rbhc, $imm6", []>;
++
++def CMPRB_ORRR : F_ORRR<0x2D, (outs GPRD:$rdhb), (ins GPRB:$rbhc, GPRB:$rbhd), "cmp $rdhb, $rbhc, $rbhd", []>;
++def ADDRB_ORRR : F_ORRR<0x2E, (outs GPRB:$rbhb), (ins GPRB:$rbhc, GPRD:$rdhd), "add $rbhb, $rbhc, $rdhd", []>;
++def SUBRB_ORRR : F_ORRR<0x2F, (outs GPRB:$rbhb), (ins GPRB:$rbhc, GPRD:$rdhd), "sub $rbhb, $rbhc, $rdhd", []>;
++}
++
++//===----------------------------------------------------------------------===//
++// Integer arithmetic (op=0x12-0x1F)
++//===----------------------------------------------------------------------===//
++let op = 0x12 in def CMPS_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRD:$rdhb, imms12:$imm12), "cmps $rdha, $rdhb, $imm12", []>;
++let op = 0x13 in def CMPU_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRD:$rdhb, immu12:$imm12), "cmpu $rdha, $rdhb, $imm12", []>;
++
++let op = 0x14 in def ORW_RWII   : F_RWII<(outs GPRD:$rdha), (ins wydepos:$ww, immu16:$imm16), "orw $rdha, $ww, $imm16", []>;
++let op = 0x15 in def ANDNW_RWII  : F_RWII<(outs GPRD:$rdha), (ins wydepos:$ww, immu16:$imm16), "andnw $rdha, $ww, $imm16", []>;
++let op = 0x16 in def SETZW_RWII  : F_RWII<(outs GPRD:$rdha), (ins wydepos:$ww, immu16:$imm16), "setzw $rdha, $ww, $imm16", []>;
++let op = 0x17 in def SETOW_RWII  : F_RWII<(outs GPRD:$rdha), (ins wydepos:$ww, immu16:$imm16), "setow $rdha, $ww, $imm16", []>;
++
++let op = 0x19 in def ADDI_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRD:$rdhb, imms12:$imm12), "addi $rdha, $rdhb, $imm12", []>;
++let op = 0x1A in def ADD_RRRR   : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "add $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x1B in def SUB_RRRR   : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "sub $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x1C in def MULS_RRRR  : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "muls $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x1D in def MULU_RRRR  : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "mulu $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x1E in def DIVS_RRRR  : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "divs $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x1F in def DIVU_RRRR  : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "divu $rdha, $rdhb, $rdhc, $rdhd", []>;
++
++//===----------------------------------------------------------------------===//
++// Conditional assign (op=0x20-0x27)
++//===----------------------------------------------------------------------===//
++let op = 0x20 in def CSN_RRRR  : F_RRRR<(outs GPRD:$rdhb), (ins GPRD:$rdha, GPRD:$rdhc, GPRD:$rdhd), "csn $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x22 in def CSZ_RRRR  : F_RRRR<(outs GPRD:$rdhb), (ins GPRD:$rdha, GPRD:$rdhc, GPRD:$rdhd), "csz $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x24 in def CSP_RRRR  : F_RRRR<(outs GPRD:$rdhb), (ins GPRD:$rdha, GPRD:$rdhc, GPRD:$rdhd), "csp $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x26 in def CSEQ_RRRR : F_RRRR<(outs GPRD:$rdhc), (ins GPRD:$rdha, GPRD:$rdhb, GPRD:$rdhd), "cseq $rdha, $rdhb, $rdhc, $rdhd", []>;
++let op = 0x27 in def CSNE_RRRR : F_RRRR<(outs GPRD:$rdhc), (ins GPRD:$rdha, GPRD:$rdhb, GPRD:$rdhd), "csne $rdha, $rdhb, $rdhc, $rdhd", []>;
++
++//===----------------------------------------------------------------------===//
++// Branch (op=0x28-0x2F)
++//===----------------------------------------------------------------------===//
++let op = 0x28 in def BRN_RIII  : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brn $rdha, $imm18", []>;
++let op = 0x29 in def BRNN_RIII : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brnn $rdha, $imm18", []>;
++let op = 0x2A in def BRZ_RIII  : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brz $rdha, $imm18", []>;
++let op = 0x2B in def BRNZ_RIII : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brnz $rdha, $imm18", []>;
++let op = 0x2C in def BRP_RIII  : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brp $rdha, $imm18", []>;
++let op = 0x2D in def BRNP_RIII : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brnp $rdha, $imm18", []>;
++let op = 0x2E in def BREQ_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRD:$rdhb, imms12:$imm12), "breq $rdha, $rdhb, $imm12", []>;
++let op = 0x2F in def BRNE_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRD:$rdhb, imms12:$imm12), "brne $rdha, $rdhb, $imm12", []>;
++
++//===----------------------------------------------------------------------===//
++// RD load (op=0x30-0x37)
++//===----------------------------------------------------------------------===//
++let op = 0x30 in def LDBS_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldbs $rdha, $rbhb, $imm12", []>;
++let op = 0x31 in def LDWS_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldws $rdha, $rbhb, $imm12", []>;
++let op = 0x32 in def LDTS_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldts $rdha, $rbhb, $imm12", []>;
++let op = 0x33 in def LDO_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldo $rdha, $rbhb, $imm12", []>;
++
++let op = 0x34 in def LDMBS_RRRI : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmbs $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x35 in def LDMWS_RRRI : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmws $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x36 in def LDMTS_RRRI : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmts $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x37 in def LDMO_RRRI : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmo $rdha, $rbhb, $rdhc, $imm6", []>;
++
++//===----------------------------------------------------------------------===//
++// RD store (op=0x38-0x3F)
++//===----------------------------------------------------------------------===//
++let op = 0x38 in def STB_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stb $rdha, $rbhb, $imm12", []>;
++let op = 0x39 in def STW_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stw $rdha, $rbhb, $imm12", []>;
++let op = 0x3A in def STT_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stt $rdha, $rbhb, $imm12", []>;
++let op = 0x3B in def STO_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "sto $rdha, $rbhb, $imm12", []>;
++
++let op = 0x3C in def STMB_RRRI  : F_RRRI<(outs), (ins GPRD:$rdha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmb $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x3D in def STMW_RRRI  : F_RRRI<(outs), (ins GPRD:$rdha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmw $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x3E in def STMT_RRRI  : F_RRRI<(outs), (ins GPRD:$rdha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmt $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x3F in def STMO_RRRI : F_RRRI<(outs), (ins GPRD:$rdha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmo $rdha, $rbhb, $rdhc, $imm6", []>;
++
++//===----------------------------------------------------------------------===//
++// RD load unsigned + RB load (op=0x40-0x47)
++//===----------------------------------------------------------------------===//
++let op = 0x40 in def LDBU_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldbu $rdha, $rbhb, $imm12", []>;
++let op = 0x41 in def LDWU_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldwu $rdha, $rbhb, $imm12", []>;
++let op = 0x42 in def LDTU_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldtu $rdha, $rbhb, $imm12", []>;
++let op = 0x43 in def LDO_RBRRII : F_RRII<(outs GPRB:$rbha), (ins GPRB:$rbhb, imms12:$imm12), "ldo $rbha, $rbhb, $imm12", []>;
++
++let op = 0x44 in def LDMBU_RRRI  : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmbu $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x45 in def LDMWU_RRRI  : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmwu $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x46 in def LDMTU_RRRI  : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmtu $rdha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x47 in def LDMO_RBRRRI : F_RRRI<(outs GPRB:$rbha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmo $rbha, $rbhb, $rdhc, $imm6", []>;
++
++//===----------------------------------------------------------------------===//
++// RB operations (op=0x48-0x4F)
++//===----------------------------------------------------------------------===//
++let op = 0x48 in def RELA_RIII   : F_RIII<(outs GPRB:$rbha), (ins imms18:$imm18), "rela $rbha, $imm18", []>;
++let op = 0x49 in def ADDI_RBRRII : F_RRII<(outs GPRB:$rbha), (ins GPRB:$rbhb, imms12:$imm12), "addi $rbha, $rbhb, $imm12", []>;
++let op = 0x4B in def STO_RBRRII  : F_RRII<(outs), (ins GPRB:$rbha, GPRB:$rbhb, imms12:$imm12), "sto $rbha, $rbhb, $imm12", []>;
++
++let op = 0x4C in def ORW_RB_RWII   : F_RWII<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "orw $rbha, $ww, $imm16", []>;
++let op = 0x4D in def ANDNW_RB_RWII : F_RWII<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "andnw $rbha, $ww, $imm16", []>;
++let op = 0x4E in def SETZW_RB_RWII : F_RWII<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "setzw $rbha, $ww, $imm16", []>;
++
++let op = 0x4F in def STMO_RB_RRRI : F_RRRI<(outs), (ins GPRB:$rbha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmo $rbha, $rbhb, $rdhc, $imm6", []>;
++
++//===----------------------------------------------------------------------===//
++// Jump / Call / Ret (op=0x64-0x6E)
++//===----------------------------------------------------------------------===//
++let op = 0x64 in def JUMP_IIII : F_IIII<(outs), (ins imms24:$imm24), "jump $imm24", []>;
++let op = 0x65 in def JUMP_RRII : F_RRII<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "jump $rbha, $rdhb, $imm12", []>;
++let op = 0x6C in def CALL_IIII : F_IIII<(outs), (ins imms24:$imm24), "call $imm24", []>;
++let op = 0x6D in def CALL_RRII : F_RRII<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "call $rbha, $rdhb, $imm12", []>;
++let op = 0x6E in def RET_RIII  : F_RIII<(outs GPRD:$rdha), (ins imms18:$imm18), "ret $rdha, $imm18", []>;
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+new file mode 100644
+index 000000000000..afb7df5a788d
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+@@ -0,0 +1,61 @@
++//===-- DADAORegisterInfo.cpp - DADAO Register Information ------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the DADAO implementation of the TargetRegisterInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#include "DADAORegisterInfo.h"
++#include "llvm/ADT/BitVector.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/Support/ErrorHandling.h"
++
++#define GET_REGINFO_TARGET_DESC
++#include "DADAOGenRegisterInfo.inc"
++
++using namespace llvm;
++
++DADAORegisterInfo::DADAORegisterInfo() : DADAOGenRegisterInfo(0) {}
++
++const uint16_t *
++DADAORegisterInfo::getCalleeSavedRegs(const MachineFunction * /*MF*/) const {
++  return nullptr;
++}
++
++BitVector DADAORegisterInfo::getReservedRegs(const MachineFunction &MF) const {
++  BitVector Reserved(getNumRegs());
++
++  Reserved.set(DADAO::RD0);
++  Reserved.set(DADAO::RD1);
++  Reserved.set(DADAO::RD2);
++  Reserved.set(DADAO::RD3);
++  Reserved.set(DADAO::RD4);
++  Reserved.set(DADAO::RD5);
++  Reserved.set(DADAO::RD6);
++  Reserved.set(DADAO::RD7);
++  Reserved.set(DADAO::RB0);
++  Reserved.set(DADAO::RB1);
++  Reserved.set(DADAO::RB2);
++  Reserved.set(DADAO::RB3);
++  Reserved.set(DADAO::RB4);
++  Reserved.set(DADAO::RB5);
++  Reserved.set(DADAO::RB6);
++  Reserved.set(DADAO::RB7);
++
++  return Reserved;
++}
++
++bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
++                                            int SPAdj, unsigned FIOperandNum,
++                                            RegScavenger *RS) const {
++  llvm_unreachable("Not yet implemented");
++}
++
++Register DADAORegisterInfo::getFrameRegister(const MachineFunction &MF) const {
++  return DADAO::RBSP;
++}
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.h b/llvm/lib/Target/DADAO/DADAORegisterInfo.h
+new file mode 100644
+index 000000000000..ab81ce1ee5da
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.h
+@@ -0,0 +1,40 @@
++//===- DADAORegisterInfo.h - DADAO Register Information Impl ----*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the DADAO implementation of the TargetRegisterInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_DADAO_DADAOREGISTERINFO_H
++#define LLVM_LIB_TARGET_DADAO_DADAOREGISTERINFO_H
++
++#include "llvm/CodeGen/TargetRegisterInfo.h"
++
++#define GET_REGINFO_HEADER
++#include "DADAOGenRegisterInfo.inc"
++
++namespace llvm {
++
++struct DADAORegisterInfo : public DADAOGenRegisterInfo {
++  DADAORegisterInfo();
++
++  const uint16_t *
++  getCalleeSavedRegs(const MachineFunction *MF = nullptr) const override;
++
++  BitVector getReservedRegs(const MachineFunction &MF) const override;
++
++  bool eliminateFrameIndex(MachineBasicBlock::iterator II, int SPAdj,
++                           unsigned FIOperandNum,
++                           RegScavenger *RS = nullptr) const override;
++
++  Register getFrameRegister(const MachineFunction &MF) const override;
++};
++
++} // end namespace llvm
++
++#endif // LLVM_LIB_TARGET_DADAO_DADAOREGISTERINFO_H
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.td b/llvm/lib/Target/DADAO/DADAORegisterInfo.td
+new file mode 100644
+index 000000000000..d570895f9330
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.td
+@@ -0,0 +1,71 @@
++//===- DADAORegisterInfo.td - DADAO Register definitions -----*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//  Declarations that describe the DADAO register file
++//===----------------------------------------------------------------------===//
++
++let Namespace = "DADAO" in {
++  class DADAOReg<bits<16> num, string n> : Register<n> {
++    let HWEncoding = num;
++  }
++}
++
++// RD bank: 64 data registers
++foreach i = 0-63 in {
++  def RD#i : DADAOReg<i, "rd"#i>;
++}
++
++// RB bank: 64 base registers
++foreach i = 0-63 in {
++  def RB#i : DADAOReg<i, "rb"#i>;
++}
++
++// RF bank: 64 float registers
++foreach i = 0-63 in {
++  def RF#i : DADAOReg<i, "rf"#i>;
++}
++
++// RA bank: 64 return address registers
++foreach i = 0-63 in {
++  def RA#i : DADAOReg<i, "ra"#i>;
++}
++
++// Register aliases
++def RBSP : DADAOReg<1, "rbsp">;
++def RBFP : DADAOReg<2, "rbfp">;
++
++// Register classes - RD bank
++def GPRD : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RD%u", 0, 63)
++)>;
++
++def GPRD_Allocatable : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RD%u", 8, 63)
++)>;
++
++// Register classes - RB bank
++def GPRB : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RB%u", 0, 63)
++)>;
++
++def GPRB_Allocatable : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RB%u", 8, 63)
++)>;
++
++// Register classes - RF bank (all non-allocatable)
++def GPRF : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RF%u", 0, 63)
++)> {
++  let isAllocatable = 0;
++}
++
++// Register classes - RA bank (not used by register allocator)
++def GPRA : RegisterClass<"DADAO", [i64], 0, (add
++  (sequence "RA%u", 0, 63)
++)> {
++  let isAllocatable = 0;
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+index e27f4126d3ab..814a8c4049fe 100644
+--- a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+@@ -10,6 +10,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "DADAORegisterInfo.h"
+ #include "DADAOTargetMachine.h"
+ #include "TargetInfo/DADAOTargetInfo.h"
+ #include "llvm/MC/TargetRegistry.h"
