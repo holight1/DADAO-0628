@@ -217,3 +217,161 @@
   status: active
   wiki_cite: "spec.md §5.1"
   notes: "brz rd0,0; rd0 always zero → taken"
+
+# ─── Encoding-only vectors ─────────────────────────────────────────────────────
+
+- mnemonic: brn
+  format: riii
+  class: encoding
+  encoding:
+    word: "0x28000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: brnn
+  format: riii
+  class: encoding
+  encoding:
+    word: "0x29000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: brz
+  format: riii
+  class: encoding
+  encoding:
+    word: "0x2A000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: brnz
+  format: riii
+  class: encoding
+  encoding:
+    word: "0x2B000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: brp
+  format: riii
+  class: encoding
+  encoding:
+    word: "0x2C000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: brnp
+  format: riii
+  class: encoding
+  encoding:
+    word: "0x2D000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: breq
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x2E000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.2"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: brne
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x2F000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.2"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: jump
+  format: iiii
+  class: encoding
+  encoding:
+    word: "0x64000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.3"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: jump
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x65000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.3"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: call
+  format: iiii
+  class: encoding
+  encoding:
+    word: "0x6C000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.3"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: call
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x6D000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.3"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: ret
+  format: riii
+  class: encoding
+  encoding:
+    word: "0x6E040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.5"
+  notes: "encoding-only: minimal operands"

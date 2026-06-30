@@ -68,3 +68,53 @@
   status: active
   wiki_cite: "spec.md §3.10"
   notes: "xnor rd3,rd1,rd2; ~(0xFF ^ 0x0F) = ~0xF0 = 0xFFFF...FF0F"
+
+# ─── Encoding-only vectors ─────────────────────────────────────────────────────
+
+- mnemonic: and
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10201000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.10"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: orr
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10241000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.10"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: xor
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10281000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.10"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: xnor
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x102C1000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.10"
+  notes: "encoding-only: minimal operands"

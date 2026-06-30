@@ -199,3 +199,101 @@
   status: active
   wiki_cite: "spec.md §2.6"
   notes: "rd2rd rd0,rd0,0; rdhb=rd0 + immu6=0 → ILLI"
+
+# ─── Encoding-only vectors ─────────────────────────────────────────────────────
+
+- mnemonic: orw
+  format: rwii
+  class: encoding
+  encoding:
+    word: "0x14040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.13"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: andnw
+  format: rwii
+  class: encoding
+  encoding:
+    word: "0x15040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.13"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: setzw
+  format: rwii
+  class: encoding
+  encoding:
+    word: "0x16040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.13"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: setow
+  format: rwii
+  class: encoding
+  encoding:
+    word: "0x17040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.13"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: rd2rd
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x10A01000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.14"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: rd2rb
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x10A41000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.14"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: rb2rd
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x10A81000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.14"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: rb2rb
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x10AC1000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.14"
+  notes: "encoding-only: minimal operands"

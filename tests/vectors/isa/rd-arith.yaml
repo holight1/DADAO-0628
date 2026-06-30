@@ -206,3 +206,89 @@
   status: active
   wiki_cite: "spec.md §3.7"
   notes: "mulu rd3,rd4,rd1,rd2; 3×5=15"
+
+# ─── Encoding-only vectors ─────────────────────────────────────────────────────
+
+- mnemonic: addi
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x19040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.6"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: add
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x1A042000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.5"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: sub
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x1B042000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.5"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: muls
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x1C042000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: mulu
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x1D042000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: divs
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x1E042000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: divu
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x1F042000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "encoding-only: minimal operands"

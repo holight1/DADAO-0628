@@ -179,3 +179,65 @@
   deferred_reason: "C-27"
   wiki_cite: "spec.md §3.12"
   notes: "csne rd1,rd2,rd4,rd4; rdhc=rdhd=rd4 → dest=src overlap deferred C-27"
+
+# ─── Encoding-only vectors ─────────────────────────────────────────────────────
+
+- mnemonic: csn
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x20001000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: csz
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x22001000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: csp
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x24001000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: cseq
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x26000040"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: csne
+  format: rrrr
+  class: encoding
+  encoding:
+    word: "0x27000040"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.12"
+  notes: "encoding-only: minimal operands"

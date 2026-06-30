@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DADAO <dev@dadao.dev>
+Date: Tue, 30 Jun 2026 10:00:00 +0800
+Subject: [PATCH 6/6] DADAO Disassembler
+
+---
+ .../DADAO/Disassembler/CMakeLists.txt         |  12 +
+ .../DADAO/Disassembler/DADAODisassembler.cpp  | 127 +++++++++
+ llvm/lib/Target/DADAO/CMakeLists.txt          |   4 +-
+ llvm/lib/Target/DADAO/DADAOInstrFormats.td    |   1 +
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       |   9 +-
+ 5 files changed, 150 insertions(+), 3 deletions(-)
+ create mode 100644 llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
+
+diff --git a/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt b/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
+new file mode 100644
+index 000000000000..
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
+@@ -0,0 +1,12 @@
++add_llvm_component_library(LLVMDADAODisassembler
++  DADAODisassembler.cpp
++
++  LINK_COMPONENTS
++  MCDisassembler
++  Support
++
++  ADD_TO_COMPONENT
++  DADAO
++)
+diff --git a/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp b/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
+new file mode 100644
+index 000000000000..
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
+@@ -0,0 +1,127 @@
++//===- DADAODisassembler.cpp - Disassembler for DADAO -----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is part of the DADAO Disassembler.
++//
++//===----------------------------------------------------------------------===//
++
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "TargetInfo/DADAOTargetInfo.h"
++#include "llvm/MC/MCDecoder.h"
++#include "llvm/MC/MCDecoderOps.h"
++#include "llvm/MC/MCDisassembler/MCDisassembler.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/Compiler.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/Endian.h"
++#include "llvm/Support/MathExtras.h"
++
++#define DEBUG_TYPE "dadao-disassembler"
++
++using namespace llvm;
++using namespace llvm::MCD;
++
++typedef MCDisassembler::DecodeStatus DecodeStatus;
++
++class DADAODisassembler : public MCDisassembler {
++public:
++  DADAODisassembler(const MCSubtargetInfo &STI, MCContext &Ctx)
++      : MCDisassembler(STI, Ctx) {}
++
++  DecodeStatus getInstruction(MCInst &Instr, uint64_t &Size,
++                              ArrayRef<uint8_t> Bytes, uint64_t Address,
++                              raw_ostream &CStream) const override;
++};
++
++static DecodeStatus DecodeGPRDRegisterClass(MCInst &Inst, unsigned RegNo,
++                                             uint64_t /*Address*/,
++                                             const MCDisassembler * /*Decoder*/) {
++  if (RegNo > 63)
++    return MCDisassembler::Fail;
++  Inst.addOperand(MCOperand::createReg(DADAO::RD0 + RegNo));
++  return MCDisassembler::Success;
++}
++
++static DecodeStatus DecodeGPRBRegisterClass(MCInst &Inst, unsigned RegNo,
++                                             uint64_t /*Address*/,
++                                             const MCDisassembler * /*Decoder*/) {
++  if (RegNo > 63)
++    return MCDisassembler::Fail;
++  Inst.addOperand(MCOperand::createReg(DADAO::RB0 + RegNo));
++  return MCDisassembler::Success;
++}
++
++static DecodeStatus decodeS12Imm(MCInst &Inst, unsigned Imm,
++                                  uint64_t /*Address*/,
++                                  const MCDisassembler * /*Decoder*/) {
++  Inst.addOperand(MCOperand::createImm(SignExtend64<12>(Imm)));
++  return MCDisassembler::Success;
++}
++
++static DecodeStatus decodeS18Imm(MCInst &Inst, unsigned Imm,
++                                  uint64_t /*Address*/,
++                                  const MCDisassembler * /*Decoder*/) {
++  Inst.addOperand(MCOperand::createImm(SignExtend64<18>(Imm)));
++  return MCDisassembler::Success;
++}
++
++static DecodeStatus decodeS24Imm(MCInst &Inst, unsigned Imm,
++                                  uint64_t /*Address*/,
++                                  const MCDisassembler * /*Decoder*/) {
++  Inst.addOperand(MCOperand::createImm(SignExtend64<24>(Imm)));
++  return MCDisassembler::Success;
++}
++
++#include "DADAOGenDisassemblerTables.inc"
++
++DecodeStatus DADAODisassembler::getInstruction(
++    MCInst &Instr, uint64_t &Size, ArrayRef<uint8_t> Bytes,
++    uint64_t Address, raw_ostream &CStream) const {
++  if (Bytes.size() < 4) {
++    Size = 0;
++    return MCDisassembler::Fail;
++  }
++  uint32_t Insn = support::endian::read32be(Bytes.data());
++  Size = 4;
++
++  return decodeInstruction(DecoderTableDADAO32, Instr, Insn, Address, this, STI);
++}
++
++static MCDisassembler *createDADAODisassembler(const Target &T,
++                                                const MCSubtargetInfo &STI,
++                                                MCContext &Ctx) {
++  return new DADAODisassembler(STI, Ctx);
++}
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeDADAODisassembler() {
++  TargetRegistry::RegisterMCDisassembler(getTheDADAOTarget(),
++                                          createDADAODisassembler);
++}
+diff --git a/llvm/lib/Target/DADAO/CMakeLists.txt b/llvm/lib/Target/DADAO/CMakeLists.txt
+index 08db6fd37cd6..728f8ffb5fcb 100644
+--- a/llvm/lib/Target/DADAO/CMakeLists.txt
++++ b/llvm/lib/Target/DADAO/CMakeLists.txt
+@@ -8,6 +8,7 @@ tablegen(LLVM DADAOGenAsmMatcher.inc -gen-asm-matcher)
+ tablegen(LLVM DADAOGenAsmWriter.inc -gen-asm-writer)
+ tablegen(LLVM DADAOGenMCCodeEmitter.inc -gen-emitter)
++tablegen(LLVM DADAOGenDisassemblerTables.inc -gen-disassembler)
+ 
+ add_public_tablegen_target(DADAOCommonTableGen)
+ 
+@@ -27,5 +28,6 @@ add_llvm_target(DADAOCodeGen
+   )
+ 
+ add_subdirectory(AsmParser)
++add_subdirectory(Disassembler)
+ add_subdirectory(MCTargetDesc)
+ add_subdirectory(TargetInfo)
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrFormats.td b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
+index 10ebcdd254b0..
+--- a/llvm/lib/Target/DADAO/DADAOInstrFormats.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
+@@ -13,6 +13,7 @@ class InstDADAO<dag outs, dag ins, string asmstr, list<dag> pattern>
+   let Size = 4;
+   let Namespace = "DADAO";
++  let DecoderNamespace = "DADAO";
+ 
+   bits<8> op;
+   bits<6> ha;
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index db600d7a70d9..
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -9,7 +9,15 @@ include "DADAOInstrFormats.td"
+   let Namespace = "DADAO"
+ 
+ // Immediate operand types
+-def imms12 : Operand<i64>;
++def imms12 : Operand<i64> {
++  let DecoderMethod = "decodeS12Imm";
++}
+ def immu12 : Operand<i64>;
+-def imms18 : Operand<i64>;
++def imms18 : Operand<i64> {
++  let DecoderMethod = "decodeS18Imm";
++}
+ def immu16 : Operand<i64>;
+ def immu6  : Operand<i64>;
+-def imms24 : Operand<i64>;
++def imms24 : Operand<i64> {
++  let DecoderMethod = "decodeS24Imm";
++}
+ def wydepos : Operand<i64>;
+-- 
+2.50.0
+

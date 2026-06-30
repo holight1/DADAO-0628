@@ -1,4 +1,5 @@
 # RUN: llvm-mc --triple=dadao-unknown-elf -filetype=obj %s -o %t
+# RUN: llvm-objdump -d --triple=dadao-unknown-elf %t | FileCheck %s
 # RUN: llvm-mc --triple=dadao-unknown-elf -filetype=asm %s | FileCheck %s
 
 # CHECK: brn rd1, 256

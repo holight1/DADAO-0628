@@ -97,3 +97,53 @@
   status: active
   wiki_cite: "spec.md §2.6.1"
   notes: "cmps rd0,rd0,imm; rdha=rd0 → ILLI"
+
+# ─── Encoding-only vectors ─────────────────────────────────────────────────────
+
+- mnemonic: cmps
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x12040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.8"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: cmpu
+  format: rrii
+  class: encoding
+  encoding:
+    word: "0x13040000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.8"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: cmps
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10901000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.9"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: cmpu
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10941000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.9"
+  notes: "encoding-only: minimal operands"

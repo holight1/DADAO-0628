@@ -181,3 +181,125 @@
   status: active
   wiki_cite: "spec.md §2.6.1"
   notes: "shlu rd0,rd1,rd0; rdhb=rd0 → ILLI"
+
+# ─── Encoding-only vectors ─────────────────────────────────────────────────────
+
+- mnemonic: shlu
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10441000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: shrs
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10481000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: shru
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x104C1000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: exts
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10501000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: extz
+  format: orrr
+  class: encoding
+  encoding:
+    word: "0x10541000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: shlu
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x10641000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: shrs
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x10681000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: shru
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x106C1000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: exts
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x10701000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
+
+- mnemonic: extz
+  format: orri
+  class: encoding
+  encoding:
+    word: "0x10741000"
+  input_state: {}
+  expected_state: null
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.11"
+  notes: "encoding-only: minimal operands"
