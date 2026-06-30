@@ -12,9 +12,9 @@ DADAO-0628 是从零开始的 greenfield 工具链重建（ADR-0001）。工具�
 汇编器（LLVM MC）和执行器（QEMU）；两者输出的期望值如果互相依赖，任何系统性
 偏差都会被掩盖，直到集成测试才暴露，代价极高。
 
-历史教训（上一版本 llvm-unicore）：部分 encoding 测试的 CHECK 字节来自 LLVM
-输出的复制粘贴，导致编码 bug 和测试同时存在，在长时间内保持"绿色"，
-直到实际运行时才崩溃。
+历史教训（上一版本 llvm-unicore）：部分任务要求依据 LLVM 实际输出填写 CHECK，
+且 DL-002h 曾在 lit 2/2 PASS 时遗漏 resolved `.equ` fixup 路径；第二个 fixup
+实际被静默写成 0。测试 oracle 或覆盖范围依赖被测实现时，绿色结果不能证明编码正确。
 
 ---
 
@@ -44,11 +44,11 @@ DADAO-0628 是从零开始的 greenfield 工具链重建（ADR-0001）。工具�
 
 ### D3：两条 LLVM 路径分别测试
 
-`-filetype=asm`（文本汇编）和 `-filetype=obj`（ELF object）的 fixup 处理
-路径不同；两条路径必须独立测试。
+`-filetype=asm` 覆盖解析和规范化文本输出，`-filetype=obj` 覆盖编码、fixup 和
+ELF object 生成；两条路径必须独立测试。
 
-只测 `-filetype=asm` 通过不代表 `-filetype=obj` 正确（MCFixup → ELF reloc 的
-转换逻辑是独立代码路径）。
+只测 `-filetype=asm` 通过不代表 `-filetype=obj` 正确；MCFixup → ELF relocation
+只在 object 路径中验证。
 
 **每个 lit 测试文件必须包含两条 RUN 行：**
 
@@ -58,12 +58,26 @@ DADAO-0628 是从零开始的 greenfield 工具链重建（ADR-0001）。工具�
 # RUN: llvm-mc --triple=dadao-unknown-elf -filetype=asm %s | FileCheck %s --check-prefix=ASM
 ```
 
-### D4：随修附测（不单独建测试任务）
+### D4：测试先于实现（向量/失败测试与实现同批提交）
 
-lit 测试随 fix 任务同批提交，不独立开"补覆盖度"任务。理由：
-- lit 测试的价值是防回归，不是发现新 bug
-- 已知 bug 的情况下先写测试不加速进度
-- 在 QEMU 语义测试高度收敛后才考虑系统性补 boundary/overlap 向量
+对应的 vector 和 lit 测试必须在实现或 fix 完成前就位，或与实现同批提交。
+不单独建"补覆盖度"任务；禁止先实现再补测。
+
+**各 class 归属 exit gate**：
+
+| Class | 归属 Phase exit gate | 例外 |
+|-------|---------------------|------|
+| encoding | Phase 2 | — |
+| legality | Phase 2/3 | — |
+| semantic | Phase 3 | — |
+| boundary | Phase 3 | — |
+| overlap | Phase 3/4 | C-27 deferred（wiki 确认前） |
+
+boundary 和已确定语义的 overlap 向量必须在各自 exit gate 前就位，不得以"Phase 3 收敛后补"为由推迟。
+
+**根据**：上一版 DL-058a 审计发现 27 个已 PASS 测试中 42 条规格只有 16 条强覆盖、
+12 条未覆盖；DL-058b 进一步发现 PASS 测试中存在"触发了错误机制却声称覆盖目标机制"
+的问题——证明事后补测无法替代测试先行。
 
 ### D5：QEMU 测试协议（exit port 签名）
 
@@ -72,12 +86,13 @@ QEMU 语义测试基于 ADR-0004 定义的 exit port（@0x10000000）：
 | exit code（低字节）| 含义 |
 |------------------|------|
 | 0x00 | PASS |
-| 0x01 | ILLI（非法指令，precise — 无寄存器写入）|
-| 0x02 | MALIGN（对齐异常，precise — 无内存写入）|
-| 0x03 | UNDI（保留编码）|
-| 0xFF | 测试 harness 错误 |
+| 0x01–0x7F | 测试特定 FAIL |
+| 0x81 | MALIGN（对齐异常，precise — 无内存写入）|
+| 0x82 | ILLI（非法指令，precise — 无寄存器写入）|
+| 0x83 | UNDI（保留编码）|
 
-exit code 的值由 trampoline + 测试程序协商写入，harness 读取并断言。
+正常 PASS/FAIL 由测试程序写 exit port；fault code 由 QEMU 按 ADR-0004 直接返回，
+harness 统一读取进程退出码并断言。
 
 ### D6：MCFixup 每指令一个原则
 
@@ -104,8 +119,9 @@ exit code 的值由 trampoline + 测试程序协商写入，harness 读取并断
 
 ### 已知风险
 
-- boundary 向量当前普遍空缺，是 Phase 4 前的计划性债务
-- 汇编器（DL-010a）就绪前，QEMU 语义测试无法运行（汇编器是生成测试 binary 的工具）
+- boundary 向量当前普遍空缺；DL-010a/016a 配套 encoding/legality 向量亦尚未填充，是 Phase 2/3 exit gate 前必须关闭的债务
+- C-27（条件赋值 overlap snapshot）overlap 向量 deferred，不阻塞 Phase 3 exit gate
+- Phase 3 state-dump 协议（寄存器/内存完整状态读取）尚未定义，必须在第一个 Phase 3 任务下发前完成设计
 
 ---
 
