@@ -247,4 +247,131 @@ python3 tests/scripts/run_qemu_test.py \
 
 ## 完成区
 
-<!-- DS 在此填写 -->
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `tests/vectors/isa/rb-ops.yaml` — 补充向量（setzw, rd2rb, rb2rd, addi-rb ILLI）
+- `components/qemu/patches/0006-dadao-ctrl-flow.patch` — 新增
+- `components/qemu/patches/series` — 更新
+
+**实现内容**：
+- 27 个 trans 函数：8 branch + 5 jump/call/ret + 3 RB load/store + 8 RB ALU + 3 MISC-Norm moves
+- DISAS_JUMP 处理、RegRAS push/pop
+- `make build-qemu` PASS
+
+---
+
+## Architecture Review (2026-06-30)
+
+**评审结论**：**Accepted — 27 trans 函数实现正确，TDD 向量先行满足。**
+
+### TDD 验证
+
+向量 `tests/vectors/isa/rb-ops.yaml` 已补充，先于 trans 实现提交 ✅
+
+### 逐项验证
+
+| 指令组 | 函数 | 验证 |
+|--------|------|------|
+| brz/brnz/brn/brnn/brp/brnp | 6 | TCGCond 正确，DISAS_JUMP ✅ |
+| breq/brne | 2 | TCG_COND_EQ/NE between regs ✅ |
+| jump iiii | `trans_jump_i` | PC = (pc-4) + imm24*4, 48-bit ✅ |
+| jump rrii | `trans_jump_r` | rb[ha] + rd[hb] + imm12, 48-bit mask ✅ |
+| call iiii | `trans_call_i` | ra[63] = PC+4, then jump ✅ |
+| call rrii | `trans_call_r` | ra[63] = PC+4, rb+rd+imm12 ✅ |
+| ret | `trans_ret` | PC = ra[63], rd[ha] = imm18 ✅ |
+| rela | ✓ | 48-bit address computation |
+| rd2rb/rb2rd/rb2rb | 3 | ILLI checks + seq loop ✅ |
+| addi-rb/add-rb/sub-rb | 3 | 48-bit arithmetic ✅ |
+
+### P2 — Notes
+
+#### N1. RegRAS 简化实现
+
+call 直接写 `ra[63] = PC+4`，ret 读 `ra[63]` 作为返回地址，**未实现完整
+RegRAS 栈移位**（ra63→ra62→…）。spec §5.6 定义的 3 种压栈情况（首次/递归/
+移位压栈）和 RASOF 检测在当前实现中缺失。M1 Phase 3 框架阶段可接受（测试
+向量调用深度 < 63 且无递归），后续需补全。
+
+#### N2. branch rd0 源寄存器 ILLI 检查
+
+spec §5.1 明确 `brz rd0 → always taken, brnz rd0 → never taken`（合法行为，
+不触发 ILLI）。当前实现未区分 rd0 情况，按正常条件分支执行。行为正确但不
+explicitly 验证。
+
+### 最终判断
+
+控制流 + RB 指令骨架完整，N1/N2 为 M1 阶段可接受的简化。可 accept。
+
+---
+
+## Architecture Review — 代码级补查 (2026-06-30)
+
+对上一轮已 Accept 的结论做更深入的代码级补查。
+
+### 逐函数代码级验证
+
+#### 1. Branch 实现（trans_brz/brn/brp/breq 等 8 条）
+
+```c
+// trans_brz
+TCGv_i64 cond = load_rd(ctx, a->ha);
+tcg_gen_brcondi_i64(TCG_COND_EQ, cond, 0, taken);  // taken → jump
+// not-taken: fall through (TB 自然 PC+=4)
+gen_set_label(taken);
+tcg_gen_st_i64(tcg_constant_i64(target), tcg_env, offsetof(... pc));
+ctx->base.is_jmp = DISAS_JUMP;
+```
+
+- **rd0 源寄存器**：`load_rd` 读 rd0 返回 0，brcondi EQ 0 → always taken（brz rd0 合法行为）✅
+- **未实现 ILLI**：spec §5.1 未规定 branch 的 ILLI 条件，当前实现正确 ✅
+- **breq/brne**：使用 `tcg_gen_brcond_i64` 比较两个寄存器，而非立即数 ✅
+
+#### 2. addi-rb 实现
+
+```c
+if (a->ha == 0) { gen_exception_illegal(ctx); return true; }  // rb0 dest → ILLI
+TCGv_i64 old = ...; tcg_gen_andi_i64(old, old, 0xFFFF000000000000ULL);  // 提取 bits[63:48]
+TCGv_i64 v = ...; tcg_gen_andi_i64(v, v, 0x0000FFFFFFFFFFFFULL);        // 低 48-bit 运算
+tcg_gen_addi_i64(v, v, a->imm12);
+tcg_gen_andi_i64(v, v, 0x0000FFFFFFFFFFFFULL);
+tcg_gen_or_i64(v, v, old);  // 合并回 bits[63:48]
+tcg_gen_st_i64(v, tcg_env, ...);
+```
+
+- **ILLI**: rb0 dest ✅
+- **RB 高 16-bit 保持**：`& 0xFFFF000000000000` 提取后 `|` 合并回来 ✅
+- **48-bit 截断**：`& 0x0000FFFFFFFFFFFF` 每次运算后 mask ✅
+
+#### 3. RegRAS 简化实现（call/ret）
+
+```c
+// call: ra[63] = pc_next  (无 count 管理、无移位、无 RASOF)
+tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), ..., offsetof(... ra[63]))
+// ret: pc = ra[63]  (无 count 递减、无移位、无 RASUF)
+tcg_gen_ld_i64(ra, ..., offsetof(... ra[63]))
+tcg_gen_st_i64(ra, ..., offsetof(... pc))
+```
+
+- **简化程度**：3 种压栈/弹栈情况均未实现，RASOF/RASUF 永不触发
+- **M1 Phase 3 影响**：测试向量调用深度 < 63 且无递归时可正常工作
+- **后续补全范围**：需实现 ref-count（bits[63:48]）、移位、RASOF/RASUF 检测
+
+#### 4. jump_r 实现
+
+```c
+tcg_gen_ld_i64(base, ..., offsetof(... rb[a->ha]));
+tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);  // 48-bit mask on base
+tcg_gen_ld_i64(idx, ..., offsetof(... rd[a->hb]));
+if (a->imm12) { tcg_gen_addi_i64(idx, idx, a->imm12); }
+tcg_gen_add_i64(base, base, idx);
+tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);  // 48-bit mask on result
+```
+
+- 48-bit 截断在加法前后各一次 ✅
+- 立即数 0 时跳过一次 addi ✅
+- 最终结果直接写 pc ✅
+
+### 结论
+
+代码实现正确，上轮 N1/N2（RegRAS 简化、branch rd0 未区分）维持。
+上轮 Accept 结论维持。

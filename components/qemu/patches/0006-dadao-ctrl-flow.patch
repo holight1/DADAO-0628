@@ -1,0 +1,481 @@
+From 16d8c118b237a049001c36804caef06b779ffb69 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 30 Jun 2026 11:35:42 +0800
+Subject: [PATCH] target/dadao: implement control flow and RB TCG translation
+
+---
+ target/dadao/translate.c | 441 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 412 insertions(+), 29 deletions(-)
+
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 79a4a17..8c2cc5c 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -91,24 +91,220 @@ static bool trans_##NAME(DisasContext *ctx, arg_##NAME *a) \
+     return true; \
+ }
+ 
+-/* MISC-Norm subtable — RB / other stubs */
+-GEN_ILLEGAL_INSN(rd2rb)
+-GEN_ILLEGAL_INSN(rb2rd)
+-GEN_ILLEGAL_INSN(rb2rb)
+-GEN_ILLEGAL_INSN(cmp_rb)
+-GEN_ILLEGAL_INSN(add_rb)
+-GEN_ILLEGAL_INSN(sub_rb)
++/* MISC-Norm RB register move (orri) */
++static bool trans_rd2rb(DisasContext *ctx, arg_rd2rb *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->hd == 0 || a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    if (a->hb + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    if (a->hc + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    for (int i = 0; i < a->hd; i++) {
++        TCGv_i64 v = load_rd(ctx, a->hc + i);
++        tcg_gen_st_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->hb + i]));
++    }
++    return true;
++}
++
++static bool trans_rb2rd(DisasContext *ctx, arg_rb2rd *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->hd == 0 || a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    if (a->hb + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    if (a->hc + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    for (int i = 0; i < a->hd; i++) {
++        TCGv_i64 v = tcg_temp_new_i64();
++        tcg_gen_ld_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->hc + i]));
++        store_rd(ctx, a->hb + i, v);
++    }
++    return true;
++}
++
++static bool trans_rb2rb(DisasContext *ctx, arg_rb2rb *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->hd == 0 || a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    if (a->hb + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    if (a->hc + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    for (int i = 0; i < a->hd; i++) {
++        TCGv_i64 v = tcg_temp_new_i64();
++        tcg_gen_ld_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->hc + i]));
++        tcg_gen_st_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->hb + i]));
++    }
++    return true;
++}
++
++/* MISC-Norm RB compare (orrr) */
++static bool trans_cmp_rb(DisasContext *ctx, arg_cmp_rb *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = tcg_temp_new_i64();
++    tcg_gen_ld_i64(s1, tcg_env, offsetof(CPUDADAOState, rb[a->hc]));
++    tcg_gen_andi_i64(s1, s1, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 s2 = tcg_temp_new_i64();
++    tcg_gen_ld_i64(s2, tcg_env, offsetof(CPUDADAOState, rb[a->hd]));
++    tcg_gen_andi_i64(s2, s2, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 d = tcg_temp_new_i64();
++    TCGv_i64 zero = tcg_constant_i64(0);
++    TCGv_i64 mone = tcg_constant_i64(-1);
++    tcg_gen_movi_i64(d, 1);
++    tcg_gen_movcond_i64(TCG_COND_EQ, d, s1, s2, zero, d);
++    tcg_gen_movcond_i64(TCG_COND_LT, d, s1, s2, mone, d);
++    store_rd(ctx, a->hb, d);
++    return true;
++}
++
++/* MISC-Norm RB add/sub (orrr) hb=dest RB, hc=RB src1, hd=RD src2 */
++static bool trans_add_rb(DisasContext *ctx, arg_add_rb *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = tcg_temp_new_i64();
++    tcg_gen_ld_i64(s1, tcg_env, offsetof(CPUDADAOState, rb[a->hc]));
++    tcg_gen_andi_i64(s1, s1, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    tcg_gen_add_i64(s1, s1, s2);
++    tcg_gen_andi_i64(s1, s1, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_st_i64(s1, tcg_env, offsetof(CPUDADAOState, rb[a->hb]));
++    return true;
++}
++
++static bool trans_sub_rb(DisasContext *ctx, arg_sub_rb *a)
++{
++    if (a->hb == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 s1 = tcg_temp_new_i64();
++    tcg_gen_ld_i64(s1, tcg_env, offsetof(CPUDADAOState, rb[a->hc]));
++    tcg_gen_andi_i64(s1, s1, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 s2 = load_rd(ctx, a->hd);
++    tcg_gen_sub_i64(s1, s1, s2);
++    tcg_gen_andi_i64(s1, s1, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_st_i64(s1, tcg_env, offsetof(CPUDADAOState, rb[a->hb]));
++    return true;
++}
++
+ GEN_ILLEGAL_INSN(unimp)
+ 
+-/* Non-RD-integer stubs */
+-GEN_ILLEGAL_INSN(brn)
+-GEN_ILLEGAL_INSN(brnn)
+-GEN_ILLEGAL_INSN(brz)
+-GEN_ILLEGAL_INSN(brnz)
+-GEN_ILLEGAL_INSN(brp)
+-GEN_ILLEGAL_INSN(brnp)
+-GEN_ILLEGAL_INSN(breq)
+-GEN_ILLEGAL_INSN(brne)
++/* === §3.17 Control Flow — Branches (riii/rrii) === */
++
++static bool trans_brz(DisasContext *ctx, arg_brz *a)
++{
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGLabel *taken = gen_new_label();
++    tcg_gen_brcondi_i64(TCG_COND_EQ, cond, 0, taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    TCGLabel *done = gen_new_label();
++    tcg_gen_br(done);
++    gen_set_label(taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    gen_set_label(done);
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_brnz(DisasContext *ctx, arg_brnz *a)
++{
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGLabel *taken = gen_new_label();
++    tcg_gen_brcondi_i64(TCG_COND_NE, cond, 0, taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    TCGLabel *done = gen_new_label();
++    tcg_gen_br(done);
++    gen_set_label(taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    gen_set_label(done);
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_brn(DisasContext *ctx, arg_brn *a)
++{
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGLabel *taken = gen_new_label();
++    tcg_gen_brcondi_i64(TCG_COND_LT, cond, 0, taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    TCGLabel *done = gen_new_label();
++    tcg_gen_br(done);
++    gen_set_label(taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    gen_set_label(done);
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_brnn(DisasContext *ctx, arg_brnn *a)
++{
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGLabel *taken = gen_new_label();
++    tcg_gen_brcondi_i64(TCG_COND_GE, cond, 0, taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    TCGLabel *done = gen_new_label();
++    tcg_gen_br(done);
++    gen_set_label(taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    gen_set_label(done);
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_brp(DisasContext *ctx, arg_brp *a)
++{
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGLabel *taken = gen_new_label();
++    tcg_gen_brcondi_i64(TCG_COND_GT, cond, 0, taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    TCGLabel *done = gen_new_label();
++    tcg_gen_br(done);
++    gen_set_label(taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    gen_set_label(done);
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_brnp(DisasContext *ctx, arg_brnp *a)
++{
++    TCGv_i64 cond = load_rd(ctx, a->ha);
++    TCGLabel *taken = gen_new_label();
++    tcg_gen_brcondi_i64(TCG_COND_LE, cond, 0, taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    TCGLabel *done = gen_new_label();
++    tcg_gen_br(done);
++    gen_set_label(taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    gen_set_label(done);
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_breq(DisasContext *ctx, arg_breq *a)
++{
++    TCGv_i64 v1 = load_rd(ctx, a->ha);
++    TCGv_i64 v2 = load_rd(ctx, a->hb);
++    TCGLabel *taken = gen_new_label();
++    tcg_gen_brcond_i64(TCG_COND_EQ, v1, v2, taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    TCGLabel *done = gen_new_label();
++    tcg_gen_br(done);
++    gen_set_label(taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm12 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    gen_set_label(done);
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_brne(DisasContext *ctx, arg_brne *a)
++{
++    TCGv_i64 v1 = load_rd(ctx, a->ha);
++    TCGv_i64 v2 = load_rd(ctx, a->hb);
++    TCGLabel *taken = gen_new_label();
++    tcg_gen_brcond_i64(TCG_COND_NE, v1, v2, taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    TCGLabel *done = gen_new_label();
++    tcg_gen_br(done);
++    gen_set_label(taken);
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm12 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    gen_set_label(done);
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
+ /* === §3.15 RD Load/Store — Single (rrii) === */
+ 
+ static bool trans_ldbs(DisasContext *ctx, arg_ldbs *a)
+@@ -331,20 +527,204 @@ static bool trans_stmo(DisasContext *ctx, arg_stmo *a)
+     return do_stm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_64 | MO_ALIGN_8, 8);
+ }
+ 
+-GEN_ILLEGAL_INSN(ldo_rb)
++/* === §4.1 RB Load/Store (rrii) — ldo_rb, sto_rb === */
++
++static bool trans_ldo_rb(DisasContext *ctx, arg_ldo_rb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_UQ | MO_ALIGN_8);
++    tcg_gen_st_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    return true;
++}
++
+ GEN_ILLEGAL_INSN(ldmo_rb)
+-GEN_ILLEGAL_INSN(rela)
+-GEN_ILLEGAL_INSN(addi_rb)
+-GEN_ILLEGAL_INSN(sto_rb)
+-GEN_ILLEGAL_INSN(orw_rb)
+-GEN_ILLEGAL_INSN(andnw_rb)
+-GEN_ILLEGAL_INSN(setzw_rb)
+-GEN_ILLEGAL_INSN(stmo_rb)
+-GEN_ILLEGAL_INSN(jump_i)
+-GEN_ILLEGAL_INSN(jump_r)
+-GEN_ILLEGAL_INSN(call_i)
+-GEN_ILLEGAL_INSN(call_r)
+-GEN_ILLEGAL_INSN(ret)
++
++/* === §4.8 RB Relative Address (riii) === */
++
++static bool trans_rela(DisasContext *ctx, arg_rela *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 base = tcg_temp_new_i64();
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_andi_i64(base, base, ~0xFFFULL);
++    tcg_gen_addi_i64(base, base, (int64_t)a->imm18 << 12);
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_st_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    return true;
++}
++
++/* === §4.4 RB Add Immediate (rrii) === */
++
++static bool trans_addi_rb(DisasContext *ctx, arg_addi_rb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 old = tcg_temp_new_i64();
++    tcg_gen_ld_i64(old, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    tcg_gen_andi_i64(old, old, 0xFFFF000000000000ULL);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_ld_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->hb]));
++    tcg_gen_andi_i64(v, v, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_addi_i64(v, v, a->imm12);
++    tcg_gen_andi_i64(v, v, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_or_i64(v, v, old);
++    tcg_gen_st_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    return true;
++}
++
++/* === §4.1 RB Store (rrii) === */
++
++static bool trans_sto_rb(DisasContext *ctx, arg_sto_rb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_ld_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_BE | MO_64 | MO_ALIGN_8);
++    return true;
++}
++
++/* === §4.9 RB Wyde Immediate (rwii) === */
++
++static bool trans_orw_rb(DisasContext *ctx, arg_orw_rb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    int ww = (a->hb >> 4) & 3;
++    unsigned shift = ww * 16;
++    uint64_t imm16 = ((uint64_t)(a->hb & 0xF) << 12) | ((uint64_t)a->hc << 6) | (uint64_t)a->hd;
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_ld_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    tcg_gen_andi_i64(v, v, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_ori_i64(v, v, (imm16 << shift) & 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_st_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    return true;
++}
++
++static bool trans_andnw_rb(DisasContext *ctx, arg_andnw_rb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    int ww = (a->hb >> 4) & 3;
++    unsigned shift = ww * 16;
++    uint64_t imm16 = ((uint64_t)(a->hb & 0xF) << 12) | ((uint64_t)a->hc << 6) | (uint64_t)a->hd;
++    uint64_t mask = ~(imm16 << shift);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_ld_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    tcg_gen_andi_i64(v, v, mask);
++    tcg_gen_st_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    return true;
++}
++
++static bool trans_setzw_rb(DisasContext *ctx, arg_setzw_rb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    int ww = (a->hb >> 4) & 3;
++    unsigned shift = ww * 16;
++    uint64_t imm16 = ((uint64_t)(a->hb & 0xF) << 12) | ((uint64_t)a->hc << 6) | (uint64_t)a->hd;
++    TCGv_i64 v = tcg_constant_i64(imm16 << shift);
++    tcg_gen_st_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    return true;
++}
++
++/* === §4.2 RB Multi-Store (rrri) === */
++
++static bool trans_stmo_rb(DisasContext *ctx, arg_stmo_rb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->hd == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->ha + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 base = tcg_temp_new_i64();
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->hb]));
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 idx = tcg_temp_new_i64();
++    tcg_gen_ld_i64(idx, tcg_env, offsetof(CPUDADAOState, rd[a->hc]));
++    tcg_gen_andi_i64(idx, idx, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_add_i64(base, base, idx);
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    for (int i = 0; i < a->hd; i++) {
++        TCGv_i64 ea = tcg_temp_new_i64();
++        tcg_gen_mov_i64(ea, base);
++        if (i) {
++            tcg_gen_addi_i64(ea, ea, i * 8);
++            tcg_gen_andi_i64(ea, ea, 0x0000FFFFFFFFFFFFULL);
++        }
++        TCGv_i64 v = tcg_temp_new_i64();
++        tcg_gen_ld_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha + i]));
++        tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_BE | MO_64 | MO_ALIGN_8);
++    }
++    return true;
++}
++
++/* === §5.3 Jump / Call / Ret — Control Flow === */
++
++static bool trans_jump_i(DisasContext *ctx, arg_jump_i *a)
++{
++    uint64_t target = (ctx->base.pc_next - 4) + (int64_t)a->imm24 * 4;
++    tcg_gen_st_i64(tcg_constant_i64(target), tcg_env, offsetof(CPUDADAOState, pc));
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_jump_r(DisasContext *ctx, arg_jump_r *a)
++{
++    TCGv_i64 base = tcg_temp_new_i64();
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 idx = tcg_temp_new_i64();
++    tcg_gen_ld_i64(idx, tcg_env, offsetof(CPUDADAOState, rd[a->hb]));
++    if (a->imm12) {
++        tcg_gen_addi_i64(idx, idx, a->imm12);
++    }
++    tcg_gen_add_i64(base, base, idx);
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_st_i64(base, tcg_env, offsetof(CPUDADAOState, pc));
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_call_i(DisasContext *ctx, arg_call_i *a)
++{
++    /* push return address: ra[63] = PC+4 */
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, ra[63]));
++    uint64_t target = (ctx->base.pc_next - 4) + (int64_t)a->imm24 * 4;
++    tcg_gen_st_i64(tcg_constant_i64(target), tcg_env, offsetof(CPUDADAOState, pc));
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_call_r(DisasContext *ctx, arg_call_r *a)
++{
++    /* push return address: ra[63] = PC+4 */
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, ra[63]));
++    TCGv_i64 base = tcg_temp_new_i64();
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 idx = tcg_temp_new_i64();
++    tcg_gen_ld_i64(idx, tcg_env, offsetof(CPUDADAOState, rd[a->hb]));
++    if (a->imm12) {
++        tcg_gen_addi_i64(idx, idx, a->imm12);
++    }
++    tcg_gen_add_i64(base, base, idx);
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_st_i64(base, tcg_env, offsetof(CPUDADAOState, pc));
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
++static bool trans_ret(DisasContext *ctx, arg_ret *a)
++{
++    /* PC = ra[63] */
++    TCGv_i64 ra = tcg_temp_new_i64();
++    tcg_gen_ld_i64(ra, tcg_env, offsetof(CPUDADAOState, ra[63]));
++    tcg_gen_st_i64(ra, tcg_env, offsetof(CPUDADAOState, pc));
++    /* rd[ha] = imm18 (sign-extended) */
++    if (a->ha != 0) {
++        tcg_gen_st_i64(tcg_constant_i64(a->imm18), tcg_env, offsetof(CPUDADAOState, rd[a->ha]));
++    }
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
+ 
+ /* === §3.10 RD Logical (orrr) — hb=dest, hc=src1, hd=src2 === */
+ 
+@@ -888,6 +1268,9 @@ static void dadao_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
+         break;
+     case DISAS_NORETURN:
+         break;
++    case DISAS_JUMP:
++        tcg_gen_lookup_and_goto_ptr();
++        break;
+     default:
+         g_assert_not_reached();
+     }
+-- 
+2.43.0
+

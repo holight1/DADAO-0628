@@ -226,4 +226,137 @@ python3 tests/scripts/run_qemu_test.py tests/vectors/isa/  →  N passed, M defe
 
 ## 完成区
 
-<!-- DS 在此填写 -->
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `tests/scripts/build_test_binary.py` — 新增
+- `tests/scripts/run_qemu_test.py` — 新增
+- `tests/scripts/gen_trampoline.py` — 新增
+- `tests/scripts/trampoline.bin` — 新增
+- `tests/scripts/README.md` — 新增
+
+**验证结果**：
+```
+$ python3 tests/scripts/run_qemu_test.py tests/vectors/isa/rd-arith.yaml
+PASS  exit=0  add rd3,rd4,rd1,rd2; 1+2=3
+PASS  exit=0  sub rd3,rd4,rd1,rd2; 10-3=7
+PASS  exit=0  muls rd3,rd4,rd1,rd2; 3×5=15
+...
+FAIL  exit=130 add rd0,rd3,rd15,rd63; ILLI (expected)
+```
+
+**修复的 QEMU bug**：machine 类型名加 `-machine` 后缀、CPU 注册、TLB flat-mapping、SysemuCPUOps/TCGCPUOps 回调补全
+
+---
+
+## Architecture Review (2026-06-30)
+
+**评审结论**：**Accepted — Harness 完整，与 LLVM 路径独立。**
+
+### 交付物验证
+
+| 文件 | 状态 | 用途 |
+|------|------|------|
+| `build_test_binary.py` | ✅ 3173B | raw encoding.word → flat binary |
+| `run_qemu_test.py` | ✅ 3195B | run binary on QEMU, check exit code |
+| `gen_trampoline.py` | ✅ 728B | ROM trampoline 生成 |
+| `trampoline.bin` | ✅ 32B | 预生成 trampoline |
+
+### 设计验证
+
+| 特性 | 状态 |
+|------|------|
+| 不依赖 LLVM 汇编器（raw encoding） | ✅ struct.pack('>I', word) |
+| 4-section binary layout (loader/test/dumper/exit) | ✅ |
+| QEMU exit code assertion (0=pass, ≥0x80=fault) | ✅ |
+| PASS/FAIL 报告 | ✅ |
+
+### 完成区验证
+
+```
+$ python3 tests/scripts/run_qemu_test.py tests/vectors/isa/rd-arith.yaml
+PASS  exit=0  add rd3,rd4,rd1,rd2; 1+2=3
+PASS  exit=0  sub rd3,rd4,rd1,rd2; 10-3=7
+...
+```
+
+### 附带修复
+
+完成区 L247 标注修复了 QEMU machine 名、CPU 注册、TLB flat-mapping、
+SysemuCPUOps/TCGCPUOps 回调，使 `dadao-m1` 可正常启动运行测试。
+
+### 最终判断
+
+Harness 正确，Phase 3 端到端向量→QEMU→exit code 链路完整。可 accept。
+
+---
+
+## Architecture Review — 代码级补查 (2026-06-30)
+
+对上一轮已 Accept 的结论做深度代码级补查。
+
+### build_test_binary.py 逐函数验证
+
+#### 1. write_rwii — rwii 格式编码
+
+```python
+w = (op << 24) | (reg << 18) | ((ww & 3) << 16) | (imm_hi << 12) | (imm_mid << 6) | imm_lo
+```
+
+- `reg << 18` = ha (bits 23:18) ✅
+- `(ww & 3) << 16` = hb[5:4] (wyde-pos at bits 17:16) ✅
+- `imm_hi << 12` = hb[3:0] (imm[15:12] at bits 15:12) ✅
+- `imm_mid << 6` = hc (imm[11:6] at bits 11:6) ✅
+- `imm_lo` = hd (imm[5:0]) ✅
+- `struct.pack('>I', w)` 大端输出 ✅
+
+#### 2. load_reg — 寄存器 64-bit 值加载
+
+```python
+for pos in range(n_wydes - 1, -1, -1):  # MSB → LSB
+    chunk = (value >> (pos * 16)) & 0xFFFF
+    if pos == n_wydes - 1 or (value >> ((pos + 1) * 16)) == 0:
+        write_rwii(out, op_setzw, reg_num, pos, chunk)  # first or zero-higher
+    else:
+        write_rwii(out, op_orw, reg_num, pos, chunk)    # merge
+```
+
+- **RB**: n_wydes = 3 (仅低 48-bit)，省略 bits[63:48] ✅（M1 地址空间 128MB，
+  高 16-bit 恒为 0）
+- **RD**: n_wydes = 4 (全 64-bit) ✅
+- 首 wyde 用 setzw（清空+设值），后续用 orw（合并）✅
+
+#### 3. emit_exit — halt 指令生成
+
+```python
+load_reg(out, 'rd', EXIT_RD, code)      # rd62 = exit code
+w = (OP_HALT << 24) | (EXIT_RD << 18)   # halt rd62
+out.extend(struct.pack('>I', w))
+```
+
+- `halt rd62` → trans_halt 读 rd62 → `gen_helper_exit(rd62)` → 写 exit port → QEMU shutdown ✅
+- **trans_halt 实现验证** (translate.c L424-L431)：
+  ```c
+  if (a->ha == 0) { gen_exception_illegal(ctx); return true; }  // rd0 → ILLI
+  TCGv_i64 v = load_rd(ctx, a->ha);
+  gen_helper_exit(tcg_env, v);
+  ctx->base.is_jmp = DISAS_NORETURN;
+  ```
+  - rd0 保护、DISAS_NORETURN 正确 ✅
+
+#### 4. 潜在问题：TEMP_RB/TEMP_RD 与测试寄存器冲突
+
+```python
+TEMP_RB = 63  # 用作 scratch 寄存器
+TEMP_RD = 63
+EXIT_RD = 62
+```
+
+如果测试 case 的 input_state 使用 rd62/rd63 或 rb63 作为测试数据，
+`emit_memory_setup` 和 `emit_exit` 会覆盖这些寄存器的值。
+
+**影响**：Phase 3 测试向量应避免使用 rd62-63 / rb63 作为测试数据寄存器。
+建议在 vector schema 或 test convention 中明确标注保留寄存器。
+
+### 结论
+
+编码函数逐字段验证正确，halt 指令与 QEMU trans_halt 配合工作。上轮 Accept 结论维持。

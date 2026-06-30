@@ -25,15 +25,18 @@ REQUIRED_FIELDS = {"mnemonic", "format", "class", "encoding", "input_state",
 
 
 def load_opcodes(path):
-    with open(path, "r") as f:
+    with open(path) as f:
         records = yaml.safe_load(f)
-    lookup = {}
+    by_mnem_fmt = {}
+    by_opid = {}
     for rec in records:
         key = (rec["mnemonic"], rec["format"])
-        if key not in lookup:
-            lookup[key] = []
-        lookup[key].append(rec)
-    return lookup
+        op = rec["op"]
+        ha = rec.get("ha")
+        opid = (op, str(ha))
+        by_mnem_fmt.setdefault(key, []).append(rec)
+        by_opid[opid] = rec["mnemonic"]
+    return by_mnem_fmt, by_opid
 
 
 def check_hex_word(word_str, path, line):
@@ -49,17 +52,17 @@ def check_hex_word(word_str, path, line):
     return None
 
 
-def validate_file(filepath, opcodes):
+def validate_file(filepath, opcodes_by_mnem_fmt):
     errors = []
-    covered_keys = set()
+    covered_opids = set()
     try:
         with open(filepath, "r") as f:
             cases = yaml.safe_load(f)
     except yaml.YAMLError as e:
-        return ([f"{filepath}: YAML parse error: {e}"], covered_keys)
+        return ([f"{filepath}: YAML parse error: {e}"], covered_opids)
 
     if not isinstance(cases, list):
-        return ([f"{filepath}: top-level must be a list"], covered_keys)
+        return ([f"{filepath}: top-level must be a list"], covered_opids)
 
     for i, case in enumerate(cases):
         tag = f"{filepath} case[{i}]"
@@ -99,6 +102,22 @@ def validate_file(filepath, opcodes):
             if err:
                 errors.append(err)
 
+        # Check encoding.word matches mask/value (at least one rec)
+        if word and mnem != "?" and fmt != "?":
+            recs = opcodes_by_mnem_fmt.get((mnem, fmt), [])
+            if recs:
+                wval = int(word, 16)
+                for rec in recs:
+                    mask_val = int(rec["mask"], 16) if isinstance(rec["mask"], str) else rec["mask"]
+                    value_val = int(rec["value"], 16) if isinstance(rec["value"], str) else rec["value"]
+                    if (wval & mask_val) == value_val:
+                        break
+                else:
+                    rec = recs[0]
+                    errors.append(
+                        f"{tag}: encoding.word {word} does not match "
+                        f"mask={rec['mask']} value={rec['value']}")
+
         # Check deferred consistency
         if status == "deferred":
             if case.get("expected_state") is not None:
@@ -111,19 +130,20 @@ def validate_file(filepath, opcodes):
         # Check mnemonic+format in opcodes
         if mnem != "?" and fmt != "?":
             key = (mnem, fmt)
-            if key not in opcodes:
+            if key not in opcodes_by_mnem_fmt:
                 errors.append(f"{tag}: unknown mnemonic+format: "
                               f"{mnem}({fmt})")
-            else:
-                if status == "active":
-                    covered_keys.add(key)
+            elif status == "active":
+                for rec in opcodes_by_mnem_fmt[key]:
+                    opid = (rec["op"], str(rec.get("ha")))
+                    covered_opids.add(opid)
 
         # Check active semantic/boundary has expected_state
         if status == "active" and cls in ("semantic", "boundary"):
             if case.get("expected_state") is None:
                 errors.append(f"{tag}: {cls} case must have expected_state")
 
-    return (errors, covered_keys)
+    return (errors, covered_opids)
 
 
 def main():
@@ -136,7 +156,7 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    opcodes = load_opcodes(opcodes_path)
+    by_mnem_fmt, by_opid = load_opcodes(opcodes_path)
 
     vectors_dir = os.path.join(repo_dir, "tests", "vectors", "isa")
     if not os.path.isdir(vectors_dir):
@@ -148,21 +168,20 @@ def main():
         print("ERROR: no YAML files in tests/vectors/isa/", file=sys.stderr)
         sys.exit(1)
 
-    covered = set()
+    covered_opids = set()
     all_errors = []
     for fpath in yaml_files:
-        errors, keys = validate_file(fpath, opcodes)
+        errors, opids = validate_file(fpath, by_mnem_fmt)
         all_errors.extend(errors)
-        covered.update(keys)
+        covered_opids.update(opids)
 
-    # Coverage check: every M1 (mnemonic,format) in opcodes must have ≥1 case
-    for key, recs in opcodes.items():
-        if key not in covered:
-            # Exclude rd2ra/ra2rd (excluded from M1)
-            if key[0] in ("rd2ra", "ra2rd"):
+    # Coverage check: every (op,ha) in opcodes must have ≥1 active case
+    for opid, mnem in by_opid.items():
+        if opid not in covered_opids:
+            if mnem in ("rd2ra", "ra2rd"):
                 continue
             all_errors.append(
-                f"COVERAGE MISSING: {key[0]}({key[1]}) — no test vector found")
+                f"COVERAGE MISSING: {mnem} op={opid[0]} ha={opid[1]}")
 
     if all_errors:
         for e in all_errors:
@@ -175,7 +194,7 @@ def main():
             cases = yaml.safe_load(f)
             total += len(cases) if isinstance(cases, list) else 0
     print(f"validate_vectors: {len(yaml_files)} files, {total} cases, "
-          f"{len(covered)}/{len(opcodes)} mnemonic+format covered OK")
+          f"{len(covered_opids)}/{len(by_opid)} opcodes covered OK")
     sys.exit(0)
 
 

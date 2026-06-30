@@ -545,3 +545,32 @@
   wiki_cite: "spec.md §3.3"
   notes: "ldmtu rd1,rb2,rd0,2; multi load unsigned tetras"
 
+# ─── RB multi-load (ldmo op=0x47) ──────────────────────────────────────────
+
+- mnemonic: ldmo
+  format: rrri
+  class: semantic
+  encoding:
+    word: "0x47042042"
+  input_state:
+    rb:
+      rb2: "0x0000000000100000"
+      rb1: "0x0000000000000000"
+    rd:
+      rd1: "0x0000000000000000"
+    memory:
+      - address: "0x0000000000100000"
+        value: "0xAAAAAAAAAAAAAAAA"
+        width: 8
+      - address: "0x0000000000100008"
+        value: "0xBBBBBBBBBBBBBBBB"
+        width: 8
+  expected_state:
+    rb:
+      rb1: "0xAAAAAAAAAAAAAAAA"
+      rb2: "0xBBBBBBBBBBBBBBBB"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.2"
+  notes: "ldmo rb1,rb2,rd1,2; RB multi-load 2 octas from mem into rb1,rb2"
+

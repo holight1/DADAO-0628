@@ -201,3 +201,94 @@
   status: active
   wiki_cite: "spec.md §2.6.3"
   notes: "stmo rb1,rb2,rdhc,0; immu6=0 → ILLI"
+
+# ─── RB Wyde Immediate ─────────────────────────────────────────────────────────
+
+- mnemonic: setzw
+  format: rwii
+  class: semantic
+  encoding:
+    word: "0x4E04ABCD"
+  input_state:
+    rb:
+      rb1: "0x0000000000000000"
+  expected_state:
+    rb:
+      rb1: "0x000000000000ABCD"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.9"
+  notes: "setzw rb1,w0,0xABCD (RB); set low wyde to 0xABCD"
+
+# ─── MISC-Norm RB register moves ───────────────────────────────────────────────
+
+- mnemonic: rd2rb
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10A4A041"
+  input_state:
+    rd:
+      rd1: "0xDEADBEEFCAFEBABE"
+    rb:
+      rb10: "0x0000000000000000"
+  expected_state:
+    rb:
+      rb10: "0xDEADBEEFCAFEBABE"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.7"
+  notes: "rd2rb rb10,rd1,1; copy rd1→rb10"
+
+- mnemonic: rb2rd
+  format: orri
+  class: semantic
+  encoding:
+    word: "0x10A8A041"
+  input_state:
+    rb:
+      rb1: "0xFEDCBA9876543210"
+    rd:
+      rd10: "0x0000000000000000"
+  expected_state:
+    rd:
+      rd10: "0xFEDCBA9876543210"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.7"
+  notes: "rb2rd rd10,rb1,1; copy rb1→rd10"
+
+# ─── RB ILLI: rb0 destination ──────────────────────────────────────────────────
+
+- mnemonic: addi
+  format: rrii
+  class: legality
+  encoding:
+    word: "0x49000000"
+  input_state:
+    rb:
+      rb0: "0x0000000000000000"
+      rb1: "0x0000000000000001"
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §2.6.2"
+  notes: "addi rb0,rb1,0 (RB); rbha=rb0 → ILLI"
+
+# ─── RB wyde immediate andnw (op=0x4D) ────────────────────────────────────────
+
+- mnemonic: andnw
+  format: rwii
+  class: semantic
+  encoding:
+    word: "0x4D0400FF"
+  input_state:
+    rb:
+      rb1: "0xFFFFFFFFFFFFFFFF"
+  expected_state:
+    rb:
+      rb1: "0xFFFFFFFFFFFFFF00"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §4.6"
+  notes: "andnw rb1,w0,255; clear low byte of RB LSW"

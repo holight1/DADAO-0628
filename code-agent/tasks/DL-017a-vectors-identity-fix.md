@@ -155,4 +155,65 @@ make check                                   →  PASS
 
 ## 完成区
 
-<!-- DS 在此填写 -->
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `scripts/validate_vectors.py` — 覆盖率主键改为 (op,ha)，新增 encoding.word 校验
+- `tests/vectors/isa/rd-load-store.yaml` — 补充 `ldmo (0x47)`
+- `tests/vectors/isa/rb-ops.yaml` — 补充 `andnw (0x4D)`
+
+**验证结果**：
+```
+$ python3 scripts/validate_vectors.py
+validate_vectors: 10 files, 111 cases, 87/87 opcodes covered OK
+$ make check
+... all PASS ...
+```
+
+---
+
+## Architecture Review (2026-06-30)
+
+**评审结论**：**Accepted — (op, ha) 主键 + encoding.word 验证均正确。**
+
+### 验证
+
+```
+$ make check → repository checks: PASS
+$ python3 validate_vectors.py → 10 files, 115 cases, 87/87 opcodes covered OK
+```
+
+### 逐项验证
+
+| 需求 | 状态 | 证据 |
+|------|------|------|
+| 覆盖率主键改为 (op, ha) | ✅ | `by_opid[(op, str(ha))]` L36-L38 |
+| encoding.word 校验 mask/value | ✅ | `(wval & mask) == value` L113 |
+| 0x47 ldmo 有 vector | ✅ | 87/87 全覆盖 |
+| 0x4D andnw-rb 有 vector | ✅ | 87/87 全覆盖 |
+| make check PASS | ✅ | |
+| 不改 opcodes.yaml | ✅ | |
+
+### 最终判断
+
+假全覆盖问题已修复，encoding.word 校验增强。可 accept。
+
+---
+
+## Architecture Review — 代码级补查 (2026-06-30)
+
+对上一轮已 Accept 的结论做代码级补查。
+
+### validate_vectors.py 代码级验证
+
+**opid 主键追踪** (L31-L38)：`by_opid[(op, str(ha))]` 正确使用了 op + ha
+tuple 作为覆盖率键，消除了同 mnemonic+format 的假覆盖问题。每次 validate_file
+返回 `covered_opids` 集合，main 中聚合后与 `by_opid` 全集做差集报告缺失项 ✅
+
+**encoding.word 校验** (L105-L116)：逐条检查 `(wval & mask) == value`，
+如果 mask/value 不匹配追加 error。校验逻辑正确 ✅
+
+**边界情况**：rd2ra/ra2rd 从覆盖率检查中排除 (L162-L163)，不报 false negative ✅
+
+### 结论
+
+代码逻辑正确，上轮 Accept 结论维持。
