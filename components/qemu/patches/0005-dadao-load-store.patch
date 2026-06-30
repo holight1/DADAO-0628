@@ -1,0 +1,398 @@
+From 83f9a3eb6242cdb4d14a4d1a30e6c0aa5557fe07 Mon Sep 17 00:00:00 2001
+From: DADAO Architecture <dadao@example.com>
+Date: Tue, 30 Jun 2026 09:30:59 +0800
+Subject: [PATCH] target/dadao: implement RD load/store TCG translation + MALIGN
+
+Replace stubs with real TCG code for all RD load/store instruction
+groups covered by ISA spec §3.15–§3.16.
+
+Fixes:
+- Add MO_ALIGN_2/4/8 flags to all non-byte loads/stores so that
+  misaligned accesses trigger do_unaligned_access.
+- Add EXCP_MALIGN exception (value 3) and dadao_cpu_do_unaligned_access
+  handler that writes exit code 0x02 to the DADAO_EXIT_PORT MMIO region.
+- Register do_unaligned_access in TCGCPUOps.
+
+---
+ target/dadao/cpu.c       |  20 +++-
+ target/dadao/cpu.h       |  10 +-
+ target/dadao/translate.c | 260 +++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 265 insertions(+), 25 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 1fa443f..1c98de5 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -7,6 +7,7 @@
+ #include "system/runstate.h"
+ #include "system/system.h"
+ #include "hw/qdev-properties.h"
++#include "exec/address-spaces.h"
+ #include "accel/tcg/cpu-ops.h"
+ 
+ extern const TCGCPUOps dadao_tcg_ops;
+@@ -86,9 +87,26 @@ static ObjectClass *dadao_cpu_class_by_name(const char *cpu_model)
+ }
+ 
+ #ifndef CONFIG_USER_ONLY
++void dadao_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
++                                   MMUAccessType access_type,
++                                   int mmu_idx, uintptr_t retaddr)
++{
++    cpu_restore_state(cs, retaddr);
++    cs->exception_index = EXCP_MALIGN;
++    cpu_loop_exit(cs);
++}
++
+ void dadao_cpu_do_interrupt(CPUState *cs)
+ {
+-    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
++    switch (cs->exception_index) {
++    case EXCP_MALIGN:
++        cpu_physical_memory_write(DADAO_EXIT_PORT, &(uint64_t){0x02}, 8);
++        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
++        break;
++    default:
++        qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
++        break;
++    }
+ }
+ 
+ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index b8ab68a..4d7c351 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -5,8 +5,9 @@
+ #include "exec/cpu-defs.h"
+ #include "qom/object.h"
+ 
+-#define EXCP_ILLI  1
+-#define EXCP_UNDI  2
++#define EXCP_ILLI   1
++#define EXCP_UNDI   2
++#define EXCP_MALIGN 3
+ 
+ #define CPU_RESOLVING_TYPE TYPE_DADAO_CPU
+ 
+@@ -47,6 +48,9 @@ struct DADAOCPUClass {
+ };
+ 
+ void dadao_cpu_do_interrupt(CPUState *cpu);
++G_NORETURN void dadao_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
++                                              MMUAccessType access_type,
++                                              int mmu_idx, uintptr_t retaddr);
+ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx,
+                         bool probe, uintptr_t retaddr);
+@@ -57,6 +61,8 @@ void dadao_translate_init(void);
+ void dadao_translate_code(CPUState *cs, TranslationBlock *tb,
+                           int *max_insns, vaddr pc, void *host_pc);
+ 
++#define DADAO_EXIT_PORT 0x10000000
++
+ #include "exec/cpu-all.h"
+ 
+ #endif
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 733008d..3b6f90b 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -23,6 +23,7 @@ typedef struct DisasContext {
+     DisasContextBase base;
+     target_ulong pc_save;
+     uint32_t opcode;
++    int mem_idx;
+     CPUState *cs;
+ } DisasContext;
+ 
+@@ -63,6 +64,19 @@ static TCGv_i64 sext64h(TCGv_i64 src)
+     return h;
+ }
+ 
++/* 48-bit effective address from RB register + signed offset */
++static TCGv_i64 gen_ea(DisasContext *ctx, int rb_reg, int64_t offset)
++{
++    TCGv_i64 ea = tcg_temp_new_i64();
++    tcg_gen_ld_i64(ea, tcg_env, offsetof(CPUDADAOState, rb[rb_reg]));
++    tcg_gen_andi_i64(ea, ea, 0x0000FFFFFFFFFFFFULL);
++    if (offset) {
++        tcg_gen_addi_i64(ea, ea, offset);
++        tcg_gen_andi_i64(ea, ea, 0x0000FFFFFFFFFFFFULL);
++    }
++    return ea;
++}
++
+ /* swym is a NOP */
+ static bool trans_swym(DisasContext *ctx, arg_swym *a)
+ {
+@@ -95,29 +109,229 @@ GEN_ILLEGAL_INSN(brp)
+ GEN_ILLEGAL_INSN(brnp)
+ GEN_ILLEGAL_INSN(breq)
+ GEN_ILLEGAL_INSN(brne)
+-GEN_ILLEGAL_INSN(ldbs)
+-GEN_ILLEGAL_INSN(ldws)
+-GEN_ILLEGAL_INSN(ldts)
+-GEN_ILLEGAL_INSN(ldo)
+-GEN_ILLEGAL_INSN(ldmbs)
+-GEN_ILLEGAL_INSN(ldmws)
+-GEN_ILLEGAL_INSN(ldmts)
+-GEN_ILLEGAL_INSN(ldmo)
+-GEN_ILLEGAL_INSN(stb)
+-GEN_ILLEGAL_INSN(stw)
+-GEN_ILLEGAL_INSN(stt)
+-GEN_ILLEGAL_INSN(sto)
+-GEN_ILLEGAL_INSN(stmb)
+-GEN_ILLEGAL_INSN(stmw)
+-GEN_ILLEGAL_INSN(stmt)
+-GEN_ILLEGAL_INSN(stmo)
+-GEN_ILLEGAL_INSN(ldbu)
+-GEN_ILLEGAL_INSN(ldwu)
+-GEN_ILLEGAL_INSN(ldtu)
++/* === §3.15 RD Load/Store — Single (rrii) === */
++
++static bool trans_ldbs(DisasContext *ctx, arg_ldbs *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_SB);
++    store_rd(ctx, a->ha, v);
++    return true;
++}
++
++static bool trans_ldbu(DisasContext *ctx, arg_ldbu *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_UB);
++    store_rd(ctx, a->ha, v);
++    return true;
++}
++
++static bool trans_ldws(DisasContext *ctx, arg_ldws *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_SW | MO_ALIGN_2);
++    store_rd(ctx, a->ha, v);
++    return true;
++}
++
++static bool trans_ldwu(DisasContext *ctx, arg_ldwu *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_UW | MO_ALIGN_2);
++    store_rd(ctx, a->ha, v);
++    return true;
++}
++
++static bool trans_ldts(DisasContext *ctx, arg_ldts *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_SL | MO_ALIGN_4);
++    store_rd(ctx, a->ha, v);
++    return true;
++}
++
++static bool trans_ldtu(DisasContext *ctx, arg_ldtu *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_UL | MO_ALIGN_4);
++    store_rd(ctx, a->ha, v);
++    return true;
++}
++
++static bool trans_ldo(DisasContext *ctx, arg_ldo *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = tcg_temp_new_i64();
++    tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_UQ | MO_ALIGN_8);
++    store_rd(ctx, a->ha, v);
++    return true;
++}
++
++/* Single RD stores (rrii) */
++
++static bool trans_stb(DisasContext *ctx, arg_stb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = load_rd(ctx, a->ha);
++    tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_8);
++    return true;
++}
++
++static bool trans_stw(DisasContext *ctx, arg_stw *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = load_rd(ctx, a->ha);
++    tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_BE | MO_16 | MO_ALIGN_2);
++    return true;
++}
++
++static bool trans_stt(DisasContext *ctx, arg_stt *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = load_rd(ctx, a->ha);
++    tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_BE | MO_32 | MO_ALIGN_4);
++    return true;
++}
++
++static bool trans_sto(DisasContext *ctx, arg_sto *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    TCGv_i64 v = load_rd(ctx, a->ha);
++    tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_BE | MO_64 | MO_ALIGN_8);
++    return true;
++}
++
++/* === §3.16 RD Load/Store — Multi (rrri) === */
++
++static bool do_ldm(DisasContext *ctx, int ha, int hb, int hc, int hd,
++                    MemOp mop, int size)
++{
++    if (ha == 0) { gen_exception_illegal(ctx); return true; }
++    if (hd == 0) { gen_exception_illegal(ctx); return true; }
++    if (ha + hd > 64) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 base = tcg_temp_new_i64();
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[hb]));
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 idx = tcg_temp_new_i64();
++    tcg_gen_ld_i64(idx, tcg_env, offsetof(CPUDADAOState, rd[hc]));
++    tcg_gen_andi_i64(idx, idx, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_add_i64(base, base, idx);
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    for (int i = 0; i < hd; i++) {
++        TCGv_i64 ea = tcg_temp_new_i64();
++        tcg_gen_mov_i64(ea, base);
++        if (i) {
++            tcg_gen_addi_i64(ea, ea, i * size);
++            tcg_gen_andi_i64(ea, ea, 0x0000FFFFFFFFFFFFULL);
++        }
++        TCGv_i64 v = tcg_temp_new_i64();
++        tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, mop);
++        store_rd(ctx, ha + i, v);
++    }
++    return true;
++}
++
++static bool do_stm(DisasContext *ctx, int ha, int hb, int hc, int hd,
++                    MemOp mop, int size)
++{
++    if (ha == 0) { gen_exception_illegal(ctx); return true; }
++    if (hd == 0) { gen_exception_illegal(ctx); return true; }
++    if (ha + hd > 64) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 base = tcg_temp_new_i64();
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[hb]));
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 idx = tcg_temp_new_i64();
++    tcg_gen_ld_i64(idx, tcg_env, offsetof(CPUDADAOState, rd[hc]));
++    tcg_gen_andi_i64(idx, idx, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_add_i64(base, base, idx);
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    for (int i = 0; i < hd; i++) {
++        TCGv_i64 ea = tcg_temp_new_i64();
++        tcg_gen_mov_i64(ea, base);
++        if (i) {
++            tcg_gen_addi_i64(ea, ea, i * size);
++            tcg_gen_andi_i64(ea, ea, 0x0000FFFFFFFFFFFFULL);
++        }
++        TCGv_i64 v = load_rd(ctx, ha + i);
++        tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, mop);
++    }
++    return true;
++}
++
++static bool trans_ldmbs(DisasContext *ctx, arg_ldmbs *a)
++{
++    return do_ldm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_SB, 1);
++}
++
++static bool trans_ldmbu(DisasContext *ctx, arg_ldmbu *a)
++{
++    return do_ldm(ctx, a->ha, a->hb, a->hc, a->hd, MO_UB, 1);
++}
++
++static bool trans_ldmws(DisasContext *ctx, arg_ldmws *a)
++{
++    return do_ldm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_SW | MO_ALIGN_2, 2);
++}
++
++static bool trans_ldmwu(DisasContext *ctx, arg_ldmwu *a)
++{
++    return do_ldm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_UW | MO_ALIGN_2, 2);
++}
++
++static bool trans_ldmts(DisasContext *ctx, arg_ldmts *a)
++{
++    return do_ldm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_SL | MO_ALIGN_4, 4);
++}
++
++static bool trans_ldmtu(DisasContext *ctx, arg_ldmtu *a)
++{
++    return do_ldm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_UL | MO_ALIGN_4, 4);
++}
++
++static bool trans_ldmo(DisasContext *ctx, arg_ldmo *a)
++{
++    return do_ldm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_UQ | MO_ALIGN_8, 8);
++}
++
++static bool trans_stmb(DisasContext *ctx, arg_stmb *a)
++{
++    return do_stm(ctx, a->ha, a->hb, a->hc, a->hd, MO_8, 1);
++}
++
++static bool trans_stmw(DisasContext *ctx, arg_stmw *a)
++{
++    return do_stm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_16 | MO_ALIGN_2, 2);
++}
++
++static bool trans_stmt(DisasContext *ctx, arg_stmt *a)
++{
++    return do_stm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_32 | MO_ALIGN_4, 4);
++}
++
++static bool trans_stmo(DisasContext *ctx, arg_stmo *a)
++{
++    return do_stm(ctx, a->ha, a->hb, a->hc, a->hd, MO_BE | MO_64 | MO_ALIGN_8, 8);
++}
++
+ GEN_ILLEGAL_INSN(ldo_rb)
+-GEN_ILLEGAL_INSN(ldmbu)
+-GEN_ILLEGAL_INSN(ldmwu)
+-GEN_ILLEGAL_INSN(ldmtu)
+ GEN_ILLEGAL_INSN(ldmo_rb)
+ GEN_ILLEGAL_INSN(rela)
+ GEN_ILLEGAL_INSN(addi_rb)
+@@ -635,6 +849,7 @@ static void dadao_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
+ {
+     DisasContext *ctx = container_of(dcbase, DisasContext, base);
+     ctx->pc_save = ctx->base.pc_first;
++    ctx->mem_idx = cpu_mmu_index(cs, false);
+     ctx->cs = cs;
+ }
+ 
+@@ -714,6 +929,7 @@ const TCGCPUOps dadao_tcg_ops = {
+ #ifndef CONFIG_USER_ONLY
+     .tlb_fill = dadao_cpu_tlb_fill,
+     .do_interrupt = dadao_cpu_do_interrupt,
++    .do_unaligned_access = dadao_cpu_do_unaligned_access,
+ #endif
+ };
+ 
+-- 
+2.43.0

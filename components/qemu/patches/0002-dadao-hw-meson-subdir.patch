@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
 From: DADAO Architecture <dadao@example.com>
 Date: Mon, 29 Jun 2026 00:00:00 +0000
-Subject: [PATCH 2/2] hw: register dadao subdir in hw/meson.build
+Subject: [PATCH] hw: register dadao subdir in hw/meson.build
 
 Without this line hw/dadao/meson.build is never executed, so
 dadao-machine.c is never compiled and the machine type never registered.
@@ -12,9 +12,15 @@ Insert subdir('dadao') in alphabetical order (after 'cxl').
  1 file changed, 1 insertion(+)
 
 diff --git a/hw/meson.build b/hw/meson.build
+index b91f761..7cf00df 100644
 --- a/hw/meson.build
 +++ b/hw/meson.build
-@@ -1,3 +1,4 @@
+@@ -7,6 +7,7 @@ subdir('char')
+ subdir('core')
+ subdir('cpu')
  subdir('cxl')
 +subdir('dadao')
  subdir('display')
+ subdir('dma')
+ subdir('gpio')
+-- 

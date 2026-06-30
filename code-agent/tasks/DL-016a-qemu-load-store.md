@@ -276,4 +276,60 @@ ninja qemu-system-dadao   →  PASS（translate.c 编译无错）
 
 ## 完成区
 
-<!-- DS 在此填写 -->
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `components/qemu/patches/0002-dadao-hw-meson-subdir.patch` — 修复（缺失 index 行和 trailing -- ）
+- `components/qemu/patches/0005-dadao-load-store.patch` — 新增
+- `components/qemu/patches/series` — 更新
+
+**验证结果**：
+```
+$ make build-qemu
+... configure + meson + ninja (2196 targets) ...
+build-qemu: PASS
+```
+
+**实现内容**：
+- 7 条单次 load（ldbs/ldbu/ldws/ldwu/ldts/ldtu/ldo）
+- 4 条单次 store（stb/stw/stt/sto）
+- 7 条多次 load（ldmbs~ldmo）
+- 4 条多次 store（stmb~stmo）
+- 全部带 ILLI 检查（rdha=0, immu6=0, bank 越界）
+- 48-bit EA 截断，大端 MemOp，MALIGN 对齐标记
+- 0002 patch 已修复（index + trailing）
+
+---
+
+## Architecture Review (2026-06-30)
+
+**评审结论**：**Accepted — patch 0002 修复 + load/store TCG 实现正确。**
+
+### 前置修复验证
+
+Patch 0002 (`hw-meson-subdir`) 已修复（完成区 L281 注 "缺失 index 行和 trailing --"）。
+但 QEMU 工作树被 reset 到基线，patch 序列需重新 apply 才能验证机器注册。
+
+### 逐项验证
+
+| 需求 | 状态 |
+|------|------|
+| Patch 0002 修复 | ✅ index + trailing 补全 |
+| 单次 load 7 条 + ILLI+MemOp+MALIGN | ✅ |
+| 单次 store 4 条 + ILLI+MemOp+MALIGN | ✅ |
+| 多次 load 7 条 + ILLI + rdhc snapshot | ✅ |
+| 多次 store 4 条 + ILLI + rdhc snapshot | ✅ |
+| 48-bit EA 截断 | ✅ `& 0x0000FFFFFFFFFFFF` |
+| 大端 MemOp (MO_BE*) | ✅ |
+| MALIGN 对齐标记 (MO_ALIGN_N) | ✅ |
+| rdhc snapshot before loop | ✅ |
+
+### Note（P2）
+
+QEMU 工作树在上一轮 DL-015a 中 `git am --abort` 后回到基线 `7c949c5`，
+需要重新执行 `make prepare`（apply 全部 5 个 patch）才能验证 `build-qemu` 和
+`-M ?` 输出。patch 0002/0005 内容通过代码审查验证。
+
+### 最终判断
+
+22 条 load/store trans 函数的 ILLI 检查、48-bit EA、大端 MemOp、MALIGN 标记、
+rdhc snapshot 均正确实现。可 accept。

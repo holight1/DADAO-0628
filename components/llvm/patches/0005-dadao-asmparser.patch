@@ -1,0 +1,683 @@
+From 566c809f40d303b512ce480069a499f16d04b153 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 30 Jun 2026 09:44:32 +0800
+Subject: [PATCH 3/3] DADAO AsmParser, MCCodeEmitter, MCInstPrinter
+
+---
+ .../lib/Target/DADAO/AsmParser/CMakeLists.txt |  16 +
+ .../Target/DADAO/AsmParser/DADAOAsmParser.cpp | 383 ++++++++++++++++++
+ llvm/lib/Target/DADAO/CMakeLists.txt          |   7 +-
+ llvm/lib/Target/DADAO/DADAO.td                |   1 +
+ .../Target/DADAO/MCTargetDesc/CMakeLists.txt  |   1 +
+ .../DADAO/MCTargetDesc/DADAOInstPrinter.cpp   |  31 +-
+ .../DADAO/MCTargetDesc/DADAOInstPrinter.h     |  11 +-
+ .../DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp |  77 ++++
+ .../DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp  |   3 +
+ .../DADAO/MCTargetDesc/DADAOMCTargetDesc.h    |   8 +
+ 10 files changed, 528 insertions(+), 10 deletions(-)
+ create mode 100644 llvm/lib/Target/DADAO/AsmParser/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+
+diff --git a/llvm/lib/Target/DADAO/AsmParser/CMakeLists.txt b/llvm/lib/Target/DADAO/AsmParser/CMakeLists.txt
+new file mode 100644
+index 000000000000..ee6011d15cda
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/AsmParser/CMakeLists.txt
+@@ -0,0 +1,16 @@
++include_directories(${CMAKE_CURRENT_BINARY_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/..)
++
++add_llvm_component_library(LLVMDADAOAsmParser
++  DADAOAsmParser.cpp
++
++  LINK_COMPONENTS
++  DADAODesc
++  MC
++  MCParser
++  Support
++
++  ADD_TO_COMPONENT
++  DADAO
++  )
++
++add_dependencies(LLVMDADAOAsmParser DADAOCommonTableGen)
+diff --git a/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp b/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
+new file mode 100644
+index 000000000000..74540f99fd3c
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
+@@ -0,0 +1,383 @@
++//===-- DADAOAsmParser.cpp - Parse DADAO assembly to MCInst instructions --===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCParser/AsmLexer.h"
++#include "llvm/MC/MCParser/MCAsmParser.h"
++#include "llvm/MC/MCParser/MCParsedAsmOperand.h"
++#include "llvm/MC/MCParser/MCTargetAsmParser.h"
++#include "llvm/MC/MCStreamer.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/MathExtras.h"
++#include "llvm/Support/SMLoc.h"
++#include "llvm/Support/raw_ostream.h"
++#include <cassert>
++#include <cstdint>
++#include <memory>
++
++using namespace llvm;
++
++namespace {
++
++struct DADAOOperand;
++
++class DADAOAsmParser : public MCTargetAsmParser {
++  SMLoc getLoc() const { return Parser.getTok().getLoc(); }
++
++  bool parseRegister(MCRegister &Reg, SMLoc &StartLoc, SMLoc &EndLoc) override;
++  ParseStatus tryParseRegister(MCRegister &Reg, SMLoc &StartLoc,
++                               SMLoc &EndLoc) override;
++
++  ParseStatus parseImmediate(OperandVector &Operands);
++  ParseStatus parseRegister(OperandVector &Operands);
++
++  bool parseInstruction(ParseInstructionInfo &Info, StringRef Name,
++                        SMLoc NameLoc, OperandVector &Operands) override;
++
++  bool matchAndEmitInstruction(SMLoc IdLoc, unsigned &Opcode,
++                               OperandVector &Operands, MCStreamer &Out,
++                               uint64_t &ErrorInfo,
++                               bool MatchingInlineAsm) override;
++
++#define GET_ASSEMBLER_HEADER
++#include "DADAOGenAsmMatcher.inc"
++
++public:
++  DADAOAsmParser(const MCSubtargetInfo &STI, MCAsmParser &Parser,
++                 const MCInstrInfo &MII, const MCTargetOptions &Options)
++      : MCTargetAsmParser(Options, STI, MII), Parser(Parser),
++        Lexer(Parser.getLexer()) {
++    setAvailableFeatures(
++        ComputeAvailableFeatures(STI.getFeatureBits()));
++  }
++
++private:
++  MCAsmParser &Parser;
++  AsmLexer &Lexer;
++};
++
++struct DADAOOperand : public MCParsedAsmOperand {
++  enum KindTy { Token, Register, Immediate } Kind;
++
++  SMLoc StartLoc, EndLoc;
++
++  struct Token {
++    const char *Data;
++    unsigned Length;
++  };
++
++  struct RegOp {
++    MCRegister RegNum;
++  };
++
++  struct ImmOp {
++    const MCExpr *Value;
++  };
++
++  union {
++    struct Token Tok;
++    struct RegOp Reg;
++    struct ImmOp Imm;
++  };
++
++  explicit DADAOOperand(KindTy K) : Kind(K) {}
++
++public:
++  SMLoc getStartLoc() const override { return StartLoc; }
++  SMLoc getEndLoc() const override { return EndLoc; }
++
++  MCRegister getReg() const override {
++    assert(isReg() && "Invalid type access!");
++    return Reg.RegNum;
++  }
++
++  const MCExpr *getImm() const {
++    assert(isImm() && "Invalid type access!");
++    return Imm.Value;
++  }
++
++  StringRef getToken() const {
++    assert(isToken() && "Invalid type access!");
++    return StringRef(Tok.Data, Tok.Length);
++  }
++
++  bool isReg() const override { return Kind == Register; }
++  bool isImm() const override { return Kind == Immediate; }
++  bool isToken() const override { return Kind == Token; }
++
++  bool isImms12() const {
++    if (!isImm()) return false;
++    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
++      return isInt<12>(CE->getValue());
++    return true;
++  }
++
++  bool isImmu12() const {
++    if (!isImm()) return false;
++    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
++      return isUInt<12>(CE->getValue());
++    return true;
++  }
++
++  bool isImms18() const {
++    if (!isImm()) return false;
++    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
++      return isInt<18>(CE->getValue());
++    return true;
++  }
++
++  bool isImmu16() const {
++    if (!isImm()) return false;
++    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
++      return isUInt<16>(CE->getValue());
++    return true;
++  }
++
++  bool isImmu6() const {
++    if (!isImm()) return false;
++    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
++      return isUInt<6>(CE->getValue());
++    return true;
++  }
++
++  bool isImms24() const {
++    if (!isImm()) return false;
++    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
++      return isInt<24>(CE->getValue());
++    return true;
++  }
++
++  bool isWydepos() const {
++    if (!isImm()) return false;
++    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
++      return isUInt<2>(CE->getValue());
++    return true;
++  }
++
++  void addExpr(MCInst &Inst, const MCExpr *Expr) const {
++    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Expr))
++      Inst.addOperand(MCOperand::createImm(CE->getValue()));
++    else
++      Inst.addOperand(MCOperand::createExpr(Expr));
++  }
++
++  void addRegOperands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    Inst.addOperand(MCOperand::createReg(getReg()));
++  }
++
++  void addImms12Operands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    addExpr(Inst, getImm());
++  }
++
++  void addImmu12Operands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    addExpr(Inst, getImm());
++  }
++
++  void addImms18Operands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    addExpr(Inst, getImm());
++  }
++
++  void addImmu16Operands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    addExpr(Inst, getImm());
++  }
++
++  void addImmu6Operands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    addExpr(Inst, getImm());
++  }
++
++  void addImms24Operands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    addExpr(Inst, getImm());
++  }
++
++  void addWydeposOperands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    addExpr(Inst, getImm());
++  }
++
++  void print(raw_ostream &OS, const MCAsmInfo &) const override {
++    switch (Kind) {
++    case Immediate:
++      OS << "Imm: " << *getImm();
++      break;
++    case Token:
++      OS << "Token: " << getToken();
++      break;
++    case Register:
++      OS << "Reg: " << getReg();
++      break;
++    }
++  }
++
++  static std::unique_ptr<DADAOOperand> CreateToken(StringRef Str, SMLoc S) {
++    auto Op = std::make_unique<DADAOOperand>(Token);
++    Op->Tok.Data = Str.data();
++    Op->Tok.Length = Str.size();
++    Op->StartLoc = S;
++    Op->EndLoc = S;
++    return Op;
++  }
++
++  static std::unique_ptr<DADAOOperand> createReg(MCRegister Reg, SMLoc S,
++                                                  SMLoc E) {
++    auto Op = std::make_unique<DADAOOperand>(Register);
++    Op->Reg.RegNum = Reg;
++    Op->StartLoc = S;
++    Op->EndLoc = E;
++    return Op;
++  }
++
++  static std::unique_ptr<DADAOOperand> createImm(const MCExpr *Val, SMLoc S,
++                                                  SMLoc E) {
++    auto Op = std::make_unique<DADAOOperand>(Immediate);
++    Op->Imm.Value = Val;
++    Op->StartLoc = S;
++    Op->EndLoc = E;
++    return Op;
++  }
++};
++
++} // end anonymous namespace
++
++bool DADAOAsmParser::matchAndEmitInstruction(SMLoc IdLoc, unsigned &Opcode,
++                                              OperandVector &Operands,
++                                              MCStreamer &Out,
++                                              uint64_t &ErrorInfo,
++                                              bool MatchingInlineAsm) {
++  MCInst Inst;
++  SMLoc ErrorLoc;
++
++  switch (MatchInstructionImpl(Operands, Inst, ErrorInfo, MatchingInlineAsm)) {
++  case Match_Success:
++    Out.emitInstruction(Inst, STI);
++    Opcode = Inst.getOpcode();
++    return false;
++  case Match_MissingFeature:
++    return Error(IdLoc, "Instruction use requires option to be enabled");
++  case Match_MnemonicFail:
++    return Error(IdLoc, "Unrecognized instruction mnemonic");
++  case Match_InvalidOperand: {
++    ErrorLoc = IdLoc;
++    if (ErrorInfo != ~0U) {
++      if (ErrorInfo >= Operands.size())
++        return Error(IdLoc, "Too few operands for instruction");
++      ErrorLoc = Operands[ErrorInfo]->getStartLoc();
++      if (ErrorLoc == SMLoc())
++        ErrorLoc = IdLoc;
++    }
++    return Error(ErrorLoc, "Invalid operand for instruction");
++  }
++  }
++  llvm_unreachable("Unknown match type detected!");
++}
++
++bool DADAOAsmParser::parseRegister(MCRegister &Reg, SMLoc &StartLoc,
++                                    SMLoc &EndLoc) {
++  const AsmToken &Tok = Parser.getTok();
++  StartLoc = Tok.getLoc();
++  EndLoc = Tok.getEndLoc();
++
++  if (Lexer.getKind() != AsmToken::Identifier)
++    return true;
++
++  MCRegister RegNum = MatchRegisterName(Tok.getIdentifier());
++  if (RegNum == 0)
++    return true;
++
++  Parser.Lex();
++  Reg = RegNum;
++  return false;
++}
++
++ParseStatus DADAOAsmParser::tryParseRegister(MCRegister &Reg, SMLoc &StartLoc,
++                                              SMLoc &EndLoc) {
++  if (!parseRegister(Reg, StartLoc, EndLoc))
++    return ParseStatus::Success;
++  return ParseStatus::NoMatch;
++}
++
++ParseStatus DADAOAsmParser::parseRegister(OperandVector &Operands) {
++  SMLoc S = getLoc();
++  SMLoc E = SMLoc::getFromPointer(Parser.getTok().getLoc().getPointer() - 1);
++
++  if (Lexer.getKind() != AsmToken::Identifier)
++    return ParseStatus::NoMatch;
++
++  MCRegister RegNum = MatchRegisterName(Lexer.getTok().getIdentifier());
++  if (RegNum == 0)
++    return ParseStatus::NoMatch;
++
++  Parser.Lex();
++  Operands.push_back(DADAOOperand::createReg(RegNum, S, E));
++  return ParseStatus::Success;
++}
++
++ParseStatus DADAOAsmParser::parseImmediate(OperandVector &Operands) {
++  SMLoc S = getLoc();
++  SMLoc E = SMLoc::getFromPointer(Parser.getTok().getLoc().getPointer() - 1);
++
++  const MCExpr *Expr;
++  if (Parser.parseExpression(Expr))
++    return ParseStatus::Failure;
++
++  Operands.push_back(DADAOOperand::createImm(Expr, S, E));
++  return ParseStatus::Success;
++}
++
++bool DADAOAsmParser::parseInstruction(ParseInstructionInfo &, StringRef Name,
++                                       SMLoc NameLoc,
++                                       OperandVector &Operands) {
++  Operands.push_back(DADAOOperand::CreateToken(Name, NameLoc));
++
++  if (Lexer.is(AsmToken::EndOfStatement))
++    return false;
++
++  while (true) {
++    if (Lexer.is(AsmToken::EndOfStatement))
++      break;
++
++    ParseStatus Res = parseRegister(Operands);
++    if (!Res.isSuccess())
++      Res = parseImmediate(Operands);
++    if (!Res.isSuccess()) {
++      Error(getLoc(), "unknown operand");
++      return true;
++    }
++
++    if (Lexer.is(AsmToken::EndOfStatement))
++      break;
++
++    if (Lexer.isNot(AsmToken::Comma)) {
++      Error(getLoc(), "expected comma");
++      return true;
++    }
++    Parser.Lex();
++  }
++
++  return false;
++}
++
++#define GET_REGISTER_MATCHER
++#define GET_MATCHER_IMPLEMENTATION
++#include "DADAOGenAsmMatcher.inc"
++
++extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void
++LLVMInitializeDADAOAsmParser() {
++  RegisterMCAsmParser<DADAOAsmParser> X(getTheDADAOTarget());
++}
+diff --git a/llvm/lib/Target/DADAO/CMakeLists.txt b/llvm/lib/Target/DADAO/CMakeLists.txt
+index 22b4303be235..08db6fd37cd6 100644
+--- a/llvm/lib/Target/DADAO/CMakeLists.txt
++++ b/llvm/lib/Target/DADAO/CMakeLists.txt
+@@ -3,11 +3,13 @@ add_llvm_component_group(DADAO)
+ set(LLVM_TARGET_DEFINITIONS DADAO.td)
+ 
+ tablegen(LLVM DADAOGenRegisterInfo.inc -gen-register-info)
++tablegen(LLVM DADAOGenInstrInfo.inc -gen-instr-info)
++tablegen(LLVM DADAOGenAsmMatcher.inc -gen-asm-matcher)
++tablegen(LLVM DADAOGenAsmWriter.inc -gen-asm-writer)
+ 
+ add_public_tablegen_target(DADAOCommonTableGen)
+ 
+-tablegen(LLVM DADAOGenInstrInfo.inc -gen-instr-info)
+-
+ add_llvm_target(DADAOCodeGen
+   DADAORegisterInfo.cpp
+   DADAOTargetMachine.cpp
+@@ -24,5 +26,6 @@ add_llvm_target(DADAOCodeGen
+   DADAO
+   )
+ 
++add_subdirectory(AsmParser)
+ add_subdirectory(MCTargetDesc)
+ add_subdirectory(TargetInfo)
+diff --git a/llvm/lib/Target/DADAO/DADAO.td b/llvm/lib/Target/DADAO/DADAO.td
+index 0bbe4f8174d2..86f36095cdb9 100644
+--- a/llvm/lib/Target/DADAO/DADAO.td
++++ b/llvm/lib/Target/DADAO/DADAO.td
+@@ -19,6 +19,7 @@ include "llvm/Target/Target.td"
+ include "DADAORegisterInfo.td"
+ 
+ def DADAOInstrInfo : InstrInfo;
++defm : RemapAllTargetPseudoPointerOperands<GPRD>;
+ 
+ //===----------------------------------------------------------------------===//
+ // DADAO processors supported.
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt b/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
+index a63416eaed67..7d73a99b2c75 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ add_llvm_component_library(LLVMDADAODesc
+   DADAOInstPrinter.cpp
++  DADAOMCCodeEmitter.cpp
+   DADAOMCTargetDesc.cpp
+   DADAOAsmInfo.cpp
+   DADAOELFObjectWriter.cpp
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
+index 84e9f3f99b07..b64a1b737afc 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
+@@ -5,21 +5,29 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ //===----------------------------------------------------------------------===//
+-//
+-// This class prints a DADAO MCInst to a .s file.
+-//
+-//===----------------------------------------------------------------------===//
+ 
+ #include "DADAOInstPrinter.h"
+ #include "llvm/MC/MCAsmInfo.h"
++#include "llvm/MC/MCExpr.h"
+ #include "llvm/MC/MCInst.h"
++#include "llvm/Support/ErrorHandling.h"
+ #include "llvm/Support/raw_ostream.h"
+ 
+ using namespace llvm;
+ 
++#define DEBUG_TYPE "asm-printer"
++
++#define PRINT_ALIAS_INSTR
++#include "DADAOGenAsmWriter.inc"
++
++void DADAOInstPrinter::printRegName(raw_ostream &OS, MCRegister Reg) {
++  OS << getRegisterName(Reg);
++}
++
+ void DADAOInstPrinter::printInst(const MCInst *MI, uint64_t Address,
+-                                 StringRef Annot, const MCSubtargetInfo &STI,
++                                 StringRef Annot, const MCSubtargetInfo &,
+                                  raw_ostream &O) {
++  printInstruction(MI, Address, O);
+   printAnnotation(O, Annot);
+ }
+ 
+@@ -28,14 +36,14 @@
+ 
+-void DADAOInstPrinter::getMnemonic(const MCInst &MI) const {
+-  return {"<unknown>", 0};
+-}
+-
+-void DADAOInstPrinter::printRegName(raw_ostream &OS, MCRegister Reg) {
+-  OS << "<unknown>";
++void DADAOInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
++                                    raw_ostream &O) {
++  const MCOperand &Op = MI->getOperand(OpNo);
++  if (Op.isReg())
++    printRegName(O, Op.getReg());
++  else if (Op.isImm())
++    O << Op.getImm();
++  else {
++    assert(Op.isExpr() && "Expected an expression");
++    MAI.printExpr(O, *Op.getExpr());
++  }
+ }
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
+index 425c81478a83..c0f1a3e8cfc4 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
+@@ -25,9 +25,18 @@ public:
+ 
+   void printInst(const MCInst *MI, uint64_t Address, StringRef Annot,
+                  const MCSubtargetInfo &STI, raw_ostream &O) override;
++  void printRegName(raw_ostream &OS, MCRegister Reg) override;
++
++  void printOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
++
+   std::pair<const char *, uint64_t>
+   getMnemonic(const MCInst &MI) const override;
+-  void printRegName(raw_ostream &OS, MCRegister Reg) override;
++  void printInstruction(const MCInst *MI, uint64_t Address, raw_ostream &O);
++  bool printAliasInstr(const MCInst *MI, uint64_t Address, raw_ostream &OS);
++  void printCustomAliasOperand(const MCInst *MI, uint64_t Address,
++                               unsigned OpIdx, unsigned PrintMethodIdx,
++                               raw_ostream &O);
++  static const char *getRegisterName(MCRegister Reg);
+ };
+ 
+ } // end namespace llvm
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+new file mode 100644
+index 000000000000..8c62185573ba
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+@@ -0,0 +1,77 @@
++//===-- DADAOMCCodeEmitter.cpp - Convert DADAO code to machine code -------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "DADAOMCTargetDesc.h"
++#include "llvm/MC/MCCodeEmitter.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCFixup.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/MC/MCRegisterInfo.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/EndianStream.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "mccodeemitter"
++
++namespace {
++
++class DADAOMCCodeEmitter : public MCCodeEmitter {
++  DADAOMCCodeEmitter(const DADAOMCCodeEmitter &) = delete;
++  void operator=(const DADAOMCCodeEmitter &) = delete;
++  MCContext &Ctx;
++
++public:
++  DADAOMCCodeEmitter(MCContext &Ctx) : Ctx(Ctx) {}
++
++  ~DADAOMCCodeEmitter() override = default;
++
++  void encodeInstruction(const MCInst &MI, SmallVectorImpl<char> &CB,
++                         SmallVectorImpl<MCFixup> &Fixups,
++                         const MCSubtargetInfo &STI) const override;
++
++  uint64_t getMachineOpValue(const MCInst &MI, const MCOperand &MO,
++                             SmallVectorImpl<MCFixup> &Fixups,
++                             const MCSubtargetInfo &STI) const;
++};
++
++} // end anonymous namespace
++
++void DADAOMCCodeEmitter::encodeInstruction(const MCInst &MI,
++                                           SmallVectorImpl<char> &CB,
++                                           SmallVectorImpl<MCFixup> &Fixups,
++                                           const MCSubtargetInfo &STI) const {
++  // FIXME: Implement once instruction encoding is properly defined
++  (void)Fixups;
++  (void)STI;
++  (void)Ctx;
++  support::endian::write<uint32_t>(CB, 0, llvm::endianness::big);
++}
++
++uint64_t
++DADAOMCCodeEmitter::getMachineOpValue(const MCInst &MI, const MCOperand &MO,
++                                      SmallVectorImpl<MCFixup> &Fixups,
++                                      const MCSubtargetInfo &STI) const {
++  if (MO.isReg())
++    return Ctx.getRegisterInfo()->getEncodingValue(MO.getReg());
++  if (MO.isImm())
++    return static_cast<uint64_t>(MO.getImm());
++  llvm_unreachable("Unhandled expression!");
++  return 0;
++}
++
++MCCodeEmitter *llvm::createDADAOMCCodeEmitter(const MCInstrInfo &,
++                                              MCContext &Ctx) {
++  return new DADAOMCCodeEmitter(Ctx);
++}
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
+index aee8830fe5f8..0ffe732e9426 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
+@@ -65,4 +65,7 @@ LLVMInitializeDADAOTargetMC() {
+ 
+   TargetRegistry::RegisterMCInstPrinter(getTheDADAOTarget(),
+                                         createDADAOMCInstPrinter);
++
++  TargetRegistry::RegisterMCCodeEmitter(getTheDADAOTarget(),
++                                        createDADAOMCCodeEmitter);
+ }
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+index 4fb8a7715650..cc7e3a73ff4e 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+@@ -14,6 +14,7 @@
+ #define LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOMCTARGETDESC_H
+ 
+ #include "llvm/MC/MCTargetOptions.h"
++#include "llvm/Support/Compiler.h"
+ #include "llvm/Support/DataTypes.h"
+ #include <memory>
+ 
+@@ -38,4 +39,11 @@ std::unique_ptr<MCObjectTargetWriter>
+ createDADAOELFObjectWriter(uint8_t OSABI);
+ } // namespace llvm
+ 
++#define GET_REGINFO_ENUM
++#include "DADAOGenRegisterInfo.inc"
++
++#define GET_INSTRINFO_ENUM
++#define GET_INSTRINFO_MC_HELPER_DECLS
++#include "DADAOGenInstrInfo.inc"
++
+ #endif // LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOMCTARGETDESC_H
+-- 
+2.43.0
+

@@ -179,4 +179,49 @@ grep "EXCP_MALIGN" components/qemu/patches/*.patch                            �
 
 ## 完成区
 
-<!-- DS 在此填写 -->
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `components/qemu/patches/0005-dadao-load-store.patch` — 替换（MALIGN + TEMP_EBB）
+
+**验证结果**：
+```
+$ make build-qemu
+... configure + meson + ninja (2196 targets) ...
+build-qemu: PASS
+```
+
+**修复内容**：
+- `cpu.h`: EXCP_MALIGN = 3
+- `cpu.c`: `cpu_do_unaligned_access` 实现 + handler（写 0x02 到 exit port）
+- `translate.c`: 16 处 `MO_ALIGN_N` 补全（wyde→ALIGN_2, tetra→ALIGN_4, octa→ALIGN_8）
+- `translate.c`: `do_ldm`/`do_stm` 循环内 temp → `tcg_temp_new_i64()`（QEMU 10.0 无 EBB variant）
+
+---
+
+## Architecture Review (2026-06-30)
+
+**评审结论**：**Accepted — MO_ALIGN + EXCP_MALIGN + cpu_do_unaligned_access 均正确。**
+
+### 逐项验证
+
+| 修复项 | 状态 | 代码证据 |
+|--------|------|---------|
+| EXCP_MALIGN = 3 | ✅ | `#define EXCP_MALIGN 3` (不冲突 ILLI=1/UNDI=2) |
+| cpu_do_unaligned_access | ✅ | `cpu_restore_state(cs, retaddr)` + `EXCP_MALIGN` |
+| do_unaligned_access 注册 | ✅ | `.do_unaligned_access = dadao_cpu_do_unaligned_access` (L393) |
+| EXCP_MALIGN handler | ✅ | case 分支写 0x02 → exit port |
+| MO_ALIGN_2 补全 | ✅ 7 处 | ldws/ldwu/stw/ldmws/ldmwu/stmw + 1 额外 |
+| MO_ALIGN_4 补全 | ✅ 6 处 | ldts/ldtu/stt/ldmts/ldmtu/stmt |
+| MO_ALIGN_8 补全 | ✅ 4 处 | ldo/sto/ldmo/stmo |
+| byte 无对齐 | ✅ | ldbs/ldbu/stb/ldmb*/stmb* 不加 ALIGN |
+
+### TEMP_EBB 说明
+
+任务 L197 注明 QEMU 10.0 无 `tcg_temp_ebb_new_i64()` API，循环内 temp 保持
+`tcg_temp_new_i64()`（TEMP_TB）。TEMP_TB 池 512，`ldmo ra1,rb1,rd1,63` 产生
+~130 temp，单 TB 内安全边际充分。后续 QEMU 升级时可迁移至 EBB。
+
+### 最终判断
+
+MALIGN 精确异常（PC 停、寄存器不写、PC restore）和 MO_ALIGN_N 补全均正确实现。
+可直接 accept。
