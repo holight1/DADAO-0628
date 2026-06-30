@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift docker-image clean-work lint check-issues check-trans
+.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -75,7 +75,13 @@ validate-vectors:
 docker-image:
 	docker build -t dadao-0628-dev:local containers/dev
 
-lint: check-issues check-trans
+check-qfc:
+	@$(PYTHON) scripts/check_qfc_coverage.py
+
+check-lit-bytes:
+	@$(PYTHON) scripts/check_lit_bytes.py
+
+lint: check-issues check-trans check-qfc check-lit-bytes
 
 check-issues:
 	@$(PYTHON) scripts/check_issues.py

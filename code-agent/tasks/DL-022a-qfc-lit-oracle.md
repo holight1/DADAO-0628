@@ -195,3 +195,89 @@ make lint
 | `Makefile` lint target | 追加 check-qfc + check-lit-bytes |
 | `consistency-coverage-analysis.md §四 O-4/O-5` | 背景与缺口描述 |
 | `scripts/validate_vectors.py` `load_opcodes()` | opcodes.yaml 加载参考实现 |
+
+## 完成区
+
+**状态**：已完成（待 Codex Review）
+**修改文件**：
+- `tests/lit/MC/Dadao/*.s`（13 个）— OBJ 行加 `{{.*}}` spacer
+- `scripts/check_lit_bytes.py` — 新增（69 OBJ patterns OK）
+- `scripts/check_qfc_coverage.py` — 新增（yaml 全在 wiki 内，29 RF/CFX 在 wiki 不在 yaml 属正常）
+- `Makefile` — lint target 追加 check-qfc + check-lit-bytes
+
+**验证**：
+```
+$ make lint
+check-issues: PASS
+check-trans: 87 opcodes, 89 trans functions
+check-qfc: PASS (29 informational, 0 errors)
+check-lit-bytes: 69 patterns OK
+$ llvm-lit tests/lit/MC/Dadao/
+14/14 PASS
+```
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — 三项子任务均正确实现。**
+
+### O-4: QFC 覆盖校验 (check_qfc_coverage.py, 287 行)
+
+**代码级逐函数验证**：
+
+| 函数 | 逻辑 | 状态 |
+|------|------|------|
+| `parse_row_main` | `(int(RRRR,2) << 1) \| int(R,2)` → op[7:3] 5-bit | ✅ 验证 "0001-0"→2, "0001-1"→3 |
+| `parse_col_main` | `int(CCC,2)` → op[2:0] 3-bit | ✅ |
+| `parse_row_sub` | `int(RRR,2)` → ha[5:3] 3-bit | ✅ |
+| `parse_col_sub` | `int(CCC,2)` → ha[2:0] 3-bit | ✅ |
+| `parse_main_table` | 跳过 MISC-Norm/RF/AMO, 其余单元格→(op,None) | ✅ |
+| `parse_sub_table` | 全单元格→(parent_op, ha) | ✅ |
+| 双向比对 | `yaml_set - wiki_all` + `wiki_all - yaml_set` | ✅ |
+
+**运行结果分析**：
+- `0 only in yaml`（opcodes.yaml 全部在 wiki 内 ✅）
+- `29 only in wiki` → 全部为 M1 排除项：
+
+| 范围 | wiki ops | 原因 |
+|------|---------|------|
+| 0x21/23/25 | csn-rf/csz-rf/csp-rf | RF conditional, M1 excluded |
+| 0x52-0x5F | ldt-rf~stmo-rf | RF load/store, M1 excluded |
+| 0x67/0x6F | ldmo-ra/stmo-ra | RA memory, M1 excluded |
+| 0x72-0x77 | cfx2rd/cfxld/trap | CFX/system, M1 excluded |
+| ha=0x31-0x3A | rd2rf/rf2rd/csp1/rd2ra/ra2rd | RF/RA, M1 excluded |
+
+**零误报** ✅
+
+### O-5: Lit 字节 Oracle (check_lit_bytes.py, 45 行)
+
+**代码验证**：
+```python
+obj_pattern = re.compile(r'# OBJ:\s*([0-9a-fA-F]{2})\s+...\s+([0-9a-fA-F]{2})')
+```
+
+- 正则提取 4 个 hex 字节，不关心 `{{.*}}` 后缀 → 兼容 spacer 修改前后 ✅
+- `check_one`: `(word & mask) == value` 与 opcodes.yaml 比对 ✅
+- 69 patterns 全部匹配 → 零误报 ✅
+- 有 WARN → exit(1) / 全 OK → exit(0) ✅
+
+### DL-011c: Lit OBJ Spacer
+
+验证 `rrii_alu.s` L5: `# OBJ: 19 20 00 01{{.*}}addi rd8, rd0, 1` ✅
+全部 13 文件已更新，`llvm-lit` 14/14 PASS ✅
+
+### Makefile 集成
+
+```makefile
+lint: check-issues check-trans check-qfc check-lit-bytes
+```
+- `.PHONY` 含 check-qfc/check-lit-bytes ✅
+- `check-qfc` 指向 `scripts/check_qfc_coverage.py` ✅
+- `check-lit-bytes` 指向 `scripts/check_lit_bytes.py` ✅
+- `make lint` 四子项全通过 ✅
+
+### 最终判断
+
+QFC 双向比对零误报（29 项均为 M1 排除），Lit 字节 69 patterns 全匹配，
+OBJ spacer 更新 13 文件。可 accept。
