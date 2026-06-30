@@ -303,3 +303,14 @@ Lit 源文件（`tests/lit/MC/Dadao/*.s`）中已有 DISASM CHECK 行（13 个�
 - [ ] `components/llvm/patches/series` 包含 `0006-dadao-disassembler.patch`
 - [ ] `make build-mc` PASS 后 `llvm-objdump -d --triple=dadao` 可反汇编编码字节
 - [ ] `llvm-lit tests/lit/MC/Dadao/` 0 failures（14 tests）
+
+---
+
+## 最终状态（2026-06-30）
+
+**Accepted（P0 修复后）**
+
+P0.1 修复：series 补 `0006-dadao-disassembler.patch`（直接修复，1 行）。
+
+P1.1 遗留债（DL-011b）：lit DISASM 更新在 patch 0006 之外；
+后续 DL-011b 将其纳入 0006 或新建 0007 patch，使 lit 更新可随 patch 重现。

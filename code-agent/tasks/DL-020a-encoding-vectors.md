@@ -206,3 +206,14 @@ spec.md §2.6.3 明确规定 `immu6 = 0 → ILLI`。任务 spec L62 明确要求
 
 - [ ] 12 条 rrri encoding 向量的 immu6 从 0 改为 1
 - [ ] `make check` PASS（105 cases → 不变）
+
+---
+
+## 最终状态（2026-06-30）
+
+**Accepted（P0 修复后）**
+
+P0.1 修复：13 条 rrri encoding 向量 immu6=0 → immu6=1（word += 1），
+直接在仓库修正，`make check` PASS（200 cases）。
+
+无遗留阻断问题。
