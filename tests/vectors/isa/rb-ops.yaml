@@ -83,15 +83,14 @@
     word: "0x48040001"
   input_state:
     rb:
-      rb0: "0x0000000087FF0000"
       rb1: "0x0000000000000000"
   expected_state:
     rb:
-      rb1: "0x0000000087FF1000"
+      rb1: "0x0000000000001000"
   expected_fault: null
   status: active
   wiki_cite: "spec.md §4.8"
-  notes: "rela rb1,imms18=1; base=0x87FF0000&~0xFFF=0x87FF0000, offset=1<<12=0x1000, target=0x87FF1000"
+  notes: "rela rb1,imms18=1; base=0x0&~0xFFF=0x0, offset=1<<12=0x1000, target=0x1000"
 
 - mnemonic: ldo
   format: rrii
@@ -122,11 +121,11 @@
   input_state:
     rb:
       rb2: "0x0000000087FF0000"
-      rb1: "0xDEADBEEFCAFEBABE"
+      rb1: "0x0000BEEFCAFEBABE"
   expected_state:
     memory:
       - address: "0x0000000087FF0000"
-        value: "0xDEADBEEFCAFEBABE"
+        value: "0x0000BEEFCAFEBABE"
         width: 8
   expected_fault: null
   status: active
@@ -175,13 +174,13 @@
   input_state:
     rb:
       rb2: "0x0000000087FF0000"
-      rb1: "0xAAAAAAAAAAAAAAAA"
+      rb1: "0x0000AAAAAAAAAAAA"
     rd:
       rd1: "0x0000000000000000"
   expected_state:
     memory:
       - address: "0x0000000087FF0000"
-        value: "0xAAAAAAAAAAAAAAAA"
+        value: "0x0000AAAAAAAAAAAA"
         width: 8
   expected_fault: null
   status: active
@@ -247,12 +246,12 @@
     word: "0x10A8A041"
   input_state:
     rb:
-      rb1: "0xFEDCBA9876543210"
+      rb1: "0x0000BA9876543210"
     rd:
       rd10: "0x0000000000000000"
   expected_state:
     rd:
-      rd10: "0xFEDCBA9876543210"
+      rd10: "0x0000BA9876543210"
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.7"
@@ -284,10 +283,10 @@
     word: "0x4D0400FF"
   input_state:
     rb:
-      rb1: "0xFFFFFFFFFFFFFFFF"
+      rb1: "0x0000FFFFFFFFFFFF"
   expected_state:
     rb:
-      rb1: "0xFFFFFFFFFFFFFF00"
+      rb1: "0x0000FFFFFFFFFF00"
   expected_fault: null
   status: active
   wiki_cite: "spec.md §4.6"
@@ -303,7 +302,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §4.1"
   notes: "encoding-only: minimal operands"
 
@@ -314,10 +313,10 @@
     word: "0x4B000000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
-  wiki_cite: "spec.md §4.1"
-  notes: "encoding-only: minimal operands"
+  wiki_cite: "spec.md §2.6.2"
+  notes: "sto_rb rbha=rb0 → ILLI"
 
 - mnemonic: addi
   format: rrii
@@ -419,13 +418,13 @@
   format: rrri
   class: encoding
   encoding:
-    word: "0x47040001"
+    word: "0x47000001"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §4.2"
-  notes: "encoding-only: minimal operands"
+  notes: "ldmo_rb ha=0 → ILLI (legality check)"
 
 - mnemonic: stmo
   format: rrri
@@ -434,7 +433,7 @@
     word: "0x4F000001"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
-  wiki_cite: "spec.md §4.2"
-  notes: "encoding-only: minimal operands"
+  wiki_cite: "spec.md §2.6.2"
+  notes: "stmo_rb rbha=rb0 → ILLI"

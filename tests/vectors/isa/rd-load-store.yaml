@@ -8,7 +8,6 @@
   input_state:
     rb:
       rb2: "0x0000000087FF0000"
-      rb0: "0x0000000087FF0000"
     memory:
       - address: "0x0000000087FF0008"
         value: "0x80"

@@ -1,4 +1,4 @@
-From 16d8c118b237a049001c36804caef06b779ffb69 Mon Sep 17 00:00:00 2001
+From a1b593aad627867aa50231e033633d4e16202e61 Mon Sep 17 00:00:00 2001
 From: suiyan <suiyan@sunmmio.com>
 Date: Tue, 30 Jun 2026 11:35:42 +0800
 Subject: [PATCH] target/dadao: implement control flow and RB TCG translation
@@ -8,7 +8,7 @@ Subject: [PATCH] target/dadao: implement control flow and RB TCG translation
  1 file changed, 412 insertions(+), 29 deletions(-)
 
 diff --git a/target/dadao/translate.c b/target/dadao/translate.c
-index 79a4a17..8c2cc5c 100644
+index 79a4a17..8d8c2fc 100644
 --- a/target/dadao/translate.c
 +++ b/target/dadao/translate.c
 @@ -91,24 +91,220 @@ static bool trans_##NAME(DisasContext *ctx, arg_##NAME *a) \
@@ -285,7 +285,7 @@ index 79a4a17..8c2cc5c 100644
 +{
 +    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
 +    TCGv_i64 base = tcg_temp_new_i64();
-+    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[0]));
 +    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
 +    tcg_gen_andi_i64(base, base, ~0xFFFULL);
 +    tcg_gen_addi_i64(base, base, (int64_t)a->imm18 << 12);
