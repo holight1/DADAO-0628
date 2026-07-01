@@ -131,7 +131,7 @@ def emit_state_compare(out, expected_state):
         reg_num = int(name.replace('rb', ''))
         val = int(value_str, 16)
         # rb2rd rd30, rb_reg  (copy actual rb value to rd30)
-        w = 0x10A80000 | (30 << 12) | (reg_num << 6) | 0
+        w = 0x10A80000 | (30 << 12) | (reg_num << 6) | 1
         out.extend(struct.pack('>I', w))
         load_reg(out, 'rd', 31, val)
         w = 0x10280000 | (31 << 12) | (31 << 6) | 30
@@ -195,7 +195,7 @@ def emit_state_compare(out, expected_state):
     # Force TB exit by storing to a different page BEFORE patching guard
     load_reg(out, 'rb', 2, 0x80001000)         # rb2 = scratch page
     write_rrii(out, 0x3B, 29, 2, 0)            # sto rd29, rb2, 0  → force TB exit
-    write_rrii(out, 0x3B, 1, 1, 0)             # sto rd1, rb1, 0  → patch guard
+    write_rrii(out, 0x3A, 1, 1, 0)             # stt rd1, rb1, 0  → patch guard (32-bit BE: preserves 4-byte instr encoding)
 
     # Guard instruction (initially swym, patched to unimp on mismatch)
     out.extend(struct.pack('>I', SWYM_ENCODING))
