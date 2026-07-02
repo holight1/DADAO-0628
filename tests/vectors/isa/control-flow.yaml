@@ -1,24 +1,38 @@
 # Control flow test vectors
+# Source: contracts/isa/spec.md §5
 
-- mnemonic: brz
+# TDD DESIGN NOTE（DL-029a — implemented）:
+# 分支语义测试使用 "branch-over-poison" pattern：
+#   [setup]
+#   [branch cond, +1]   ← 若 taken，跳过 poison
+#   [unimp]             ← poison: 若 NOT taken 则 ILLI
+#   [emit_exit(0)]      ← taken 路径：正常退出
+# build_test_binary.py 的 build_branch_test_binary() 实现此 layout。
+# 测试向量字段使用 branch_behavior: taken/not_taken 标记。
+
+# ─── Semantic tests (branch-over-poison pattern) ──────────────────────────
+
+- mnemonic: brn
   format: riii
   class: semantic
   encoding:
-    word: "0x2A040100"
+    word: "0x28040001"
+  branch_behavior: taken
   input_state:
     rd:
-      rd1: "0x0000000000000000"
+      rd1: "0x8000000000000000"
   expected_state: {}
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.1"
-  notes: "brz rd1,imm=256; rd1=0 → taken"
+  notes: "brn rd1,+1; rd1 negative → taken → skip unimp → exit=0"
 
-- mnemonic: brnz
+- mnemonic: brn
   format: riii
   class: semantic
   encoding:
-    word: "0x2B040100"
+    word: "0x28040001"
+  branch_behavior: not_taken
   input_state:
     rd:
       rd1: "0x0000000000000001"
@@ -26,13 +40,164 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.1"
-  notes: "brnz rd1,imm=256; rd1=1 → not taken"
+  notes: "brn rd1,+1; rd1 non-negative → not taken → exit=0"
+
+- mnemonic: brnn
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x29040001"
+  branch_behavior: taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brnn rd1,+1; rd1 non-negative → taken → skip unimp → exit=0"
+
+- mnemonic: brnn
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x29040001"
+  branch_behavior: not_taken
+  input_state:
+    rd:
+      rd1: "0x8000000000000000"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brnn rd1,+1; rd1 negative → not taken → exit=0"
+
+- mnemonic: brz
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x2A040001"
+  branch_behavior: taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000000"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brz rd1,+1; rd1=0 → taken → skip unimp → exit=0"
+
+- mnemonic: brz
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x2A040001"
+  branch_behavior: not_taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brz rd1,+1; rd1 != 0 → not taken → exit=0"
+
+- mnemonic: brnz
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x2B040001"
+  branch_behavior: taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brnz rd1,+1; rd1 != 0 → taken → skip unimp → exit=0"
+
+- mnemonic: brnz
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x2B040001"
+  branch_behavior: not_taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000000"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brnz rd1,+1; rd1=0 → not taken → exit=0"
+
+- mnemonic: brp
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x2C040001"
+  branch_behavior: taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brp rd1,+1; rd1 > 0 → taken → skip unimp → exit=0"
+
+- mnemonic: brp
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x2C040001"
+  branch_behavior: not_taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000000"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brp rd1,+1; rd1=0 → not taken → exit=0"
+
+- mnemonic: brnp
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x2D040001"
+  branch_behavior: taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000000"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brnp rd1,+1; rd1 <= 0 → taken → skip unimp → exit=0"
+
+- mnemonic: brnp
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x2D040001"
+  branch_behavior: not_taken
+  input_state:
+    rd:
+      rd1: "0x0000000000000001"
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.1"
+  notes: "brnp rd1,+1; rd1 > 0 → not taken → exit=0"
 
 - mnemonic: breq
   format: rrii
   class: semantic
   encoding:
-    word: "0x2E042028"
+    word: "0x2E042001"
+  branch_behavior: taken
   input_state:
     rd:
       rd1: "0x000000000000000A"
@@ -41,13 +206,14 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.2"
-  notes: "breq rd1,rd2,imm=40; equal → taken"
+  notes: "breq rd1,rd2,+1; equal → taken → skip unimp → exit=0"
 
-- mnemonic: brne
+- mnemonic: breq
   format: rrii
   class: semantic
   encoding:
-    word: "0x2F042028"
+    word: "0x2E042001"
+  branch_behavior: not_taken
   input_state:
     rd:
       rd1: "0x000000000000000A"
@@ -56,167 +222,65 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.2"
-  notes: "brne rd1,rd2,imm=40; not equal → taken"
+  notes: "breq rd1,rd2,+1; not equal → not taken → exit=0"
 
-# ─── Missing branch variants ──────────────────────────────────────────────────
-
-- mnemonic: brn
-  format: riii
+- mnemonic: brne
+  format: rrii
   class: semantic
   encoding:
-    word: "0x28040100"
+    word: "0x2F042001"
+  branch_behavior: taken
   input_state:
     rd:
-      rd1: "0x8000000000000000"
+      rd1: "0x000000000000000A"
+      rd2: "0x000000000000000B"
   expected_state: {}
   expected_fault: null
   status: active
-  wiki_cite: "spec.md §5.1"
-  notes: "brn rd1,imm=256; rd1 negative → taken"
+  wiki_cite: "spec.md §5.2"
+  notes: "brne rd1,rd2,+1; not equal → taken → skip unimp → exit=0"
 
-- mnemonic: brnn
-  format: riii
+- mnemonic: brne
+  format: rrii
   class: semantic
   encoding:
-    word: "0x29040100"
+    word: "0x2F042001"
+  branch_behavior: not_taken
   input_state:
     rd:
-      rd1: "0x0000000000000001"
+      rd1: "0x000000000000000A"
+      rd2: "0x000000000000000A"
   expected_state: {}
   expected_fault: null
   status: active
-  wiki_cite: "spec.md §5.1"
-  notes: "brnn rd1,imm=256; rd1 non-negative → taken"
-
-- mnemonic: brp
-  format: riii
-  class: semantic
-  encoding:
-    word: "0x2C040100"
-  input_state:
-    rd:
-      rd1: "0x0000000000000001"
-  expected_state: {}
-  expected_fault: null
-  status: active
-  wiki_cite: "spec.md §5.1"
-  notes: "brp rd1,imm=256; rd1 positive → taken"
-
-- mnemonic: brnp
-  format: riii
-  class: semantic
-  encoding:
-    word: "0x2D040100"
-  input_state:
-    rd:
-      rd1: "0x8000000000000000"
-  expected_state: {}
-  expected_fault: null
-  status: active
-  wiki_cite: "spec.md §5.1"
-  notes: "brnp rd1,imm=256; rd1 non-positive (neg) → taken"
+  wiki_cite: "spec.md §5.2"
+  notes: "brne rd1,rd2,+1; equal → not taken → exit=0"
 
 - mnemonic: jump
   format: iiii
   class: semantic
   encoding:
-    word: "0x64000100"
+    word: "0x64000001"
+  branch_behavior: taken
   input_state: {}
   expected_state: {}
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.3"
-  notes: "jump imm=256 (1024 bytes); PC-relative"
+  notes: "jump_i imm=+1; unconditional → skip unimp → exit=0"
 
 - mnemonic: jump
   format: rrii
   class: semantic
   encoding:
     word: "0x65042000"
-  input_state:
-    rb:
-      rb1: "0x0000000000100000"
-    rd:
-      rd2: "0x0000000000000100"
-  expected_state: {}
-  expected_fault: null
-  status: active
-  wiki_cite: "spec.md §5.3"
-  notes: "jump rb1,rd2,0; absolute jump: rb1+rd2"
-
-- mnemonic: call
-  format: iiii
-  class: semantic
-  encoding:
-    word: "0x6C000100"
+  branch_behavior: taken
   input_state: {}
   expected_state: {}
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.3"
-  notes: "call imm=256; PC-relative, pushes RA"
-
-- mnemonic: call
-  format: rrii
-  class: semantic
-  encoding:
-    word: "0x6D042000"
-  input_state:
-    rb:
-      rb1: "0x0000000000100000"
-    rd:
-      rd2: "0x0000000000000100"
-  expected_state: {}
-  expected_fault: null
-  status: active
-  wiki_cite: "spec.md §5.3"
-  notes: "call rb1,rd2,0; absolute call"
-
-- mnemonic: ret
-  format: riii
-  class: semantic
-  encoding:
-    word: "0x6E040000"
-  input_state:
-    rd:
-      rd1: "0x0000000000000000"
-  expected_state:
-    rd:
-      rd1: "0x0000000000000000"
-  expected_fault: null
-  status: active
-  wiki_cite: "spec.md §5.5"
-  notes: "ret rd1,0; return value=0"
-
-- mnemonic: ret
-  format: riii
-  class: semantic
-  encoding:
-    word: "0x6E042000"
-  input_state:
-    rd:
-      rd1: "0x0000000000000000"
-  expected_state:
-    rd:
-      rd1: "0x0000000000002000"
-  expected_fault: null
-  status: active
-  wiki_cite: "spec.md §5.5"
-  notes: "ret rd1,0x2000; return value=0x2000"
-
-- mnemonic: brz
-  format: riii
-  class: boundary
-  encoding:
-    word: "0x2A000000"
-  input_state:
-    rd:
-      rd0: "0x0000000000000000"
-  expected_state: {}
-  expected_fault: null
-  status: active
-  wiki_cite: "spec.md §5.1"
-  notes: "brz rd0,0; rd0 always zero → taken"
+  notes: "jump_r rb1,rd2,0; rb1=base rd2=offset → skip unimp → exit=0"
 
 # ─── Encoding-only vectors ─────────────────────────────────────────────────────
 
@@ -230,7 +294,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: ha=0, imm=0 (branch to next instruction)"
 
 - mnemonic: brnn
   format: riii
@@ -242,7 +306,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: ha=0, imm=0"
 
 - mnemonic: brz
   format: riii
@@ -254,7 +318,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: ha=0, imm=0"
 
 - mnemonic: brnz
   format: riii
@@ -266,7 +330,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: ha=0, imm=0"
 
 - mnemonic: brp
   format: riii
@@ -278,7 +342,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: ha=0, imm=0"
 
 - mnemonic: brnp
   format: riii
@@ -290,7 +354,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: ha=0, imm=0"
 
 - mnemonic: breq
   format: rrii
@@ -302,7 +366,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.2"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: ha=0, hb=0, imm=0"
 
 - mnemonic: brne
   format: rrii
@@ -314,7 +378,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.2"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: ha=0, hb=0, imm=0"
 
 - mnemonic: jump
   format: iiii
@@ -326,7 +390,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: imm=0 (jump to next instruction)"
 
 - mnemonic: jump
   format: rrii
@@ -335,10 +399,10 @@
     word: "0x65000000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §5.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb0=0 → addr=0 → halt rd0 → ILLI"
 
 - mnemonic: call
   format: iiii
@@ -350,7 +414,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §5.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: imm=0 (call to next instruction)"
 
 - mnemonic: call
   format: rrii
@@ -359,10 +423,10 @@
     word: "0x6D000000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §5.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb0=0 → addr=0 → halt rd0 → ILLI"
 
 - mnemonic: ret
   format: riii
@@ -371,7 +435,45 @@
     word: "0x6E040000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §5.5"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: RA stack cold=0 → jump to addr=0 → halt rd0 → ILLI"
+
+# ─── Legality test stubs ────────────────────────────────────────────────────────
+
+- mnemonic: jump
+  format: rrii
+  class: legality
+  encoding:
+    word: "0x65000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §5.3"
+  notes: "jump_r rb0,rd0,0; addr=0 → halt rd0 → ILLI"
+
+- mnemonic: call
+  format: rrii
+  class: legality
+  encoding:
+    word: "0x6D000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §5.3"
+  notes: "call_r rb0,rd0,0; addr=0 → halt rd0 → ILLI"
+
+- mnemonic: ret
+  format: riii
+  class: legality
+  encoding:
+    word: "0x6E000000"
+  input_state: {}
+  expected_state: null
+  expected_fault: ILLI
+  status: active
+  wiki_cite: "spec.md §5.5"
+  notes: "ret rd0,0; RA=0 → jump to addr=0 → halt rd0 → ILLI"

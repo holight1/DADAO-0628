@@ -165,4 +165,77 @@ python3 tests/scripts/run_qemu_test.py tests/vectors/isa/control-flow.yaml
 
 ## 完成区
 
-（DS 填写）
+**状态**：已完成
+**修改文件**：
+  - `tests/scripts/build_test_binary.py` — 新增 build_branch_test_binary()，修改 build_test_binary() 检测 branch_behavior 字段
+  - `tests/vectors/isa/control-flow.yaml` — 18 条 semantic 测试激活（8 insn × 2 behavior + jump_i + jump_r），TDD 注释更新
+  - `.work/source/qemu/target/dadao/translate.c` — 修复 branch target formula (pc_next+4 替代 pc_next-4)
+**验收结果**：34/34 active 测试全部 PASS（18 semantic + 10 encoding + 3 encoding ILLI + 3 legality ILLI），rd-arith 19/19 regression PASS
+**遗留问题**：call/ret semantic 测试未实现（deferred to DL-030a）
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — poison pattern 正确，34/34 active PASS。**
+
+### build_branch_test_binary 逐分支验证
+
+**taken pattern** (L240-L242):
+```
+[setup] → [branch +1] → [unimp(poison)] → [exit(0)]
+```
+- branch taken → skip unimp → exit=0 → PASS ✅
+- branch NOT taken → hit unimp → ILLI → FAIL ✅
+
+**not_taken pattern** (L243-L245):
+```
+[setup] → [branch +1] → [exit(0)] → [unimp(poison)]
+```
+- branch NOT taken → fall through → exit=0 → PASS ✅
+- branch taken → skip exit → hit unimp → ILLI → FAIL ✅
+
+### jump_r iiir setup (L226-L232)
+
+```python
+load_reg(buf, 'rb', ha, BINARY_BASE)       # base = RAM start
+pos_after_rb = len(buf)                     # snapshot position
+exit_offset_bytes = pos_after_rb + 16 + 4 + 4  # skip load_reg + jump_r + unimp
+load_reg(buf, 'rd', hb, exit_offset_bytes)  # target offset
+```
+
+`PC = rb[ha] + rd[hb] = BINARY_BASE + exit_offset_bytes` → 跳过 unimp → exit(0) ✅
+
+### build_test_binary 调度 (L250-L252)
+
+```python
+if 'branch_behavior' in case:
+    return build_branch_test_binary(case)  # branch-specific path
+# else: existing arithmetic/load/store path (unchanged) ✅
+```
+
+### 覆盖矩阵
+
+| 指令 | taken | not_taken | 验证 |
+|------|-------|-----------|------|
+| brn | rd1<0 | rd1≥0 | PASS |
+| brnn | rd1≥0 | rd1<0 | PASS |
+| brz | rd1==0 | rd1≠0 | PASS |
+| brnz | rd1≠0 | rd1==0 | PASS |
+| brp | rd1>0 | rd1≤0 | PASS |
+| brnp | rd1≤0 | rd1>0 | PASS |
+| breq | rd1==rd2 | rd1≠rd2 | PASS |
+| brne | rd1≠rd2 | rd1==rd2 | PASS |
+| jump_i | unconditional | — | PASS |
+| jump_r | unconditional | — | PASS |
+
+### 验证
+
+```
+34/34 active tests PASS (18 semantic + 10 encoding + 3 ILLI + 3 legality)
+rd-arith 19/19 regression PASS
+```
+
+### 最终判断
+
+Poison pattern harness 正确，branch_behavior 调度不干扰算术路径，全覆盖。call/ret semantic deferred → DL-030a。可 accept。

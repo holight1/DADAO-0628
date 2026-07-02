@@ -204,7 +204,53 @@ def emit_state_compare(out, expected_state):
     emit_exit(out, 0)
 
 
+def build_branch_test_binary(case):
+    """Build binary for branch/jump semantic tests using poison pattern.
+
+    taken pattern:
+        [setup] [branch/jump +1] [unimp] [exit(0)]
+        Branch/jump taken → skips unimp → exit=0 → PASS
+        NOT taken → hits unimp → ILLI → FAIL
+
+    not_taken pattern:
+        [setup] [branch +1] [exit(0)] [unimp]
+        Branch NOT taken → fall through → exit=0 → PASS
+        Taken → skips exit → hits unimp → ILLI → FAIL
+    """
+    buf = bytearray()
+    mnemonic = case['mnemonic']
+    fmt = case['format']
+    behavior = case['branch_behavior']
+    word = int(case['encoding']['word'], 16)
+
+    if mnemonic == 'jump' and fmt == 'rrii':
+        ha = (word >> 18) & 0x3F
+        hb = (word >> 12) & 0x3F
+        load_reg(buf, 'rb', ha, BINARY_BASE)
+        pos_after_rb = len(buf)
+        exit_offset_bytes = pos_after_rb + 16 + 4 + 4
+        load_reg(buf, 'rd', hb, exit_offset_bytes)
+    elif mnemonic == 'jump' and fmt == 'iiii':
+        pass
+    else:
+        emit_register_loader(buf, case)
+
+    buf.extend(struct.pack('>I', word))
+
+    if behavior == 'taken':
+        buf.extend(struct.pack('>I', UNIMP_ENCODING))
+        emit_exit(buf, 0)
+    else:
+        emit_exit(buf, 0)
+        buf.extend(struct.pack('>I', UNIMP_ENCODING))
+
+    return bytes(buf)
+
+
 def build_test_binary(case):
+    if 'branch_behavior' in case:
+        return build_branch_test_binary(case)
+
     buf = bytearray()
 
     emit_register_loader(buf, case)

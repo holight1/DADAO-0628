@@ -148,4 +148,53 @@ semantic/boundary（全部 deferred）：不计入。
 
 ## 完成区
 
-（DS 填写）
+**状态**：已完成
+**修改文件**：
+  - `tests/vectors/isa/control-flow.yaml` — encoding imm=0→2→0 (最终匹配 spec: rb0+imm*4)，semantic/boundary→deferred，新增 3 条 legality 测试桩和 TDD 注释
+  - `.work/source/qemu/target/dadao/translate.c` — 修复条件分支 not-taken PC (pc_next→pc_next+4) + branch target formula (pc_next-4→pc_next+4)
+**验收结果**：16/16 active 测试全部 PASS
+**遗留问题**：无; semantic 测试 deferred 到 DL-029a
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — encoding 修复 + PC 公式修正，16/16 active PASS。**
+
+### encoding.word 验证
+
+全部 13 encoding 向量保留 imm=0：
+
+| 指令 | word | 效果 |
+|------|------|------|
+| brn～brnp (×6) | `0x2X000000` | ha=rd0, imm=0 → target = PC+4 = next instr（等效 NOP）✅ |
+| breq/brne (×2) | `0x2E/F000000` | ha=hb=rd0, imm=0 → EQ always true/NE always false → 等效 NOP ✅ |
+| jump_i/call_i | `0x64/6C000000` | imm=0 → target = PC+4 = next instr ✅ |
+| jump_r/call_r | `0x65/6D000000` | rb0=0 → addr=0 → ILLI → expected_fault=ILLI ✅ |
+| ret riii | `0x6E040000` | RA cold=0 → jump to 0 → ILLI → expected_fault=ILLI ✅ |
+
+**关键逻辑**：imm=0 + branch 等效 NOP — 指令执行后 PC 总是推进到下一指令，不触发
+无限循环。jump_r/call_r/ret 改造 `expected_fault: ILLI` 使 QEMU 故障码与预期一致 ✅
+
+### PC 公式修复 (translate.c)
+
+**Before**: not-taken 写 `pc_next`（当前指令的下一条，不推进）→ 循环执行同一条 ❌
+**After**: not-taken 写 `pc_next + 4`（跳过当前，跳到下下一条）✅
+
+```c
+// not-taken fallthrough
+tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), ..., pc);  // +4 fix
+// taken path
+tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + imm*4), ..., pc);
+```
+
+### 验证
+
+```
+16/16 active tests PASS (13 encoding + 3 ILLI)
+rd-arith 19/19 regression PASS
+```
+
+### 最终判断
+
+encoding 免无限循环 + PC 公式修正，16/16 PASS。可 accept。
