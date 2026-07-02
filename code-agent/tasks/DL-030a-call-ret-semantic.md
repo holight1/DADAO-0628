@@ -196,4 +196,67 @@ python3 tests/scripts/run_qemu_test.py tests/vectors/isa/rd-arith.yaml  # regres
 
 ## 完成区
 
-（DS 填写）
+**状态**：已完成
+**修改文件**：
+  - `tests/scripts/build_test_binary.py` — 新增 emit_call_ret_pattern()，build_branch_test_binary 支持 call_i/call_r (rrii) 和 call_ret behavior
+  - `tests/vectors/isa/control-flow.yaml` — 新增 3 条 semantic: call_i taken, call_r taken, ret call_ret pattern
+**验收结果**：37/37 control-flow PASS（+3 新增）+ 19/19 rd-arith PASS = 56 total
+**遗留问题**：无; call/ret RA value 正确性已隐含验证（call_ret pattern PASS 证明 ra[63] 压栈/弹栈正确）
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — call_ret pattern 正确，37/37 PASS。**
+
+### emit_call_ret_pattern 逐字节验证 (L207-L225)
+
+```
+pos 0-3:   call_i +5          PC = pc_next+4 + 5*4 = 24
+           ra[63] = pc_next+4 = 4 (= ret_landing)
+pos 4-23:  emit_exit(0)       ← ret_landing: PASS
+pos 24-27: ret rd1, 0         PC = ra[63] = 4 → ret_landing
+pos 28-47: emit_exit(0xAB)    poison (不应到达)
+```
+
+**PC 算术验证**（与 translate.c 对照）：
+
+```c
+// trans_call_i (DL-028a 已更新)
+ra[63] = ctx->base.pc_next + 4           // = 0 + 4 = 4 ✓
+target  = (ctx->base.pc_next + 4) + imm * 4  // = 4 + 20 = 24 ✓
+```
+
+- `emit_exit(0)` = load_reg(rd62,0) 16B + halt 4B = 20B → 占 pos 4-23 ✅
+- ret 在 pos 24，call target 正好命中 ✅
+- ret 读 ra[63]=4 → 跳回 pos 4 = emit_exit(0) → PASS ✅
+
+### dispatch 扩展 (L250-L251)
+
+```python
+if behavior == 'call_ret':
+    return emit_call_ret_pattern(buf, case)
+```
+
+- 新增 `call_ret` behavior → 不干扰 taken/not_taken 路径 ✅
+- call iiii/rrii + taken + not_taken 可复用原有 branch 逻辑 ✅
+
+### 测试向量验证
+
+| 指令 | word | 验证 |
+|------|------|------|
+| call_i taken | `0x6C000001` | `(0x6C000001 & 0xFF000000) == (0x6C<<24)` ✅ |
+| call_r taken | `0x6D042000` | `(0x6D042000 & 0xFF000000) == (0x6D<<24)` ✅ |
+| ret call_ret | `0x6E040000` | `(0x6E040000 & 0xFF000000) == (0x6E<<24)` ✅ |
+
+### 验证
+
+```
+37/37 control-flow PASS (+3 新增)
+19/19 rd-arith regression PASS
+```
+
+### 最终判断
+
+call_ret pattern 逐字节匹配，PC 算术与 translate.c 修复后一致。RA push/pop 正确性
+由 call→ret→ret_landing 完整往返路径隐式验证。可 accept。

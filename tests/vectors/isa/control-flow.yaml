@@ -282,6 +282,45 @@
   wiki_cite: "spec.md §5.3"
   notes: "jump_r rb1,rd2,0; rb1=base rd2=offset → skip unimp → exit=0"
 
+- mnemonic: call
+  format: iiii
+  class: semantic
+  encoding:
+    word: "0x6C000001"
+  branch_behavior: taken
+  input_state: {}
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.4"
+  notes: "call_i imm=+1; target=PC+8; skip unimp → exit=0"
+
+- mnemonic: call
+  format: rrii
+  class: semantic
+  encoding:
+    word: "0x6D042000"
+  branch_behavior: taken
+  input_state: {}
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.4"
+  notes: "call_r rb1,rd2,0; rb1=base rd2=offset → skip unimp → exit=0"
+
+- mnemonic: ret
+  format: riii
+  class: semantic
+  encoding:
+    word: "0x6E040000"
+  branch_behavior: call_ret
+  input_state: {}
+  expected_state: {}
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §5.5"
+  notes: "call_i+ret pattern; ra[63] by call, ret跳回 → exit=0"
+
 # ─── Encoding-only vectors ─────────────────────────────────────────────────────
 
 - mnemonic: brn

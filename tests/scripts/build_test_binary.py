@@ -204,18 +204,42 @@ def emit_state_compare(out, expected_state):
     emit_exit(out, 0)
 
 
+def emit_call_ret_pattern(buf, case):
+    """Build binary for call+ret semantic test.
+
+    Layout:
+      [call_i +5]           call subroutine (target after ret_landing)
+      [ret_landing:]        ret returns here
+        emit_exit(0)        20 bytes → PASS
+      [subr:]
+        ret rd1, 0           4 bytes → jump back to ra[63] (=ret_landing)
+      emit_exit(0xAB)      poison: should never reach here
+    """
+    call_pos = len(buf)
+    word = (0x6C << 24) | 5
+    buf.extend(struct.pack('>I', word))
+    emit_exit(buf, 0)
+    word = int(case['encoding']['word'], 16)
+    buf.extend(struct.pack('>I', word))
+    emit_exit(buf, 0xAB)
+    return bytes(buf)
+
+
 def build_branch_test_binary(case):
     """Build binary for branch/jump semantic tests using poison pattern.
 
     taken pattern:
         [setup] [branch/jump +1] [unimp] [exit(0)]
-        Branch/jump taken → skips unimp → exit=0 → PASS
-        NOT taken → hits unimp → ILLI → FAIL
+        Branch/jump taken -> skips unimp -> exit=0 -> PASS
+        NOT taken -> hits unimp -> ILLI -> FAIL
 
     not_taken pattern:
         [setup] [branch +1] [exit(0)] [unimp]
-        Branch NOT taken → fall through → exit=0 → PASS
-        Taken → skips exit → hits unimp → ILLI → FAIL
+        Branch NOT taken -> fall through -> exit=0 -> PASS
+        Taken -> skips exit -> hits unimp -> ILLI -> FAIL
+
+    call_ret pattern:
+        [call_i +5] [emit_exit(0)] [ret rd1,0] [emit_exit(0xAB)]
     """
     buf = bytearray()
     mnemonic = case['mnemonic']
@@ -223,14 +247,17 @@ def build_branch_test_binary(case):
     behavior = case['branch_behavior']
     word = int(case['encoding']['word'], 16)
 
-    if mnemonic == 'jump' and fmt == 'rrii':
+    if behavior == 'call_ret':
+        return emit_call_ret_pattern(buf, case)
+
+    if (mnemonic == 'jump' or mnemonic == 'call') and fmt == 'rrii':
         ha = (word >> 18) & 0x3F
         hb = (word >> 12) & 0x3F
         load_reg(buf, 'rb', ha, BINARY_BASE)
         pos_after_rb = len(buf)
         exit_offset_bytes = pos_after_rb + 16 + 4 + 4
         load_reg(buf, 'rd', hb, exit_offset_bytes)
-    elif mnemonic == 'jump' and fmt == 'iiii':
+    elif (mnemonic == 'jump' or mnemonic == 'call') and fmt == 'iiii':
         pass
     else:
         emit_register_loader(buf, case)

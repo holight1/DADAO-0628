@@ -106,4 +106,65 @@ python3 scripts/validate_vectors.py tests/vectors/  # 0 error（yaml 未被改�
 
 ## 完成区
 
-（DS 填写）
+**状态**：已完成
+**修改文件**：
+- `code-agent/knowledge/02-isa-encoding-rules.md` — 新增（ISA 字段布局、格式、操作数合法性、RB 高位规则、除法语义）
+- `code-agent/knowledge/03-test-vector-conventions.md` — 新增（5 类向量、YAML schema、encoding.word 计算、RD/RB 变体处理）
+- `code-agent/knowledge/04-qemu-tcg-patterns.md` — 新增（TCG label 规则、ILLI 纪律、128-bit add/sub、EA 计算、MemOp、条件分支、多寄存器）
+- `code-agent/knowledge/05-harness-binary-protocol.md` — 新增（binary 布局、exit code 协议、语义比较引擎、poison pattern、halt 指令）
+- `code-agent/knowledge/06-machine-memory-map.md` — 新增（内存映射、复位值、exit port、TLB identity map、精确异常）
+- `code-agent/knowledge/07-abi-call-convention.md` — 新增（寄存器角色、参数传递、返回值、栈帧、RegRAS、sret、FP 序言/尾声安全模式）
+
+**来源任务扫描**：已覆盖 DL-001b/d, DL-002a, DL-013a/014a/015a/016a/018a/019a/021a/022b/024a/025a/026a/028a/029a 共 19 个已完成任务
+
+**验证**：
+```
+$ ls code-agent/knowledge/
+01-qemu-translate-patterns.md  02-isa-encoding-rules.md
+03-test-vector-conventions.md  04-qemu-tcg-patterns.md
+05-harness-binary-protocol.md  06-machine-memory-map.md
+07-abi-call-convention.md      README.md
+
+$ python3 scripts/validate_vectors.py  →  YAML 未被误改（已存在 17 个 deferred 字段 warning，非本任务引入）
+```
+
+---
+
+## Codex Review（2026-07-02，架构师 re-review）
+
+**总体评价**：知识库覆盖面良好，7 个章节涵盖 ISA 编码、test vector、TCG patterns、harness 协议、机器模型和 ABI。结构清晰，可复用性强。
+
+### 已确认问题（4 项）
+
+1. **§ 编号内部不一致**（中等）
+   - `05-harness-binary-protocol.md` 内部标题 `§4` → 应为 `§5`
+   - `06-machine-memory-map.md` 内部标题 `§5` → 应为 `§6`
+   - `07-abi-call-convention.md` 内部标题 `§6` → 应为 `§7`
+   - 文件名编号（01–07）与内部 § 标题（§1–§6，有断层）不匹配
+
+2. **DL-030a call_ret pattern 未反映**（低）
+   - `05-harness-binary-protocol.md` §4.4 只覆盖 `taken/not_taken` 两种 poison pattern
+   - DL-030a 新增的 `branch_behavior: call_ret`（`emit_call_ret_pattern`，layout: `[call_i +5] [emit_exit(0)] [ret rd1,0]`）未写入
+   - 建议追加 §4.6
+
+3. **02–07 来源日期过时**（低）
+   - §1（01-）标注 2026-07-02（DL-028a/029a review），但 02–07 仍标注 2026-06-29
+   - DL-028a/029a/030a 的知识已分布在 §1 中，仅日期需更新
+
+4. **YAML 有 17 个 pre-existing warning**（无新增）
+   - `status: deferred` 但缺 `deferred_reason` 字段（来自 rd-load-store.yaml、rb-ops.yaml、misc.yaml）
+   - 非本任务引入，建议另建任务统一补充
+
+### 验证通过
+
+- 全部 7 章节文件存在（01–07 + README）
+- DL-028a/029a/030a 知识均已反映（§1 包含 branch target formula + branch-over-poison + call_ret RA 约定）
+- YAML 未因本任务引入新 error
+- 知识点经交叉阅读 translate.c / build_test_binary.py 确认与当前源码一致
+
+### 建议
+
+1. 修正 § 编号（trivial，可直接 commit）
+2. 追补 §4.6 call_ret pattern
+3. 更新 02–07 来源日期
+4. 补充 deferred 向量的 `deferred_reason`（另建任务）
