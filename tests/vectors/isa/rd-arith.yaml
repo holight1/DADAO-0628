@@ -103,9 +103,9 @@
       rd3: "0x0000000000000001"
       rd4: "0x0000000000000004"
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.7"
-  notes: "divs rd3,rd4,rd1,rd2; 17÷4=4 rem 1 (trunc-toward-zero) — deferred: TCG label bug DL-026a"
+  notes: "divs rd3,rd4,rd1,rd2; 17÷4=4 rem 1 (trunc-toward-zero)"
 
 - mnemonic: divs
   format: rrrr
@@ -136,9 +136,9 @@
       rd3: "0x0000000000000001"
       rd4: "0x0000000000000004"
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.7"
-  notes: "divu rd3,rd4,rd1,rd2; 17÷4=4 rem 1 — deferred: TCG label bug DL-026a"
+  notes: "divu rd3,rd4,rd1,rd2; 17÷4=4 rem 1"
 
 - mnemonic: addi
   format: rrii
@@ -275,10 +275,10 @@
     word: "0x1E042000"
   input_state: {}
   expected_state: null
-  expected_fault: null
-  status: deferred
+  expected_fault: ILLI
+  status: active
   wiki_cite: "spec.md §3.7"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: minimal operands (div-by-zero → ILLI)"
 
 - mnemonic: divu
   format: rrrr
@@ -287,7 +287,7 @@
     word: "0x1F042000"
   input_state: {}
   expected_state: null
-  expected_fault: null
-  status: deferred
+  expected_fault: ILLI
+  status: active
   wiki_cite: "spec.md §3.7"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: minimal operands (div-by-zero → ILLI)"
