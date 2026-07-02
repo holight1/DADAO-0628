@@ -5,3 +5,5 @@
 0004-dadao-rd-arith.patch
 0005-dadao-load-store.patch
 0006-dadao-ctrl-flow.patch
+0007-dadao-branch-call-fix.patch
+0008-dadao-fix-helper-exit.patch

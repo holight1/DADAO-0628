@@ -1,0 +1,2 @@
+// RUN: %binbuilder smoke_jump %t.bin
+// RUN: %python %S/../../scripts/run_e2e.py %qemu %trampoline %t.bin

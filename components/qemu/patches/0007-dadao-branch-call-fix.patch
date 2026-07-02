@@ -1,0 +1,163 @@
+From e6e9df7af65225e3bbd8c247321caf9ac64735ac Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 2 Jul 2026 19:54:56 +0800
+Subject: [PATCH] target/dadao: DL-028a/030a branch PC formula + call RA fix
+
+- Conditional branches (brz/brnz/brn/brnn/brp/brnp/breq/brne):
+  not-taken: pc_next -> pc_next+4 (was re-executing branch)
+  taken: pc_next-4+imm*4 -> pc_next+4+imm*4 (DADAO offset from PC+4)
+- call_i/call_r: ra[63] = pc_next -> pc_next+4 (return after call)
+
+Validated: 137/137 test vectors PASS
+---
+ target/dadao/translate.c | 40 ++++++++++++++++++++--------------------
+ 1 file changed, 20 insertions(+), 20 deletions(-)
+
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 165752f..adf68b3 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -194,11 +194,11 @@ static bool trans_brz(DisasContext *ctx, arg_brz *a)
+     TCGv_i64 cond = load_rd(ctx, a->ha);
+     TCGLabel *taken = gen_new_label();
+     tcg_gen_brcondi_i64(TCG_COND_EQ, cond, 0, taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, pc));
+     TCGLabel *done = gen_new_label();
+     tcg_gen_br(done);
+     gen_set_label(taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
+     gen_set_label(done);
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -209,11 +209,11 @@ static bool trans_brnz(DisasContext *ctx, arg_brnz *a)
+     TCGv_i64 cond = load_rd(ctx, a->ha);
+     TCGLabel *taken = gen_new_label();
+     tcg_gen_brcondi_i64(TCG_COND_NE, cond, 0, taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, pc));
+     TCGLabel *done = gen_new_label();
+     tcg_gen_br(done);
+     gen_set_label(taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
+     gen_set_label(done);
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -224,11 +224,11 @@ static bool trans_brn(DisasContext *ctx, arg_brn *a)
+     TCGv_i64 cond = load_rd(ctx, a->ha);
+     TCGLabel *taken = gen_new_label();
+     tcg_gen_brcondi_i64(TCG_COND_LT, cond, 0, taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, pc));
+     TCGLabel *done = gen_new_label();
+     tcg_gen_br(done);
+     gen_set_label(taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
+     gen_set_label(done);
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -239,11 +239,11 @@ static bool trans_brnn(DisasContext *ctx, arg_brnn *a)
+     TCGv_i64 cond = load_rd(ctx, a->ha);
+     TCGLabel *taken = gen_new_label();
+     tcg_gen_brcondi_i64(TCG_COND_GE, cond, 0, taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, pc));
+     TCGLabel *done = gen_new_label();
+     tcg_gen_br(done);
+     gen_set_label(taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
+     gen_set_label(done);
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -254,11 +254,11 @@ static bool trans_brp(DisasContext *ctx, arg_brp *a)
+     TCGv_i64 cond = load_rd(ctx, a->ha);
+     TCGLabel *taken = gen_new_label();
+     tcg_gen_brcondi_i64(TCG_COND_GT, cond, 0, taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, pc));
+     TCGLabel *done = gen_new_label();
+     tcg_gen_br(done);
+     gen_set_label(taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
+     gen_set_label(done);
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -269,11 +269,11 @@ static bool trans_brnp(DisasContext *ctx, arg_brnp *a)
+     TCGv_i64 cond = load_rd(ctx, a->ha);
+     TCGLabel *taken = gen_new_label();
+     tcg_gen_brcondi_i64(TCG_COND_LE, cond, 0, taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, pc));
+     TCGLabel *done = gen_new_label();
+     tcg_gen_br(done);
+     gen_set_label(taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + (int64_t)a->imm18 * 4), tcg_env, offsetof(CPUDADAOState, pc));
+     gen_set_label(done);
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -285,11 +285,11 @@ static bool trans_breq(DisasContext *ctx, arg_breq *a)
+     TCGv_i64 v2 = load_rd(ctx, a->hb);
+     TCGLabel *taken = gen_new_label();
+     tcg_gen_brcond_i64(TCG_COND_EQ, v1, v2, taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, pc));
+     TCGLabel *done = gen_new_label();
+     tcg_gen_br(done);
+     gen_set_label(taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm12 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + (int64_t)a->imm12 * 4), tcg_env, offsetof(CPUDADAOState, pc));
+     gen_set_label(done);
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -301,11 +301,11 @@ static bool trans_brne(DisasContext *ctx, arg_brne *a)
+     TCGv_i64 v2 = load_rd(ctx, a->hb);
+     TCGLabel *taken = gen_new_label();
+     tcg_gen_brcond_i64(TCG_COND_NE, v1, v2, taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, pc));
+     TCGLabel *done = gen_new_label();
+     tcg_gen_br(done);
+     gen_set_label(taken);
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next - 4 + (int64_t)a->imm12 * 4), tcg_env, offsetof(CPUDADAOState, pc));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4 + (int64_t)a->imm12 * 4), tcg_env, offsetof(CPUDADAOState, pc));
+     gen_set_label(done);
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -700,7 +700,7 @@ static bool trans_stmo_rb(DisasContext *ctx, arg_stmo_rb *a)
+ 
+ static bool trans_jump_i(DisasContext *ctx, arg_jump_i *a)
+ {
+-    uint64_t target = (ctx->base.pc_next - 4) + (int64_t)a->imm24 * 4;
++    uint64_t target = (ctx->base.pc_next + 4) + (int64_t)a->imm24 * 4;
+     tcg_gen_st_i64(tcg_constant_i64(target), tcg_env, offsetof(CPUDADAOState, pc));
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -726,8 +726,8 @@ static bool trans_jump_r(DisasContext *ctx, arg_jump_r *a)
+ static bool trans_call_i(DisasContext *ctx, arg_call_i *a)
+ {
+     /* push return address: ra[63] = PC+4 */
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, ra[63]));
+-    uint64_t target = (ctx->base.pc_next - 4) + (int64_t)a->imm24 * 4;
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, ra[63]));
++    uint64_t target = (ctx->base.pc_next + 4) + (int64_t)a->imm24 * 4;
+     tcg_gen_st_i64(tcg_constant_i64(target), tcg_env, offsetof(CPUDADAOState, pc));
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
+@@ -736,7 +736,7 @@ static bool trans_call_i(DisasContext *ctx, arg_call_i *a)
+ static bool trans_call_r(DisasContext *ctx, arg_call_r *a)
+ {
+     /* push return address: ra[63] = PC+4 */
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env, offsetof(CPUDADAOState, ra[63]));
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, ra[63]));
+     TCGv_i64 base = tcg_temp_new_i64();
+     tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
+     tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
+-- 
+2.43.0
+

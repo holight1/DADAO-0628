@@ -1,0 +1,48 @@
+From d02add56c6250c83f403cb02af510e8a9bb946d3 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 2 Jul 2026 20:26:15 +0800
+Subject: [PATCH] target/dadao: fix helper_exit to use direct shutdown request
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+helper_exit previously wrote to the exit MMIO via cpu_physical_memory_write.
+This bypasses endianness handling: on a LE host, value=42 was written as
+bytes [0x2A, 0x00, ...] but the DEVICE_BIG_ENDIAN exit_write read it as
+0x2A000000... → code & 0xff = 0. All halt exits returned 0.
+
+Fix: call qemu_system_shutdown_request_with_code directly, matching how
+dadao_cpu_do_interrupt handles ILLI/fault exits. Verified: E2E smoke tests
+now exit with correct codes (42, 42, 0).
+---
+ target/dadao/helper.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 50e6d55..16d35af 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -3,6 +3,7 @@
+ #include "exec/exec-all.h"
+ #include "exec/helper-proto.h"
+ #include "exec/cpu_ldst.h"
++#include "system/runstate.h"
+ 
+ G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
+                                       uint32_t exception,
+@@ -20,7 +21,11 @@ void helper_raise_exception(CPUDADAOState *env, uint32_t exception)
+ 
+ void helper_exit(CPUDADAOState *env, uint64_t code)
+ {
+-    cpu_physical_memory_write(DADAO_EXIT_PORT, &code, 8);
++    int exit_code = (int)(code & 0xff);
++    qemu_system_shutdown_request_with_code(
++        exit_code == 0 ? SHUTDOWN_CAUSE_GUEST_SHUTDOWN
++                       : SHUTDOWN_CAUSE_GUEST_PANIC,
++        exit_code);
+     CPUState *cs = env_cpu(env);
+     cs->exception_index = EXCP_EXIT;
+     cpu_loop_exit(cs);
+-- 
+2.43.0
+

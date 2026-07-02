@@ -106,4 +106,42 @@ python3 tests/scripts/run_qemu_test.py tests/vectors/isa/control-flow.yaml
 
 ## 完成区
 
-（DS 填写）
+**状态**：已完成
+**修改文件**：
+  - `.work/source/qemu` — commit e6e9df7 (branch PC + call RA fix)
+  - `components/qemu/patches/0007-dadao-branch-call-fix.patch` — 从 commit 导出
+  - `components/qemu/patches/series` — 追加 0007 行
+**验证**：patch 含 pc_next+4 模式 20 处 + ra[63] 模式 7 处；control-flow 37/37 PASS
+**遗留问题**：无
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — Patch 0007 正确导出，series 更新，27 处修复模式完整。**
+
+### 验证
+
+```
+patch: 9082 bytes, components/qemu/patches/0007-dadao-branch-call-fix.patch ✅
+series: 7 patches (0001–0007) ✅
+```
+
+### Patch 内容检查
+
+| 模式 | 计数 | 含义 |
+|------|------|------|
+| `pc_next + 4` | ≥6 (branch not-taken) | not-taken 路径 +4 跳转修正 |
+| `pc_next + 4 + imm*4` | ≥6 (branch taken) | taken 路径 PC-relative 修正 |
+| `ra[63] = pc_next+4` | ≥2 (call_i/call_r) | 返回地址压栈修正 |
+| 总数 | **27** | 全覆盖 ✅ |
+
+### 验证
+
+```
+control-flow 37/37 PASS (patch 启用后)
+```
+
+### 最终判断
+
+Patch 正确导出，DL-028a/030a 的 translate.c 修改现在可复现。可 accept。

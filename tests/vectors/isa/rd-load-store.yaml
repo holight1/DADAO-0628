@@ -579,85 +579,99 @@
   format: rrii
   class: encoding
   encoding:
-    word: "0x30040000"
-  input_state: {}
+    word: "0x30041000"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldbu
   format: rrii
   class: encoding
   encoding:
-    word: "0x40040000"
-  input_state: {}
+    word: "0x40041000"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldws
   format: rrii
   class: encoding
   encoding:
-    word: "0x31040000"
-  input_state: {}
+    word: "0x31041000"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldwu
   format: rrii
   class: encoding
   encoding:
-    word: "0x41040000"
-  input_state: {}
+    word: "0x41041000"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldts
   format: rrii
   class: encoding
   encoding:
-    word: "0x32040000"
-  input_state: {}
+    word: "0x32041000"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldtu
   format: rrii
   class: encoding
   encoding:
-    word: "0x42040000"
-  input_state: {}
+    word: "0x42041000"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldo
   format: rrii
   class: encoding
   encoding:
-    word: "0x33040000"
-  input_state: {}
+    word: "0x33041000"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: stb
   format: rrii
@@ -711,85 +725,99 @@
   format: rrri
   class: encoding
   encoding:
-    word: "0x34040001"
-  input_state: {}
+    word: "0x34041001"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldmbu
   format: rrri
   class: encoding
   encoding:
-    word: "0x44040001"
-  input_state: {}
+    word: "0x44041001"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldmws
   format: rrri
   class: encoding
   encoding:
-    word: "0x35040001"
-  input_state: {}
+    word: "0x35041001"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldmwu
   format: rrri
   class: encoding
   encoding:
-    word: "0x45040001"
-  input_state: {}
+    word: "0x45041001"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldmts
   format: rrri
   class: encoding
   encoding:
-    word: "0x36040001"
-  input_state: {}
+    word: "0x36041001"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldmtu
   format: rrri
   class: encoding
   encoding:
-    word: "0x46040001"
-  input_state: {}
+    word: "0x46041001"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: ldmo
   format: rrri
   class: encoding
   encoding:
-    word: "0x37040001"
-  input_state: {}
+    word: "0x37041001"
+  input_state: 
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §3.3"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=RAM"
 
 - mnemonic: stmb
   format: rrri

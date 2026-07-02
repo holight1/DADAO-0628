@@ -94,4 +94,51 @@ python3 tests/scripts/run_qemu_test.py tests/vectors/isa/rd-load-store.yaml
 
 ## 完成区
 
-（DS 填写）
+**状态**：已完成
+**修改文件**：
+  - `tests/vectors/isa/rd-load-store.yaml` — 14 条 load encoding 测试：hb=0→1 (rb1 基址) + input_state.rb1=BINARY_BASE + status deferred→active
+**方案**：方案 B（使用有效基址）。ha=1 (rd1), hb 从 0 改为 1 (rb1)，imm=0，rb1 预加载 0x80000000 → 访问 RAM 合法地址
+**验收结果**：rd-load-store.yaml 49/49 PASS（原 35 + 新激活 14），0 timeout
+**遗留问题**：无
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — 14 条 load encoding 全部激活，方案正确。**
+
+### 逐条验证
+
+| 指令 | word | ha(dest) | hb(base) | imm | 说明 |
+|------|------|----------|----------|-----|------|
+| ldbs | `0x30041000` | 1(rd1) | 1(rb1) | 0 | rb1=0x80000000 |
+| ldbu | `0x40041000` | 1(rd1) | 1(rb1) | 0 | |
+| ldws | `0x31041000` | 1(rd1) | 1(rb1) | 0 | |
+| ldwu | `0x41041000` | 1(rd1) | 1(rb1) | 0 | |
+| ldts | `0x32041000` | 1(rd1) | 1(rb1) | 0 | |
+| ldtu | `0x42041000` | 1(rd1) | 1(rb1) | 0 | |
+| ldo | `0x33041000` | 1(rd1) | 1(rb1) | 0 | 8-byte aligned load |
+| ldmbs | `0x34041001` | 1(rd1) | 1(rb1) | immu6=1 | count=1, source=rd0 |
+| ldmbu | `0x44041001` | 1(rd1) | 1(rb1) | immu6=1 | |
+| ldmws | `0x35041001` | 1(rd1) | 1(rb1) | immu6=1 | |
+| ldmwu | `0x45041001` | 1(rd1) | 1(rb1) | immu6=1 | |
+| ldmts | `0x36041001` | 1(rd1) | 1(rb1) | immu6=1 | |
+| ldmtu | `0x46041001` | 1(rd1) | 1(rb1) | immu6=1 | |
+| ldmo | `0x37041001` | 1(rd1) | 1(rb1) | immu6=1 | count=1, source=rd0 |
+
+- ha=1(rd1): 目标非 rd0 → 不触发 ILLI ✅
+- hb=1(rb1): base 非 rb0 → 不触发 ILLI ✅
+- input_state.rb1 = 0x80000000 (BINARY_BASE) → RAM 合法地址 ✅
+- multi load immu6=1 (非 0) → 不触发 ILLI ✅
+- mask/value 全匹配 opcodes.yaml ✅
+- 状态: 14/14 deferred → active ✅
+
+### 验证
+
+```
+49/49 rd-load-store.yaml PASS (原 35 + 新激活 14)
+```
+
+### 最终判断
+
+方案 B（有效基址 + rb1 预加载 BINARY_BASE）正确实施，0 timeout。可 accept。
