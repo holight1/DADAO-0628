@@ -298,13 +298,15 @@
   format: rrii
   class: encoding
   encoding:
-    word: "0x43040000"
-  input_state: {}
+    word: "0x43041000"
+  input_state:
+    rb:
+      rb1: "0x0000000080000000"
   expected_state: null
   expected_fault: null
-  status: deferred
+  status: active
   wiki_cite: "spec.md §4.1"
-  notes: "encoding-only: minimal operands"
+  notes: "encoding-only: rb1 base=BINARY_BASE (addr-0 was deferred)"
 
 - mnemonic: sto
   format: rrii
