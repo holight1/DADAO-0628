@@ -24,9 +24,9 @@
     rb:
       rb0: "0x0000000000100004"
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §6.1"
-  notes: "swym 0; PC increments by 4, no other effect"
+  notes: "swym 0; PC increments by 4 — deferred: rb0=PC is load-address not settable via input_state"
 
 - mnemonic: unimp
   format: oiii
@@ -35,10 +35,10 @@
     word: "0x10FC0000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §6.2"
-  notes: "unimp 0; encoding-only test"
+  notes: "unimp 0; always ILLI"
 
 - mnemonic: unimp
   format: oiii

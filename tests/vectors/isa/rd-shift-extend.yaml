@@ -26,11 +26,11 @@
       rd1: "0xFFFFFFFFFFFFFF00"
   expected_state:
     rd:
-      rd3: "0xFFFFFFFFFFFFF0F0"
+      rd3: "0xFFFFFFFFFFFFFFF0"
   expected_fault: null
   status: active
   wiki_cite: "spec.md §3.11"
-  notes: "shrs rd3,rd1,4; arithmetic right shift of negative value"
+  notes: "shrs rd3,rd1,4; arithmetic right shift of negative value; -256>>4=-16=0xFFFF...FF0"
 
 - mnemonic: shru
   format: orri
@@ -110,11 +110,11 @@
       rd2: "0x0000000000000004"
   expected_state:
     rd:
-      rd3: "0xFFFFFFFFFFFFF0F0"
+      rd3: "0xFFFFFFFFFFFFFFF0"
   expected_fault: null
   status: active
   wiki_cite: "spec.md §3.11"
-  notes: "shrs rd3,rd1,rd2; arithmetic right shift by rd2"
+  notes: "shrs rd3,rd1,rd2; arithmetic right shift by rd2=4; -256>>4=-16=0xFFFF...FF0"
 
 - mnemonic: shru
   format: orrr

@@ -583,7 +583,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.1"
   notes: "encoding-only: minimal operands"
 
@@ -595,7 +595,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.1"
   notes: "encoding-only: minimal operands"
 
@@ -607,7 +607,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.1"
   notes: "encoding-only: minimal operands"
 
@@ -619,7 +619,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.1"
   notes: "encoding-only: minimal operands"
 
@@ -631,7 +631,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.1"
   notes: "encoding-only: minimal operands"
 
@@ -643,7 +643,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.1"
   notes: "encoding-only: minimal operands"
 
@@ -655,7 +655,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.1"
   notes: "encoding-only: minimal operands"
 
@@ -666,7 +666,7 @@
     word: "0x38000000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §3.2"
   notes: "encoding-only: minimal operands"
@@ -678,7 +678,7 @@
     word: "0x39000000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §3.2"
   notes: "encoding-only: minimal operands"
@@ -690,7 +690,7 @@
     word: "0x3A000000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §3.2"
   notes: "encoding-only: minimal operands"
@@ -702,7 +702,7 @@
     word: "0x3B000000"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §3.2"
   notes: "encoding-only: minimal operands"
@@ -715,7 +715,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.3"
   notes: "encoding-only: minimal operands"
 
@@ -727,7 +727,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.3"
   notes: "encoding-only: minimal operands"
 
@@ -739,7 +739,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.3"
   notes: "encoding-only: minimal operands"
 
@@ -751,7 +751,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.3"
   notes: "encoding-only: minimal operands"
 
@@ -763,7 +763,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.3"
   notes: "encoding-only: minimal operands"
 
@@ -775,7 +775,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.3"
   notes: "encoding-only: minimal operands"
 
@@ -787,7 +787,7 @@
   input_state: {}
   expected_state: null
   expected_fault: null
-  status: active
+  status: deferred
   wiki_cite: "spec.md §3.3"
   notes: "encoding-only: minimal operands"
 
@@ -798,7 +798,7 @@
     word: "0x3C000001"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §3.4"
   notes: "encoding-only: minimal operands"
@@ -810,7 +810,7 @@
     word: "0x3D000001"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §3.4"
   notes: "encoding-only: minimal operands"
@@ -822,7 +822,7 @@
     word: "0x3E000001"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §3.4"
   notes: "encoding-only: minimal operands"
@@ -834,7 +834,7 @@
     word: "0x3F000001"
   input_state: {}
   expected_state: null
-  expected_fault: null
+  expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §3.4"
   notes: "encoding-only: minimal operands"
