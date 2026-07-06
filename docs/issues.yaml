@@ -104,3 +104,12 @@
   scope: [M1]
   blocks: null
   resolved_by: wiki-13a414d
+
+# ── Found by M1 wiki-ref audit (DL-039a/b/c) ─────────────────────────────────
+
+- id: IntDiv-fault
+  title: "整数 div-by-zero 与 divs INT64_MIN÷-1 → ILLI：spec §3.7 断言，但 wiki §乘除操作 未定义（DADAO-11-AEE 的 DZ 位仅为浮点状态）。当前记为 spec-decision，待 wiki 团队确认或补入 wiki。"
+  status: open
+  scope: [M1]
+  blocks: null
+  resolved_by: null

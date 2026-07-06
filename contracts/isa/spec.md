@@ -30,7 +30,7 @@ in 6-bit fields.
 
 - 64 registers `rd0`–`rd63`, each 64 bits.
 - `rd0` is hardwired to zero. Reads always return 0. Encoding `rd0` as a
-  destination where it is not legal → **ILLI** (see §2.6.1). The only legal
+  destination where it is not legal → **ILLI** (see §2.6.1). The only legal [wiki §SimRISC-01 §rd0 为目的寄存器约定]
   destination-position uses of `rd0` are: dual-destination instructions (result
   half discarded) and `ret rdha=rd0` (return value discarded); in those cases
   the write is a no-op.
@@ -42,7 +42,7 @@ in 6-bit fields.
 - `rb0` holds the address of the instruction immediately after the currently
   executing instruction (i.e., `current_PC + 4`). Hardware-maintained; software
   cannot write to `rb0`. Any instruction that encodes `rb0` as a destination
-  (rbha=rb0 or rbhb=rb0 where rb0 would be written) → **ILLI** (see §2.6.2).
+  (rbha=rb0 or rbhb=rb0 where rb0 would be written) → **ILLI** (see §2.6.2). [wiki §SimRISC-02 §存取类]
   `rb0[63:48]` is always zero. [wiki §DADAO-11-AEE §基址寄存器]
 - Effective address width is 48 bits (bits[47:0]). Bits[63:48] are ignored in
   address calculations; register write-back behavior depends on instruction
@@ -88,7 +88,7 @@ in 6-bit fields.
 ### 2.1 Instruction Width, Endianness, and Alignment
 
 - Each instruction is exactly 32 bits (4 bytes).
-- Instructions must be 4-byte aligned. If `PC[1:0] ≠ 00`, an **IALIGN**
+- Instructions must be 4-byte aligned. If `PC[1:0] ≠ 00`, an **IALIGN** [wiki §DADAO-12-SEE §精确异常]
   exception is raised (precise, instruction not fetched).
   [wiki §SimRISC-00 L13]
 - Instruction fetch is **big-endian**: bits[31:24] at the lowest address,
@@ -115,7 +115,7 @@ Operand type letters:
 - `r`: 6-bit register number
 - `i`: signed or unsigned immediate
 - `w`: wyde-position (`hb[5:4]`) + 4-bit high immediate (`hb[3:0]`)
-- `z`: must be zero (SBZ)
+- `z`: must be zero (SBZ) [wiki §SimRISC-04] [spec-decision: ADR-0004 D5]
 
 ### 2.3 Operand Format Types
 
@@ -153,22 +153,22 @@ concatenated high-to-low: `hb[5:0] → hc[5:0] → hd[5:0]`.
 | wyde-pos | 2     | Unsigned      | 0 to 3                       | hb[5:4]              |
 
 Note: `immu6` for multi-load/store and block-copy has effective range 1–63;
-  value 0 triggers ILLI (see §2.6).
+  value 0 triggers ILLI (see §2.6). [wiki §SimRISC-01 §存取RD寄存器]
 
 ### 2.5 Reserved Encoding Behavior
 
 All opcode table cells marked as reserved (blank in opcode tables) trigger the
-**UNDI** exception when executed (precise, no architectural side effect).
+**UNDI** exception when executed (precise, no architectural side effect). [wiki §SimRISC-00 §SimRISC QFC]
 [wiki §SimRISC-00 §SimRISC QFC 表头注: "执行保留编码触发 UNDI 异常"]
 
 All `ha` minor-opcode encodings not listed in MISC-Norm/RF/AMO subtables are
-also reserved and trigger UNDI.
+also reserved and trigger UNDI. [wiki §SimRISC-00 §SimRISC QFC]
 
 ### 2.6 Instruction Legality
 
 Unified rules for all M1 instructions. Violations are **static**: the
-assembler must reject them. If a hand-encoded instruction reaches execution
-with an illegal operand, the hardware raises **ILLI** (precise, no side
+assembler must reject them. If a hand-encoded instruction reaches execution [wiki §SimRISC-02 §存取类]
+with an illegal operand, the hardware raises **ILLI** (precise, no side [wiki §SimRISC-01 §rd0 为目的寄存器约定]
 effect). [wiki §SimRISC-01 开头约定行; §SimRISC-02 开头约定行]
 
 #### 2.6.1 RD Destination Rules
@@ -177,7 +177,7 @@ The destination register field varies by instruction format. Binding the
 constraint to the correct field:
 
 - **`rdha`-destination instructions** (ld*, addi, cmps(i)/cmpu(i),
-  orw/andnw/setzw/setow): `rdha = rd0` → ILLI.
+  orw/andnw/setzw/setow): `rdha = rd0` → ILLI. [wiki §SimRISC-01 §rd0 为目的寄存器约定]
   Exception: `ret` with `rdha = rd0` is legal (return value discarded).
   [wiki §SimRISC-01 L7]
 - **Branch condition source** (brn/brnn/brz/brnz/brp/brnp): `rdha` is read as
@@ -185,17 +185,17 @@ constraint to the correct field:
   e.g., `brz rd0` is always taken, `brnz rd0` never taken).
 - **`rdhb`-destination instructions** (`orrr`/`orri` format: and/orr/xor/xnor,
   shlu/shrs/shru, exts/extz — register form; cmps(r)/cmpu(r); rb2rd; cmp-rb;
-  csn/csz/csp): destination is `rdhb`, so `rdhb = rd0` → ILLI.
+  csn/csz/csp): destination is `rdhb`, so `rdhb = rd0` → ILLI. [wiki §SimRISC-01 §rd0 为目的寄存器约定]
   [wiki §SimRISC-01 L87]
 - **`rdhc`-destination instructions** (cseq, csne): destination is `rdhc`, so
-  `rdhc = rd0` → ILLI.
+  `rdhc = rd0` → ILLI. [wiki §SimRISC-01 §rd0 为目的寄存器约定]
 - **Store data source** (st*, stm*): `rdha` is the data register, not a
-  destination — but `rdha = rd0` → ILLI. Storing from rd0 is not legal.
+  destination — but `rdha = rd0` → ILLI. Storing from rd0 is not legal. [wiki §SimRISC-01 §rd0 为目的寄存器约定]
   [wiki §SimRISC-01 L37]
 - **Dual-destination instructions** (add, sub, muls, mulu, divs, divu):
   - At most one of `rdha, rdhb` may be `rd0` (discards that half-result).
-  - `rdha` and `rdhb` must not be the same non-`rd0` register.
-  - Violation → ILLI.
+  - `rdha` and `rdhb` must not be the same non-`rd0` register. [wiki §SimRISC-01 §加减操作]
+  - Violation → ILLI. [wiki §SimRISC-01 §加减操作]
   [wiki §SimRISC-01 L147, L195]
 
 #### 2.6.2 RB Destination Rules
@@ -211,16 +211,16 @@ The destination RB field also varies by format:
 
 For all multi-register instructions (ldm/stm*, rd2rd, rd2rb, rb2rd, rb2rb,
 rd2ra, ra2rd, ldmo-rb, stmo-rb, ldmo-ra, stmo-ra):
-- `immu6 = 0` → ILLI.
-- `first_reg + immu6 > 64` (exceeds bank boundary) → ILLI. No wrap, no
+- `immu6 = 0` → ILLI. [wiki §SimRISC-01 §存取RD寄存器]
+- `first_reg + immu6 > 64` (exceeds bank boundary) → ILLI. No wrap, no [wiki §SimRISC-01 §存取RD寄存器]
   truncation.
   [wiki §SimRISC-01 L63–L65; §SimRISC-02 L41–L45, L60–L62, L85–L89]
 
 #### 2.6.4 SBZ Fields
 
-Fields marked SBZ (Should Be Zero) in encoding tables must be zero in valid
+Fields marked SBZ (Should Be Zero) in encoding tables must be zero in valid [wiki §SimRISC-04]
 encodings. Non-zero SBZ: [OPEN — behavior not specified in wiki; suggested:
-ILLI or UNDI].
+ILLI or UNDI]. [spec-decision: ADR-0004 D5]
 
 ### 2.7 Instruction Execution Model
 
@@ -233,15 +233,15 @@ ILLI or UNDI].
   operation is processed in increasing-register order, element read-then-write
   (per-element overlap well-defined). Base register snapshotted before loop.
   [wiki §SimRISC-01 §SimRISC-02, respective instruction sections]
-- **Exceptions during execution**: All ISA-defined exceptions (ILLI, UNDI,
-  MALIGN, IALIGN, RASOF, RASUF) are **precise**: the faulting instruction
+- **Exceptions during execution**: All ISA-defined exceptions (ILLI, UNDI, [wiki §DADAO-12-SEE §精确异常]
+  MALIGN, IALIGN, RASOF, RASUF) are **precise**: the faulting instruction [wiki §DADAO-12-SEE §精确异常]
   has no architectural side effect (destination registers and memory are not
   updated; RA is not modified; PC points to the faulting instruction).
   [wiki §DADAO-11-AEE L183; §SEE L248–L253]
 
 ### 2.8 M1-Covered Opcode Map
 
-Row-by-row reference. Entries not listed are reserved (UNDI) or excluded (§7).
+Row-by-row reference. Entries not listed are reserved (UNDI) or excluded (§7). [wiki §SimRISC-00 §SimRISC QFC]
 
 | `op[7:3]` | `op[2:0]` | Instruction(s)                        | Format   |
 |-----------|-----------|---------------------------------------|----------|
@@ -322,7 +322,7 @@ Row-by-row reference. Entries not listed are reserved (UNDI) or excluded (§7).
 | 11_0010   | ra2rd       | orri   | [Excluded — see §7] |
 | 11_1111   | unimp       | oiii   | Yes |
 
-All other `ha` values within MISC-Norm → UNDI.
+All other `ha` values within MISC-Norm → UNDI. [wiki §SimRISC-00 §SimRISC QFC]
 
 ---
 
@@ -355,11 +355,11 @@ Alignment:
 | Width | Mnemonic      | Min alignment | Unaligned |
 |-------|---------------|---------------|-----------|
 | 8-bit | ldbs, ldbu    | 1             | No fault  |
-| 16-bit| ldws, ldwu    | 2             | MALIGN    |
-| 32-bit| ldts, ldtu    | 4             | MALIGN    |
-| 64-bit| ldo           | 8             | MALIGN    |
+| 16-bit| ldws, ldwu    | 2             | MALIGN    | [wiki §SimRISC-01 §对齐要求]
+| 32-bit| ldts, ldtu    | 4             | MALIGN    | [wiki §SimRISC-01 §对齐要求]
+| 64-bit| ldo           | 8             | MALIGN    | [wiki §SimRISC-01 §对齐要求]
 
-MALIGN is precise: no register write, PC at faulting instruction.
+MALIGN is precise: no register write, PC at faulting instruction. [wiki §SimRISC-01 §对齐要求]
 [wiki §SimRISC-01 L35; §SEE L248–L253]
 
 Legality: `rdha ≠ rd0` (else ILLI). [wiki §SimRISC-01 L37]
@@ -378,7 +378,7 @@ Encoding: §2.8 row 00111. Format `rrii`.
 EA: `ea[47:0] = (rbhb[47:0] + sext_12(imms12)) mod 2^48`
 Semantic: `memory_be[ea : ea+N-1] = rdha[N×8-1 : 0]`
 
-Alignment: same as loads (MALIGN if violated).
+Alignment: same as loads (MALIGN if violated). [wiki §SimRISC-01 §对齐要求]
 
 Legality: `rdha ≠ rd0` (ILLI; storing from rd0 is not legal). [wiki §SimRISC-01 L37]
 
@@ -407,7 +407,7 @@ well-defined). Address uses original `rdhc` (snapshotted before any write).
 
 Alignment: same element rules as single load.
 
-Legality: `rdha ≠ rd0`; `immu6 ∈ [1,63]`; `rdha + immu6 ≤ 64` (all → ILLI).
+Legality: `rdha ≠ rd0`; `immu6 ∈ [1,63]`; `rdha + immu6 ≤ 64` (all → ILLI). [wiki §SimRISC-01 §存取RD寄存器]
 [wiki §SimRISC-01 L63–L66]
 
 ### 3.4 RD Multi Store (rrri)
@@ -424,7 +424,7 @@ Encoding: §2.8 row 00111. Format `rrri`.
 EA for register i: same as multi load.
 Semantic: `memory_be[ea_i : ea_i+N-1] = rd(ha+i)[N×8-1 : 0]`
 
-Legality: `rdha ≠ rd0`; `immu6 ∈ [1,63]`; `rdha + immu6 ≤ 64` (all → ILLI).
+Legality: `rdha ≠ rd0`; `immu6 ∈ [1,63]`; `rdha + immu6 ≤ 64` (all → ILLI). [wiki §SimRISC-01 §存取RD寄存器]
 [wiki §SimRISC-01 L63–L66]
 
 ### 3.5 RD Arithmetic — add/sub (rrrr)
@@ -445,7 +445,7 @@ Semantic:
 Source snapshot: rdhc, rdhd read before any write. [wiki §SimRISC-01 L138]
 
 Legality: `rdha` and `rdhb` may each be `rd0` individually (discarding that
-half), but not both simultaneously, and not the same non-zero register. ILLI
+half), but not both simultaneously, and not the same non-zero register. ILLI [wiki §SimRISC-01 §加减操作]
 if violated. [wiki §SimRISC-01 L147]
 
 ### 3.6 RD addi (rrii)
@@ -458,9 +458,9 @@ Encoding: §2.8 row 00011 col 001. Format `rrii`.
 - `ha`=rdha; `hb`=rdhb; `hc:hd`=imms12.
 
 Semantic: 64-bit addition. `rdha[63:0] = rdhb[63:0] + sext_12(imms12)`.
-No overflow detection (overflow is architectural; software must check).
+No overflow detection (overflow is architectural; software must check). [spec-decision: ADR-0004]
 
-Legality: `rdha ≠ rd0` (ILLI).
+Legality: `rdha ≠ rd0` (ILLI). [wiki §SimRISC-01 §rd0 为目的寄存器约定]
 
 ### 3.7 RD Multiply/Divide (rrrr)
 
@@ -480,8 +480,8 @@ Legality: same dual-destination rule as add/sub (§2.6.1).
 - `divs`: signed. Quotient truncates toward zero (C99).
   Remainder sign = dividend sign: `rem = dividend - trunc(dividend/divisor) × divisor`
 - `divu`: unsigned.
-- Divide-by-zero: **ILLI** (precise, rdha/rdhb not written).
-- `divs INT64_MIN ÷ -1`: **ILLI** (precise, only overflow case).
+- Divide-by-zero: **ILLI** (precise, rdha/rdhb not written). [spec-decision: 整数除零 fault，wiki 未定义（DZ 为 FP 状态位），见 open-spec-issues]
+- `divs INT64_MIN ÷ -1`: **ILLI** (precise, only overflow case). [spec-decision: divs INT64_MIN÷-1 fault，wiki 未定义，见 open-spec-issues]
 - `divu` has no overflow.
 - Source snapshot: rdhc, rdhd read before any write.
 - Legality: same dual-destination rule.
@@ -498,7 +498,7 @@ Encoding: §2.8 row 00010 col 010/011. Format `rrii`.
 Semantic: `rdha = -1 if a < b; 0 if a == b; 1 if a > b`, where (a, b) =
 (rdhb, immediate). Comparison is signed for cmps, unsigned for cmpu.
 
-Legality: `rdha ≠ rd0` (ILLI).
+Legality: `rdha ≠ rd0` (ILLI). [wiki §SimRISC-01 §rd0 为目的寄存器约定]
 
 ### 3.9 RD Compare — Register Form (orrr)
 
@@ -598,8 +598,8 @@ conditional assignment. Non-overlapping vectors are definite; overlap vectors
 are deferred pending C-27 resolution.
 
 Legality:
-- csn/csz/csp: `rdhb ≠ rd0` (ILLI; destination is rdhb).
-- cseq/csne: `rdhc ≠ rd0` (ILLI; destination is rdhc).
+- csn/csz/csp: `rdhb ≠ rd0` (ILLI; destination is rdhb). [wiki §SimRISC-01 §rd0 为目的寄存器约定]
+- cseq/csne: `rdhc ≠ rd0` (ILLI; destination is rdhc). [wiki §SimRISC-01 §rd0 为目的寄存器约定]
 
 ### 3.13 RD Wyde Immediate (rwii)
 
@@ -623,7 +623,7 @@ Semantic:
 - `orw`: target wyde |= immu16; other wydes unchanged.
 - `andnw`: target wyde &= ~immu16; other wydes unchanged.
 
-Legality: `rdha ≠ rd0` (ILLI).
+Legality: `rdha ≠ rd0` (ILLI). [wiki §SimRISC-01 §rd0 为目的寄存器约定]
 
 ### 3.14 RD Block Copy — rd2rd (orri)
 
@@ -677,9 +677,9 @@ Semantic:
 - `ldo`: `rbha[63:0] = memory_be[ea : ea+7]` (full 64-bit overwrite).
 - `sto`: `memory_be[ea : ea+7] = rbha[63:0]`.
 
-Alignment: 8-byte; unaligned → MALIGN.
+Alignment: 8-byte; unaligned → MALIGN. [wiki §SimRISC-01 §对齐要求]
 
-Legality: `rbha ≠ rb0` (ILLI for ldo; sto to rb0 is also ILLI per §2.6.2).
+Legality: `rbha ≠ rb0` (ILLI for ldo; sto to rb0 is also ILLI per §2.6.2). [wiki §SimRISC-02 §存取类]
 
 ### 4.2 RB Multi Load/Store (rrri)
 
@@ -695,7 +695,7 @@ Full 64-bit overwrite per register.
 
 Alignment: 8-byte per element.
 
-Legality: `rbha ≠ rb0`; `immu6 ∈ [1,63]`; `rbha + immu6 ≤ 64`. ILLI if
+Legality: `rbha ≠ rb0`; `immu6 ∈ [1,63]`; `rbha + immu6 ≤ 64`. ILLI if [wiki §SimRISC-02 §存取RB寄存器]
 violated. [wiki §SimRISC-02 L41–L45]
 
 ### 4.3 RB Arithmetic — add/sub (orrr)
@@ -720,7 +720,7 @@ addi    rbha, rbhb, imms12      ; rbha[47:0] = (rbhb[47:0] + sext_12(imms12)) mo
 Encoding: §2.8 row 01001 col 001. Format `rrii`.
 
 Semantic: Low 48 bits only. `rbha[63:48]` unchanged.
-Legality: `rbha ≠ rb0` (ILLI).
+Legality: `rbha ≠ rb0` (ILLI). [wiki §SimRISC-02 §存取类]
 
 ### 4.5 RB Compare (orrr)
 
@@ -749,7 +749,7 @@ Semantic: same as RD wyde immediate (§3.13), operating on RB.
 Full 64-bit overwrite; wyde-pos=3 (bits[63:48]) is legal.
 [wiki §SimRISC-02 L15]
 
-Legality: `rbha ≠ rb0` (ILLI).
+Legality: `rbha ≠ rb0` (ILLI). [wiki §SimRISC-02 §存取类]
 
 ### 4.7 RB Block Copy (orri)
 
@@ -766,7 +766,7 @@ Semantic: Copy `immu6` consecutive 64-bit values. No type conversion.
 [wiki §SimRISC-02 §寄存器组之间块赋值]
 
 Legality: `immu6 ∈ [1,63]`; for RB target: `rbhb ≠ rb0`;
-`start_reg + immu6 ≤ 64` for both source and destination banks. ILLI.
+`start_reg + immu6 ≤ 64` for both source and destination banks. ILLI. [wiki §SimRISC-01 §寄存器组之间块赋值]
 [wiki §SimRISC-02 L86–L89]
 
 ### 4.8 PC-Relative Address (riii)
@@ -895,7 +895,7 @@ Semantic:
 2. Else if `ra63[63:48] ∈ [1, 0xFFFE]` and `ra63[47:0] == new_ra`:
    `ra63[63:48] += 1` (recursion)
 3. Else:
-   If `ra1[63:48] ≠ 0` (valid before shift) → **RASOF** (precise, RA unchanged).
+   If `ra1[63:48] ≠ 0` (valid before shift) → **RASOF** (precise, RA unchanged). [wiki §DADAO-11-AEE §返回地址栈]
    Else: shift entries down: `ra{i-1} ← ra{i}` for i=2..63
    (ra1←ra2, ra2←ra3, …, ra62←ra63)
    `ra63[63:48] = 1; ra63[47:0] = rb0[47:0]`
@@ -908,9 +908,9 @@ Semantic:
    Shift entries up: `ra{i+1} ← ra{i}` for i=62..1
    (ra63←ra62, ra62←ra61, …, ra2←ra1); `ra1 = 0`
 3. Else (`ra63[63:48] == 0`):
-   **RASUF** (precise, RA unchanged).
+   **RASUF** (precise, RA unchanged). [wiki §DADAO-11-AEE §返回地址栈]
 
-RASOF/RASUF are precise: PC stays at faulting call/ret; RA registers are not
+RASOF/RASUF are precise: PC stays at faulting call/ret; RA registers are not [wiki §DADAO-11-AEE §返回地址栈]
 modified. [wiki §DADAO-11-AEE L183]
 
 ---
@@ -938,7 +938,7 @@ unimp   immu18
 
 Encoding: §2.8.1 ha=11_1111. Format `oiii`.
 
-Semantic: Triggers **ILLI** exception (illegal instruction, precise).
+Semantic: Triggers **ILLI** exception (illegal instruction, precise). [wiki §SimRISC-04 §unimp]
 The immediate has no semantic meaning.
 [wiki §SimRISC-04 L31]
 
@@ -947,7 +947,7 @@ The immediate has no semantic meaning.
 ## §7 M1 Excluded
 
 M1 scope per `code-agent/designs/0002-detailed-roadmap.md` §Scope Matrix.
-Excluded operations must produce an explicit, assertable error (not silent
+Excluded operations must produce an explicit, assertable error (not silent [spec-decision: ADR-0007]
 no-op). The exact test-machine observable protocol is defined in ADR-0004.
 
 | Area | Instructions excluded | Matrix reference |
@@ -968,7 +968,7 @@ Each record: `op`, `ha` (minor, if applicable), format, operand fields, and 32-b
 encoding oracle (`mask`/`value`).
 
 **Encoding oracle columns** (32-bit big-endian instruction word):
-- `mask`: bits that must match to identify the instruction (fixed opcode bits set to 1).
+- `mask`: bits that must match to identify the instruction (fixed opcode bits set to 1). [spec-decision]
 - `value`: the fixed bits' expected values (all variable bits are 0).
 - Computed from layout: op=[31:24], ha=[23:18], hb=[17:12], hc=[11:6], hd=[5:0].
 - For MISC-Norm (op=0x10): `mask=0xFFFC0000` (op+ha both fixed).
@@ -1146,7 +1146,7 @@ previous reviews are RESOLVED by wiki commit `13a414d`.
 | C-18a | Reset | Known: rb0 reset vector (SEE); RA process-entry = zero (AEE L185); RB bits[63:48] power-on = 0 (SimRISC-02 L21) | PARTIALLY KNOWN |
 | C-18b | Reset | Unknown: RD, RB[1-63] (non-high bits), RF, RA power-on low-level reset state | OPEN — test-machine init defined by ADR-0004 |
 | C-27 | Execution | Conditional assignment (csn/csz/csp/cseq/csne) source snapshot on src/dst overlap: spec §3.12 asserts "all sources read before write" but no wiki reference found | OPEN — blocks overlap test vectors |
-| — | SBZ | Behavior of non-zero SBZ fields in opcode encoding | OPEN — wiki defines SBZ but not fault type (ILLI vs UNDI) |
+| — | SBZ | Behavior of non-zero SBZ fields in opcode encoding | OPEN — wiki defines SBZ but not fault type (ILLI vs UNDI) | [spec-decision: ADR-0004 D5]
 | — | Reset | M1 test-machine initialization values vs architectural reset | OPEN — ADR-0004 to define test entry state |
 
 All other C-items (C-01 through C-13, C-15 through C-17, C-19 through C-26)

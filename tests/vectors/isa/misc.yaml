@@ -20,13 +20,12 @@
   input_state:
     rb:
       rb0: "0x0000000000100000"
-  expected_state:
-    rb:
-      rb0: "0x0000000000100004"
+  expected_state: null
   expected_fault: null
   status: deferred
+  deferred_reason: "rb0=PC is load-address, not settable via input_state; swym PC+4 semantic not assertable under current harness"
   wiki_cite: "spec.md §6.1"
-  notes: "swym 0; PC increments by 4 — deferred: rb0=PC is load-address not settable via input_state"
+  notes: "swym 0; PC increments by 4"
 
 - mnemonic: unimp
   format: oiii

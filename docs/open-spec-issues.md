@@ -14,6 +14,7 @@ These issues remain open after Wiki update to `13a414d` (SimRISC 0.4.1).
 | ~~ELF/object ABI~~ | **Closed by ADR-0003** (2026-06-29): EM_DADAO=0x0DA0, e_flags=0x1 (M1), ELFCLASS64/ELFDATA2MSB, 10 relocation types | — |
 | Hardware reset | Power-on values for RD/RB/RF/RA beyond process-entry init | QEMU, test machine |
 | ~~SBZ behavior~~ | **Closed by ADR-0004** (2026-06-29): SBZ → ILLI (exit 0x82); analogy to illegal operand in known opcode | — |
+| Integer division fault (found by M1 audit DL-039) | spec §3.7 asserts div-by-zero and `divs INT64_MIN÷-1` → ILLI, but wiki §乘除操作 does not define it (the DZ bit in DADAO-11-AEE is FP-only). Marked `[spec-decision]` pending wiki-team confirmation. | M1 spec-fidelity |
 
 **Resolved by Architecture Decision (2026-06-29):**
 - rd2ra/ra2rd scope → Excluded (M1 scope decision; ISA semantics clear per SimRISC-02)

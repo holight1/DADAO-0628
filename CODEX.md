@@ -8,3 +8,7 @@
 - Record architecture decisions in `docs/adr/` before they become cross-component contracts.
 - Track substantial work in `code-agent/tasks/` and design changes in `code-agent/designs/`.
 - Unsupported semantics must fail explicitly; do not add compatibility stubs that silently succeed.
+
+## Review
+
+Reviewers: read `reviewer.md` before reviewing. Verdicts must rest on the reviewer's own re-run of the task's acceptance block, not on the worker's narrative.
