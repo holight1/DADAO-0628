@@ -254,10 +254,13 @@ ABI_NORMATIVE_PATTERNS = [
     r'grows downward', r'\bpreserve[sd]?\b',
 ]
 
-# Legal markers per DL-040b: [wiki §…] (handled separately by the line skip),
-# [spec-decision: …], and [OPEN] (explicitly declared undefined).
+# Legal markers per DL-040b/c: [wiki §…] (handled separately by the line skip),
+# [spec-decision: …], [OPEN] (explicitly declared undefined), and
+# [M1 architecture decision: …] (DL-040c C1 — treated same as [spec-decision:];
+# an adopted M1-scope decision explicitly attributed in-line).
 ABI_DECISION_MARKERS = [
     r'\[spec-decision\]', r'\[spec-decision:',
+    r'\[M1 architecture decision:',
     r'\[OPEN',
 ]
 
@@ -284,6 +287,93 @@ def check_normative_assertions(text, patterns=NORMATIVE_PATTERNS,
 
     return violations
 
+# --- ABI-profile refined Check-2 (DL-040c) -----------------------------------
+# The ABI contract is authored with chapter-level inline citations plus an
+# appendix citation table (not per-line refs), and embeds asm examples in
+# fenced code blocks. Line-level Check-2 over-reports on that shape. This
+# refined variant (ABI profile ONLY — ISA path stays byte-for-byte identical)
+# adds five suppressions faithful to how the contract cites the wiki:
+#   (1) skip lines inside ``` fenced code blocks (asm example comments are not
+#       normative assertions);
+#   (2) chapter-level citation inheritance: if the enclosing `##` chapter body
+#       already carries a `[wiki §…]`, its normative lines are traced;
+#   (3) appendix citation rows (## Appendix + `§X | `DADAO-… §Y`` map rows) are
+#       themselves references;
+#   (4) pure table separator / header rows are structure, not assertions;
+#   (5) decision markers (incl. the [M1 architecture decision:] whitelist).
+_FENCE_RE = re.compile(r'^\s*```')
+_CHAPTER_RE = re.compile(r'^##\s+(.*)$')          # ## only (### has no space after ##)
+_APPENDIX_RE = re.compile(r'^##\s+Appendix', re.IGNORECASE)
+_SEP_ROW_RE = re.compile(r'^\s*\|[\s:|\-]+\|\s*$')  # table separator |---|---|
+_CITATION_ROW_RE = re.compile(r'\|\s*`[^`]*(?:DADAO|SimRISC)[^`]*§[^`]*`')
+
+def _is_separator_row(line):
+    return bool(_SEP_ROW_RE.match(line)) and '-' in line
+
+def check_normative_assertions_abi(text, patterns, markers):
+    lines = text.split('\n')
+    n = len(lines)
+
+    # pass 1: fenced-code membership (the ``` delimiter lines are skipped too).
+    in_fence = [False] * n
+    fence = False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            fence = not fence
+            in_fence[i] = True
+        else:
+            in_fence[i] = fence
+
+    # pass 2: ## chapter boundaries + per-chapter wiki-ref / appendix flags.
+    chapter_of = [-1] * n
+    chapters = []          # list of [start, end, has_wiki, is_appendix]
+    cur = -1
+    for i, line in enumerate(lines):
+        if _CHAPTER_RE.match(line):
+            cur = len(chapters)
+            chapters.append([i, n, False, bool(_APPENDIX_RE.match(line))])
+            if len(chapters) >= 2:
+                chapters[-2][1] = i
+        chapter_of[i] = cur
+    for c in chapters:
+        start, end = c[0], c[1]
+        body = '\n'.join(lines[start:end])
+        c[2] = bool(re.search(r'\[wiki\s+§', body))
+
+    violations = []
+    for i, line in enumerate(lines, 0):
+        stripped = line.strip()
+        idx1 = i + 1  # 1-based line number for reporting
+        if not stripped or stripped.startswith('#'):
+            continue
+        if in_fence[i]:                                  # (1)
+            continue
+        ci = chapter_of[i]
+        if ci >= 0 and chapters[ci][3]:                  # (3a) appendix section
+            continue
+        if _CITATION_ROW_RE.search(line):                # (3b) `DADAO-… §…` map row
+            continue
+        if _is_separator_row(line):                      # (4) separator
+            continue
+        # (4) header row = table row whose next non-blank line is a separator
+        if stripped.startswith('|'):
+            j = i + 1
+            while j < n and not lines[j].strip():
+                j += 1
+            if j < n and _is_separator_row(lines[j]):
+                continue
+        if re.search(r'\[wiki\s+§', line):               # per-line wiki ref
+            continue
+        if any(re.search(m, line) for m in markers):     # (5) decision markers
+            continue
+        if ci >= 0 and chapters[ci][2]:                  # (2) chapter inheritance
+            continue
+        matched = [p for p in patterns if re.search(p, line, re.IGNORECASE)]
+        if matched:
+            violations.append((idx1, stripped[:120], matched))
+
+    return violations
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -300,6 +390,7 @@ PROFILES = {
         'label': 'contracts/abi/spec.md',
         'normative_patterns': ABI_NORMATIVE_PATTERNS,
         'decision_markers': ABI_DECISION_MARKERS,
+        'refined': True,   # DL-040c: chapter/appendix/code-fence-aware Check-2
     },
 }
 
@@ -349,7 +440,9 @@ def run_audit(config):
     print("Check 2: Normative assertions without wiki reference")
     print("=" * 60)
 
-    violations = check_normative_assertions(
+    check2_fn = (check_normative_assertions_abi if config.get('refined')
+                 else check_normative_assertions)
+    violations = check2_fn(
         spec_text,
         patterns=config['normative_patterns'],
         markers=config['decision_markers'],

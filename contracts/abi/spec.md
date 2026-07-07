@@ -241,6 +241,8 @@ Aggregates ≤ 64 bits are returned in rd31.
 
 ## §5 Call Sequence (Prologue/Epilogue)
 
+[wiki §DADAO-21-ABI §函数调用规范]
+
 ### 5.1 Caller Responsibilities
 
 1. Evaluate arguments and place in rd16–rd31 (integer) / rb16–rb31 (pointer).
@@ -315,7 +317,7 @@ of rb2, avoiding the high-16-bit preservation issue of `addi` (ISA §4.4).
 |-------|--------|-----------|
 | Varargs | Excluded from M1; varargs save area layout defined in wiki but not needed for scalar non-variadic | `docs/open-spec-issues.md` |
 | HFA/HPA | Excluded from M1; aggregate classification rules defined in wiki | `docs/open-spec-issues.md` |
-| Mixed-bank multi-return | Excluded from M1; Wiki ordering conflict must be resolved before Advanced CodeGen | `docs/open-spec-issues.md` |
+| Mixed-bank multi-return | [OPEN] Excluded from M1; Wiki ordering conflict must be resolved before Advanced CodeGen | `docs/open-spec-issues.md` |
 | Complex aggregate ABI | Struct splitting rules for >64-bit non-HFA/HPA aggregates; deferred post-M2 | — |
 | Dynamic linking TLS | Excluded from M1 | `docs/open-spec-issues.md` |
 | Frame pointer convention | Optional rbfp use is a CodeGen optimization choice; this contract does not mandate either strategy | — |

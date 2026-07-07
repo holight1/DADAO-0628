@@ -36,7 +36,7 @@ apply-series: manifest-check
 
 prepare: fetch apply-series
 
-check: manifest-check validate-encoding validate-vectors check-wiki-drift check-wiki-refs check-issues
+check: manifest-check validate-encoding validate-vectors check-wiki-drift check-wiki-refs check-wiki-refs-abi check-issues
 	@$(PYTHON) -m compileall -q scripts
 	@echo "repository checks: PASS"
 
@@ -70,9 +70,9 @@ check-wiki-refs:
 	@$(PYTHON) scripts/check_wiki_refs.py
 
 # C1 (ADR-0009 CodeGen/ABI branch): wiki->spec audit of contracts/abi/spec.md.
-# INTENTIONALLY standalone — NOT part of `make check`. The first ABI audit has a
-# known backlog of un-referenced normative assertions; this target EXPOSES it for
-# triage (补引用 / spec-decision / OPEN / wiki-team), it must not block `make check`.
+# DL-040c closed the first-round backlog (Check-2 refined for chapter-level
+# citations + code-fence/appendix/table shape; residuals tagged/cited). Now
+# fail-closed and part of `make check`, alongside check-wiki-refs (ISA).
 check-wiki-refs-abi:
 	@$(PYTHON) scripts/check_wiki_refs.py --profile abi
 
