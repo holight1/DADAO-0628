@@ -1,0 +1,96 @@
+# tools/abi.yaml — Machine-readable ABI facts (C2, ADR-0009 CodeGen/ABI branch)
+#
+# Derived ONLY from contracts/abi/spec.md (+ isa/spec.md for endianness, which
+# the ABI contract cites as wiki §数据表示). DADAO SimRISC M1: non-variadic,
+# scalar integer + pointer only.
+#
+# Rules honored:
+#   - Every fact carries an `abi_cite` (§ of the source contract).
+#   - Facts the ABI contract marks [OPEN] carry `status: open` and are NOT
+#     assigned a callee-saved/allocation value. A backend that nonetheless
+#     commits to a choice on an open register is reported by
+#     scripts/check_codegen_abi.py as OPEN-COMMIT (warning, not error).
+#   - Nothing here is invented; if the contract is silent, it is `open`.
+#
+# Source contract: contracts/abi/spec.md (Wiki 13a414da..., SimRISC 0.4.1)
+
+meta:
+  contract: contracts/abi/spec.md
+  scope: "M1 non-variadic scalar (integer + pointer)"
+  model: LP64
+
+# ---- §2.1 Argument passing: parameter registers ----
+arguments:
+  integer:
+    registers: [rd16, rd17, rd18, rd19, rd20, rd21, rd22, rd23,
+                rd24, rd25, rd26, rd27, rd28, rd29, rd30, rd31]
+    abi_cite: "abi §2.1"
+  pointer:
+    registers: [rb16, rb17, rb18, rb19, rb20, rb21, rb22, rb23,
+                rb24, rb25, rb26, rb27, rb28, rb29, rb30, rb31]
+    abi_cite: "abi §2.1"
+
+# ---- §3.1 Return values: scalar return registers ----
+returns:
+  integer:
+    register: rd31
+    abi_cite: "abi §3.1"
+  pointer:
+    register: rb31
+    abi_cite: "abi §3.1"
+
+# ---- §1.1 / §1.2 Callee-saved (general-purpose) registers ----
+# Facts only; the Phase-5 spike does not yet implement frame lowering, so these
+# are not hard-compared against the backend (reported INFO by the checker).
+callee_saved:
+  rd:
+    range: "rd32-rd63"
+    abi_cite: "abi §1.1"
+  rb:
+    range: "rb32-rb63"
+    abi_cite: "abi §1.2"
+
+# ---- §1.1 / §1.2 Non-allocatable / reserved registers ----
+# status: fixed  -> contract mandates non-allocatable (hard compare).
+# status: open   -> contract marks [OPEN]; a backend choice = OPEN-COMMIT.
+reserved:
+  - {reg: rd0, reason: "hardwired zero",                       status: fixed, abi_cite: "abi §1.1"}
+  - {reg: rd1, reason: "kernel errno; callee-saved [OPEN]",    status: open,  abi_cite: "abi §1.1"}
+  - {reg: rd2, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.1"}
+  - {reg: rd3, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.1"}
+  - {reg: rd4, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.1"}
+  - {reg: rd5, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.1"}
+  - {reg: rd6, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.1"}
+  - {reg: rd7, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.1"}
+  - {reg: rb0, reason: "PC / instruction pointer (read-only)", status: fixed, abi_cite: "abi §1.2"}
+  - {reg: rb1, reason: "stack pointer (rbsp)",                 status: fixed, abi_cite: "abi §1.2"}
+  - {reg: rb2, reason: "frame pointer (rbfp)",                 status: fixed, abi_cite: "abi §1.2"}
+  - {reg: rb3, reason: "global pointer; callee-saved [OPEN]",  status: open,  abi_cite: "abi §1.2"}
+  - {reg: rb4, reason: "thread pointer; callee-saved [OPEN]",  status: open,  abi_cite: "abi §1.2"}
+  - {reg: rb5, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.2"}
+  - {reg: rb6, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.2"}
+  - {reg: rb7, reason: "ABI-reserved",                         status: fixed, abi_cite: "abi §1.2"}
+
+# ---- DataLayout (derived from ABI: big-endian LP64, 8-byte stack) ----
+# Compared component-by-component with the backend's `case Triple::dadao` string.
+datalayout:
+  endianness: E              # big-endian
+  endianness_cite: "isa §2.1 (data big-endian; abi appendix cites wiki §数据表示)"
+  mangling: "m:e"            # ELF mangling
+  mangling_cite: "elf §ELFDATA2MSB (ELF object model)"
+  int64: "i64:64"            # 64-bit integer, 64-bit aligned (LP64)
+  int64_cite: "abi §2.2 (long/long long are 64-bit)"
+  native: "n64"              # native integer width = 64
+  native_cite: "abi §2.2"
+  # Stack alignment: ABI mandates 8-byte (64-bit) stack alignment before `call`.
+  stack_alignment_bits: 64   # -> DataLayout token S64
+  stack_alignment_bytes: 8
+  stack_alignment_cite: "abi §4.2 (SP must be 8-byte aligned before call)"
+  # Full expected string implied by the facts above:
+  expected_string: "E-m:e-i64:64-n64-S64"
+  expected_string_cite: "abi §2.2 + §4.2, isa §2.1"
+
+# ---- §4.2 Stack alignment (standalone fact, cross-checked vs S-token above) ----
+stack:
+  alignment_bytes: 8
+  abi_cite: "abi §4.2"

@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes
+.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -94,3 +94,9 @@ check-trans:
 
 clean-work:
 	@$(PYTHON) scripts/clean_work.py
+
+# C3 (ADR-0009 CodeGen/ABI branch): read-only backend-vs-abi.yaml conformance.
+# INTENTIONALLY standalone — NOT part of `make check`. The Phase-5 CodeGen spike
+# is WIP; this target EXPOSES divergence, it must not block repository checks.
+check-codegen-abi:
+	@$(PYTHON) scripts/check_codegen_abi.py

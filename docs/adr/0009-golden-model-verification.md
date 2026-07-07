@@ -62,6 +62,24 @@ DADAO 的验证路径是 `wiki → spec → test → QEMU`，同时 `spec → LL
 
 87 指令 × 每类非法输入（rd0 做目标、immu6=0、保留编码、SBZ 非零、非对齐…）机械生成编码 + 断言 QEMU 抛正确 fault。非法输入空间逐指令**可穷尽**。**射程**：fault 空间完备；不覆盖深层语义交互（属 M2 差分）。独立于 M1/M2。
 
+### CodeGen/ABI 验证分支（M1–M3 的盲区补全，2026-07-07 补）
+
+**盲区**：M1–M3 全部围绕 **ISA 执行侧（QEMU）**。而 CodeGen 侧（LLVM 后端）有一条**完全未机械化的链**：
+
+```
+contracts/abi/spec.md → CallingConv.td / RegisterInfo.td / DataLayout / ISelLowering → ∅（无 oracle）
+```
+
+QEMU 侧有 `spec → opcodes.yaml → 向量 → harness`；CodeGen 侧只有 lit **编码**字节检查（MC 层），**没有任何东西校验后端的调用约定/寄存器模型/DataLayout/帧布局是否符合 ABI 契约**。且 M1 的 wiki 审计**只覆盖 `isa/spec.md`，未覆盖 `abi/spec.md`**。CodeGen（Phase 5 spike）恰恰建在这段未审、未验的地基上——这被怀疑是 spike 崩溃难诊断的结构性根因（发现：spike 的 CallingConv 恰与 ABI 一致，但**无任何东西验证过它一致**，靠手工比对才知道）。
+
+补三个机制（与 M1–M3 正交）：
+
+- **C1 — M1-ABI**：把 `check_wiki_refs` 扩到 `contracts/abi/spec.md`（引用有效性 + 无引用规范断言），与 M1 同机制、同工具。
+- **C2 — 机器可读 ABI facts**：从 ABI 契约派生 `abi.yaml`（类比 opcodes.yaml）：参数/返回/callee-saved 寄存器集、DataLayout 串、帧布局、SBZ/对齐约束。含 `[OPEN]` 项显式标注（rd1、rb3/rb4 callee-saved 未定义等）。
+- **C3 — CodeGen 一致性检查**：机械比对 LLVM 后端 `CallingConv.td` / `RegisterInfo.td`（allocatable/reserved/callee-saved）/ `DataLayout` **是否匹配 `abi.yaml`**。**射程**：抓"后端 vs ABI 契约"漂移（会机械确认 CallingConv 一致、抓 DataLayout `S128` vs ABI 8B、标出后端依赖的 [OPEN] 项）；**不保证** ABI 契约本身对 wiki 忠实（那是 C1）、也不验运行时 ABI 行为（那需执行测试/M2 类）。
+
+**与 spike 的关系**：C1–C3 给 CodeGen spike 一个**验证过的地基 + 静态 oracle**；之后再回去 debug expand-ir-insts 崩溃，是在已知输入正确的前提下定位 target-wiring bug，而非盲猜。
+
 ---
 
 ## 射程总表
@@ -72,6 +90,9 @@ DADAO 的验证路径是 `wiki → spec → test → QEMU`，同时 `spec → LL
 | M2a Python 黄金模型 | QEMU 匹配 wiki 派生模型（生成式，含抓 spec.md 翻译错误）；DADAO 自控随时可用 | 非权威；模型与 QEMU 若对 wiki 相同误读则抓不到（相关性误差） |
 | M2b Sail 黄金模型 | 同上 + **wiki 团队审核后成权威**；可生成形式化定义 | 权威性依赖外部审核；87 全量 + RTL tandem 属下个项目 |
 | M3 legality 矩阵 | 每指令每类非法输入 QEMU 抛对 fault | 深层语义交互 |
+| C1 ABI wiki 审计 | 每条 ABI 断言可溯源 wiki | ABI 被正确理解（需人） |
+| C2 abi.yaml facts | ABI 契约结构化、[OPEN] 项显式 | facts 对 wiki 忠实（靠 C1） |
+| C3 CodeGen 一致性 | 后端 CallingConv/RegInfo/DataLayout 匹配 ABI 契约 | ABI 契约对不对（C1）；运行时 ABI 行为（需执行测试） |
 | （下个项目）RTL tandem + 形式化 | QEMU/RTL/Sail 互证、可证明 | 需 RTL + Sail 权威版存在 |
 
 **净效果**：机械保证不了"QEMU==wiki"（散文所限），但压缩成 **"QEMU==wiki 派生黄金模型（M2 生成式 / M3 穷尽 fault，DADAO 自控） + 黄金模型==wiki（M2b 经 wiki 团队审核 / M1 可审计引用）"**。这是散文 wiki + 外部团队下的诚实上限。
@@ -93,12 +114,14 @@ DADAO 的验证路径是 `wiki → spec → test → QEMU`，同时 `spec → LL
 
 ## 优先级与时序（含带宽纪律）
 
-Phase 5 CodeGen 是当前主线，且其 spike 已磕三次（DS 报告失真）。**别在 CodeGen spike 收口前塞入 Sail 彩排**——带宽/注意力是真的。
+**决策（2026-07-07）：验证链先收敛再推 spike。** CodeGen spike（DL-036a~038a）疑因 CodeGen 侧断链而难诊断，故先补 C1–C3 给它验证过的地基，再回去 debug。
 
-1. **现在**（便宜、不抢 CodeGen 带宽）：M1 wiki 审计器 + M3 legality 矩阵。
-2. **近期**：M2a Python 解释器 = 开发期工作黄金模型（wiki 直派、QEMU 独立、不同作者）。
-3. **CodeGen spike 收口后**：独立、带 charter + 时间盒的 **M2b Sail 彩排 spike**（垂直切片）。
-4. **下个项目**：完整 Sail + wiki 团队审核背书 + RTL tandem + 形式化。
+1. **M1 wiki 审计器**：✅ 完成（DL-039a/b/c，isa/spec.md，已并入 make check）。
+2. **现在 → CodeGen 验证分支 C1–C3**（收敛 CodeGen 断链，直接对应 spike 地基）：C1 M1-ABI 审计 → C2 abi.yaml facts → C3 后端一致性检查。
+3. **并行/稍后（QEMU 侧、便宜）**：M3 legality 矩阵；M2a Python 工作黄金模型（wiki 直派、QEMU 独立、不同作者）。
+4. **CodeGen 验证链收敛后**：回 CodeGen spike，在验证过的地基上 debug expand-ir-insts 崩溃 → 取 MIR。
+5. **spike 收口后**：带 charter + 时间盒的 **M2b Sail 彩排**（垂直切片）。
+6. **下个项目**：完整 Sail + wiki 团队审核背书 + RTL tandem + 形式化。
 
 ---
 
