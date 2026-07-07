@@ -118,10 +118,10 @@
 
 - id: ldo-align-MALIGN
   title: "ldo 非对齐 EA：spec §3.1 要求 8B 对齐→MALIGN，但 QEMU 不抛（exit0），且 rd-load-store.yaml case[2](+255)/case[6](+4095=-1) EA 非对齐却期望成功。黄金模型（从 spec）抛 MALIGN。→ 修 QEMU ldo 对齐检查 + 修 2 向量为对齐 EA 或 MALIGN 用例。QEMU+向量共同盲区，M2a 抓到。"
-  status: open
+  status: closed
   scope: [M1]
   blocks: null
-  resolved_by: null
+  resolved_by: DL-042b
 
 - id: RASUF-cold-ret
   title: "冷 RegRAS（ra0 低48位=0）ret 单指令语义 = RASUF（spec §5.6），但 QEMU 落到 halt→ILLI，疑 RASUF 未实现。建议 M3 legality 矩阵覆盖 RASOF/RASUF。"
@@ -132,7 +132,7 @@
 
 - id: opcodes-store-legality
   title: "opcodes.yaml 中 stb/stw/stt/sto/stm* 的 legality 为空，但 spec §2.6.1/§3.2 要求 store-from-rd0(rdha=rd0)→ILLI。编码契约不完备，建议回填。"
-  status: open
+  status: closed
   scope: [M1]
   blocks: null
-  resolved_by: null
+  resolved_by: DL-042b

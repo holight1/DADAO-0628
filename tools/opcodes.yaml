@@ -869,7 +869,8 @@
     - {name: rdha, bits: "[23:18]", role: src, bank: rd, signed: null}
     - {name: rbhb, bits: "[17:12]", role: src, bank: rb, signed: null}
     - {name: imms12, bits: "[11:0]", role: imm, bank: imm, signed: true}
-  legality: []
+  legality:
+    - "rdha != rd0"
   wiki_cite: "SimRISC-01 §存取RD寄存器"
 
 - mnemonic: stw
@@ -882,7 +883,8 @@
     - {name: rdha, bits: "[23:18]", role: src, bank: rd, signed: null}
     - {name: rbhb, bits: "[17:12]", role: src, bank: rb, signed: null}
     - {name: imms12, bits: "[11:0]", role: imm, bank: imm, signed: true}
-  legality: []
+  legality:
+    - "rdha != rd0"
   wiki_cite: "SimRISC-01 §存取RD寄存器"
 
 - mnemonic: stt
@@ -895,7 +897,8 @@
     - {name: rdha, bits: "[23:18]", role: src, bank: rd, signed: null}
     - {name: rbhb, bits: "[17:12]", role: src, bank: rb, signed: null}
     - {name: imms12, bits: "[11:0]", role: imm, bank: imm, signed: true}
-  legality: []
+  legality:
+    - "rdha != rd0"
   wiki_cite: "SimRISC-01 §存取RD寄存器"
 
 - mnemonic: sto
@@ -908,7 +911,8 @@
     - {name: rdha, bits: "[23:18]", role: src, bank: rd, signed: null}
     - {name: rbhb, bits: "[17:12]", role: src, bank: rb, signed: null}
     - {name: imms12, bits: "[11:0]", role: imm, bank: imm, signed: true}
-  legality: []
+  legality:
+    - "rdha != rd0"
   wiki_cite: "SimRISC-01 §存取RD寄存器"
 
 - mnemonic: stmb

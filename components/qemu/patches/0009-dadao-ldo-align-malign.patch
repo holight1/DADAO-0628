@@ -1,0 +1,124 @@
+From a0d2fe33586b0678991c511c6536c70a385e4b65 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 7 Jul 2026 17:37:52 +0800
+Subject: [PATCH] =?UTF-8?q?target/dadao:=20ldo/ldt/ldw=20+=20store=20?=
+ =?UTF-8?q?=E5=AF=B9=E9=BD=90=E6=A3=80=E6=9F=A5=20=E2=86=92=20MALIGN?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+M2a 黄金模型差分（DL-042a）发现 QEMU 对非对齐 EA 的 ldo 不抛 MALIGN
+（spec §3.1 要求 8/4/2 字节对齐）。QEMU 10.0 对 identity-map TLB 的
+MO_ALIGN 不生成对齐检查代码，故显式 gen_check_align（and+brcond+raise）
+绕过。EXCP_MALIGN 退出码对齐 harness FAULT_CODES（0x81）。
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ target/dadao/cpu.c       |  4 ++--
+ target/dadao/translate.c | 19 +++++++++++++++++++
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index b0367d9..79d46db 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -112,8 +112,8 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+         break;
+     case EXCP_MALIGN:
+-        cpu_physical_memory_write(DADAO_EXIT_PORT, &(uint64_t){0x02}, 8);
+-        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
++        qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x81);
++        break;
+         break;
+     default:
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index adf68b3..4234a16 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -82,6 +82,17 @@ static TCGv_i64 gen_ea(DisasContext *ctx, int rb_reg, int64_t offset)
+     return ea;
+ }
+ 
++static void gen_check_align(DisasContext *ctx, TCGv_i64 ea, unsigned size)
++{
++    TCGLabel *aligned = gen_new_label();
++    TCGv_i64 masked = tcg_temp_new_i64();
++    tcg_gen_mov_i64(masked, ea);
++    tcg_gen_andi_i64(masked, masked, size - 1);
++    tcg_gen_brcondi_i64(TCG_COND_EQ, masked, 0, aligned);
++    gen_helper_raise_exception(tcg_env, tcg_constant_i32(EXCP_MALIGN));
++    gen_set_label(aligned);
++}
++
+ /* swym is a NOP */
+ static bool trans_swym(DisasContext *ctx, arg_swym *a)
+ {
+@@ -336,6 +347,7 @@ static bool trans_ldws(DisasContext *ctx, arg_ldws *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+     TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    gen_check_align(ctx, ea, 2);
+     TCGv_i64 v = tcg_temp_new_i64();
+     tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_SW | MO_ALIGN_2);
+     store_rd(ctx, a->ha, v);
+@@ -346,6 +358,7 @@ static bool trans_ldwu(DisasContext *ctx, arg_ldwu *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+     TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    gen_check_align(ctx, ea, 2);
+     TCGv_i64 v = tcg_temp_new_i64();
+     tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_UW | MO_ALIGN_2);
+     store_rd(ctx, a->ha, v);
+@@ -356,6 +369,7 @@ static bool trans_ldts(DisasContext *ctx, arg_ldts *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+     TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    gen_check_align(ctx, ea, 4);
+     TCGv_i64 v = tcg_temp_new_i64();
+     tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_SL | MO_ALIGN_4);
+     store_rd(ctx, a->ha, v);
+@@ -366,6 +380,7 @@ static bool trans_ldtu(DisasContext *ctx, arg_ldtu *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+     TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    gen_check_align(ctx, ea, 4);
+     TCGv_i64 v = tcg_temp_new_i64();
+     tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_UL | MO_ALIGN_4);
+     store_rd(ctx, a->ha, v);
+@@ -376,6 +391,7 @@ static bool trans_ldo(DisasContext *ctx, arg_ldo *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+     TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    gen_check_align(ctx, ea, 8);
+     TCGv_i64 v = tcg_temp_new_i64();
+     tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_UQ | MO_ALIGN_8);
+     store_rd(ctx, a->ha, v);
+@@ -397,6 +413,7 @@ static bool trans_stw(DisasContext *ctx, arg_stw *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+     TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    gen_check_align(ctx, ea, 2);
+     TCGv_i64 v = load_rd(ctx, a->ha);
+     tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_BE | MO_16 | MO_ALIGN_2);
+     return true;
+@@ -406,6 +423,7 @@ static bool trans_stt(DisasContext *ctx, arg_stt *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+     TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    gen_check_align(ctx, ea, 4);
+     TCGv_i64 v = load_rd(ctx, a->ha);
+     tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_BE | MO_32 | MO_ALIGN_4);
+     return true;
+@@ -415,6 +433,7 @@ static bool trans_sto(DisasContext *ctx, arg_sto *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+     TCGv_i64 ea = gen_ea(ctx, a->hb, a->imm12);
++    gen_check_align(ctx, ea, 8);
+     TCGv_i64 v = load_rd(ctx, a->ha);
+     tcg_gen_qemu_st_i64(v, ea, ctx->mem_idx, MO_BE | MO_64 | MO_ALIGN_8);
+     return true;
+-- 
+2.43.0
+

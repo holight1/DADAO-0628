@@ -44,12 +44,12 @@
   format: rrii
   class: semantic
   encoding:
-    word: "0x330420FF"
+    word: "0x33042100"
   input_state:
     rb:
       rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000087FF00FF"
+      - address: "0x0000000087FF0100"
         value: "0x1234567890ABCDEF"
         width: 8
   expected_state:
@@ -58,7 +58,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §3.1"
-  notes: "ldo rd1,rb2,+255; load octa = 0x1234567890ABCDEF"
+  notes: "ldo rd1,rb2,+256; load octa = 0x1234567890ABCDEF (8-aligned)"
 
 - mnemonic: stb
   format: rrii
@@ -118,12 +118,12 @@
   format: rrii
   class: boundary
   encoding:
-    word: "0x33042FFF"
+    word: "0x330427F8"
   input_state:
     rb:
       rb2: "0x0000000087FF0000"
     memory:
-      - address: "0x0000000087FF0FFF"
+      - address: "0x0000000087FF07F8"
         value: "0x0000000000000001"
         width: 8
   expected_state:
@@ -132,7 +132,7 @@
   expected_fault: null
   status: active
   wiki_cite: "spec.md §3.1"
-  notes: "ldo rd1,rb2,+4095; max offset (0xFFF)"
+  notes: "ldo rd1,rb2,+2040; max 8-aligned offset (0x7F8)"
 
 # ─── Missing width variants ──────────────────────────────────────────────────
 
@@ -867,3 +867,17 @@
   wiki_cite: "spec.md §3.4"
   notes: "encoding-only: minimal operands"
 
+
+- mnemonic: ldo
+  format: rrii
+  class: legality
+  encoding:
+    word: "0x330420FF"
+  input_state:
+    rb:
+      rb2: "0x0000000087FF0000"
+  expected_state: null
+  expected_fault: MALIGN
+  status: active
+  wiki_cite: "spec.md §3.1"
+  notes: "ldo rd1,rb2,+255; EA=0x87FF00FF 非 8 对齐 → MALIGN（DL-042b 覆盖对齐检查）"
