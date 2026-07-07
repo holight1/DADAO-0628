@@ -1,0 +1,30 @@
+From b295d8f38927eaa5ac4fcd0a9017b87cefd68d28 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 7 Jul 2026 18:12:33 +0800
+Subject: [PATCH] target/dadao: reserved encoding -> UNDI (L-043b)
+
+Add EXCP_UNDI handler with exit code 0x83 (UNDI), separating
+reserved/decode-failure paths from operand-legality ILLI.
+
+decode_opc already correctly calls gen_exception_undi for
+unmatched encodings; only the interrupt handler was missing.
+---
+ target/dadao/cpu.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 79d46db..013c9f9 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -114,6 +114,8 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+     case EXCP_MALIGN:
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x81);
+         break;
++    case EXCP_UNDI:
++        qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x83);
+         break;
+     default:
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
+-- 
+2.43.0
+
