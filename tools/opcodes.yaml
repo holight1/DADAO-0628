@@ -927,6 +927,7 @@
     - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
     - {name: immu6, bits: "[5:0]", role: imm, bank: imm, signed: false}
   legality:
+    - "rdha != rd0"
     - "immu6 != 0"
     - "rdha + immu6 <= 64"
   wiki_cite: "SimRISC-01 §多load/store"
@@ -943,6 +944,7 @@
     - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
     - {name: immu6, bits: "[5:0]", role: imm, bank: imm, signed: false}
   legality:
+    - "rdha != rd0"
     - "immu6 != 0"
     - "rdha + immu6 <= 64"
   wiki_cite: "SimRISC-01 §多load/store"
@@ -959,6 +961,7 @@
     - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
     - {name: immu6, bits: "[5:0]", role: imm, bank: imm, signed: false}
   legality:
+    - "rdha != rd0"
     - "immu6 != 0"
     - "rdha + immu6 <= 64"
   wiki_cite: "SimRISC-01 §多load/store"
@@ -975,6 +978,7 @@
     - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
     - {name: immu6, bits: "[5:0]", role: imm, bank: imm, signed: false}
   legality:
+    - "rdha != rd0"
     - "immu6 != 0"
     - "rdha + immu6 <= 64"
   wiki_cite: "SimRISC-01 §多load/store"
