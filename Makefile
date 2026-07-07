@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi
+.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi check-golden
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -107,3 +107,13 @@ clean-work:
 # is WIP; this target EXPOSES divergence, it must not block repository checks.
 check-codegen-abi:
 	@$(PYTHON) scripts/check_codegen_abi.py
+
+# M2a (ADR-0009): Python golden model + differential vs QEMU (DL-042a core slice).
+# INTENTIONALLY standalone — NOT part of `make check` (coverage is the arith /
+# load-store / control-flow slice only). This target EXPOSES interp-vs-QEMU
+# divergence (the M2a value); a non-zero exit means a real divergence to triage,
+# it must not block repository structural checks.
+check-golden:
+	@$(PYTHON) tools/validate_interp.py; a=$$?; \
+	 $(PYTHON) tools/run_differential.py; b=$$?; \
+	 if [ $$a -ne 0 ] || [ $$b -ne 0 ]; then exit 1; fi
