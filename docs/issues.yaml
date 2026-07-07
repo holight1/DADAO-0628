@@ -136,3 +136,19 @@
   scope: [M1]
   blocks: null
   resolved_by: DL-042b
+
+# ── Found by M3 legality matrix (DL-043a) ─────────────────────────────────────
+
+- id: QEMU-reserved-UNDI
+  title: "保留编码：spec §2.5/§2.8.1 要求 UNDI(0x83)，但 QEMU 抛 ILLI(0x82)（5 例：MISC-Norm ha=0x01/0x0C/0x26、major op=0x11/0x18）。黄金模型 dadao_interp 对同编码抛 UNDI；全仓无 UNDI 向量。M3 抓到的 QEMU fault 完备性洞。→ 定夺：修 QEMU handler 分类 UNDI，或确认 M1 UNDI≡ILLI 取舍（若后者需 spec/golden/opcodes 同步）。"
+  status: open
+  scope: [M1]
+  blocks: null
+  resolved_by: null
+
+- id: opcodes-legality-cs-rb
+  title: "opcodes.yaml 漏记 8 条 legality：cmp/csn/csz/csp 缺 rdhb!=rd0、cseq/csne 缺 rdhc!=rd0、RB add/sub 缺 rbhb!=rb0（spec §2.6.1/§2.6.2 明列，QEMU 均正确抛 ILLI）。stm* 同类洞新一批。→ 架构师直修补记（最小行改，勿 yaml.dump）。"
+  status: open
+  scope: [M1]
+  blocks: null
+  resolved_by: null

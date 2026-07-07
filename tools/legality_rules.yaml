@@ -1,0 +1,212 @@
+# DADAO SimRISC M1 — Legality Rule Catalog (ADR-0009 M3)
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ SOURCE OF TRUTH: contracts/isa/spec.md  (§2.6 general + per-instruction §) │
+# │ These rules are transcribed from the SPEC PROSE, *not* reverse-engineered  │
+# │ from tools/opcodes.yaml's `legality` field.                                │
+# │                                                                            │
+# │ Why this matters (M3's whole point): opcodes.yaml `legality` is a SECOND   │
+# │ hand-translation of the spec with no completeness check. It has blind      │
+# │ spots — e.g. DL-042b found stm* was MISSING `rdha != rd0` (spec §3.4 has   │
+# │ it). If this catalog were derived from opcodes.yaml, it would inherit that │
+# │ same blind spot and could never test the missing constraint. So opcodes    │
+# │ .yaml is a CROSS-CHECKED OBJECT (check 2), never a rule source.            │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Each rule:
+#   id             : stable identifier
+#   fault          : ILLI(0x82) / UNDI(0x83) / MALIGN(0x81)
+#   spec_cite      : contracts/isa/spec.md section the rule is read from
+#   wiki_cite      : upstream wiki anchor (traceability, via spec)
+#   kind           : encoder dispatch (scripts/check_legality_matrix.py)
+#   status         : active | deferred
+#   check2         : true if opcodes.yaml `legality` is expected to record it
+#                    (static operand constraints). MALIGN/UNDI are dynamic /
+#                    reserved-cell faults, NOT static legality strings → false.
+#
+# Scope of THIS phase (ADR-0009 M3 first slice): enumerable, non-state-dependent
+# legality classes. State-dependent classes (RASOF/RASUF, divide-by-zero,
+# IALIGN) are catalogued as `status: deferred` and reported "not covered".
+
+rules:
+  # ── §2.6.1 RD Destination Rules ────────────────────────────────────────────
+  - id: rd_dest_rd0
+    fault: ILLI
+    spec_cite: "spec.md §2.6.1 (RD Destination Rules)"
+    wiki_cite: "SimRISC-01 §rd0 为目的寄存器约定"
+    kind: reg_dest_zero
+    bank: rd
+    status: active
+    check2: true
+    desc: >
+      An instruction whose destination is an RD register may not target rd0.
+      Applies per-role to the single-destination field (rdha for ld*/addi/
+      cmps(i)/cmpu(i)/orw/andnw/setzw/setow; rdhb for orrr/orri reg-form logic/
+      shift/ext/cmp-reg/rb2rd/cmp-rb/csn/csz/csp; rdhc for cseq/csne).
+      EXCEPTION: `ret` with rdha=rd0 is legal (return value discarded);
+      branch condition sources (brn/brnn/brz/brnz/brp/brnp, breq/brne) read
+      rdha as an input, so rdha=rd0 is legal there. Both excluded.
+
+  - id: store_src_rd0
+    fault: ILLI
+    spec_cite: "spec.md §2.6.1 (Store data source) + §3.2 + §3.4"
+    wiki_cite: "SimRISC-01 §rd0 为目的寄存器约定 (L37)"
+    kind: store_src_zero
+    bank: rd
+    status: active
+    check2: true
+    desc: >
+      For st*/stm* the rdha field is the data SOURCE, not a destination, but
+      storing from rd0 is still illegal → ILLI. This is the DL-042b class:
+      spec §3.4 requires stm* rdha≠rd0; opcodes.yaml originally omitted it.
+
+  - id: dual_dest_both_rd0
+    fault: ILLI
+    spec_cite: "spec.md §2.6.1 (Dual-destination) + §3.5 + §3.7"
+    wiki_cite: "SimRISC-01 §加减操作 (L147)"
+    kind: dual_dest_both_zero
+    bank: rd
+    status: active
+    check2: true
+    desc: >
+      add/sub/muls/mulu/divs/divu (rrrr) have two RD destinations (rdha,rdhb).
+      At most one may be rd0; BOTH = rd0 → ILLI.
+
+  - id: dual_dest_same_reg
+    fault: ILLI
+    spec_cite: "spec.md §2.6.1 (Dual-destination) + §3.5 + §3.7"
+    wiki_cite: "SimRISC-01 §加减操作 (L147, L195)"
+    kind: dual_dest_same
+    bank: rd
+    status: active
+    check2: true
+    desc: >
+      add/sub/muls/mulu/divs/divu: rdha and rdhb must not be the same non-rd0
+      register → ILLI.
+
+  # ── §2.6.2 RB Destination Rules ────────────────────────────────────────────
+  - id: rb_dest_rb0
+    fault: ILLI
+    spec_cite: "spec.md §2.6.2 (RB Destination Rules)"
+    wiki_cite: "SimRISC-02 §存取类 (L5)"
+    kind: reg_dest_zero
+    bank: rb
+    status: active
+    check2: true
+    desc: >
+      An instruction whose destination is an RB register may not target rb0.
+      rrii/riii RB dest (ldo-rb, addi-rb, rela) → rbha=rb0; orrr/orri RB dest
+      (add-rb, sub-rb, rd2rb, rb2rb) → rbhb=rb0.
+
+  - id: rb_base_rb0_store
+    fault: ILLI
+    spec_cite: "spec.md §4.1 + §4.2 (sto-rb / stmo-rb rbha=rb0)"
+    wiki_cite: "SimRISC-02 §存取类"
+    kind: rb_store_base_zero
+    bank: rb
+    status: active
+    check2: true
+    desc: >
+      §4.1/§4.2: for RB store forms (sto-rb, stmo-rb) rbha=rb0 is illegal
+      (ILLI per §2.6.2), even though rbha is not a write destination there.
+
+  # ── §2.6.3 Multi-Register Range Rules ──────────────────────────────────────
+  - id: multi_immu6_zero
+    fault: ILLI
+    spec_cite: "spec.md §2.6.3 (Multi-Register Range) + §3.3/§3.4/§4.2/§3.14"
+    wiki_cite: "SimRISC-01 §存取RD寄存器 (L63-L65)"
+    kind: immu6_zero
+    bank: n/a
+    status: active
+    check2: true
+    desc: >
+      For all multi-register instructions (ldm*/stm*, rd2rd, rd2rb, rb2rd,
+      rb2rb, ldmo-rb, stmo-rb) immu6=0 → ILLI. NOTE: shift/ext immediate forms
+      (shlu/shrs/shru/exts/extz orri) also carry immu6 but 0 is a LEGAL shift
+      amount there — excluded (rule scoped to multi-reg/block-copy only).
+
+  - id: multi_range_overflow
+    fault: ILLI
+    spec_cite: "spec.md §2.6.3 (first_reg + immu6 > 64) + §3.3/§3.4/§4.2/§3.14"
+    wiki_cite: "SimRISC-01 §存取RD寄存器 (L63-L65); SimRISC-02 (L41-L45)"
+    kind: range_overflow
+    bank: n/a
+    status: active
+    check2: true
+    desc: >
+      For all multi-register instructions first_reg + immu6 > 64 → ILLI
+      (no wrap, no truncation). first_reg is rdha/rbha (rrri) or the block-copy
+      dst/src register (orri).
+
+  # ── §2.1 / §3.1-3.2 / §4.1 Data Access Alignment ───────────────────────────
+  - id: data_malign
+    fault: MALIGN
+    spec_cite: "spec.md §2.1 + §3.1/§3.2 (alignment tables) + §4.1"
+    wiki_cite: "SimRISC-01 §对齐要求"
+    kind: malign
+    bank: n/a
+    status: active
+    check2: false   # dynamic (depends on runtime EA), not a static legality string
+    desc: >
+      Data load/store to an address not aligned to the access width raises
+      MALIGN. Min alignment: wyde=2, tetra=4, octa=8 (byte has none). Applies to
+      single ld*/st* (width>1) and RB ldo/sto, plus multi element accesses.
+
+  # ── §2.5 Reserved Encoding ─────────────────────────────────────────────────
+  - id: reserved_undi
+    fault: UNDI
+    spec_cite: "spec.md §2.5 (Reserved Encoding Behavior) + §2.8.1"
+    wiki_cite: "SimRISC-00 §SimRISC QFC"
+    kind: reserved_undi
+    bank: n/a
+    status: active
+    check2: false   # reserved cells are not per-instruction legality strings
+    desc: >
+      Executing a reserved opcode cell, or a reserved MISC-Norm ha minor-opcode
+      not listed in the subtable, raises UNDI. Enumerated over a representative
+      set of reserved encodings (not per-instruction).
+
+  # ── §2.6.4 SBZ Fields (no applicable M1 instruction this phase) ─────────────
+  - id: sbz_nonzero
+    fault: ILLI
+    spec_cite: "spec.md §2.6.4 (SBZ Fields) + ADR-0004 D5"
+    wiki_cite: "SimRISC-04"
+    kind: sbz_nonzero
+    bank: n/a
+    status: deferred
+    check2: false
+    desc: >
+      Non-zero SBZ field → ILLI (ADR-0004 D5; spec §2.6.4 marks the fault type
+      [OPEN]). No current M1 encoding record exposes an SBZ ('z') operand field,
+      so there is NO applicable instruction this phase → reported "not covered".
+
+  # ── State-dependent classes (deferred to a later M3 slice) ──────────────────
+  - id: divide_by_zero
+    fault: ILLI
+    spec_cite: "spec.md §3.7 (Multiply/Divide)"
+    wiki_cite: "SimRISC-01 §乘除操作"
+    kind: state_dependent
+    bank: n/a
+    status: deferred
+    check2: false
+    desc: "divs/divu by zero → ILLI. State-dependent (needs operand value); deferred."
+
+  - id: ras_overflow_underflow
+    fault: ILLI
+    spec_cite: "spec.md §5.6 (RAS Behavior)"
+    wiki_cite: "SimRISC §RegRAS"
+    kind: state_dependent
+    bank: n/a
+    status: deferred
+    check2: false
+    desc: "RASOF/RASUF on call/ret. State-dependent (needs RA depth); deferred."
+
+  - id: instruction_align
+    fault: IALIGN
+    spec_cite: "spec.md §2.1 (Instruction alignment)"
+    wiki_cite: "DADAO-12-SEE §精确异常"
+    kind: state_dependent
+    bank: n/a
+    status: deferred
+    check2: false
+    desc: "PC[1:0]≠00 → IALIGN. Requires a mis-aligned control transfer; deferred."

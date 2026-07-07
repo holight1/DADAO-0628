@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi check-golden
+.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi check-golden check-legality
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -117,3 +117,11 @@ check-golden:
 	@$(PYTHON) tools/validate_interp.py; a=$$?; \
 	 $(PYTHON) tools/run_differential.py; b=$$?; \
 	 if [ $$a -ne 0 ] || [ $$b -ne 0 ]; then exit 1; fi
+
+# M3 (ADR-0009): generative legality matrix. Spec-derived legality rules x every
+# applicable instruction → violating encoding → 3 cross-checks (QEMU fault /
+# opcodes.yaml completeness / vector coverage). INTENTIONALLY standalone — NOT
+# part of `make check`. First-round may surface QEMU-BUG / opcodes-漏 / 向量-缺;
+# this target EXPOSES them (reports to architect), it must not block repo checks.
+check-legality:
+	@$(PYTHON) scripts/check_legality_matrix.py
