@@ -6,13 +6,20 @@ Check 1: Three-state wiki reference resolution:
   - DANGLING: file found but target missing (hard error)
   - UNPARSEABLE: complex format parser can't handle (warning, non-blocking)
 
-Check 2: Normative assertions (ILLI/UNDI/MALIGN etc.) lacking wiki ref
-         or spec-decision marker.
+Check 2: Normative assertions lacking a wiki ref, a spec-decision marker,
+         or an explicit [OPEN] declaration.
+
+Auditing is parameterized by --profile (default: isa). The ISA profile is
+byte-for-byte identical to the historical behaviour (DL-039a/b/c) so that
+`make check`'s `check-wiki-refs` target never regresses. The ABI profile
+(DL-040b, ADR-0009 C1) audits contracts/abi/spec.md with ABI-specific
+normative wording and legal markers.
 """
 
 import re
 import sys
 import os
+import argparse
 from pathlib import Path
 from collections import defaultdict
 
@@ -231,7 +238,31 @@ SELF_DECISION_MARKERS = [
     r'自主决策', r'自主决定',
 ]
 
-def check_normative_assertions(text):
+# --- ABI profile (DL-040b, ADR-0009 C1) --------------------------------------
+# Normative wording actually used by contracts/abi/spec.md: register
+# save-classification (callee/caller-saved, immutable), argument-passing and
+# return rules (must/shall, extension), stack/alignment discipline, SBZ/reserved.
+ABI_NORMATIVE_PATTERNS = [
+    r'\bshall\b', r'\bmust\b', r'\bmust not\b',
+    r'必须', r'禁止',
+    r'\bcallee-saved\b', r'\bcaller-saved\b',
+    r'\bImmutable\b',
+    r'\bSBZ\b', r'\breserved\b',
+    r'sign-extend', r'zero-extend', r'sign- or zero-extend',
+    r'\baligned\b', r'\balignment\b', r'对齐',
+    r'\bred zone\b', r'红区',
+    r'grows downward', r'\bpreserve[sd]?\b',
+]
+
+# Legal markers per DL-040b: [wiki §…] (handled separately by the line skip),
+# [spec-decision: …], and [OPEN] (explicitly declared undefined).
+ABI_DECISION_MARKERS = [
+    r'\[spec-decision\]', r'\[spec-decision:',
+    r'\[OPEN',
+]
+
+def check_normative_assertions(text, patterns=NORMATIVE_PATTERNS,
+                               markers=SELF_DECISION_MARKERS):
     violations = []
     lines = text.split('\n')
 
@@ -243,11 +274,11 @@ def check_normative_assertions(text):
         if re.search(r'\[wiki\s+§', line):
             continue
 
-        has_decision = any(re.search(m, line) for m in SELF_DECISION_MARKERS)
+        has_decision = any(re.search(m, line) for m in markers)
         if has_decision:
             continue
 
-        matched = [p for p in NORMATIVE_PATTERNS if re.search(p, line, re.IGNORECASE)]
+        matched = [p for p in patterns if re.search(p, line, re.IGNORECASE)]
         if matched:
             violations.append((i, stripped[:120], matched))
 
@@ -257,12 +288,30 @@ def check_normative_assertions(text):
 # Main
 # ============================================================================
 
-def main():
-    if not SPEC_FILE.exists():
-        print(f"ERROR: spec file not found: {SPEC_FILE}", file=sys.stderr)
+PROFILES = {
+    'isa': {
+        'spec_file': REPO_ROOT / "contracts" / "isa" / "spec.md",
+        'label': 'spec.md',
+        'normative_patterns': NORMATIVE_PATTERNS,
+        'decision_markers': SELF_DECISION_MARKERS,
+    },
+    'abi': {
+        'spec_file': REPO_ROOT / "contracts" / "abi" / "spec.md",
+        'label': 'contracts/abi/spec.md',
+        'normative_patterns': ABI_NORMATIVE_PATTERNS,
+        'decision_markers': ABI_DECISION_MARKERS,
+    },
+}
+
+def run_audit(config):
+    spec_file = config['spec_file']
+    label = config['label']
+
+    if not spec_file.exists():
+        print(f"ERROR: spec file not found: {spec_file}", file=sys.stderr)
         sys.exit(1)
 
-    spec_text = SPEC_FILE.read_text()
+    spec_text = spec_file.read_text()
 
     # ---- Check 1: reference validity ----
     print("=" * 60)
@@ -287,12 +336,12 @@ def main():
     if results['DANGLING']:
         print("--- DANGLING refs ---")
         for line_num, full_ref, inner_ref, err in results['DANGLING']:
-            print(f"  spec.md:{line_num}: {full_ref}  -> {err}")
+            print(f"  {label}:{line_num}: {full_ref}  -> {err}")
 
     if results['UNPARSEABLE']:
         print("--- UNPARSEABLE refs (non-blocking) ---")
         for line_num, full_ref, inner_ref, err in results['UNPARSEABLE']:
-            print(f"  spec.md:{line_num}: {full_ref}  -> {err}")
+            print(f"  {label}:{line_num}: {full_ref}  -> {err}")
     print()
 
     # ---- Check 2: normative assertions without ref ----
@@ -300,14 +349,18 @@ def main():
     print("Check 2: Normative assertions without wiki reference")
     print("=" * 60)
 
-    violations = check_normative_assertions(spec_text)
+    violations = check_normative_assertions(
+        spec_text,
+        patterns=config['normative_patterns'],
+        markers=config['decision_markers'],
+    )
     print(f"Assertions without wiki ref or spec-decision marker: {len(violations)}")
     print()
 
     if violations:
         print("--- Violations ---")
         for line_num, snippet, patterns in violations:
-            print(f"  spec.md:{line_num}: {snippet}")
+            print(f"  {label}:{line_num}: {snippet}")
         print()
 
     # ---- Summary ----
@@ -322,10 +375,21 @@ def main():
     hard_errors = len(results['DANGLING']) + len(violations)
     if hard_errors:
         print(f"\n  OVERALL: FAIL ({hard_errors} hard errors)")
-        sys.exit(1)
+        return 1
     else:
         print("\n  OVERALL: PASS")
-        sys.exit(0)
+        return 0
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Audit wiki->spec traceability (ADR-0009).")
+    parser.add_argument(
+        '--profile', choices=sorted(PROFILES.keys()), default='isa',
+        help="Audit profile / target spec (default: isa).")
+    args = parser.parse_args()
+
+    config = PROFILES[args.profile]
+    sys.exit(run_audit(config))
 
 if __name__ == "__main__":
     main()

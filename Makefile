@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi
+.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -68,6 +68,13 @@ check-wiki-drift:
 
 check-wiki-refs:
 	@$(PYTHON) scripts/check_wiki_refs.py
+
+# C1 (ADR-0009 CodeGen/ABI branch): wiki->spec audit of contracts/abi/spec.md.
+# INTENTIONALLY standalone — NOT part of `make check`. The first ABI audit has a
+# known backlog of un-referenced normative assertions; this target EXPOSES it for
+# triage (补引用 / spec-decision / OPEN / wiki-team), it must not block `make check`.
+check-wiki-refs-abi:
+	@$(PYTHON) scripts/check_wiki_refs.py --profile abi
 
 validate-encoding:
 	@$(PYTHON) scripts/validate_encoding.py tools/opcodes.yaml
