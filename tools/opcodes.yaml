@@ -311,7 +311,8 @@
     - {name: rdhb, bits: "[17:12]", role: dst, bank: rd, signed: null}
     - {name: rbhc, bits: "[11:6]", role: src, bank: rb, signed: null}
     - {name: rbhd, bits: "[5:0]", role: src, bank: rb, signed: null}
-  legality: []
+  legality:
+    - "rdhb != rd0"
   wiki_cite: "SimRISC-02 §比较操作"
 
 - mnemonic: add
@@ -324,7 +325,8 @@
     - {name: rbhb, bits: "[17:12]", role: dst, bank: rb, signed: null}
     - {name: rbhc, bits: "[11:6]", role: src, bank: rb, signed: null}
     - {name: rdhd, bits: "[5:0]", role: src, bank: rd, signed: null}
-  legality: []
+  legality:
+    - "rbhb != rb0"
   wiki_cite: "SimRISC-02 §加减操作"
 
 - mnemonic: sub
@@ -337,7 +339,8 @@
     - {name: rbhb, bits: "[17:12]", role: dst, bank: rb, signed: null}
     - {name: rbhc, bits: "[11:6]", role: src, bank: rb, signed: null}
     - {name: rdhd, bits: "[5:0]", role: src, bank: rd, signed: null}
-  legality: []
+  legality:
+    - "rbhb != rb0"
   wiki_cite: "SimRISC-02 §加减操作"
 
 - mnemonic: unimp
@@ -572,7 +575,8 @@
     - {name: rdhb, bits: "[17:12]", role: dst, bank: rd, signed: null}
     - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
     - {name: rdhd, bits: "[5:0]", role: src, bank: rd, signed: null}
-  legality: []
+  legality:
+    - "rdhb != rd0"
   wiki_cite: "SimRISC-01 §条件赋值"
 
 - mnemonic: csz
@@ -586,7 +590,8 @@
     - {name: rdhb, bits: "[17:12]", role: dst, bank: rd, signed: null}
     - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
     - {name: rdhd, bits: "[5:0]", role: src, bank: rd, signed: null}
-  legality: []
+  legality:
+    - "rdhb != rd0"
   wiki_cite: "SimRISC-01 §条件赋值"
 
 - mnemonic: csp
@@ -600,7 +605,8 @@
     - {name: rdhb, bits: "[17:12]", role: dst, bank: rd, signed: null}
     - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
     - {name: rdhd, bits: "[5:0]", role: src, bank: rd, signed: null}
-  legality: []
+  legality:
+    - "rdhb != rd0"
   wiki_cite: "SimRISC-01 §条件赋值"
 
 - mnemonic: cseq
@@ -614,7 +620,8 @@
     - {name: rdhb, bits: "[17:12]", role: src, bank: rd, signed: null}
     - {name: rdhc, bits: "[11:6]", role: dst, bank: rd, signed: null}
     - {name: rdhd, bits: "[5:0]", role: src, bank: rd, signed: null}
-  legality: []
+  legality:
+    - "rdhc != rd0"
   wiki_cite: "SimRISC-01 §条件赋值"
 
 - mnemonic: csne
@@ -628,7 +635,8 @@
     - {name: rdhb, bits: "[17:12]", role: src, bank: rd, signed: null}
     - {name: rdhc, bits: "[11:6]", role: dst, bank: rd, signed: null}
     - {name: rdhd, bits: "[5:0]", role: src, bank: rd, signed: null}
-  legality: []
+  legality:
+    - "rdhc != rd0"
   wiki_cite: "SimRISC-01 §条件赋值"
 
 # ─── A.1.5 Branches (op=0x28-0x2F) ───────────────────────────────────────────

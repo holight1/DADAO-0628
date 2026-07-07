@@ -148,7 +148,7 @@
 
 - id: opcodes-legality-cs-rb
   title: "opcodes.yaml 漏记 8 条 legality：cmp/csn/csz/csp 缺 rdhb!=rd0、cseq/csne 缺 rdhc!=rd0、RB add/sub 缺 rbhb!=rb0（spec §2.6.1/§2.6.2 明列，QEMU 均正确抛 ILLI）。stm* 同类洞新一批。→ 架构师直修补记（最小行改，勿 yaml.dump）。"
-  status: open
+  status: closed
   scope: [M1]
   blocks: null
-  resolved_by: null
+  resolved_by: architect-direct（DL-043a 后续）
