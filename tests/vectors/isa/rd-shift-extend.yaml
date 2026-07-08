@@ -171,16 +171,15 @@
   format: orrr
   class: legality
   encoding:
-    word: "0x10443000"
+    word: "0x10440040"
   input_state:
     rd:
-      rd0: "0x0000000000000000"
       rd1: "0x0000000000000001"
   expected_state: null
   expected_fault: ILLI
   status: active
   wiki_cite: "spec.md §2.6.1"
-  notes: "shlu rd0,rd1,rd0; rdhb=rd0 → ILLI"
+  notes: "shlu rd0,rd1,rd2 dest=rdhb=rd0 → ILLI（原 0x10443000 误编码为 dest=rd3 合法；rd0 不得入 input_state，见 feedback_dadao_test_vector_constraints）"
 
 # ─── Encoding-only vectors ─────────────────────────────────────────────────────
 

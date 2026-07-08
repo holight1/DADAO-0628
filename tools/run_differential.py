@@ -34,13 +34,15 @@ sys.path.insert(0, os.path.join(REPO, 'tests', 'scripts'))
 import validate_interp as V
 import run_qemu_test as Q
 
-CORE_FILES = ['rd-arith.yaml', 'rd-load-store.yaml', 'control-flow.yaml']
 VEC_DIR = os.path.join(REPO, 'tests', 'vectors', 'isa')
+# DL-042c: differential over every active vector across all ISA yaml files.
+CORE_FILES = [os.path.basename(p)
+              for p in sorted(glob.glob(os.path.join(VEC_DIR, '*.yaml')))]
 
 
 def main():
     qemu_bin = Q.find_qemu()
-    print("=== run_differential: interpreter vs QEMU (DL-042a core slice) ===")
+    print("=== run_differential: interpreter vs QEMU (DL-042c full coverage) ===")
     print(f"    qemu = {qemu_bin}")
 
     agree = diverge = harness = qskip = 0

@@ -152,3 +152,19 @@
   scope: [M1]
   blocks: null
   resolved_by: architect-direct（DL-043a 后续）
+
+# ── Found by M2a golden model full-87 differential (DL-042c) ──────────────────
+
+- id: QEMU-rb0-not-maintained
+  title: "QEMU 从不维护 env->rb[0]=PC+4（spec §1.3「rb0=current_PC+4，硬件维护」/§4.8 rela base=rb0[47:0]&~0xFFF）。全 dadao target 中 rb[0] 仅 translate.c:609 一处引用（读），无任何写 PC 的点，故 rb0 恒复位值≈0。rela（word 0x48040001）实际 PC≈BINARY_BASE=0x80000000 → 黄金模型 spec-correct 0x80001000；QEMU 读 rb0=0 得 0x1000，向量 rb-ops case[4] expected 也按 QEMU 写 0x1000（违 independent-oracle）。架构师初判「解释器 bug」经解码+QEMU 源码+探针三查证伪：是 QEMU 缺陷。→ 修 QEMU trans_rela 用 ctx PC+4（参 RISC-V auipc 用 ctx->base.pc_next）+ 同步修 rb-ops case[4] expected 0x1000→0x80001000（须同时落地）。影响面：任何以 rb0 为源的指令（rela / call 返回地址 / rb2rd rb0）在 QEMU 均读 0，Phase 5 CodeGen 用 rela 物化 PC-relative 地址前必须修。"
+  status: open
+  scope: [M1]
+  blocks: [phase5-codegen-rela]
+  resolved_by: null
+
+- id: vector-shlu-rd0-mislabel
+  title: "rd-shift-extend case[10] 向量缺陷：word 0x10443000 实解码为 shlu rd3,rd0,rd0（dest=rdhb=rd3≠rd0，合法），但 notes/class 标 dest=rd0→ILLI，编码与意图矛盾；且 rd0 混入 input_state（违 feedback_dadao_test_vector_constraints），harness setzw rd0 在 setup 即 ILLI（伪产物，根本没跑到 shlu）。M2a full-87 抓到。→ 架构师直修：word→0x10440040（真 dest=rd0）+ 去 input_state 的 rd0；QEMU+解释器均验证 ILLI。"
+  status: closed
+  scope: [M1]
+  blocks: null
+  resolved_by: architect-direct（DL-042c 收口）

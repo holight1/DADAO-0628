@@ -28,7 +28,9 @@ import dadao_interp as I
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VEC_DIR = os.path.join(os.path.dirname(HERE), 'tests', 'vectors', 'isa')
-CORE_FILES = ['rd-arith.yaml', 'rd-load-store.yaml', 'control-flow.yaml']
+# DL-042c: full coverage = every active vector across all ISA yaml files.
+CORE_FILES = [os.path.basename(p)
+              for p in sorted(glob.glob(os.path.join(VEC_DIR, '*.yaml')))]
 
 
 def _cmp_state(st, expected):
@@ -131,7 +133,7 @@ def main():
     mism, harness = [], []
     ops_seen = set()
 
-    print("=== validate_interp: DL-042a core slice ===")
+    print("=== validate_interp: DL-042c full coverage (all active vectors) ===")
     for path in files:
         with open(path) as fh:
             cases = yaml.safe_load(fh)
