@@ -7,3 +7,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# lit 运行产物
+tests/lit/**/Output/
+tests/lit/**/.lit_test_times.txt

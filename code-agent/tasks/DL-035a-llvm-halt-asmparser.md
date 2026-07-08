@@ -172,4 +172,65 @@ echo "回归: 0 failures"
 
 ## 完成区
 
-（DS 填写）
+**状态**：已完成
+**修改文件**：
+  - `.work/source/llvm/llvm/lib/Target/DADAO/DADAOInstrInfo.td` — 添加 HALT_RIII（op=0x00, riii, `halt $rdha`, imm18=0）
+  - `tests/e2e/smoke_jump.s` — `jump_i` → `jump`（匹配 LLVM mnemonic）
+  - `tests/lit/E2E/lit.cfg` — 添加 `%llvm-mc` / `%llvm-objcopy` 替换变量
+  - `tests/lit/E2E/smoke_arith.test` — 改用 llvm-mc pipeline + 内嵌汇编
+  - `tests/lit/E2E/smoke_add.test` — 同上
+  - `tests/lit/E2E/smoke_jump.test` — 同上
+**验证**：
+  - `grep halt DADAOGenAsmMatcher.inc` → 确认 halt 已注册
+  - llvm-mc 三场景全部汇编成功
+  - llvm-mc 输出与 gen_e2e_binary.py 字节完全一致（diff MATCH）
+  - QEMU 运行：smoke_arith exit=42, smoke_add exit=42, smoke_jump exit=0
+  - `llvm-lit tests/lit/E2E/` → 3/3 PASS
+  - 全套 QEMU yaml 向量回归：203 PASS, 0 FAIL
+**遗留问题**：无
+
+---
+
+## Architecture Review — 代码级 (2026-06-30)
+
+**评审结论**：**Accepted — halt 指令定义正确，smoke_jump 助记符修正，E2E 字节一致。**
+
+### halt 定义验证 (InstrInfo.td)
+
+```tablegen
+let op = 0x00 in
+def HALT_RIII : F_RIII_RD<(outs), (ins GPRD:$rdha), "halt", []> {
+  let imm18 = 0;
+  let AsmString = "halt $rdha";
+}
+```
+
+- op=0x00，格式 riii，ha=rd_src(exit code)，imm18=0 ✅
+- `halt rd1` → (0x00<<24)|(1<<18) = `0x00040000` ✅
+- AsmMatcher 中 `halt` 已注册（`"halt": 117, HALT_RIII`）✅
+
+### E2E 验证
+
+| 场景 | llvm-mc 字节 | QEMU exit | gen_e2e 一致 |
+|------|-------------|-----------|-------------|
+| smoke_arith | `1904002A_00040000` | 42 | ✅ IDENTICAL |
+| smoke_add | `19040003_...` | 42 | ✅ |
+| smoke_jump | `64000001_00040000_...` | 0 | ✅ |
+
+### smoke_jump.s 助记符修正
+
+```
+jump_i 1 → jump 1    (LLVM asm 使用 "jump" 而非 "jump_i")  ✅
+```
+
+### Lit 更新
+
+```
+smoke_arith.test: %llvm-mc → .s 内嵌汇编 → %llvm-objcopy → QEMU ✅
+3/3 E2E lit PASS, 203/203 QEMU yaml regression PASS
+```
+
+### 最终判断
+
+halt 定义正确，AsmMatcher 注册成功，llvm-mc 字节与手推 golden 完全一致。
+E2E 流程正式闭环：`.s → .o → .bin → QEMU → exit code`。可 accept。

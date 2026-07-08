@@ -1,2 +1,8 @@
-// RUN: %binbuilder smoke_jump %t.bin
-// RUN: %python %S/../../scripts/run_e2e.py %qemu %trampoline %t.bin
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %s
+// RUN: %llvm-objcopy -O binary --only-section=.text %t.o %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 0'
+.text
+jump    1
+halt    rd1
+addi    rd1, rd0, 0
+halt    rd1
