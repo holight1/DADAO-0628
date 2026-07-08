@@ -162,6 +162,13 @@
   blocks: [phase5-codegen-rela]
   resolved_by: null
 
+- id: QEMU-rela-rbha-hi16-not-preserved
+  title: "QEMU trans_rela 写目的 rbha 时用整值覆写（& 0x0000FFFFFFFFFFFF），清零了 rbha[63:48]，违反 spec §4.8 L785「rbha[63:48] = unchanged 保留」。预存 bug（DL-042d 前旧代码也整值覆写），DL-042d narrow 范围未触及。当前向量 rb-ops case[4] rb1 高位=0 故未暴露；黄金模型 dadao_interp 正确保留（(old & HI16)|res）。参照同文件 trans_addi_rb 的 read-modify-write 保留范式。→ 修 QEMU rela 保留高 16 + 加一条 rbha 高位非零的覆盖向量（M2a/M3 才能抓到分歧）。DL-042d review 架构师发现。"
+  status: open
+  scope: [M1]
+  blocks: null
+  resolved_by: null
+
 - id: vector-shlu-rd0-mislabel
   title: "rd-shift-extend case[10] 向量缺陷：word 0x10443000 实解码为 shlu rd3,rd0,rd0（dest=rdhb=rd3≠rd0，合法），但 notes/class 标 dest=rd0→ILLI，编码与意图矛盾；且 rd0 混入 input_state（违 feedback_dadao_test_vector_constraints），harness setzw rd0 在 setup 即 ILLI（伪产物，根本没跑到 shlu）。M2a full-87 抓到。→ 架构师直修：word→0x10440040（真 dest=rd0）+ 去 input_state 的 rd0；QEMU+解释器均验证 ILLI。"
   status: closed

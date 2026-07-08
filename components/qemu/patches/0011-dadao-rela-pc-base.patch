@@ -1,0 +1,43 @@
+From 3e0e57c2bf1418c2a2cdef9a3da3603b824c919f Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 8 Jul 2026 15:08:16 +0800
+Subject: [PATCH] target/dadao: rela use PC+4 (not env->rb[0]) for base
+ (L-042d)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+per spec §1.3/§4.8, rb0 = current_PC+4 computed at instruction
+address. Replace tcg_gen_ld_i64(rb[0]) with tcg_constant_i64(PC+4),
+computed entirely at translation time.
+
+Narrow fix: only rela; broad rb0 maintenance (call retaddr etc.)
+deferred to separate issue.
+---
+ target/dadao/translate.c | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 4234a16..9754014 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -605,13 +605,9 @@ static bool trans_ldmo_rb(DisasContext *ctx, arg_ldmo_rb *a)
+ static bool trans_rela(DisasContext *ctx, arg_rela *a)
+ {
+     if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
+-    TCGv_i64 base = tcg_temp_new_i64();
+-    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[0]));
+-    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
+-    tcg_gen_andi_i64(base, base, ~0xFFFULL);
+-    tcg_gen_addi_i64(base, base, (int64_t)a->imm18 << 12);
+-    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
+-    tcg_gen_st_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
++    uint64_t pc = (ctx->base.pc_next + 4) & 0x0000FFFFFFFFFFFFULL;
++    uint64_t target = ((pc & ~0xFFFULL) + ((int64_t)a->imm18 << 12)) & 0x0000FFFFFFFFFFFFULL;
++    tcg_gen_st_i64(tcg_constant_i64(target), tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
+     return true;
+ }
+ 
+-- 
+2.43.0
+
