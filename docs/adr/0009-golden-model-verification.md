@@ -58,9 +58,18 @@ DADAO 的验证路径是 `wiki → spec → test → QEMU`，同时 `spec → LL
 
   **为何 M2a 与 M2b 都要**：Sail 权威性依赖外部 wiki 团队审核（慢、不可控）→ Python 是 DADAO 自控、随时可用的黄金模型，不阻塞于审核周期。二者分工 = **速度/自控（Python） vs 权威/背书（Sail）**。
 
-### M3：生成式 legality 矩阵（fault 完备性，可迁移）
+### M3：生成式 legality 矩阵（fault 完备性 + opcodes 交叉核对，可迁移）
 
-87 指令 × 每类非法输入（rd0 做目标、immu6=0、保留编码、SBZ 非零、非对齐…）机械生成编码 + 断言 QEMU 抛正确 fault。非法输入空间逐指令**可穷尽**。**射程**：fault 空间完备；不覆盖深层语义交互（属 M2 差分）。独立于 M1/M2。
+87 指令 × 每类非法输入（rd0 做目标、immu6=0、保留编码、SBZ 非零、非对齐…）机械生成编码 + 断言 QEMU 抛正确 fault。非法输入空间逐指令**可穷尽**。
+
+**三重目标（一次堵三个空子）**——从 **spec legality 规则**生成矩阵，每条规则同时核：
+- **QEMU 实现了吗**（生成非法输入 → 断言 QEMU 抛对 fault）；
+- **opcodes.yaml 记全了吗**（该 legality 规则是否在 opcodes.yaml 对应指令的 `legality` 里）；
+- **有向量覆盖吗**（是否存在 legality-class 向量测它）。
+
+**为何**：M2a 差分只能在**被测输入**上抓分歧，抓不到"从没测过的非法输入"（例：stm* 缺 `rdha≠rd0`——spec §3.4 有、opcodes.yaml 漏、无向量、QEMU 未知，三处齐空，M2a/validate_* 全穿透，靠人读 spec §3.4 才逮到，DL-042b）。这类"legality 完备性"洞是 **M3 形状**（生成式穷举），非 M2 形状（差分）。opcodes.yaml legality 是 spec 的第二次手工转译、无完备性校验，M3 兼做此交叉核对。
+
+**射程**：fault/legality 空间完备 + opcodes 记录完备；不覆盖深层语义交互（属 M2 差分）。独立于 M1/M2。
 
 ### CodeGen/ABI 验证分支（M1–M3 的盲区补全，2026-07-07 补）
 
@@ -114,14 +123,19 @@ QEMU 侧有 `spec → opcodes.yaml → 向量 → harness`；CodeGen 侧只有 l
 
 ## 优先级与时序（含带宽纪律）
 
-**决策（2026-07-07）：验证链先收敛再推 spike。** CodeGen spike（DL-036a~038a）疑因 CodeGen 侧断链而难诊断，故先补 C1–C3 给它验证过的地基，再回去 debug。
+**已完成**：
+1. **M1** wiki 审计器（ISA）：✅ DL-039a/b/c，已并入 make check。
+2. **C1/C2/C3** CodeGen 验证分支：✅ DL-040a/b/c，ABI 审计 + abi.yaml + 后端一致性，已并入 make check。
+3. **CodeGen spike**：✅ SPIKE PASS（DL-041a，数据侧 GPRD MIR 实证；GPRB/地址侧留 Phase 5）。
 
-1. **M1 wiki 审计器**：✅ 完成（DL-039a/b/c，isa/spec.md，已并入 make check）。
-2. **现在 → CodeGen 验证分支 C1–C3**（收敛 CodeGen 断链，直接对应 spike 地基）：C1 M1-ABI 审计 → C2 abi.yaml facts → C3 后端一致性检查。
-3. **并行/稍后（QEMU 侧、便宜）**：M3 legality 矩阵；M2a Python 工作黄金模型（wiki 直派、QEMU 独立、不同作者）。
-4. **CodeGen 验证链收敛后**：回 CodeGen spike，在验证过的地基上 debug expand-ir-insts 崩溃 → 取 MIR。
-5. **spike 收口后**：带 charter + 时间盒的 **M2b Sail 彩排**（垂直切片）。
-6. **下个项目**：完整 Sail + wiki 团队审核背书 + RTL tandem + 形式化。
+**决策（2026-07-07，用户）：验证链主体全闭再推 Phase 5；M2b Sail 保持 deferred。**
+理由：直接给 CodeGen 兜底的 C1/C2/C3 已闭环；剩余 M2a/M3 属 QEMU 侧，其中 **M2a 有真协同**——给 Phase 5 生成的代码当**生成式 oracle**（编译→QEMU 跑→比对 Python 模型），把 E2E 从手写向量升级为生成式。M2b Sail 服务下个 ISA+RTL 项目、不服务 Phase 5，按原计划延后。
+
+4. **现在 → M2a** Python 工作黄金模型（wiki 直派、QEMU 独立、不同作者）：闭合 QEMU 侧链 + 给 Phase 5 当生成式 oracle。
+5. **然后 → M3** legality 矩阵（便宜、QEMU fault 完备性；正交但补齐链）。
+6. **然后 → Phase 5 正式实现**（DL-042 GPRB bank →043 load/store →044 ADD_RRRR 双输出 →045 CallingConv →046 AsmPrinter），在全闭合验证链上。
+7. **deferred → M2b Sail 彩排**：服务下个项目，与 Phase 5 并行/后，带 charter + 时间盒。
+8. **下个项目**：完整 Sail + wiki 团队审核背书 + RTL tandem + 形式化。
 
 ---
 
