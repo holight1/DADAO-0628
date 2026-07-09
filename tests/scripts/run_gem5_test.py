@@ -36,11 +36,8 @@ GEM5_TESTS = os.path.join(GEM5_DIR, 'tests', 'dadao')
 
 sys.path.insert(0, HERE)
 sys.path.insert(0, GEM5_TESTS)
-from build_test_binary import write_rrii          # noqa: E402
+from build_test_binary import load_reg             # noqa: E402
 import gen_min_elf                                 # noqa: E402
-
-# gem5 G1 core instructions (opcode -> mnemonic).
-SUPPORTED_OPS = {0x00: 'halt', 0x19: 'addi', 0x1A: 'add', 0x64: 'jump'}
 
 DEFAULT_GEM5 = os.path.join(GEM5_DIR, 'build', 'DADAO', 'gem5.opt')
 DEFAULT_CONFIG = os.path.join(GEM5_TESTS, 'dadao_se.py')
@@ -56,52 +53,40 @@ def find_gem5():
     return None
 
 
-def _as_signed64(v):
-    return v - (1 << 64) if v >= (1 << 63) else v
-
-
-def _fits_imm12(v):
-    s = _as_signed64(v & MASK64)
-    return -2048 <= s <= 2047
-
-
 def build_gem5_binary(case):
-    """Return a flat DADAO binary runnable on the gem5 G1 core, or None if the
-    case is outside gem5's current coverage (caller reports SKIP-unsupported)."""
-    if case.get('branch_behavior'):
-        return None                                   # branch harness: DG-004a
-    if case.get('expected_fault') is not None:
-        return None                                   # no fault model yet
+    """Build a flat DADAO binary that sets up the vector's rd inputs, runs the
+    instruction under test, and halts (dumping final state). Returns None when
+    the case is outside gem5's current coverage (caller reports
+    SKIP-unsupported): branch harness, fault-expecting vectors (no fault model),
+    or state gem5 cannot set up / read back (rb input, memory).
 
-    word = int(case['encoding']['word'], 16)
-    if (word >> 24) not in SUPPORTED_OPS:
-        return None
+    rd inputs are loaded with setzw/orw (build_test_binary.load_reg), which gem5
+    now implements, so arbitrary 64-bit inputs are supported. Whether the
+    instruction under test is actually implemented is decided at run time: if it
+    decodes to Unknown, no halt/regdump is produced and the caller SKIPs. This
+    keeps coverage auto-growing as gem5 gains instructions."""
+    if case.get('branch_behavior'):
+        return None                                   # branch harness: DG-004b
+    if case.get('expected_fault') is not None:
+        return None                                   # no fault model yet (DG-004c)
 
     inp = case.get('input_state') or {}
     if inp.get('memory'):
         return None                                   # cannot set up memory
     if inp.get('rb'):
-        return None                                   # no rb loader instruction
+        return None                                   # no rb loader instruction yet
 
     exp = case.get('expected_state') or {}
     if exp.get('memory'):
         return None                                   # cannot read back memory
 
-    rd_in = inp.get('rd', {})
-    for name, vstr in rd_in.items():
-        if not _fits_imm12(int(vstr, 16)):
-            return None                               # input not addi-loadable
-
+    word = int(case['encoding']['word'], 16)
     out = bytearray()
-    # Set up rd inputs with `addi rdN, rd0, value` (value fits signed imm12).
-    for name in sorted(rd_in):
+    for name in sorted(inp.get('rd', {})):
         n = int(name.replace('rd', ''))
-        val = _as_signed64(int(rd_in[name], 16) & MASK64)
-        write_rrii(out, 0x19, n, 0, val)              # addi rdN, rd0, val
-    # The instruction under test.
-    out.extend(struct.pack('>I', word))
-    # halt rd0 -> exit 0 and dump final registers.
-    out.extend(struct.pack('>I', 0x00 << 24))
+        load_reg(out, 'rd', n, int(inp['rd'][name], 16) & MASK64)
+    out.extend(struct.pack('>I', word))               # instruction under test
+    out.extend(struct.pack('>I', 0x00 << 24))         # halt rd0 -> exit 0 + dump
     return bytes(out)
 
 
