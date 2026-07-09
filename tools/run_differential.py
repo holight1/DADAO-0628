@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.join(REPO, 'tests', 'scripts'))
 
 import validate_interp as V
 import run_qemu_test as Q
+import run_gem5_test as G
 
 VEC_DIR = os.path.join(REPO, 'tests', 'vectors', 'isa')
 # DL-042c: differential over every active vector across all ISA yaml files.
@@ -42,10 +43,14 @@ CORE_FILES = [os.path.basename(p)
 
 def main():
     qemu_bin = Q.find_qemu()
-    print("=== run_differential: interpreter vs QEMU (DL-042c full coverage) ===")
+    gem5_bin = G.find_gem5()
+    print("=== run_differential: interpreter vs QEMU vs gem5 (DG-003a 3-way) ===")
     print(f"    qemu = {qemu_bin}")
+    print(f"    gem5 = {gem5_bin}")
 
-    agree = diverge = harness = qskip = 0
+    # agree3   : interp + QEMU + gem5 all concur with the vector (3-way).
+    # agree_gs : interp + QEMU concur; gem5 abstains (SKIP-unsupported).
+    agree3 = agree_gs = diverge = harness = qskip = 0
     diverges, harnesses = [], []
 
     for fname in CORE_FILES:
@@ -72,28 +77,41 @@ def main():
                 qskip += 1
                 continue
 
+            gstatus, gdetail = G.run_case(case, gem5_bin=gem5_bin)
+            gem5_ran = gstatus in ('PASS', 'FAIL')
+
             interp_ok = (ibucket == 'PASS')
             qemu_ok = (qstatus == 'PASS')
-            if interp_ok and qemu_ok:
-                agree += 1
+            gem5_ok = (gstatus == 'PASS')
+
+            if interp_ok and qemu_ok and (not gem5_ran or gem5_ok):
+                # interp + QEMU agree with the vector; gem5 either also agrees
+                # (3-way) or abstains (SKIP-unsupported, coverage grows w/ G2).
+                if gem5_ran:
+                    agree3 += 1
+                else:
+                    agree_gs += 1
             else:
                 diverge += 1
                 diverges.append(
                     f'{fname} case[{i}] {case["mnemonic"]}: '
-                    f'interp={ibucket}({idetail}); qemu={qstatus}({qdetail}) | {desc}')
+                    f'interp={ibucket}({idetail}); qemu={qstatus}({qdetail}); '
+                    f'gem5={gstatus}({gdetail}) | {desc}')
 
     if harnesses:
         print("\n--- HARNESS (single-instr model deliberately abstains) ---")
         for h in harnesses:
             print('  ', h)
     if diverges:
-        print("\n--- DIVERGE (interp vs QEMU — findings, architect triages) ---")
+        print("\n--- DIVERGE (interp vs QEMU vs gem5 — architect triages) ---")
         for d in diverges:
             print('  ', d)
 
-    print(f"\n=== AGREE={agree} DIVERGE={diverge} "
-          f"HARNESS={harness} QEMU-SKIP={qskip} ===")
-    if qskip and agree == 0 and diverge == 0:
+    print(f"\n=== AGREE(3-way)={agree3}  AGREE(interp+QEMU, gem5-SKIP)={agree_gs}"
+          f"  DIVERGE={diverge}  HARNESS={harness}  QEMU-SKIP={qskip} ===")
+    print(f"    gem5 covers {agree3} of the {agree3 + agree_gs} interp+QEMU-agreed "
+          f"cases (G1 = 4 instrs; grows with DG-004a).")
+    if qskip and agree3 == 0 and agree_gs == 0 and diverge == 0:
         print("ERROR: all comparable cases QEMU-skipped (QEMU missing?)",
               file=sys.stderr)
         sys.exit(2)
