@@ -11,3 +11,6 @@ __pycache__/
 # lit 运行产物
 tests/lit/**/Output/
 tests/lit/**/.lit_test_times.txt
+
+# gem5 运行产物
+m5out/

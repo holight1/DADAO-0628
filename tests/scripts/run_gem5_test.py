@@ -45,6 +45,14 @@ DEFAULT_CONFIG = os.path.join(GEM5_TESTS, 'dadao_se.py')
 MASK48 = (1 << 48) - 1
 MASK64 = (1 << 64) - 1
 
+# DG-004b memory window. Must match arch/dadao/decoder.cc (MEM_WINDOW_BASE /
+# MEM_WINDOW_SIZE). A fixed RW data segment covering [BASE, BASE+SIZE) is mapped
+# into every test ELF so loads/stores have valid pages; at halt gem5 dumps this
+# window (DADAO_MEMDUMP) for expected_state.memory comparison. All memory test
+# vectors cluster at 0x87FF0000, well inside the window.
+MEM_WINDOW_BASE = 0x87FEF000
+MEM_WINDOW_SIZE = 0x3000
+
 
 def find_gem5():
     for p in [os.environ.get('GEM5_OPT'), DEFAULT_GEM5]:
@@ -54,40 +62,51 @@ def find_gem5():
 
 
 def build_gem5_binary(case):
-    """Build a flat DADAO binary that sets up the vector's rd inputs, runs the
-    instruction under test, and halts (dumping final state). Returns None when
-    the case is outside gem5's current coverage (caller reports
-    SKIP-unsupported): branch harness, fault-expecting vectors (no fault model),
-    or state gem5 cannot set up / read back (rb input, memory).
+    """Build a flat DADAO binary that sets up the vector's rd/rb inputs, runs the
+    instruction under test, and halts (dumping final register + memory state).
+    Returns (code_bytes, window_bytes) or None when outside gem5's current
+    coverage (caller reports SKIP-unsupported): branch harness or fault-expecting
+    vectors (no fault model yet, DG-004c).
 
-    rd inputs are loaded with setzw/orw (build_test_binary.load_reg), which gem5
-    now implements, so arbitrary 64-bit inputs are supported. Whether the
-    instruction under test is actually implemented is decided at run time: if it
-    decodes to Unknown, no halt/regdump is produced and the caller SKIPs. This
-    keeps coverage auto-growing as gem5 gains instructions."""
+    rd/rb inputs are loaded with setzw/orw (build_test_binary.load_reg), which
+    gem5 implements for both banks (setzw-rb/orw-rb added in DG-004b). Initial
+    memory (input_state.memory) is placed directly in a fixed RW data segment
+    (the memory window) initialised big-endian, so it is mapped and readable by
+    loads and writable by stores. expected_state.memory is checked by reading the
+    window back from gem5's DADAO_MEMDUMP. Whether the instruction under test is
+    actually implemented is decided at run time: if it decodes to Unknown, no
+    halt/regdump is produced and the caller SKIPs."""
     if case.get('branch_behavior'):
-        return None                                   # branch harness: DG-004b
+        return None                                   # branch harness
     if case.get('expected_fault') is not None:
         return None                                   # no fault model yet (DG-004c)
 
     inp = case.get('input_state') or {}
-    if inp.get('memory'):
-        return None                                   # cannot set up memory
-    if inp.get('rb'):
-        return None                                   # no rb loader instruction yet
 
-    exp = case.get('expected_state') or {}
-    if exp.get('memory'):
-        return None                                   # cannot read back memory
+    # Initial memory window (big-endian), mapped RW into the ELF.
+    window = bytearray(MEM_WINDOW_SIZE)
+    for entry in inp.get('memory') or []:
+        addr = int(entry['address'], 16)
+        width = int(entry.get('width', 8))
+        val = int(entry['value'], 16) if isinstance(entry['value'], str) \
+            else int(entry['value'])
+        off = addr - MEM_WINDOW_BASE
+        if off < 0 or off + width > MEM_WINDOW_SIZE:
+            return None                               # memory outside window
+        for i in range(width):
+            window[off + i] = (val >> (8 * (width - 1 - i))) & 0xFF
 
     word = int(case['encoding']['word'], 16)
     out = bytearray()
+    for name in sorted(inp.get('rb', {})):
+        n = int(name.replace('rb', ''))
+        load_reg(out, 'rb', n, int(inp['rb'][name], 16) & MASK64)
     for name in sorted(inp.get('rd', {})):
         n = int(name.replace('rd', ''))
         load_reg(out, 'rd', n, int(inp['rd'][name], 16) & MASK64)
     out.extend(struct.pack('>I', word))               # instruction under test
     out.extend(struct.pack('>I', 0x00 << 24))         # halt rd0 -> exit 0 + dump
-    return bytes(out)
+    return bytes(out), bytes(window)
 
 
 def parse_regdump(text):
@@ -102,7 +121,27 @@ def parse_regdump(text):
     return None
 
 
-def _compare(dump, expected_state):
+def parse_memdump(text):
+    """Parse the DADAO_MEMDUMP line into (base, bytearray) or None."""
+    for line in text.splitlines():
+        if line.startswith('DADAO_MEMDUMP'):
+            base = size = None
+            data_hex = ''
+            for tok in line.split()[1:]:
+                key, _, val = tok.partition('=')
+                if key == 'base':
+                    base = int(val, 16)
+                elif key == 'size':
+                    size = int(val, 16)
+                elif key == 'data':
+                    data_hex = val
+            if base is None:
+                return None
+            return base, bytes.fromhex(data_hex)
+    return None
+
+
+def _compare(dump, expected_state, memdump=None):
     diffs = []
     for name, vstr in (expected_state.get('rd') or {}).items():
         want = int(vstr, 16) & MASK64
@@ -119,6 +158,26 @@ def _compare(dump, expected_state):
             diffs.append(f'{name} missing in dump')
         elif (got & MASK48) != want:
             diffs.append(f'{name}=0x{got & MASK48:012X} want 0x{want:012X}')
+    # Memory: read expected bytes back (big-endian §2.1) from the dumped window.
+    for entry in expected_state.get('memory') or []:
+        addr = int(entry['address'], 16)
+        width = int(entry.get('width', 8))
+        want = (int(entry['value'], 16) if isinstance(entry['value'], str)
+                else int(entry['value'])) & ((1 << (width * 8)) - 1)
+        if memdump is None:
+            diffs.append(f'mem@0x{addr:X} missing memdump')
+            continue
+        base, data = memdump
+        off = addr - base
+        if off < 0 or off + width > len(data):
+            diffs.append(f'mem@0x{addr:X} outside dump window')
+            continue
+        got = 0
+        for i in range(width):
+            got = (got << 8) | data[off + i]
+        if got != want:
+            diffs.append(f'mem@0x{addr:X}=0x{got:0{width*2}X} '
+                         f'want 0x{want:0{width*2}X}')
     return diffs
 
 
@@ -137,12 +196,14 @@ def _run_one(case, gem5_bin, config):
     if config is None:
         config = DEFAULT_CONFIG
 
-    binary = build_gem5_binary(case)
-    if binary is None:
+    built = build_gem5_binary(case)
+    if built is None:
         mn = case.get('mnemonic', '?')
         return ('SKIP-unsupported', f'{mn}: not in gem5 G1 coverage')
+    binary, window = built
 
-    elf = gen_min_elf.build_elf(binary)
+    elf = gen_min_elf.build_elf(
+        binary, data_segs=[(MEM_WINDOW_BASE, window)])
     with tempfile.NamedTemporaryFile(suffix='.elf', delete=False) as f:
         f.write(elf)
         elf_path = f.name
@@ -164,11 +225,12 @@ def _run_one(case, gem5_bin, config):
         # No halt reached -> hit an unsupported instruction at run time.
         return ('SKIP-unsupported',
                 f'{case.get("mnemonic", "?")}: no halt/regdump (runtime unknown inst)')
+    memdump = parse_memdump(out)
 
     exp = case.get('expected_state')
     if not exp:                                       # encoding-only / no state
         return ('PASS', 'ran, no-state')
-    diffs = _compare(dump, exp)
+    diffs = _compare(dump, exp, memdump)
     if not diffs:
         return ('PASS', 'state match')
     return ('FAIL', '; '.join(diffs))
