@@ -53,6 +53,14 @@ MASK64 = (1 << 64) - 1
 MEM_WINDOW_BASE = 0x87FEF000
 MEM_WINDOW_SIZE = 0x3000
 
+# DG-004c fault SE exit codes — must match arch/dadao/faults.hh and the QEMU
+# harness FAULT_CODES (run_qemu_test.py). ILLI=illegal operand of a known
+# instruction, MALIGN=misaligned access, UNDI=reserved encoding.
+FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83}
+# Private sentinel gem5 exits with for opcodes it has not implemented yet
+# (control flow beyond jump-iiii, register-bank block-copy semantics) → SKIP.
+UNIMPL_CODE = 0x7F
+
 
 def find_gem5():
     for p in [os.environ.get('GEM5_OPT'), DEFAULT_GEM5]:
@@ -73,13 +81,15 @@ def build_gem5_binary(case):
     memory (input_state.memory) is placed directly in a fixed RW data segment
     (the memory window) initialised big-endian, so it is mapped and readable by
     loads and writable by stores. expected_state.memory is checked by reading the
-    window back from gem5's DADAO_MEMDUMP. Whether the instruction under test is
-    actually implemented is decided at run time: if it decodes to Unknown, no
-    halt/regdump is produced and the caller SKIPs."""
+    window back from gem5's DADAO_MEMDUMP.
+
+    expected_fault vectors (DG-004c) are also built and run: gem5 raises the
+    fault, exits with the fault's SE code, and _run_one compares it to
+    FAULT_CODES. Whether the instruction under test is actually implemented is
+    decided at run time: an unimplemented opcode exits with the UNIMPL sentinel
+    (or leaves no regdump) and the caller SKIPs."""
     if case.get('branch_behavior'):
         return None                                   # branch harness
-    if case.get('expected_fault') is not None:
-        return None                                   # no fault model yet (DG-004c)
 
     inp = case.get('input_state') or {}
 
@@ -138,6 +148,20 @@ def parse_memdump(text):
             if base is None:
                 return None
             return base, bytes.fromhex(data_hex)
+    return None
+
+
+def parse_exit_code(text):
+    """Extract the SE exit code from dadao_se.py's 'SIM_END: <cause> code=<n>'
+    line (decimal). Returns int or None."""
+    for line in text.splitlines():
+        if line.startswith('SIM_END:'):
+            for tok in line.split():
+                if tok.startswith('code='):
+                    try:
+                        return int(tok[len('code='):])
+                    except ValueError:
+                        return None
     return None
 
 
@@ -221,10 +245,29 @@ def _run_one(case, gem5_bin, config):
 
     out = result.stdout + result.stderr
     dump = parse_regdump(out)
+    exit_code = parse_exit_code(out)
+    mn = case.get('mnemonic', '?')
+    expected_fault = case.get('expected_fault')
+
     if dump is None:
-        # No halt reached -> hit an unsupported instruction at run time.
+        # No halt/regdump -> the instruction faulted or is unimplemented.
+        if exit_code == UNIMPL_CODE:
+            return ('SKIP-unsupported', f'{mn}: unimplemented opcode')
+        if expected_fault is not None:
+            want = FAULT_CODES.get(expected_fault)
+            if want is None:
+                return ('FAIL', f'unknown fault type {expected_fault}')
+            if exit_code == want:
+                return ('PASS', f'{expected_fault} (0x{exit_code:02X})')
+            got = 'none' if exit_code is None else f'0x{exit_code:02X}'
+            return ('FAIL', f'expected {expected_fault}=0x{want:02X}, got {got}')
+        # non-fault vector with no state readout -> uncovered (unknown inst)
         return ('SKIP-unsupported',
-                f'{case.get("mnemonic", "?")}: no halt/regdump (runtime unknown inst)')
+                f'{mn}: no halt/regdump (runtime unknown inst)')
+
+    # Reached halt (normal exit, regdump present).
+    if expected_fault is not None:
+        return ('FAIL', f'expected {expected_fault}, got no fault (halted)')
     memdump = parse_memdump(out)
 
     exp = case.get('expected_state')
