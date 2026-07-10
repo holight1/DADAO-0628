@@ -148,7 +148,7 @@ def main():
     print(f"=== SAIL 4th column: AGREE(4-way)={agree4}  "
           f"Sail-SKIP(out-of-slice)={agree4_sskip}  SAIL-DIVERGE={sdiverge} ===")
     print(f"    Sail covers {agree4} of the {agree3 + agree_gs} agreed cases "
-          f"(SL-002a rehearsal slice ~6-8 instrs).")
+          f"(SL-003a full 87-instruction model).")
     if qskip and agree3 == 0 and agree_gs == 0 and diverge == 0:
         print("ERROR: all comparable cases QEMU-skipped (QEMU missing?)",
               file=sys.stderr)
