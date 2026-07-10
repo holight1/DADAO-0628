@@ -36,7 +36,7 @@ GEM5_TESTS = os.path.join(GEM5_DIR, 'tests', 'dadao')
 
 sys.path.insert(0, HERE)
 sys.path.insert(0, GEM5_TESTS)
-from build_test_binary import load_reg             # noqa: E402
+from build_test_binary import load_reg, build_branch_test_binary  # noqa: E402
 import gen_min_elf                                 # noqa: E402
 
 DEFAULT_GEM5 = os.path.join(GEM5_DIR, 'build', 'DADAO', 'gem5.opt')
@@ -87,9 +87,23 @@ def build_gem5_binary(case):
     fault, exits with the fault's SE code, and _run_one compares it to
     FAULT_CODES. Whether the instruction under test is actually implemented is
     decided at run time: an unimplemented opcode exits with the UNIMPL sentinel
-    (or leaves no regdump) and the caller SKIPs."""
+    (or leaves no regdump) and the caller SKIPs.
+
+    branch_behavior vectors (DG-004d) use the same branch-over-poison layout as
+    the QEMU harness (build_branch_test_binary): correct branch/jump/call/ret →
+    exit 0; wrong direction → poison → ILLI. _run_one scores these by exit code.
+    The 6 HARNESS control-flow abstains (jump/call/ret with rb0=0 / cold-RAS,
+    whose vector ILLI is a trampoline artifact the single-instruction model
+    cannot reproduce) are SKIPped here."""
     if case.get('branch_behavior'):
-        return None                                   # branch harness
+        return build_branch_test_binary(case), bytes(MEM_WINDOW_SIZE)
+
+    # Structural abstain: jump/call/ret 'ILLI' vectors are harness artifacts
+    # (jump to addr 0 → trampoline halt → ILLI), not single-instruction faults;
+    # gem5 relative-jumps / RASUFs instead. Keep the 6 HARNESS cases SKIP.
+    if case.get('mnemonic') in ('jump', 'call', 'ret') \
+            and case.get('expected_fault') is not None:
+        return None
 
     inp = case.get('input_state') or {}
 
@@ -248,6 +262,16 @@ def _run_one(case, gem5_bin, config):
     exit_code = parse_exit_code(out)
     mn = case.get('mnemonic', '?')
     expected_fault = case.get('expected_fault')
+
+    # Branch-over-poison vectors: correctness is carried by the exit code
+    # (0 = branch reached the PASS path; ILLI = poison hit = wrong direction).
+    if case.get('branch_behavior'):
+        if exit_code == 0:
+            return ('PASS', f'{case["branch_behavior"]} exit=0')
+        if exit_code == UNIMPL_CODE:
+            return ('SKIP-unsupported', f'{mn}: unimplemented opcode')
+        got = 'none' if exit_code is None else f'0x{exit_code:02X}'
+        return ('FAIL', f'{case["branch_behavior"]}: poison/wrong path exit={got}')
 
     if dump is None:
         # No halt/regdump -> the instruction faulted or is unimplemented.
