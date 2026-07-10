@@ -1,0 +1,11 @@
+// DADAO SimRISC (M1) rehearsal-slice Sail project (SL-002a / ADR-0011 M2b).
+// Modules follow the sail-riscv layout idiom: types -> state -> instructions
+// -> top-level step loop. Build via ./build.sh (sail -c). Semantics derive only
+// from contracts/isa/spec.md § + tools/opcodes.yaml (independence, ADR-0011 D4).
+dadao {
+  files
+    dadao_types.sail,
+    dadao_state.sail,
+    dadao_insts.sail,
+    dadao_main.sail
+}

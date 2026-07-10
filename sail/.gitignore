@@ -1,0 +1,6 @@
+# sail -c build products (regenerate with ./build.sh)
+dadao_model.c
+dadao_model.h
+c_harness/dadao_sail_sim
+*.o
+sail_smt_cache
