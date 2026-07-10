@@ -1,0 +1,8 @@
+# One repository-relative patch path per line, in application order.
+0001-dadao-arch-skeleton.patch
+0002-dadao-core-isa.patch
+0003-dadao-halt-regdump.patch
+0004-dadao-alu.patch
+0005-dadao-memory.patch
+0006-dadao-faults.patch
+0007-dadao-controlflow-ras.patch

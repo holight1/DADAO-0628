@@ -1,0 +1,419 @@
+From 2c716add01e7c9613616d2ec2ccc5ac0751dec38 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 10 Jul 2026 05:49:42 +0800
+Subject: [PATCH 5/7] =?UTF-8?q?arch/dadao:=20G2=20memory=20load/store=20+?=
+ =?UTF-8?q?=20block-copy=20=E2=80=94=203-way=20AGREE=3D131?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement DADAO memory instructions (DG-004b), spec-derived (§2.1 big-endian,
+§3.1-§3.4 RD load/store/multi, §4.1/§4.2/§4.5/§4.6 RB variants):
+
+  - RD single load  ldbs/ldbu/ldws/ldwu/ldts/ldtu/ldo  (op 0x30-0x33,0x40-0x42)
+  - RD single store stb/stw/stt/sto                     (op 0x38-0x3B)
+  - RD multi  load  ldm{bs,bu,ws,wu,ts,tu,o}            (op 0x34-0x37,0x44-0x46)
+  - RD multi  store stm{b,w,t,o}                        (op 0x3C-0x3F)
+  - RB load/store   ldo-rb/sto-rb, ldmo-rb/stmo-rb      (op 0x43,0x4B,0x47,0x4F)
+  - RB wyde imm     setzw-rb/orw-rb/andnw-rb            (op 0x4E,0x4C,0x4D)
+  - RB compare      cmp-rb (fixes 0x2D: was comparing RD, now RB 48-bit §4.5)
+
+EA = (rbhb[47:0] + off) mod 2^48 (§1.3); multi EA_i adds rdhc + i*N (§3.3).
+All multi-byte accesses assemble/disassemble bytes explicitly big-endian, so
+host endianness is irrelevant. Atomic readMem/writeMem via ExecContext.
+
+Harness plumbing:
+  - dadao_se.py: switch to AtomicSimpleCPU (synchronous readMem/writeMem;
+    multi-element loops need no timing split). Smokes unchanged (42/42/0).
+  - decoder.cc dumpFinalState: at halt, tryReadBlob a fixed memory window
+    [0x87FEF000,+0x3000) and emit DADAO_MEMDUMP for the differential adapter;
+    tryReadBlob so smoke ELFs (window unmapped) do not abort.
+  - gen_min_elf.build_elf: optional RW data segments (the adapter maps the
+    memory window so loads/stores have valid pages + initial contents).
+
+Exceptions/faults (ILLI/MALIGN/store-from-rd0/immu6=0) deferred to DG-004c;
+those vectors remain gem5-SKIP.
+
+3-way differential: AGREE(3-way) 77 -> 131, DIVERGE=0.
+rd-load-store PASS=38/SKIP=11/FAIL=0; rb-ops PASS=20/SKIP=8/FAIL=0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/arch/dadao/decoder.cc  | 218 ++++++++++++++++++++++++++++++++++++-
+ tests/dadao/dadao_se.py    |   6 +-
+ tests/dadao/gen_min_elf.py |  50 ++++++---
+ 3 files changed, 254 insertions(+), 20 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 208f5af69b..a1d6d1f273 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -8,15 +8,32 @@
+ #include "cpu/exec_context.hh"
+ #include "cpu/static_inst.hh"
+ #include "cpu/thread_context.hh"
++#include "mem/request.hh"
++#include "mem/se_translating_port_proxy.hh"
+ #include "sim/sim_exit.hh"
+ 
+ #include <iostream>
++#include <vector>
+ 
+ namespace gem5 { namespace DADAOISA {
+ 
++// spec §1.3: RB effective addresses are 48-bit.
++static constexpr uint64_t MASK48 = 0xFFFFFFFFFFFFULL;
++
++// DG-004b memory readout window. The gem5 differential adapter maps a fixed RW
++// data segment [MEM_WINDOW_BASE, +MEM_WINDOW_SIZE) into every test ELF so that
++// (a) load inputs / store targets have valid pages and (b) at halt this window
++// can be dumped back for expected_state.memory comparison. All memory test
++// vectors cluster at 0x87FF0000 (RAM), well inside this window. Adapter and
++// gem5 share these constants; keep them in sync with run_gem5_test.py.
++static constexpr uint64_t MEM_WINDOW_BASE = 0x87FEF000ULL;
++static constexpr uint64_t MEM_WINDOW_SIZE = 0x3000ULL;   // 12 KiB
++
+ // DG-003a terminal-state readout (restored): at halt, dump the architectural
+ // RD (rd0-63) and RB (rb0-63) registers on one line to stdout so the gem5
+-// differential adapter can parse the final state. Observability only.
++// differential adapter can parse the final state. DG-004b adds a second line
++// (DADAO_MEMDUMP) with the raw big-endian bytes of the memory window so the
++// adapter can compare expected_state.memory. Observability only.
+ static void
+ dumpFinalState(ExecContext *xc)
+ {
+@@ -29,6 +46,21 @@ dumpFinalState(ExecContext *xc)
+         line += csprintf(" rb%d=0x%016x", i,
+                          (uint64_t)tc->getReg(intRegId(RB_BASE + i)));
+     std::cout << line << std::endl;
++
++    // Read the memory window from the process address space (big-endian bytes
++    // as stored) and emit as one hex string: base then contiguous byte hex.
++    // tryReadBlob so workloads that do not map the window (e.g. the G1 smoke
++    // ELFs) simply produce no DADAO_MEMDUMP rather than aborting.
++    std::vector<uint8_t> buf(MEM_WINDOW_SIZE, 0);
++    if (SETranslatingPortProxy(tc).tryReadBlob(MEM_WINDOW_BASE, buf.data(),
++                                               MEM_WINDOW_SIZE)) {
++        std::string mem = csprintf("DADAO_MEMDUMP base=0x%x size=0x%x data=",
++                                   MEM_WINDOW_BASE, MEM_WINDOW_SIZE);
++        mem.reserve(mem.size() + MEM_WINDOW_SIZE * 2);
++        for (uint64_t i = 0; i < MEM_WINDOW_SIZE; i++)
++            mem += csprintf("%02x", buf[i]);
++        std::cout << mem << std::endl;
++    }
+ }
+ 
+ // === field extractors ===
+@@ -259,6 +291,153 @@ SwymInst() : StaticInst("swym", enums::No_OpClass) { setRegIdxArrays(reinterpret
+ Fault execute(ExecContext*, trace::InstRecord*) const override { return NoFault; }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"swym";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
++// === Memory access helpers (spec §2.1 big-endian, §3.1-§3.4, §4.1-§4.2) ===
++// Data access is big-endian: byte at the lowest address is the most
++// significant. Assemble/disassemble explicitly so host endianness is
++// irrelevant.
++static inline Fault
++memReadBE(ExecContext *xc, const StaticInst *si, Addr ea, int N, uint64_t &out)
++{
++    uint8_t b[8] = {};
++    std::vector<bool> be(N, true);
++    Fault f = xc->readMem(ea, b, N, Request::Flags(0), be);
++    if (f != NoFault) return f;
++    uint64_t v = 0;
++    for (int i = 0; i < N; i++) v = (v << 8) | b[i];   // big-endian §2.1
++    out = v;
++    return NoFault;
++}
++
++static inline Fault
++memWriteBE(ExecContext *xc, Addr ea, int N, uint64_t val)
++{
++    uint8_t b[8] = {};
++    for (int i = 0; i < N; i++) b[i] = (val >> (8 * (N - 1 - i))) & 0xFF;
++    std::vector<bool> be(N, true);
++    return xc->writeMem(b, N, ea, Request::Flags(0), nullptr, be);
++}
++
++static inline uint64_t
++sextN(uint64_t v, int N)
++{
++    if (N >= 8) return v;
++    uint64_t m = 1ULL << (N * 8 - 1);
++    return (v ^ m) - m;                                // sign-extend N bytes
++}
++
++// === RD/RB single load (rrii, spec §3.1 / §4.1) ===
++// EA = (rbhb[47:0] + sext_12(imms12)) mod 2^48; rd/rb(ha) = extend_N(mem_be).
++// destRb selects the destination bank (RD load vs RB ldo). rbha=0/rdha=0
++// legality (ILLI) is DG-004c; here ha==0 simply performs no register write.
++class LoadInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; int N; bool sgn; bool destRb; public:
++LoadInst(uint8_t ha, uint8_t hb, int64_t imm, int width, bool s, bool dRb)
++  : StaticInst("ld", enums::MemRead), imm_(imm), N(width), sgn(s), destRb(dRb) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);
++  if (ha) dstRegs[_numDestRegs++] = intRegId((destRb ? RB_BASE : RD_BASE) + ha); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  uint64_t base = xc->getRegOperand(this, 0) & MASK48;
++  Addr ea = (base + (uint64_t)imm_) & MASK48;
++  uint64_t v; Fault f = memReadBE(xc, this, ea, N, v); if (f != NoFault) return f;
++  if (sgn) v = sextN(v, N);
++  if (_numDestRegs) xc->setRegOperand(this, 0, v); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"ld";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === RD/RB single store (rrii, spec §3.2 / §4.1) ===
++// mem_be[ea : ea+N-1] = data[N*8-1:0]. dataRb selects source bank (RD st vs RB
++// sto). rdha=0 storing is ILLI (DG-004c); here it stores 0.
++class StoreInst : public StaticInst { RegId srcRegs[2], dstRegs[0]; int64_t imm_; int N; int dataIdx; public:
++StoreInst(uint8_t ha, uint8_t hb, int64_t imm, int width, bool dataRb)
++  : StaticInst("st", enums::MemWrite), imm_(imm), N(width) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);   // operand 0 = base
++  dataIdx = -1;
++  if (ha) { srcRegs[_numSrcRegs] = intRegId((dataRb ? RB_BASE : RD_BASE) + ha); dataIdx = _numSrcRegs++; } }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  uint64_t base = xc->getRegOperand(this, 0) & MASK48;
++  Addr ea = (base + (uint64_t)imm_) & MASK48;
++  uint64_t val = (dataIdx < 0) ? 0 : xc->getRegOperand(this, dataIdx);
++  return memWriteBE(xc, ea, N, val); }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"st";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === RD/RB multi load (rrri, spec §3.3 / §4.2) ===
++// EA_i = (rbhb[47:0] + rdhc[47:0] + i*N) mod 2^48; reg(ha+i)=extend_N(mem_be).
++class MultiLoadInst : public StaticInst { RegId srcRegs[2], dstRegs[63]; int N; bool sgn; int count; int idxIdx; public:
++MultiLoadInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t immu6, int width, bool s, bool destRb)
++  : StaticInst("ldm", enums::MemRead), N(width), sgn(s), count(immu6) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);   // operand 0 = base
++  idxIdx = -1;
++  if (hc) { srcRegs[_numSrcRegs] = intRegId(RD_BASE + hc); idxIdx = _numSrcRegs++; }
++  RegIndex destBase = destRb ? RB_BASE : RD_BASE;
++  for (int i = 0; i < count && i < 63; i++) dstRegs[_numDestRegs++] = intRegId(destBase + ha + i); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  uint64_t base = xc->getRegOperand(this, 0) & MASK48;
++  uint64_t idx = (idxIdx < 0) ? 0 : (xc->getRegOperand(this, idxIdx) & MASK48);
++  for (int i = 0; i < _numDestRegs; i++) {
++    Addr ea = (base + idx + (uint64_t)i * N) & MASK48;
++    uint64_t v; Fault f = memReadBE(xc, this, ea, N, v); if (f != NoFault) return f;
++    if (sgn) v = sextN(v, N);
++    xc->setRegOperand(this, i, v); }
++  return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"ldm";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === RD/RB multi store (rrri, spec §3.4 / §4.2) ===
++class MultiStoreInst : public StaticInst { RegId srcRegs[65], dstRegs[0]; int N; int count; int idxIdx; int dataStart; public:
++MultiStoreInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t immu6, int width, bool dataRb)
++  : StaticInst("stm", enums::MemWrite), N(width), count(immu6) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);   // operand 0 = base
++  idxIdx = -1;
++  if (hc) { srcRegs[_numSrcRegs] = intRegId(RD_BASE + hc); idxIdx = _numSrcRegs++; }
++  dataStart = _numSrcRegs;
++  RegIndex dataBase = dataRb ? RB_BASE : RD_BASE;
++  for (int i = 0; i < count && i < 63; i++) srcRegs[_numSrcRegs++] = intRegId(dataBase + ha + i); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  uint64_t base = xc->getRegOperand(this, 0) & MASK48;
++  uint64_t idx = (idxIdx < 0) ? 0 : (xc->getRegOperand(this, idxIdx) & MASK48);
++  int n = _numSrcRegs - dataStart;
++  for (int i = 0; i < n; i++) {
++    Addr ea = (base + idx + (uint64_t)i * N) & MASK48;
++    uint64_t val = xc->getRegOperand(this, dataStart + i);
++    Fault f = memWriteBE(xc, ea, N, val); if (f != NoFault) return f; }
++  return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"stm";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === RB wyde immediate (rwii, spec §4.6): setzw/orw/andnw into RB, full 64-bit ===
++class SetzwRbInst : public StaticInst { RegId srcRegs[0], dstRegs[1]; int shift; uint64_t imm16; public:
++SetzwRbInst(uint8_t d, int wyde, uint16_t imm) : StaticInst("setzw.rb", enums::No_OpClass), shift(wyde*16), imm16(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(d)dstRegs[_numDestRegs++]=intRegId(RB_BASE+d); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(_numDestRegs) xc->setRegOperand(this,0,(uint64_t)imm16<<shift); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"setzw.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class OrwRbInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int shift; uint64_t imm16; public:
++OrwRbInst(uint8_t d, int wyde, uint16_t imm) : StaticInst("orw.rb", enums::No_OpClass), shift(wyde*16), imm16(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(d){ srcRegs[_numSrcRegs++]=intRegId(RB_BASE+d); dstRegs[_numDestRegs++]=intRegId(RB_BASE+d); } }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(_numDestRegs){ uint64_t v=xc->getRegOperand(this,0); xc->setRegOperand(this,0,v|((uint64_t)imm16<<shift)); } return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"orw.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class AndnwRbInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int shift; uint64_t imm16; public:
++AndnwRbInst(uint8_t d, int wyde, uint16_t imm) : StaticInst("andnw.rb", enums::No_OpClass), shift(wyde*16), imm16(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(d){ srcRegs[_numSrcRegs++]=intRegId(RB_BASE+d); dstRegs[_numDestRegs++]=intRegId(RB_BASE+d); } }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(_numDestRegs){ uint64_t v=xc->getRegOperand(this,0); xc->setRegOperand(this,0,v&~((uint64_t)imm16<<shift)); } return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"andnw.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === RB compare (orrr, spec §4.5): cmp rdhb, rbhc, rbhd; unsigned 48-bit ===
++// rdhb = -1 if rbhc<rbhd, 0 if ==, 1 if >; RB bits[63:48] ignored.
++class CmpRbInst : public StaticInst { RegId srcRegs[2], dstRegs[1]; public:
++CmpRbInst(uint8_t d, uint8_t c, uint8_t e) : StaticInst("cmp.rb", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(RB_BASE+c); srcRegs[_numSrcRegs++]=intRegId(RB_BASE+e);
++  if(d)dstRegs[_numDestRegs++]=intRegId(RD_BASE+d); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  uint64_t a=xc->getRegOperand(this,0)&MASK48, b=xc->getRegOperand(this,1)&MASK48;
++  if(_numDestRegs) xc->setRegOperand(this,0,(a<b)?-1ULL:(a>b)?1ULL:0); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"cmp.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
+ // === Decoder ===
+ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     uint32_t w = inst.inst; uint8_t op = w >> 24;
+@@ -288,7 +467,7 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+         case 0x29: return StaticInstPtr(new UnknownInst()); // rd2rb
+         case 0x2A: return StaticInstPtr(new UnknownInst()); // rb2rd
+         case 0x2B: return StaticInstPtr(new UnknownInst()); // rb2rb
+-        case 0x2D: return StaticInstPtr(new CmpuInst(hb(w), hc(w), hd(w))); // cmp RB
++        case 0x2D: return StaticInstPtr(new CmpRbInst(hb(w), hc(w), hd(w))); // cmp RB (spec §4.5)
+         case 0x2E: return StaticInstPtr(new AddRbInst(hb(w), hc(w), hd(w)));
+         case 0x2F: return StaticInstPtr(new SubRbInst(hb(w), hc(w), hd(w)));
+         default:  return StaticInstPtr(new UnknownInst());
+@@ -312,8 +491,43 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     case 0x24: return StaticInstPtr(new CspInst(ha(w), hb(w), hc(w), hd(w)));
+     case 0x26: return StaticInstPtr(new CseqInst(ha(w), hb(w), hc(w), hd(w)));
+     case 0x27: return StaticInstPtr(new CsneInst(ha(w), hb(w), hc(w), hd(w)));
++    // === RD single load (rrii, spec §3.1) ===
++    case 0x30: return StaticInstPtr(new LoadInst(ha(w), hb(w), imm12s(w), 1, true,  false)); // ldbs
++    case 0x31: return StaticInstPtr(new LoadInst(ha(w), hb(w), imm12s(w), 2, true,  false)); // ldws
++    case 0x32: return StaticInstPtr(new LoadInst(ha(w), hb(w), imm12s(w), 4, true,  false)); // ldts
++    case 0x33: return StaticInstPtr(new LoadInst(ha(w), hb(w), imm12s(w), 8, false, false)); // ldo
++    // === RD multi load (rrri, spec §3.3) ===
++    case 0x34: return StaticInstPtr(new MultiLoadInst(ha(w), hb(w), hc(w), hd(w), 1, true,  false)); // ldmbs
++    case 0x35: return StaticInstPtr(new MultiLoadInst(ha(w), hb(w), hc(w), hd(w), 2, true,  false)); // ldmws
++    case 0x36: return StaticInstPtr(new MultiLoadInst(ha(w), hb(w), hc(w), hd(w), 4, true,  false)); // ldmts
++    case 0x37: return StaticInstPtr(new MultiLoadInst(ha(w), hb(w), hc(w), hd(w), 8, false, false)); // ldmo
++    // === RD single store (rrii, spec §3.2) ===
++    case 0x38: return StaticInstPtr(new StoreInst(ha(w), hb(w), imm12s(w), 1, false)); // stb
++    case 0x39: return StaticInstPtr(new StoreInst(ha(w), hb(w), imm12s(w), 2, false)); // stw
++    case 0x3A: return StaticInstPtr(new StoreInst(ha(w), hb(w), imm12s(w), 4, false)); // stt
++    case 0x3B: return StaticInstPtr(new StoreInst(ha(w), hb(w), imm12s(w), 8, false)); // sto
++    // === RD multi store (rrri, spec §3.4) ===
++    case 0x3C: return StaticInstPtr(new MultiStoreInst(ha(w), hb(w), hc(w), hd(w), 1, false)); // stmb
++    case 0x3D: return StaticInstPtr(new MultiStoreInst(ha(w), hb(w), hc(w), hd(w), 2, false)); // stmw
++    case 0x3E: return StaticInstPtr(new MultiStoreInst(ha(w), hb(w), hc(w), hd(w), 4, false)); // stmt
++    case 0x3F: return StaticInstPtr(new MultiStoreInst(ha(w), hb(w), hc(w), hd(w), 8, false)); // stmo
++    // === RD load unsigned + RB load (row 01000, spec §3.1/§4.1/§3.3/§4.2) ===
++    case 0x40: return StaticInstPtr(new LoadInst(ha(w), hb(w), imm12s(w), 1, false, false)); // ldbu
++    case 0x41: return StaticInstPtr(new LoadInst(ha(w), hb(w), imm12s(w), 2, false, false)); // ldwu
++    case 0x42: return StaticInstPtr(new LoadInst(ha(w), hb(w), imm12s(w), 4, false, false)); // ldtu
++    case 0x43: return StaticInstPtr(new LoadInst(ha(w), hb(w), imm12s(w), 8, false, true));  // ldo-rb
++    case 0x44: return StaticInstPtr(new MultiLoadInst(ha(w), hb(w), hc(w), hd(w), 1, false, false)); // ldmbu
++    case 0x45: return StaticInstPtr(new MultiLoadInst(ha(w), hb(w), hc(w), hd(w), 2, false, false)); // ldmwu
++    case 0x46: return StaticInstPtr(new MultiLoadInst(ha(w), hb(w), hc(w), hd(w), 4, false, false)); // ldmtu
++    case 0x47: return StaticInstPtr(new MultiLoadInst(ha(w), hb(w), hc(w), hd(w), 8, false, true));  // ldmo-rb
+     case 0x48: return StaticInstPtr(new RelaInst(ha(w), imm18s(w)));
+     case 0x49: return StaticInstPtr(new AddiRbInst(ha(w), hb(w), imm12s(w)));
++    // === RB store/wyde (row 01001, spec §4.1/§4.2/§4.6) ===
++    case 0x4B: return StaticInstPtr(new StoreInst(ha(w), hb(w), imm12s(w), 8, true)); // sto-rb
++    case 0x4C: return StaticInstPtr(new OrwRbInst(ha(w), ww(w), imm16u(w)));          // orw-rb
++    case 0x4D: return StaticInstPtr(new AndnwRbInst(ha(w), ww(w), imm16u(w)));        // andnw-rb
++    case 0x4E: return StaticInstPtr(new SetzwRbInst(ha(w), ww(w), imm16u(w)));        // setzw-rb
++    case 0x4F: return StaticInstPtr(new MultiStoreInst(ha(w), hb(w), hc(w), hd(w), 8, true)); // stmo-rb
+     case 0x64: return StaticInstPtr(new JumpIIIIInst(imm24s(w)));
+     default:   return StaticInstPtr(new UnknownInst());
+     }
+diff --git a/tests/dadao/dadao_se.py b/tests/dadao/dadao_se.py
+index c91be62541..0a7c2c3dbc 100755
+--- a/tests/dadao/dadao_se.py
++++ b/tests/dadao/dadao_se.py
+@@ -2,7 +2,7 @@
+ """Gem5 syscall-emulation runner for DADAO G1 smoke tests.
+ 
+ Loads a DADAO ELF (arch "dadao", e_machine 0xda0) via the SEWorkload / Process
+-loader path, runs it on a DADAO TimingSimpleCPU, and exits the gem5 process with
++loader path, runs it on a DADAO AtomicSimpleCPU, and exits the gem5 process with
+ the exit code carried by the halting instruction (halt -> exitSimLoop(code)).
+ 
+ Usage: build/DADAO/gem5.opt tests/dadao/dadao_se.py <binary.elf>
+@@ -17,9 +17,9 @@ binary = sys.argv[1]
+ system = System()
+ system.clk_domain = SrcClockDomain(
+     clock="1GHz", voltage_domain=VoltageDomain())
+-system.mem_mode = "timing"
++system.mem_mode = "atomic"
+ system.mem_ranges = [AddrRange("512MiB")]
+-system.cpu = DADAOTimingSimpleCPU()
++system.cpu = DADAOAtomicSimpleCPU()
+ 
+ system.membus = SystemXBar()
+ system.cpu.icache_port = system.membus.cpu_side_ports
+diff --git a/tests/dadao/gen_min_elf.py b/tests/dadao/gen_min_elf.py
+index 1242154b43..717c98c9a7 100755
+--- a/tests/dadao/gen_min_elf.py
++++ b/tests/dadao/gen_min_elf.py
+@@ -24,9 +24,18 @@ SEG_OFF = 0x1000         # page-aligned file offset for the load segment
+ PAGE = 0x1000
+ 
+ 
+-def build_elf(binary: bytes) -> bytes:
++def build_elf(binary: bytes, data_segs=None) -> bytes:
++    """Wrap .text (and optional RW data segments) in a DADAO ELF.
++
++    data_segs: optional list of (vaddr, bytes) tuples. Each becomes an
++    additional PT_LOAD (RW) segment — used by the gem5 differential adapter
++    (DG-004b) to map the memory-test window at 0x87FEF000 so loads/stores have
++    valid pages and initial memory contents.
++    """
++    data_segs = list(data_segs or [])
+     e_ident = b"\x7fELF\x02\x02\x01\x00" + b"\x00" * 8  # ELF64, MSB, v1
+ 
++    n_ph = 1 + len(data_segs)
+     ehdr = struct.pack(
+         ">16sHHIQQQIHHHHHH",
+         e_ident,
+@@ -39,28 +48,39 @@ def build_elf(binary: bytes) -> bytes:
+         0,          # e_flags
+         EHDR_SIZE,  # e_ehsize
+         PHDR_SIZE,  # e_phentsize
+-        1,          # e_phnum
++        n_ph,       # e_phnum
+         0, 0, 0,    # e_shentsize, e_shnum, e_shstrndx
+     )
+ 
+     seg = binary if binary else b"\x00" * 16
+-    phdr = struct.pack(
++
++    # Assign page-aligned file offsets: .text at SEG_OFF, each data segment on
++    # the next free page boundary (p_offset ≡ p_vaddr (mod PAGE) holds because
++    # both are page-aligned).
++    phdrs = bytearray()
++    phdrs += struct.pack(
+         ">IIQQQQQQ",
+-        1,            # p_type  = PT_LOAD
+-        5,            # p_flags = R + X
+-        SEG_OFF,      # p_offset
+-        LOAD_ADDR,    # p_vaddr
+-        LOAD_ADDR,    # p_paddr
+-        len(seg),     # p_filesz
+-        len(seg),     # p_memsz
+-        PAGE,         # p_align
+-    )
++        1, 5, SEG_OFF, LOAD_ADDR, LOAD_ADDR, len(seg), len(seg), PAGE)
++
++    body = bytearray()
++    body += b"\x00" * (SEG_OFF - EHDR_SIZE - PHDR_SIZE * n_ph)  # pad to SEG_OFF
++    body += seg
++
++    for vaddr, data in data_segs:
++        # place each data segment on the next page boundary in the file; both
++        # seg_off and vaddr are page-aligned, so p_offset ≡ p_vaddr (mod PAGE).
++        file_pos = EHDR_SIZE + PHDR_SIZE * n_ph + len(body)
++        body += b"\x00" * ((-file_pos) % PAGE)
++        seg_off = EHDR_SIZE + PHDR_SIZE * n_ph + len(body)
++        phdrs += struct.pack(
++            ">IIQQQQQQ",
++            1, 6, seg_off, vaddr, vaddr, len(data), len(data), PAGE)
++        body += data
+ 
+     out = bytearray()
+     out += ehdr
+-    out += phdr
+-    out += b"\x00" * (SEG_OFF - len(out))   # pad to the segment file offset
+-    out += seg
++    out += phdrs
++    out += body
+     return bytes(out)
+ 
+ 
+-- 
+2.43.0
+

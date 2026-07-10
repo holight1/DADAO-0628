@@ -1,0 +1,72 @@
+From 28d9f9149e4b7ff2bbacb45644e984f4a6c2bc30 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 9 Jul 2026 16:22:53 +0800
+Subject: [PATCH 3/7] arch/dadao: dump final RD/RB registers at halt for
+ differential readout
+
+DG-003a terminal-state readout. At `halt`, print a one-line
+"DADAO_REGDUMP rd0=.. .. rb63=.." with the architectural RD (rd0-63) and RB
+(rb0-63) register values (read via the ThreadContext). This lets the gem5
+differential adapter (DADAO-0628 tests/scripts/run_gem5_test.py) parse gem5's
+final state and compare it against a vector's expected_state in Python, since
+gem5's G1 core cannot execute the QEMU harness's in-guest self-check.
+
+Observability only: the halt exit code (rd[ha]) is unchanged; the 3 smokes
+still exit 42/42/0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/arch/dadao/decoder.cc | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 3df686cdee..7a320c250e 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -6,12 +6,35 @@
+ #include "arch/dadao/faults.hh"
+ #include "arch/dadao/pcstate.hh"
+ #include "arch/dadao/registers.hh"
++#include "base/cprintf.hh"
+ #include "cpu/exec_context.hh"
+ #include "cpu/static_inst.hh"
++#include "cpu/thread_context.hh"
+ #include "sim/sim_exit.hh"
+ 
++#include <iostream>
++
+ namespace gem5 { namespace DADAOISA {
+ 
++// DG-003a terminal-state readout: at halt, dump the architectural RD (rd0-63)
++// and RB (rb0-63) registers on one line to stdout so the gem5 differential
++// adapter (run_gem5_test.py) can parse the final state and compare it against a
++// vector's expected_state in Python. This is observability only; the halt exit
++// code (rd[ha]) is unchanged.
++static void
++dumpFinalState(ExecContext *xc)
++{
++    ThreadContext *tc = xc->tcBase();
++    std::string line = "DADAO_REGDUMP";
++    for (int i = 0; i < 64; i++)
++        line += csprintf(" rd%d=0x%016x", i,
++                         (uint64_t)tc->getReg(intRegId(RD_BASE + i)));
++    for (int i = 0; i < 64; i++)
++        line += csprintf(" rb%d=0x%016x", i,
++                         (uint64_t)tc->getReg(intRegId(RB_BASE + i)));
++    std::cout << line << std::endl;
++}
++
+ static inline uint8_t ha(uint32_t w) { return (w >> 18) & 0x3F; }
+ static inline uint8_t hb(uint32_t w) { return (w >> 12) & 0x3F; }
+ static inline uint8_t hc(uint32_t w) { return (w >> 6)  & 0x3F; }
+@@ -42,6 +65,7 @@ public:
+     }
+     Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
+         RegVal code = (_numSrcRegs > 0) ? xc->getRegOperand(this, 0) : 0;
++        dumpFinalState(xc);
+         exitSimLoop("halt", code & 0xFF);
+         return NoFault;
+     }
+-- 
+2.43.0
+

@@ -1,0 +1,535 @@
+From e0f346bf787830372fe343b0b7c0973940f73a57 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 9 Jul 2026 17:38:10 +0800
+Subject: [PATCH 4/7] =?UTF-8?q?arch/dadao:=20G2=20ALU=20batch=20=E2=80=94?=
+ =?UTF-8?q?=20~35=20register-compute=20instructions,=203-way=20AGREE=3D77?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DG-004a. Add the register-computation instruction set (no memory, no faults)
+and restore/repair the differential readout so the three-way differential
+(interp/QEMU/gem5) coverage grows from 6 to 77 cases with DIVERGE=0.
+
+Fixes to the incoming batch:
+  * Regression: restored the DG-003a halt-time DADAO_REGDUMP hook (had been
+    dropped in the rewrite -> adapter saw no final state -> add/addi coverage
+    fell to 0). This was the "add/addi decode regression".
+  * jump: PC = (instAddr+4) + (imm<<2)  (rb0=PC+4, spec §5.3/§1.3) — was missing +4.
+  * add/sub: true 128-bit rdha:rdhb = sext128(rdhc) ± sext128(rdhd)  (spec §3.5) —
+    was a 1-bit carry approximation (wrong hi for negatives).
+  * cseq/csne: false branch leaves rdhc unchanged (old value), condition is
+    EQ/NE(rdha,rdhb), dest is rdhc  (spec §3.12) — was writing rdha on false.
+  * exts/extz: (x<<amt)>>amt with amt=hd[5:0], amt=0 => identity  (spec §3.11) —
+    removed a s?s:64 branch that shifted by 64 (UB) and broke amt=0.
+  * csn/csz/csp and cseq/csne: operand-index tracking so a cond/true/false
+    operand that is rd0 reads as 0 (spec §1.2 rd0==0) instead of a shifted operand.
+
+Implemented (spec-derived, no QEMU translate.c): logic (and/orr/xor/xnor §3.10),
+shift/extend reg+imm (shlu/shrs/shru/exts/extz §3.11), compare reg+imm
+(cmps/cmpu §3.8/§3.9), conditional assign (csn/csz/csp/cseq/csne §3.12), muls/mulu
+(§3.7), sub (§3.5), wyde immediate (setzw/setow/orw/andnw §3.13), RB add/sub/addi
+(§4.3/§4.4) and rela (§4.8). MISC-Norm (op 0x10) sub-decoded by ha per §2.8.1.
+
+gen_min_elf loads at 0x80000000 to match the QEMU harness base and interpreter
+DEFAULT_PC, so PC-relative results (rela, jump) agree across the differential.
+
+3 smokes unchanged (42/42/0); block-copy (rd2rd/rd2rb/...), memory and
+fault-expecting vectors remain SKIP for DG-004b/c.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/arch/dadao/decoder.cc  | 439 +++++++++++++++++++++++--------------
+ tests/dadao/gen_min_elf.py |   5 +-
+ 2 files changed, 282 insertions(+), 162 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 7a320c250e..208f5af69b 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -1,7 +1,5 @@
+-// DG-002a G1: halt, addi (RD), add (rrrr), jump (iiii)
+-// Encoding from DADAO-0628 tools/opcodes.yaml + contracts/isa/spec.md
+-// Gem5 v25 pattern: member RegId arrays + reinterpret_cast per RISC-V zcmt.cc
+-
++// DG-004a G2: ALU batch — register computation instructions
++// Template: RegId arrays + setRegIdxArrays + getRegOperand/setRegOperand
+ #include "arch/dadao/decoder.hh"
+ #include "arch/dadao/faults.hh"
+ #include "arch/dadao/pcstate.hh"
+@@ -16,11 +14,9 @@
+ 
+ namespace gem5 { namespace DADAOISA {
+ 
+-// DG-003a terminal-state readout: at halt, dump the architectural RD (rd0-63)
+-// and RB (rb0-63) registers on one line to stdout so the gem5 differential
+-// adapter (run_gem5_test.py) can parse the final state and compare it against a
+-// vector's expected_state in Python. This is observability only; the halt exit
+-// code (rd[ha]) is unchanged.
++// DG-003a terminal-state readout (restored): at halt, dump the architectural
++// RD (rd0-63) and RB (rb0-63) registers on one line to stdout so the gem5
++// differential adapter can parse the final state. Observability only.
+ static void
+ dumpFinalState(ExecContext *xc)
+ {
+@@ -35,168 +31,289 @@ dumpFinalState(ExecContext *xc)
+     std::cout << line << std::endl;
+ }
+ 
++// === field extractors ===
+ static inline uint8_t ha(uint32_t w) { return (w >> 18) & 0x3F; }
+ static inline uint8_t hb(uint32_t w) { return (w >> 12) & 0x3F; }
+ static inline uint8_t hc(uint32_t w) { return (w >> 6)  & 0x3F; }
+ static inline uint8_t hd(uint32_t w) { return w & 0x3F; }
+-static inline int64_t imm12s(uint32_t w) {
+-    int64_t v = w & 0xFFF;
+-    return (v & 0x800) ? (v | 0xFFFFFFFFFFFFF000ULL) : v;
+-}
+-static inline int64_t imm24s(uint32_t w) {
+-    int64_t v = w & 0xFFFFFF;
+-    return (v & 0x800000) ? (v | 0xFFFFFFFFFF000000ULL) : v;
++static inline int64_t imm12s(uint32_t w) { int64_t v = w & 0xFFF; return (v & 0x800) ? (v | 0xFFFFFFFFFFFFF000ULL) : v; }
++static inline int64_t imm18s(uint32_t w) { int64_t v = w & 0x3FFFF; return (v & 0x20000) ? (v | 0xFFFFFFFFFFFC0000ULL) : v; }
++static inline int64_t imm24s(uint32_t w) { int64_t v = w & 0xFFFFFF; return (v & 0x800000) ? (v | 0xFFFFFFFFFF000000ULL) : v; }
++static inline uint16_t imm16u(uint32_t w) { return ((w & 0xF000) >> 12) << 12 | (hc(w) << 6) | hd(w); }
++static inline int ww(uint32_t w) { return (hb(w) >> 4) & 3; }
++
++// Macro to reduce boilerplate for simple 2R-1R instructions
++#define DECL_RR2R(NAME, MNEM, FN) \
++class NAME : public StaticInst { RegId srcRegs[2], dstRegs[1]; \
++public: NAME(uint8_t d, uint8_t s1, uint8_t s2) : StaticInst(MNEM, enums::No_OpClass) { \
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); \
++  srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2); if(d) dstRegs[_numDestRegs++]=intRegId(d); } \
++  Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t a=xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); if(_numDestRegs)xc->setRegOperand(this,0,FN); return NoFault; } \
++  std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return MNEM;} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// Macro for 2R-1R with imm
++#define DECL_RI2R(NAME, MNEM, FN) \
++class NAME : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; public: NAME(uint8_t d, uint8_t s, int64_t i) : StaticInst(MNEM, enums::No_OpClass), imm_(i) { \
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); \
++  if(s) srcRegs[_numSrcRegs++]=intRegId(s); if(d) dstRegs[_numDestRegs++]=intRegId(d); } \
++  Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t a=(_numSrcRegs>0)?xc->getRegOperand(this,0):0; if(_numDestRegs)xc->setRegOperand(this,0,FN); return NoFault; } \
++  std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return MNEM;} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === G1 instructions (halt, addi, add, jump) — unchanged ===
++class HaltInst : public StaticInst { RegId srcRegs[1], dstRegs[0]; public:
++HaltInst(uint8_t rd) : StaticInst("halt", enums::No_OpClass) { setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); if(rd){setSrcRegIdx(_numSrcRegs++,intRegId(rd));} }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { RegVal c=(_numSrcRegs>0)?xc->getRegOperand(this,0):0; dumpFinalState(xc); exitSimLoop("halt",c&0xFF); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"halt";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++DECL_RI2R(AddiInst,"addi", a+imm_)
++DECL_RR2R(AddInst,"add", a+b)
++
++class JumpIIIIInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; int64_t imm_; public:
++JumpIIIIInst(int64_t i) : StaticInst("jump", enums::No_OpClass), imm_(i) { setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { PCState pc=xc->pcState().as<PCState>(); pc.set(pc.instAddr()+4+(imm_<<2)); xc->pcState(pc); return NoFault; } // spec §5.3/§1.3: rb0=PC+4
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return csprintf("jump %d",(int)imm_);} void advancePC(PCStateBase&)const override{}};
++
++class UnknownInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; public:
++UnknownInst() : StaticInst("unknown", enums::No_OpClass) { setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext*, trace::InstRecord*) const override { return std::make_shared<DADAOSyscallFault>(); }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"unknown";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === ALU batch: sub, logic, muls/mulu, divs/divu ===
++// add/sub/muls/mulu are 128-bit dual-dest (ha=hi, hb=lo) — spec §3.5/3.7
++class AddDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
++AddDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("add", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2);
++  if(lo)dstRegs[_numDestRegs++]=intRegId(lo); if(hi)dstRegs[_numDestRegs++]=intRegId(hi); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { __int128 r=(__int128)(int64_t)xc->getRegOperand(this,0)+(__int128)(int64_t)xc->getRegOperand(this,1); if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)r); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(r>>64)); return NoFault; } // spec §3.5: rdha:rdhb=sext128(rdhc)+sext128(rdhd)
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"add";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class SubDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
++SubDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("sub", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2);
++  if(lo)dstRegs[_numDestRegs++]=intRegId(lo); if(hi)dstRegs[_numDestRegs++]=intRegId(hi); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { __int128 r=(__int128)(int64_t)xc->getRegOperand(this,0)-(__int128)(int64_t)xc->getRegOperand(this,1); if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)r); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(r>>64)); return NoFault; } // spec §3.5: rdha:rdhb=sext128(rdhc)-sext128(rdhd)
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"sub";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class MulsDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
++MulsDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("muls", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2);
++  if(lo)dstRegs[_numDestRegs++]=intRegId(lo); if(hi)dstRegs[_numDestRegs++]=intRegId(hi); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { __int128 a=(int64_t)xc->getRegOperand(this,0), b=(int64_t)xc->getRegOperand(this,1); __int128 p=a*b; if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)p); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(p>>64)); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"muls";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class MuluDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
++MuluDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("mulu", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2);
++  if(lo)dstRegs[_numDestRegs++]=intRegId(lo); if(hi)dstRegs[_numDestRegs++]=intRegId(hi); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { unsigned __int128 a= xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); unsigned __int128 p=a*b; if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)p); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(p>>64)); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"mulu";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++DECL_RR2R(AndInst,"and", a&b)
++DECL_RR2R(OrrInst,"orr", a|b)
++DECL_RR2R(XorInst,"xor", a^b)
++DECL_RR2R(XnorInst,"xnor", ~(a^b))
++
++// divs: signed division with truncation toward zero (spec 3.7)
++class DivsInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
++DivsInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divs", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(num); srcRegs[_numSrcRegs++]=intRegId(den);
++  if(rem)dstRegs[_numDestRegs++]=intRegId(rem); if(quo)dstRegs[_numDestRegs++]=intRegId(quo); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { int64_t a=xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); if(b==0)return std::make_shared<DADAOSyscallFault>(); if(a==INT64_MIN&&b==-1)return std::make_shared<DADAOSyscallFault>(); int64_t q=a/b, r=a%b; if(_numDestRegs>=1)xc->setRegOperand(this,0,r); if(_numDestRegs>=2)xc->setRegOperand(this,1,q); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"divs";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class DivuInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
++DivuInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divu", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(num); srcRegs[_numSrcRegs++]=intRegId(den);
++  if(rem)dstRegs[_numDestRegs++]=intRegId(rem); if(quo)dstRegs[_numDestRegs++]=intRegId(quo); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t a=xc->getRegOperand(this,0),b=xc->getRegOperand(this,1); if(b==0)return std::make_shared<DADAOSyscallFault>(); if(_numDestRegs>=1)xc->setRegOperand(this,0,a%b); if(_numDestRegs>=2)xc->setRegOperand(this,1,a/b); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"divu";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === Shift/extend (orrr: hb=dst, hc=src1, hd=src2) ===
++DECL_RR2R(ShluInst,"shlu", a<<(b&63))
++DECL_RR2R(ShrsInst,"shrs", (int64_t)a>>(b&63))
++DECL_RR2R(ShruInst,"shru", a>>(b&63))
++
++// exts/extz: spec §3.11 — (x<<amt) >>{s,u} amt, amt=hd[5:0] (amt=0 => identity)
++DECL_RR2R(ExtsInst,"exts", ({int s=b&63; ((int64_t)a<<s)>>s;}))
++DECL_RR2R(ExtzInst,"extz", ({int s=b&63; (a<<s)>>s;}))
++
++// Shift/extend immediate (orri: hb=dst, hc=src, hd=imm6)
++DECL_RI2R(ShluIInst,"shlu", a<<(imm_&63))
++DECL_RI2R(ShrsIInst,"shrs", (int64_t)a>>(imm_&63))
++DECL_RI2R(ShruIInst,"shru", a>>(imm_&63))
++DECL_RI2R(ExtsIInst,"exts", ({int s=imm_&63; ((int64_t)a<<s)>>s;}))
++DECL_RI2R(ExtzIInst,"extz", ({int s=imm_&63; (a<<s)>>s;}))
++
++// === Compare ===
++DECL_RR2R(CmpsInst,"cmps", ((int64_t)a<(int64_t)b)?-1ULL:((int64_t)a>(int64_t)b)?1ULL:0)
++DECL_RR2R(CmpuInst,"cmpu", (a<b)?-1ULL:(a>b)?1ULL:0)
++// cmps/cmpu imm (rrii): d=ha, s=hb, imm=imm12
++DECL_RI2R(CmpsIInst,"cmps", ({int64_t x=(int64_t)a, y=imm_; (x<y)?-1ULL:(x>y)?1ULL:0;}))
++DECL_RI2R(CmpuIInst,"cmpu", ({uint64_t x=a, y=imm_; (x<y)?-1ULL:(x>y)?1ULL:0;}))
++
++// Helper: read rd[reg] honoring rd0==0 (idx<0 means reg was rd0 -> value 0).
++static inline uint64_t rdOp(ExecContext *xc, const StaticInst *si, int idx) {
++    return idx < 0 ? 0 : xc->getRegOperand(si, idx);
+ }
+ 
+-// === halt (op=0x00, riii): exitSimLoop with rd[ha], spec 3.1 ===
+-class HaltInst : public StaticInst {
+-    RegId srcRegIdxArr[1];
+-    RegId destRegIdxArr[0];
+-public:
+-    HaltInst(uint8_t rd) : StaticInst("halt", enums::No_OpClass) {
+-        setRegIdxArrays(
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
+-        if (rd != 0) {
+-            setSrcRegIdx(_numSrcRegs++, intRegId(rd));
+-        }
+-    }
+-    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
+-        RegVal code = (_numSrcRegs > 0) ? xc->getRegOperand(this, 0) : 0;
+-        dumpFinalState(xc);
+-        exitSimLoop("halt", code & 0xFF);
+-        return NoFault;
+-    }
+-    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
+-        return "halt";
+-    }
+-    void advancePC(PCStateBase &pc) const override { pc.as<PCState>().advance(); }
+-};
+-
+-// === addi (op=0x19, rrii): rd[ha] = rd[hb] + sext(imm12), spec 3.6 ===
+-class AddiInst : public StaticInst {
+-    RegId srcRegIdxArr[1];
+-    RegId destRegIdxArr[1];
+-    int64_t imm_;
+-public:
+-    AddiInst(uint8_t dst, uint8_t src, int64_t i)
+-        : StaticInst("addi", enums::No_OpClass), imm_(i) {
+-        setRegIdxArrays(
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
+-        if (src != 0) {
+-            setSrcRegIdx(_numSrcRegs++, intRegId(src));
+-        }
+-        if (dst != 0) {
+-            setDestRegIdx(_numDestRegs++, intRegId(dst));
+-        }
+-    }
+-    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
+-        RegVal s = (_numSrcRegs > 0) ? xc->getRegOperand(this, 0) : 0;
+-        if (_numDestRegs > 0) {
+-            xc->setRegOperand(this, 0, s + imm_);
+-        }
+-        return NoFault;
+-    }
+-    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
+-        return "addi";
+-    }
+-    void advancePC(PCStateBase &pc) const override { pc.as<PCState>().advance(); }
+-};
+-
+-// === add (op=0x1A, rrrr): rd[hb]=lo, rd[ha]=hi, spec 3.5 ===
+-class AddInst : public StaticInst {
+-    RegId srcRegIdxArr[2];
+-    RegId destRegIdxArr[2];
+-public:
+-    AddInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2)
+-        : StaticInst("add", enums::No_OpClass) {
+-        setRegIdxArrays(
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
+-        setSrcRegIdx(_numSrcRegs++, intRegId(s1));
+-        setSrcRegIdx(_numSrcRegs++, intRegId(s2));
+-        if (lo != 0) { setDestRegIdx(_numDestRegs++, intRegId(lo)); }
+-        if (hi != 0) { setDestRegIdx(_numDestRegs++, intRegId(hi)); }
+-    }
+-    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
+-        // spec §3.5: rdha:rdhb = rdhc + rdhd, sign-extended to 128 bits.
+-        // srcs are dest-order: operand 0 = rdhb (low), operand 1 = rdha (high).
+-        __int128 a = (int64_t)xc->getRegOperand(this, 0);
+-        __int128 b = (int64_t)xc->getRegOperand(this, 1);
+-        __int128 r = a + b;
+-        uint64_t lo = (uint64_t)r;
+-        uint64_t hi = (uint64_t)(r >> 64);
+-        if (_numDestRegs >= 1) { xc->setRegOperand(this, 0, lo); } // rdhb
+-        if (_numDestRegs >= 2) { xc->setRegOperand(this, 1, hi); } // rdha
+-        return NoFault;
+-    }
+-    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
+-        return "add";
+-    }
+-    void advancePC(PCStateBase &pc) const override { pc.as<PCState>().advance(); }
+-};
+-
+-// === jump (op=0x64, iiii): PC = (PC) + sext(imm24)<<2, spec 5.3 ===
+-class JumpIIIIInst : public StaticInst {
+-    RegId srcRegIdxArr[0];
+-    RegId destRegIdxArr[0];
+-    int64_t imm_;
+-public:
+-    JumpIIIIInst(int64_t i) : StaticInst("jump", enums::No_OpClass), imm_(i) {
+-        setRegIdxArrays(
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
+-    }
+-    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
+-        // spec §5.3 + §1.3: PC_next = rb0 + (sext24(imm) << 2), where rb0 is
+-        // the hardware base = current_PC + 4 (address of the next instruction).
+-        PCState pc = xc->pcState().as<PCState>();
+-        pc.set(pc.instAddr() + 4 + (imm_ << 2));
+-        xc->pcState(pc);
+-        return NoFault;
+-    }
+-    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
+-        return csprintf("jump %d", (int)imm_);
+-    }
+-    void advancePC(PCStateBase &pc) const override {}
+-};
+-
+-// === unknown -> fault ===
+-class UnknownInst : public StaticInst {
+-    RegId srcRegIdxArr[0];
+-    RegId destRegIdxArr[0];
+-public:
+-    UnknownInst() : StaticInst("unknown", enums::No_OpClass) {
+-        setRegIdxArrays(
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
+-            reinterpret_cast<RegIdArrayPtr>(
+-                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
+-    }
+-    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
+-        return std::make_shared<DADAOSyscallFault>();
+-    }
+-    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
+-        return "unknown";
+-    }
+-    void advancePC(PCStateBase &pc) const override { pc.as<PCState>().advance(); }
+-};
++// === Conditional assign csn/csz/csp (rrrr: ha=cond, hb=dest, hc=true, hd=false) ===
++// spec §3.12: if COND(rdha): rdhb=rdhc, else rdhb=rdhd. Operand indices are
++// tracked so any of cond/true/false being rd0 reads as 0 (not a shifted operand).
++#define DECL_COND3(NAME, MNEM, COND) \
++class NAME : public StaticInst { RegId srcRegs[3], dstRegs[1]; int iC,iT,iF; public: NAME(uint8_t cond, uint8_t d, uint8_t t, uint8_t f) : StaticInst(MNEM, enums::No_OpClass) { \
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); \
++  int n=0; iC=iT=iF=-1; if(cond){srcRegs[n]=intRegId(cond);iC=n++;} if(t){srcRegs[n]=intRegId(t);iT=n++;} if(f){srcRegs[n]=intRegId(f);iF=n++;} _numSrcRegs=n; if(d)dstRegs[_numDestRegs++]=intRegId(d); } \
++  Fault execute(ExecContext *xc, trace::InstRecord*) const override { int64_t c=(int64_t)rdOp(xc,this,iC); uint64_t tv=rdOp(xc,this,iT), fv=rdOp(xc,this,iF); if(_numDestRegs)xc->setRegOperand(this,0,(COND)?tv:fv); return NoFault; } \
++  std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return MNEM;} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++DECL_COND3(CsnInst,"csn", c<0)
++DECL_COND3(CszInst,"csz", c==0)
++DECL_COND3(CspInst,"csp", c>0)
+ 
++// === cseq/csne (rrrr: ha,hb compared; hc=dest; hd=true value) ===
++// spec §3.12: if EQ/NE(rdha,rdhb): rdhc = rdhd, else rdhc UNCHANGED (old rdhc).
++#define DECL_CSEQ(NAME, MNEM, EQOP) \
++class NAME : public StaticInst { RegId srcRegs[4], dstRegs[1]; int iA,iB,iT,iC; public: NAME(uint8_t rha, uint8_t rhb, uint8_t rhc, uint8_t rhd) : StaticInst(MNEM, enums::No_OpClass) { \
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); \
++  int n=0; iA=iB=iT=iC=-1; if(rha){srcRegs[n]=intRegId(rha);iA=n++;} if(rhb){srcRegs[n]=intRegId(rhb);iB=n++;} if(rhd){srcRegs[n]=intRegId(rhd);iT=n++;} if(rhc){srcRegs[n]=intRegId(rhc);iC=n++;} _numSrcRegs=n; if(rhc)dstRegs[_numDestRegs++]=intRegId(rhc); } \
++  Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t av=rdOp(xc,this,iA), bv=rdOp(xc,this,iB), tv=rdOp(xc,this,iT), oldc=rdOp(xc,this,iC); if(_numDestRegs)xc->setRegOperand(this,0,(av EQOP bv)?tv:oldc); return NoFault; } \
++  std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return MNEM;} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++DECL_CSEQ(CseqInst,"cseq", ==)
++DECL_CSEQ(CsneInst,"csne", !=)
++
++// === Wyde operations (rwii: ha=dst, hb=ww+imm_hi, hc=imm_mid, hd=imm_lo, spec 3.13/4.6) ===
++class SetzwInst : public StaticInst { RegId srcRegs[0], dstRegs[1]; int shift; uint64_t imm16; public:
++SetzwInst(uint8_t d, int wyde, uint16_t imm) : StaticInst("setzw", enums::No_OpClass), shift(wyde*16), imm16(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(d)dstRegs[_numDestRegs++]=intRegId(d); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(_numDestRegs) xc->setRegOperand(this,0,(uint64_t)imm16<<shift); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"setzw";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class SetowInst : public StaticInst { RegId srcRegs[0], dstRegs[1]; int shift; uint64_t imm16; public:
++SetowInst(uint8_t d, int wyde, uint16_t imm) : StaticInst("setow", enums::No_OpClass), shift(wyde*16), imm16(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(d)dstRegs[_numDestRegs++]=intRegId(d); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(_numDestRegs) { uint64_t mask=~(0xFFFFULL<<shift); xc->setRegOperand(this,0,mask|((uint64_t)imm16<<shift)); } return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"setow";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class OrwInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int shift; uint64_t imm16; public:
++OrwInst(uint8_t d, int wyde, uint16_t imm) : StaticInst("orw", enums::No_OpClass), shift(wyde*16), imm16(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(d){ srcRegs[_numSrcRegs++]=intRegId(d); dstRegs[_numDestRegs++]=intRegId(d); } }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(_numDestRegs){ uint64_t v=xc->getRegOperand(this,0); xc->setRegOperand(this,0,v|((uint64_t)imm16<<shift)); } return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"orw";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class AndnwInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int shift; uint64_t imm16; public:
++AndnwInst(uint8_t d, int wyde, uint16_t imm) : StaticInst("andnw", enums::No_OpClass), shift(wyde*16), imm16(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(d){ srcRegs[_numSrcRegs++]=intRegId(d); dstRegs[_numDestRegs++]=intRegId(d); } }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(_numDestRegs){ uint64_t v=xc->getRegOperand(this,0); xc->setRegOperand(this,0,v&~((uint64_t)imm16<<shift)); } return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"andnw";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === RD/RB block copy (rd2rd/rd2rb/rb2rd/rb2rb, spec 3.14/4.7) ===
++// These are block-move operations — unimplemented for G2, fall through to unknown
++// === RB arithmetic in MISC-Norm (orrr: hb=dst, hc=src, hd=rd_src) ===
++// add rb, sub rb: RB + RD -> RB, 48-bit truncation
++class AddRbInst : public StaticInst { RegId srcRegs[2], dstRegs[1]; public:
++AddRbInst(uint8_t d, uint8_t rs, uint8_t rds) : StaticInst("add.rb", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(RB_BASE+rs); srcRegs[_numSrcRegs++]=intRegId(rds);
++  if(d)dstRegs[_numDestRegs++]=intRegId(RB_BASE+d); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t b=xc->getRegOperand(this,0)&0xFFFFFFFFFFFFULL, rd=xc->getRegOperand(this,1); if(_numDestRegs)xc->setRegOperand(this,0,(b+rd)&0xFFFFFFFFFFFFULL); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"add.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class SubRbInst : public StaticInst { RegId srcRegs[2], dstRegs[1]; public:
++SubRbInst(uint8_t d, uint8_t rs, uint8_t rds) : StaticInst("sub.rb", enums::No_OpClass) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++]=intRegId(RB_BASE+rs); srcRegs[_numSrcRegs++]=intRegId(rds);
++  if(d)dstRegs[_numDestRegs++]=intRegId(RB_BASE+d); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t b=xc->getRegOperand(this,0)&0xFFFFFFFFFFFFULL, rd=xc->getRegOperand(this,1); if(_numDestRegs)xc->setRegOperand(this,0,(b-rd)&0xFFFFFFFFFFFFULL); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"sub.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// addi RB (rrii, op=0x49): rb[ha] = rb[hb] + sext(imm12), 48-bit truncation
++class AddiRbInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; public:
++AddiRbInst(uint8_t d, uint8_t s, int64_t i) : StaticInst("addi.rb", enums::No_OpClass), imm_(i) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(s)srcRegs[_numSrcRegs++]=intRegId(RB_BASE+s); if(d)dstRegs[_numDestRegs++]=intRegId(RB_BASE+d); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t a=(_numSrcRegs>0)?xc->getRegOperand(this,0)&0xFFFFFFFFFFFFULL:0; if(_numDestRegs)xc->setRegOperand(this,0,(a+imm_)&0xFFFFFFFFFFFFULL); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"addi.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// rela (op=0x48, riii): rb[ha] = ((PC+4)&~0xFFF) + sext(imm18)<<12, spec 4.8
++class RelaInst : public StaticInst { RegId srcRegs[0], dstRegs[1]; int64_t imm18; public:
++RelaInst(uint8_t d, int64_t imm) : StaticInst("rela", enums::No_OpClass), imm18(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if(d)dstRegs[_numDestRegs++]=intRegId(RB_BASE+d); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { Addr pc=xc->pcState().instAddr(); uint64_t target=(((pc+4)&0xFFFFFFFFFFFFULL)&~0xFFFULL)+((imm18<<12)&0xFFFFFFFFFFFFULL); if(_numDestRegs)xc->setRegOperand(this,0,target); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"rela";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === swym/unimp (nop and reserved, oiii) ===
++class SwymInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; public:
++SwymInst() : StaticInst("swym", enums::No_OpClass) { setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext*, trace::InstRecord*) const override { return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"swym";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === Decoder ===
+ StaticInstPtr Decoder::decode(DADAOInst inst) {
+-    uint32_t w = inst.inst;
+-    switch (w >> 24) {
++    uint32_t w = inst.inst; uint8_t op = w >> 24;
++    switch (op) {
+     case 0x00: return StaticInstPtr(new HaltInst(ha(w)));
++    case 0x10: { // MISC-Norm: sub-decode by ha minor-op
++        uint8_t minor = ha(w);
++        switch (minor) {
++        case 0x00: return StaticInstPtr(new SwymInst());
++        case 0x08: return StaticInstPtr(new AndInst(hb(w), hc(w), hd(w)));
++        case 0x09: return StaticInstPtr(new OrrInst(hb(w), hc(w), hd(w)));
++        case 0x0A: return StaticInstPtr(new XorInst(hb(w), hc(w), hd(w)));
++        case 0x0B: return StaticInstPtr(new XnorInst(hb(w), hc(w), hd(w)));
++        case 0x11: return StaticInstPtr(new ShluInst(hb(w), hc(w), hd(w)));
++        case 0x12: return StaticInstPtr(new ShrsInst(hb(w), hc(w), hd(w)));
++        case 0x13: return StaticInstPtr(new ShruInst(hb(w), hc(w), hd(w)));
++        case 0x14: return StaticInstPtr(new ExtsInst(hb(w), hc(w), hd(w)));
++        case 0x15: return StaticInstPtr(new ExtzInst(hb(w), hc(w), hd(w)));
++        case 0x19: return StaticInstPtr(new ShluIInst(hb(w), hc(w), hd(w)));
++        case 0x1A: return StaticInstPtr(new ShrsIInst(hb(w), hc(w), hd(w)));
++        case 0x1B: return StaticInstPtr(new ShruIInst(hb(w), hc(w), hd(w)));
++        case 0x1C: return StaticInstPtr(new ExtsIInst(hb(w), hc(w), hd(w)));
++        case 0x1D: return StaticInstPtr(new ExtzIInst(hb(w), hc(w), hd(w)));
++        case 0x24: return StaticInstPtr(new CmpsInst(hb(w), hc(w), hd(w)));
++        case 0x25: return StaticInstPtr(new CmpuInst(hb(w), hc(w), hd(w)));
++        case 0x28: return StaticInstPtr(new UnknownInst()); // rd2rd
++        case 0x29: return StaticInstPtr(new UnknownInst()); // rd2rb
++        case 0x2A: return StaticInstPtr(new UnknownInst()); // rb2rd
++        case 0x2B: return StaticInstPtr(new UnknownInst()); // rb2rb
++        case 0x2D: return StaticInstPtr(new CmpuInst(hb(w), hc(w), hd(w))); // cmp RB
++        case 0x2E: return StaticInstPtr(new AddRbInst(hb(w), hc(w), hd(w)));
++        case 0x2F: return StaticInstPtr(new SubRbInst(hb(w), hc(w), hd(w)));
++        default:  return StaticInstPtr(new UnknownInst());
++        }
++    }
++    case 0x12: return StaticInstPtr(new CmpsIInst(ha(w), hb(w), imm12s(w)));
++    case 0x13: return StaticInstPtr(new CmpuIInst(ha(w), hb(w), imm12s(w)));
++    case 0x14: return StaticInstPtr(new OrwInst(ha(w), ww(w), imm16u(w)));
++    case 0x15: return StaticInstPtr(new AndnwInst(ha(w), ww(w), imm16u(w)));
++    case 0x16: return StaticInstPtr(new SetzwInst(ha(w), ww(w), imm16u(w)));
++    case 0x17: return StaticInstPtr(new SetowInst(ha(w), ww(w), imm16u(w)));
+     case 0x19: return StaticInstPtr(new AddiInst(ha(w), hb(w), imm12s(w)));
+-    case 0x1A: return StaticInstPtr(new AddInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x1A: return StaticInstPtr(new AddDualInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x1B: return StaticInstPtr(new SubDualInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x1C: return StaticInstPtr(new MulsDualInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x1D: return StaticInstPtr(new MuluDualInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x1E: return StaticInstPtr(new DivsInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x1F: return StaticInstPtr(new DivuInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x20: return StaticInstPtr(new CsnInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x22: return StaticInstPtr(new CszInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x24: return StaticInstPtr(new CspInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x26: return StaticInstPtr(new CseqInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x27: return StaticInstPtr(new CsneInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x48: return StaticInstPtr(new RelaInst(ha(w), imm18s(w)));
++    case 0x49: return StaticInstPtr(new AddiRbInst(ha(w), hb(w), imm12s(w)));
+     case 0x64: return StaticInstPtr(new JumpIIIIInst(imm24s(w)));
+     default:   return StaticInstPtr(new UnknownInst());
+     }
+diff --git a/tests/dadao/gen_min_elf.py b/tests/dadao/gen_min_elf.py
+index 15718ffa42..1242154b43 100755
+--- a/tests/dadao/gen_min_elf.py
++++ b/tests/dadao/gen_min_elf.py
+@@ -16,7 +16,10 @@ import sys
+ EM_DADAO = 0x0DA0
+ EHDR_SIZE = 64
+ PHDR_SIZE = 56
+-LOAD_ADDR = 0x00100000   # 1 MiB — inside the config's memory range
++# Match the QEMU harness base (build_test_binary.BINARY_BASE) and the
++# interpreter's DEFAULT_PC (both 0x80000000) so PC-relative instructions (rela,
++# jump target) produce identical results across the three-way differential.
++LOAD_ADDR = 0x80000000
+ SEG_OFF = 0x1000         # page-aligned file offset for the load segment
+ PAGE = 0x1000
+ 
+-- 
+2.43.0
+

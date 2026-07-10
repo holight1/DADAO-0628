@@ -1,0 +1,320 @@
+From 1a0e7b22ee7dba418482ac2e6aec2cc95983dfa4 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 10 Jul 2026 10:35:50 +0800
+Subject: [PATCH 7/7] =?UTF-8?q?arch/dadao:=20G2=20finale=20=E2=80=94=20con?=
+ =?UTF-8?q?trol=20flow=20+=20RegRAS=20+=20block=20copy,=203-way=20AGREE=3D?=
+ =?UTF-8?q?198?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement the remaining G2 functional instructions (DG-004d), spec-derived
+(§3.14/§4.7 block copy, §5 control flow), never from QEMU translate.c.
+
+registers.hh: add the RegRAS bank ra0..ra63 (int class 128..191); NumIntRegs
+128 → 192. RA is architectural but internal (not an operand), accessed by
+call/ret via ThreadContext.
+
+decoder.cc:
+  - Conditional branches br{n,nn,z,nz,p,np} (riii §5.1) / br{eq,ne} (rrii §5.2):
+    condition per Appendix B on rdha (rd0→0); taken PC ← (PC+4 + sext<<2) mod
+    2^48, else fall through.
+  - jump_r (rrii §5.3): target = base + rdhb + sext12<<2; rbha=rb0 ⇒ relative.
+  - call_i (iiii §5.4) / call_r (rrii §5.4): push rb0(=PC+4) to RegRAS, jump.
+  - ret (riii §5.5): pop RegRAS → PC; rdha = sext18(imms18).
+  - RegRAS push/pop (§5.6) mirrors the spec's refcount/shift model; RASOF (full)
+    / RASUF (empty) are precise (PC & RA unchanged).
+  - Register block copy rd2rd/rd2rb/rb2rd/rb2rb (§3.14/§4.7): copy immu6 regs;
+    asymmetry — RB *source* reads low 48 bits (rb2rd/rb2rb dest high16=0), RD
+    source reads full 64, dest written full width (rd2rb stores 64). Legality
+    (immu6=0 / dest reg0 / src|dst+immu6>64) → ILLI.
+
+faults.hh: RasofFault(0x84)/RasufFault(0x85) (untested by runnable vectors; the
+cold-ret abstain is HARNESS).
+
+3-way differential: AGREE(3-way) 162 → 198, DIVERGE=0, gem5-SKIP=0 — gem5 now
+covers ALL 198 interp+QEMU-agreed cases. The 6 HARNESS control-flow abstains
+(jump/call/ret rb0=0, cold-RAS ret — trampoline artifacts) remain out of scope.
+Smokes 42/42/0. G2 = functional second reference achieved.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/arch/dadao/decoder.cc   | 180 +++++++++++++++++++++++++++++++-----
+ src/arch/dadao/faults.hh    |  24 ++++-
+ src/arch/dadao/registers.hh |  11 ++-
+ 3 files changed, 185 insertions(+), 30 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index df6e249a70..318ccb8001 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -137,17 +137,148 @@ AbstainInst() : StaticInst("unimpl", enums::No_OpClass) { setRegIdxArrays(reinte
+ Fault execute(ExecContext*, trace::InstRecord*) const override { return std::make_shared<UnimplFault>(); }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"unimpl";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+-// Register-bank block copy rd2rd/rd2rb/rb2rd/rb2rb (orri, spec §4.7). Semantics
+-// are out of G2 scope, but the legality check is in-scope: immu6=0 / dest reg0 /
+-// first+immu6>64 → ILLI (spec §2.6.3). A legal-but-unimplemented case abstains
+-// via UnimplFault so the adapter reports SKIP-unsupported (not a bad result).
+-class BlockCopyStub : public StaticInst { RegId srcRegs[0], dstRegs[0]; bool illegal; public:
+-BlockCopyStub(uint8_t hb, uint8_t hd) : StaticInst("blockcopy", enums::No_OpClass),
+-    illegal(hb==0 || hd==0 || hb+hd>64) {
+-  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
+-Fault execute(ExecContext*, trace::InstRecord*) const override { if(illegal) RET_ILLI; return std::make_shared<UnimplFault>(); }
++// Register-bank block copy rd2rd/rd2rb/rb2rd/rb2rb (orri, spec §3.14/§4.7).
++// hb=dest first reg, hc=src first reg, hd=immu6. Copy immu6 consecutive regs.
++// Asymmetry (memory feedback): reading an RB *source* yields low 48 bits (RB is
++// a 48-bit effective register); reading an RD source yields full 64; the copied
++// value is written full-width to the destination. So rd2rb stores 64 bits while
++// rb2rd/rb2rb read 48 (dest high 16 = 0). Legality (spec §2.6.3/§3.14/§4.7):
++// immu6=0 / dest reg0 / dest+immu6>64 / src+immu6>64 → ILLI.
++class BlockCopyInst : public StaticInst { RegId srcRegs[63], dstRegs[63]; int count; bool srcRb; bool illegal; public:
++BlockCopyInst(uint8_t hb, uint8_t hc, uint8_t immu6, bool destRb, bool sRb)
++  : StaticInst("blockcopy", enums::No_OpClass), count(immu6), srcRb(sRb),
++    illegal(hb==0 || immu6==0 || hb+immu6>64 || hc+immu6>64) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  RegIndex sBase = sRb ? RB_BASE : RD_BASE, dBase = destRb ? RB_BASE : RD_BASE;
++  for (int i = 0; i < count && i < 63; i++) srcRegs[_numSrcRegs++] = intRegId(sBase + hc + i);
++  for (int i = 0; i < count && i < 63; i++) dstRegs[_numDestRegs++] = intRegId(dBase + hb + i); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (illegal) RET_ILLI;
++  for (int i = 0; i < _numDestRegs; i++) {           // increasing i, read-then-write (§3.14)
++    uint64_t v = xc->getRegOperand(this, i);
++    if (srcRb) v &= MASK48;                           // RB source: 48-bit (§4.7 asymmetry)
++    xc->setRegOperand(this, i, v); }
++  return NoFault; }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"blockcopy";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
++// ─── Control flow (spec §5): conditional branches, jump_r, call, ret + RegRAS ──
++// RegRAS push/pop (spec §5.6), accessing ra0..ra63 directly via ThreadContext.
++static inline uint64_t rasR(ThreadContext *tc, int i) { return (uint64_t)tc->getReg(intRegId(RA_BASE + i)); }
++static inline void rasW(ThreadContext *tc, int i, uint64_t v) { tc->setReg(intRegId(RA_BASE + i), (RegVal)v); }
++
++static Fault
++rasPush(ThreadContext *tc, uint64_t new_addr)
++{
++  new_addr &= MASK48;
++  uint64_t top = rasR(tc, 63), cnt = (top >> 48) & 0xFFFF, addr48 = top & MASK48;
++  if (cnt == 0) { rasW(tc, 63, (1ULL << 48) | new_addr); return NoFault; }
++  if (cnt >= 1 && cnt <= 0xFFFE && addr48 == new_addr) {  // recursion collapse
++    rasW(tc, 63, ((cnt + 1) << 48) | addr48); return NoFault; }
++  if (((rasR(tc, 1) >> 48) & 0xFFFF) != 0) return std::make_shared<RasofFault>();
++  for (int i = 2; i < 64; i++) rasW(tc, i - 1, rasR(tc, i));  // shift down
++  rasW(tc, 63, (1ULL << 48) | new_addr); return NoFault;
++}
++
++static Fault
++rasPop(ThreadContext *tc, uint64_t &ret_addr)
++{
++  uint64_t top = rasR(tc, 63), cnt = (top >> 48) & 0xFFFF, addr48 = top & MASK48;
++  if (cnt > 1) { rasW(tc, 63, ((cnt - 1) << 48) | addr48); ret_addr = addr48; return NoFault; }
++  if (cnt == 1) {
++    ret_addr = addr48;
++    for (int i = 62; i >= 1; i--) rasW(tc, i + 1, rasR(tc, i));  // shift up
++    rasW(tc, 1, 0); return NoFault; }
++  return std::make_shared<RasufFault>();
++}
++
++// Single-register conditional branch (riii, spec §5.1). ha=rdha (condition; rd0
++// reads 0), imms18. Taken: PC ← (PC+4 + sext18<<2) mod 2^48; else fall through.
++#define DECL_BR1(NAME, MNEM, COND) \
++class NAME : public StaticInst { RegId srcRegs[1], dstRegs[0]; int64_t imm_; int iC; public: \
++NAME(uint8_t ha, int64_t imm) : StaticInst(MNEM, enums::No_OpClass), imm_(imm), iC(-1) { \
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); \
++  if (ha) { srcRegs[_numSrcRegs] = intRegId(ha); iC = _numSrcRegs++; } } \
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { \
++  int64_t c = (iC < 0) ? 0 : (int64_t)xc->getRegOperand(this, iC); \
++  PCState pc = xc->pcState().as<PCState>(); uint64_t nextSeq = (pc.instAddr() + 4) & MASK48; \
++  pc.set((COND) ? ((nextSeq + (uint64_t)(imm_ << 2)) & MASK48) : nextSeq); xc->pcState(pc); return NoFault; } \
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return MNEM;} void advancePC(PCStateBase&)const override{}};
++
++DECL_BR1(BrnInst,  "brn",  c < 0)     // negative      §Appendix B
++DECL_BR1(BrnnInst, "brnn", c >= 0)    // non-negative
++DECL_BR1(BrzInst,  "brz",  c == 0)    // zero
++DECL_BR1(BrnzInst, "brnz", c != 0)    // non-zero
++DECL_BR1(BrpInst,  "brp",  c > 0)     // positive
++DECL_BR1(BrnpInst, "brnp", c <= 0)    // non-positive
++
++// Dual-register conditional branch (rrii, spec §5.2). ha=rdha, hb=rdhb (rd0→0),
++// imms12. Taken: PC ← (PC+4 + sext12<<2) mod 2^48.
++#define DECL_BR2(NAME, MNEM, COND) \
++class NAME : public StaticInst { RegId srcRegs[2], dstRegs[0]; int64_t imm_; int iA, iB; public: \
++NAME(uint8_t ha, uint8_t hb, int64_t imm) : StaticInst(MNEM, enums::No_OpClass), imm_(imm), iA(-1), iB(-1) { \
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); \
++  if (ha) { srcRegs[_numSrcRegs] = intRegId(ha); iA = _numSrcRegs++; } \
++  if (hb) { srcRegs[_numSrcRegs] = intRegId(hb); iB = _numSrcRegs++; } } \
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { \
++  uint64_t a = (iA < 0) ? 0 : xc->getRegOperand(this, iA), b = (iB < 0) ? 0 : xc->getRegOperand(this, iB); \
++  PCState pc = xc->pcState().as<PCState>(); uint64_t nextSeq = (pc.instAddr() + 4) & MASK48; \
++  pc.set((COND) ? ((nextSeq + (uint64_t)(imm_ << 2)) & MASK48) : nextSeq); xc->pcState(pc); return NoFault; } \
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return MNEM;} void advancePC(PCStateBase&)const override{}};
++
++DECL_BR2(BreqInst, "breq", a == b)
++DECL_BR2(BrneInst, "brne", a != b)
++
++// Register-indirect jump (rrii, spec §5.3). ha=rbha (base; rbha=rb0 ⇒ relative,
++// base=PC+4), hb=rdhb (offset), imms12. Target = (base+rdhb+sext12<<2) mod 2^48.
++class JumpRInst : public StaticInst { RegId srcRegs[2], dstRegs[0]; int64_t imm_; bool baseRb; int iBase, iOff; public:
++JumpRInst(uint8_t ha, uint8_t hb, int64_t imm) : StaticInst("jump", enums::No_OpClass), imm_(imm), baseRb(ha!=0), iBase(-1), iOff(-1) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if (ha) { srcRegs[_numSrcRegs] = intRegId(RB_BASE + ha); iBase = _numSrcRegs++; }
++  if (hb) { srcRegs[_numSrcRegs] = intRegId(RD_BASE + hb); iOff = _numSrcRegs++; } }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  PCState pc = xc->pcState().as<PCState>(); uint64_t nextSeq = (pc.instAddr() + 4) & MASK48;
++  uint64_t base = baseRb ? (xc->getRegOperand(this, iBase) & MASK48) : nextSeq;  // rbha=rb0 ⇒ relative §5.3
++  uint64_t off = (iOff < 0) ? 0 : xc->getRegOperand(this, iOff);
++  pc.set((base + off + (uint64_t)(imm_ << 2)) & MASK48); xc->pcState(pc); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"jump";} void advancePC(PCStateBase&)const override{}};
++
++// call relative (iiii, spec §5.4): target=(PC+4+sext24<<2); push rb0(=PC+4).
++class CallIInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; int64_t imm_; public:
++CallIInst(int64_t imm) : StaticInst("call", enums::No_OpClass), imm_(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  PCState pc = xc->pcState().as<PCState>(); uint64_t nextSeq = (pc.instAddr() + 4) & MASK48;
++  Fault f = rasPush(xc->tcBase(), nextSeq); if (f != NoFault) return f;  // RASOF precise: PC unchanged
++  pc.set((nextSeq + (uint64_t)(imm_ << 2)) & MASK48); xc->pcState(pc); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"call";} void advancePC(PCStateBase&)const override{}};
++
++// call absolute (rrii, spec §5.4): target=(base+rdhb+sext12<<2), base=rbha
++// (rbha=rb0 ⇒ relative). push rb0(=PC+4).
++class CallRInst : public StaticInst { RegId srcRegs[2], dstRegs[0]; int64_t imm_; bool baseRb; int iBase, iOff; public:
++CallRInst(uint8_t ha, uint8_t hb, int64_t imm) : StaticInst("call", enums::No_OpClass), imm_(imm), baseRb(ha!=0), iBase(-1), iOff(-1) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if (ha) { srcRegs[_numSrcRegs] = intRegId(RB_BASE + ha); iBase = _numSrcRegs++; }
++  if (hb) { srcRegs[_numSrcRegs] = intRegId(RD_BASE + hb); iOff = _numSrcRegs++; } }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  PCState pc = xc->pcState().as<PCState>(); uint64_t nextSeq = (pc.instAddr() + 4) & MASK48;
++  Fault f = rasPush(xc->tcBase(), nextSeq); if (f != NoFault) return f;
++  uint64_t base = baseRb ? (xc->getRegOperand(this, iBase) & MASK48) : nextSeq;
++  uint64_t off = (iOff < 0) ? 0 : xc->getRegOperand(this, iOff);
++  pc.set((base + off + (uint64_t)(imm_ << 2)) & MASK48); xc->pcState(pc); return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"call";} void advancePC(PCStateBase&)const override{}};
++
++// ret (riii, spec §5.5): pop RegRAS → PC; rdha = sext18(imms18) (rd0 discards).
++class RetInst : public StaticInst { RegId srcRegs[0], dstRegs[1]; int64_t imm_; bool haveDst; public:
++RetInst(uint8_t ha, int64_t imm) : StaticInst("ret", enums::No_OpClass), imm_(imm), haveDst(ha!=0) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if (ha) dstRegs[_numDestRegs++] = intRegId(ha); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  uint64_t ret_addr; Fault f = rasPop(xc->tcBase(), ret_addr); if (f != NoFault) return f;  // RASUF precise
++  PCState pc = xc->pcState().as<PCState>(); pc.set(ret_addr & MASK48); xc->pcState(pc);
++  if (_numDestRegs) xc->setRegOperand(this, 0, (uint64_t)imm_);  // return value = sext18(imms18)
++  return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"ret";} void advancePC(PCStateBase&)const override{}};
++
+ // === ALU batch: sub, logic, muls/mulu, divs/divu ===
+ // add/sub/muls/mulu are 128-bit dual-dest (ha=hi, hb=lo) — spec §3.5/3.7
+ // spec §2.6.1 dual-dest legality: both rdha,rdhb=rd0 → ILLI; rdha==rdhb (same
+@@ -519,10 +650,10 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+         case 0x1D: return StaticInstPtr(new ExtzIInst(hb(w), hc(w), hd(w)));
+         case 0x24: return StaticInstPtr(new CmpsInst(hb(w), hc(w), hd(w)));
+         case 0x25: return StaticInstPtr(new CmpuInst(hb(w), hc(w), hd(w)));
+-        case 0x28: return StaticInstPtr(new BlockCopyStub(hb(w), hd(w))); // rd2rd (legality only, §4.7)
+-        case 0x29: return StaticInstPtr(new BlockCopyStub(hb(w), hd(w))); // rd2rb
+-        case 0x2A: return StaticInstPtr(new BlockCopyStub(hb(w), hd(w))); // rb2rd
+-        case 0x2B: return StaticInstPtr(new BlockCopyStub(hb(w), hd(w))); // rb2rb
++        case 0x28: return StaticInstPtr(new BlockCopyInst(hb(w), hc(w), hd(w), false, false)); // rd2rd §3.14
++        case 0x29: return StaticInstPtr(new BlockCopyInst(hb(w), hc(w), hd(w), true,  false)); // rd2rb §4.7
++        case 0x2A: return StaticInstPtr(new BlockCopyInst(hb(w), hc(w), hd(w), false, true));  // rb2rd §4.7 (48-bit src)
++        case 0x2B: return StaticInstPtr(new BlockCopyInst(hb(w), hc(w), hd(w), true,  true));  // rb2rb §4.7 (48-bit src)
+         case 0x2D: return StaticInstPtr(new CmpRbInst(hb(w), hc(w), hd(w))); // cmp RB (spec §4.5)
+         case 0x2E: return StaticInstPtr(new AddRbInst(hb(w), hc(w), hd(w)));
+         case 0x2F: return StaticInstPtr(new SubRbInst(hb(w), hc(w), hd(w)));
+@@ -585,15 +716,20 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     case 0x4D: return StaticInstPtr(new AndnwRbInst(ha(w), ww(w), imm16u(w)));        // andnw-rb
+     case 0x4E: return StaticInstPtr(new SetzwRbInst(ha(w), ww(w), imm16u(w)));        // setzw-rb
+     case 0x4F: return StaticInstPtr(new MultiStoreInst(ha(w), hb(w), hc(w), hd(w), 8, true)); // stmo-rb
+-    // Control flow beyond jump-iiii — defined but unimplemented (spec §2.8).
+-    // Abstain (SKIP) rather than UNDI: these are not reserved encodings.
+-    case 0x28: case 0x29: case 0x2A: case 0x2B: // brn/brnn/brz/brnz
+-    case 0x2C: case 0x2D: case 0x2E: case 0x2F: // brp/brnp/breq/brne
+-    case 0x65:                                  // jump-rrii (jump_r)
+-    case 0x6C: case 0x6D:                        // call-iiii / call-rrii
+-    case 0x6E:                                   // ret
+-        return StaticInstPtr(new AbstainInst());
+-    case 0x64: return StaticInstPtr(new JumpIIIIInst(imm24s(w)));
++    // Control flow (spec §5). Conditional branches (riii / rrii):
++    case 0x28: return StaticInstPtr(new BrnInst(ha(w), imm18s(w)));   // brn  §5.1
++    case 0x29: return StaticInstPtr(new BrnnInst(ha(w), imm18s(w)));  // brnn
++    case 0x2A: return StaticInstPtr(new BrzInst(ha(w), imm18s(w)));   // brz
++    case 0x2B: return StaticInstPtr(new BrnzInst(ha(w), imm18s(w)));  // brnz
++    case 0x2C: return StaticInstPtr(new BrpInst(ha(w), imm18s(w)));   // brp
++    case 0x2D: return StaticInstPtr(new BrnpInst(ha(w), imm18s(w)));  // brnp
++    case 0x2E: return StaticInstPtr(new BreqInst(ha(w), hb(w), imm12s(w))); // breq §5.2
++    case 0x2F: return StaticInstPtr(new BrneInst(ha(w), hb(w), imm12s(w))); // brne
++    case 0x64: return StaticInstPtr(new JumpIIIIInst(imm24s(w)));     // jump  §5.3
++    case 0x65: return StaticInstPtr(new JumpRInst(ha(w), hb(w), imm12s(w))); // jump_r §5.3
++    case 0x6C: return StaticInstPtr(new CallIInst(imm24s(w)));        // call  §5.4
++    case 0x6D: return StaticInstPtr(new CallRInst(ha(w), hb(w), imm12s(w))); // call_r §5.4
++    case 0x6E: return StaticInstPtr(new RetInst(ha(w), imm18s(w)));   // ret   §5.5
+     default:   return StaticInstPtr(new UnknownInst()); // reserved major op → UNDI
+     }
+ }
+diff --git a/src/arch/dadao/faults.hh b/src/arch/dadao/faults.hh
+index 6818041424..7265054d46 100644
+--- a/src/arch/dadao/faults.hh
++++ b/src/arch/dadao/faults.hh
+@@ -58,10 +58,26 @@ class UndiFault : public DADAOFault
+     UndiFault() : DADAOFault("UNDI", 0x83) {}
+ };
+ 
+-// Sentinel for opcodes DADAO gem5 has not implemented yet (control-flow beyond
+-// jump-iiii, register-bank block copy semantics). NOT an architectural fault —
+-// its private exit code lets the adapter report SKIP-unsupported rather than
+-// mis-scoring the case. Kept out of FAULT_CODES.
++// RegRAS overflow / underflow (spec §5.6): precise control-flow exceptions on
++// call (full stack) / ret (empty stack). No runnable single-instruction vector
++// exercises these (cold-ret is a HARNESS abstain), so their exact SE codes are
++// only for internal distinctness — kept out of FAULT_CODES.
++class RasofFault : public DADAOFault
++{
++  public:
++    RasofFault() : DADAOFault("RASOF", 0x84) {}
++};
++
++class RasufFault : public DADAOFault
++{
++  public:
++    RasufFault() : DADAOFault("RASUF", 0x85) {}
++};
++
++// Sentinel for opcodes DADAO gem5 has not implemented yet (register-bank block
++// copy was G2; now implemented — this remains for any future gap). NOT an
++// architectural fault — its private exit code lets the adapter report
++// SKIP-unsupported rather than mis-scoring the case. Kept out of FAULT_CODES.
+ class UnimplFault : public DADAOFault
+ {
+   public:
+diff --git a/src/arch/dadao/registers.hh b/src/arch/dadao/registers.hh
+index 5184a98376..da538c3aec 100644
+--- a/src/arch/dadao/registers.hh
++++ b/src/arch/dadao/registers.hh
+@@ -13,10 +13,12 @@ namespace gem5
+ namespace DADAOISA
+ {
+ 
+-// DADAO banks are modelled in a single flat integer RegClass for the G1
+-// skeleton: indices 0..63 are RD (data) registers, 64..127 are RB (base)
+-// registers. spec §1.2/§1.3.
+-constexpr unsigned NumIntRegs = 128;
++// DADAO banks are modelled in a single flat integer RegClass: indices 0..63 are
++// RD (data) registers, 64..127 are RB (base) registers, 128..191 are the RegRAS
++// return-address stack ra0..ra63 (ra63 = top; bits[63:48]=refcount, [47:0]=addr,
++// spec §5.6). RA is architectural but internal (not an instruction operand), so
++// call/ret access it directly via ThreadContext. spec §1.2/§1.3/§5.6.
++constexpr unsigned NumIntRegs = 192;
+ constexpr unsigned NumFloatRegs = 64;
+ constexpr unsigned NumMiscRegs = 1;
+ 
+@@ -26,6 +28,7 @@ using FloatReg = uint64_t;
+ // Bank base offsets within the flat integer class.
+ constexpr RegIndex RD_BASE = 0;    // rd0..rd63
+ constexpr RegIndex RB_BASE = 64;   // rb0..rb63
++constexpr RegIndex RA_BASE = 128;  // ra0..ra63 (RegRAS, spec §5.6)
+ 
+ // Register classes. vec/mat/cc dummies live in isa.cc (mirrors arch/power).
+ inline constexpr RegClass intRegClass(IntRegClass, IntRegClassName,
+-- 
+2.43.0
+

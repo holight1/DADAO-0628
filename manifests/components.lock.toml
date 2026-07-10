@@ -21,6 +21,14 @@ patch_series = "components/qemu/patches/series"
 role = "CPU core, decode, scalar execution, and bare-metal machine"
 
 [[component]]
+name = "gem5"
+enabled = true
+repository = "https://github.com/gem5/gem5.git"
+commit = "c8222cc67a399bfc01e8658dd14b30d5bfd634f9"
+patch_series = "components/gem5/patches/series"
+role = "Functional second reference: ISA differential (interp/QEMU/gem5), SE mode"
+
+[[component]]
 name = "musl"
 enabled = false
 repository = "https://git.musl-libc.org/git/musl"

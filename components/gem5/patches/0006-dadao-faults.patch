@@ -1,0 +1,462 @@
+From e3d12ae48f045d3aad31d09539ad91fd8a6c86cb Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 10 Jul 2026 06:19:26 +0800
+Subject: [PATCH 6/7] =?UTF-8?q?arch/dadao:=20G2=20fault=20model=20?=
+ =?UTF-8?q?=E2=80=94=20ILLI/MALIGN/UNDI=20+=20legality,=203-way=20AGREE=3D?=
+ =?UTF-8?q?162?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the DADAO exception model (DG-004c), spec-derived (§2.5/§2.6/§3.1/§3.7,
+ADR-0004), never from QEMU cpu.c/translate.c. SE exit codes shared with the
+harness FAULT_CODES: ILLI=0x82, MALIGN=0x81, UNDI=0x83.
+
+faults.{hh,cc}: DADAOFault now carries (name, exit code); invoke() exits the
+sim loop with it. Add IlliFault(0x82)/MalignFault(0x81)/UndiFault(0x83) and a
+private UnimplFault(0x7F) sentinel (unimplemented opcode → adapter SKIP).
+
+decoder.cc legality (return the fault before any register/memory write, per
+the §2.7 precise-exception rule):
+  - ILLI: rdha/rdhb-destination = rd0 (RR2R/RI2R families, load/store/multi,
+    addi-rd/rb); rbha/rbhb = rb0 (RB load/store, addi-rb); dual-dest both rd0
+    or same reg (add/sub/muls/mulu/divs/divu); div-by-zero and INT64_MIN÷-1;
+    multi immu6=0 and first+immu6>64; register block-copy legality; unimp.
+  - MALIGN: single & multi load/store whose EA is not width-aligned (§3.1).
+  - UNDI: reserved encodings (unallocated major op, reserved MISC-Norm minor)
+    via UnknownInst. Distinct from ILLI — reserved ≠ illegal-operand (QEMU once
+    conflated these in DL-043b; gem5 splits them from the spec).
+
+Reserved vs unimplemented: control flow beyond jump-iiii (br*, jump_r, call,
+ret) and register-bank block-copy *semantics* are defined-but-unimplemented →
+AbstainInst/BlockCopyStub raise UnimplFault (SKIP), NOT UNDI. Block-copy still
+enforces its ILLI legality.
+
+Spot-checked distinct codes: ILLI=130, MALIGN=129, UNDI=131 (reserved major op
+and reserved MISC-Norm minor), halt=0.
+
+3-way differential: AGREE(3-way) 131 -> 162, DIVERGE=0. Every expected_fault
+vector now PASSes (FAIL=0). Remaining 36 gem5-SKIP are control-flow branch and
+register block-copy *semantics* (functional, not faults — future work). Smokes
+42/42/0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/arch/dadao/decoder.cc | 155 +++++++++++++++++++++++++++-----------
+ src/arch/dadao/faults.cc  |   5 +-
+ src/arch/dadao/faults.hh  |  50 +++++++++++-
+ 3 files changed, 162 insertions(+), 48 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index a1d6d1f273..df6e249a70 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -63,6 +63,11 @@ dumpFinalState(ExecContext *xc)
+     }
+ }
+ 
++// DG-004c fault shortcuts (spec §2.6 ILLI, §3.1 MALIGN). Defined before the
++// first DECL_RR2R/DECL_RI2R expansion so those macros can use them.
++#define RET_ILLI   return std::make_shared<IlliFault>()
++#define RET_MALIGN return std::make_shared<MalignFault>()
++
+ // === field extractors ===
+ static inline uint8_t ha(uint32_t w) { return (w >> 18) & 0x3F; }
+ static inline uint8_t hb(uint32_t w) { return (w >> 12) & 0x3F; }
+@@ -74,21 +79,24 @@ static inline int64_t imm24s(uint32_t w) { int64_t v = w & 0xFFFFFF; return (v &
+ static inline uint16_t imm16u(uint32_t w) { return ((w & 0xF000) >> 12) << 12 | (hc(w) << 6) | hd(w); }
+ static inline int ww(uint32_t w) { return (hb(w) >> 4) & 3; }
+ 
+-// Macro to reduce boilerplate for simple 2R-1R instructions
++// Macro to reduce boilerplate for simple 2R-1R instructions.
++// Destination field (d) is rdhb (and/orr/xor/…/shift/exts/cmp-reg): d==rd0 →
++// ILLI (spec §2.6.1 rdhb-destination rules).
+ #define DECL_RR2R(NAME, MNEM, FN) \
+-class NAME : public StaticInst { RegId srcRegs[2], dstRegs[1]; \
+-public: NAME(uint8_t d, uint8_t s1, uint8_t s2) : StaticInst(MNEM, enums::No_OpClass) { \
++class NAME : public StaticInst { RegId srcRegs[2], dstRegs[1]; bool destZero; \
++public: NAME(uint8_t d, uint8_t s1, uint8_t s2) : StaticInst(MNEM, enums::No_OpClass), destZero(d==0) { \
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); \
+   srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2); if(d) dstRegs[_numDestRegs++]=intRegId(d); } \
+-  Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t a=xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); if(_numDestRegs)xc->setRegOperand(this,0,FN); return NoFault; } \
++  Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(destZero) RET_ILLI; uint64_t a=xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); if(_numDestRegs)xc->setRegOperand(this,0,FN); return NoFault; } \
+   std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return MNEM;} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+-// Macro for 2R-1R with imm
++// Macro for 2R-1R with imm. Destination field (d) is rdha (addi/cmps-i/cmpu-i)
++// or rdhb (shift-i/exts-i): d==rd0 → ILLI (spec §2.6.1).
+ #define DECL_RI2R(NAME, MNEM, FN) \
+-class NAME : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; public: NAME(uint8_t d, uint8_t s, int64_t i) : StaticInst(MNEM, enums::No_OpClass), imm_(i) { \
++class NAME : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; bool destZero; public: NAME(uint8_t d, uint8_t s, int64_t i) : StaticInst(MNEM, enums::No_OpClass), imm_(i), destZero(d==0) { \
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); \
+   if(s) srcRegs[_numSrcRegs++]=intRegId(s); if(d) dstRegs[_numDestRegs++]=intRegId(d); } \
+-  Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t a=(_numSrcRegs>0)?xc->getRegOperand(this,0):0; if(_numDestRegs)xc->setRegOperand(this,0,FN); return NoFault; } \
++  Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(destZero) RET_ILLI; uint64_t a=(_numSrcRegs>0)?xc->getRegOperand(this,0):0; if(_numDestRegs)xc->setRegOperand(this,0,FN); return NoFault; } \
+   std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return MNEM;} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // === G1 instructions (halt, addi, add, jump) — unchanged ===
+@@ -105,43 +113,78 @@ JumpIIIIInst(int64_t i) : StaticInst("jump", enums::No_OpClass), imm_(i) { setRe
+ Fault execute(ExecContext *xc, trace::InstRecord*) const override { PCState pc=xc->pcState().as<PCState>(); pc.set(pc.instAddr()+4+(imm_<<2)); xc->pcState(pc); return NoFault; } // spec §5.3/§1.3: rb0=PC+4
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return csprintf("jump %d",(int)imm_);} void advancePC(PCStateBase&)const override{}};
+ 
++// Reserved/unallocated encoding → UNDI (spec §2.5/§2.8.1). NOT ILLI: reserved
++// encoding is UNDI; a known instruction with an illegal operand is ILLI.
+ class UnknownInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; public:
+-UnknownInst() : StaticInst("unknown", enums::No_OpClass) { setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
+-Fault execute(ExecContext*, trace::InstRecord*) const override { return std::make_shared<DADAOSyscallFault>(); }
+-std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"unknown";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++UnknownInst() : StaticInst("undi", enums::No_OpClass) { setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext*, trace::InstRecord*) const override { return std::make_shared<UndiFault>(); }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"undi";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// unimp (MISC-Norm ha=11_1111, spec §2.8.1): a *defined* instruction that always
++// raises ILLI — distinct from reserved (UNDI).
++class UnimpInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; public:
++UnimpInst() : StaticInst("unimp", enums::No_OpClass) { setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext*, trace::InstRecord*) const override { RET_ILLI; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"unimp";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// Defined-but-unimplemented opcode (control flow beyond jump-iiii: br*, jump_r,
++// call, ret). NOT reserved — so it must NOT raise UNDI. Abstains via UnimplFault
++// (0x7F) so the adapter reports SKIP-unsupported. Keeps the reserved→UNDI
++// distinction clean and lets the harness abstain on these (incl. the 6 HARNESS
++// control-flow fault vectors the single-instruction model cannot reproduce).
++class AbstainInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; public:
++AbstainInst() : StaticInst("unimpl", enums::No_OpClass) { setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext*, trace::InstRecord*) const override { return std::make_shared<UnimplFault>(); }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"unimpl";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// Register-bank block copy rd2rd/rd2rb/rb2rd/rb2rb (orri, spec §4.7). Semantics
++// are out of G2 scope, but the legality check is in-scope: immu6=0 / dest reg0 /
++// first+immu6>64 → ILLI (spec §2.6.3). A legal-but-unimplemented case abstains
++// via UnimplFault so the adapter reports SKIP-unsupported (not a bad result).
++class BlockCopyStub : public StaticInst { RegId srcRegs[0], dstRegs[0]; bool illegal; public:
++BlockCopyStub(uint8_t hb, uint8_t hd) : StaticInst("blockcopy", enums::No_OpClass),
++    illegal(hb==0 || hd==0 || hb+hd>64) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext*, trace::InstRecord*) const override { if(illegal) RET_ILLI; return std::make_shared<UnimplFault>(); }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"blockcopy";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // === ALU batch: sub, logic, muls/mulu, divs/divu ===
+ // add/sub/muls/mulu are 128-bit dual-dest (ha=hi, hb=lo) — spec §3.5/3.7
+-class AddDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
+-AddDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("add", enums::No_OpClass) {
++// spec §2.6.1 dual-dest legality: both rdha,rdhb=rd0 → ILLI; rdha==rdhb (same
++// non-rd0) → ILLI. (Exactly one rd0 is legal — discards that half.)
++static inline bool dualBadDst(uint8_t hi, uint8_t lo) {
++  return (hi==0 && lo==0) || (hi!=0 && hi==lo);
++}
++class AddDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; public:
++AddDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("add", enums::No_OpClass), badDst(dualBadDst(hi,lo)) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2);
+   if(lo)dstRegs[_numDestRegs++]=intRegId(lo); if(hi)dstRegs[_numDestRegs++]=intRegId(hi); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { __int128 r=(__int128)(int64_t)xc->getRegOperand(this,0)+(__int128)(int64_t)xc->getRegOperand(this,1); if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)r); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(r>>64)); return NoFault; } // spec §3.5: rdha:rdhb=sext128(rdhc)+sext128(rdhd)
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; __int128 r=(__int128)(int64_t)xc->getRegOperand(this,0)+(__int128)(int64_t)xc->getRegOperand(this,1); if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)r); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(r>>64)); return NoFault; } // spec §3.5: rdha:rdhb=sext128(rdhc)+sext128(rdhd)
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"add";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+-class SubDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
+-SubDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("sub", enums::No_OpClass) {
++class SubDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; public:
++SubDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("sub", enums::No_OpClass), badDst(dualBadDst(hi,lo)) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2);
+   if(lo)dstRegs[_numDestRegs++]=intRegId(lo); if(hi)dstRegs[_numDestRegs++]=intRegId(hi); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { __int128 r=(__int128)(int64_t)xc->getRegOperand(this,0)-(__int128)(int64_t)xc->getRegOperand(this,1); if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)r); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(r>>64)); return NoFault; } // spec §3.5: rdha:rdhb=sext128(rdhc)-sext128(rdhd)
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; __int128 r=(__int128)(int64_t)xc->getRegOperand(this,0)-(__int128)(int64_t)xc->getRegOperand(this,1); if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)r); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(r>>64)); return NoFault; } // spec §3.5: rdha:rdhb=sext128(rdhc)-sext128(rdhd)
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"sub";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+-class MulsDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
+-MulsDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("muls", enums::No_OpClass) {
++class MulsDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; public:
++MulsDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("muls", enums::No_OpClass), badDst(dualBadDst(hi,lo)) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2);
+   if(lo)dstRegs[_numDestRegs++]=intRegId(lo); if(hi)dstRegs[_numDestRegs++]=intRegId(hi); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { __int128 a=(int64_t)xc->getRegOperand(this,0), b=(int64_t)xc->getRegOperand(this,1); __int128 p=a*b; if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)p); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(p>>64)); return NoFault; }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; __int128 a=(int64_t)xc->getRegOperand(this,0), b=(int64_t)xc->getRegOperand(this,1); __int128 p=a*b; if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)p); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(p>>64)); return NoFault; }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"muls";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+-class MuluDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
+-MuluDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("mulu", enums::No_OpClass) {
++class MuluDualInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; public:
++MuluDualInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2) : StaticInst("mulu", enums::No_OpClass), badDst(dualBadDst(hi,lo)) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++]=intRegId(s1); srcRegs[_numSrcRegs++]=intRegId(s2);
+   if(lo)dstRegs[_numDestRegs++]=intRegId(lo); if(hi)dstRegs[_numDestRegs++]=intRegId(hi); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { unsigned __int128 a= xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); unsigned __int128 p=a*b; if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)p); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(p>>64)); return NoFault; }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; unsigned __int128 a= xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); unsigned __int128 p=a*b; if(_numDestRegs>=1)xc->setRegOperand(this,0,(uint64_t)p); if(_numDestRegs>=2)xc->setRegOperand(this,1,(uint64_t)(p>>64)); return NoFault; }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"mulu";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ DECL_RR2R(AndInst,"and", a&b)
+@@ -150,20 +193,20 @@ DECL_RR2R(XorInst,"xor", a^b)
+ DECL_RR2R(XnorInst,"xnor", ~(a^b))
+ 
+ // divs: signed division with truncation toward zero (spec 3.7)
+-class DivsInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
+-DivsInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divs", enums::No_OpClass) {
++class DivsInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; public:
++DivsInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divs", enums::No_OpClass), badDst(dualBadDst(rem,quo)) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++]=intRegId(num); srcRegs[_numSrcRegs++]=intRegId(den);
+   if(rem)dstRegs[_numDestRegs++]=intRegId(rem); if(quo)dstRegs[_numDestRegs++]=intRegId(quo); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { int64_t a=xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); if(b==0)return std::make_shared<DADAOSyscallFault>(); if(a==INT64_MIN&&b==-1)return std::make_shared<DADAOSyscallFault>(); int64_t q=a/b, r=a%b; if(_numDestRegs>=1)xc->setRegOperand(this,0,r); if(_numDestRegs>=2)xc->setRegOperand(this,1,q); return NoFault; }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; int64_t a=xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); if(b==0) RET_ILLI; if(a==INT64_MIN&&b==-1) RET_ILLI; int64_t q=a/b, r=a%b; if(_numDestRegs>=1)xc->setRegOperand(this,0,r); if(_numDestRegs>=2)xc->setRegOperand(this,1,q); return NoFault; } // spec §3.7: div0 / INT64_MIN÷-1 → ILLI
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"divs";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+-class DivuInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; public:
+-DivuInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divu", enums::No_OpClass) {
++class DivuInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; public:
++DivuInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divu", enums::No_OpClass), badDst(dualBadDst(rem,quo)) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++]=intRegId(num); srcRegs[_numSrcRegs++]=intRegId(den);
+   if(rem)dstRegs[_numDestRegs++]=intRegId(rem); if(quo)dstRegs[_numDestRegs++]=intRegId(quo); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t a=xc->getRegOperand(this,0),b=xc->getRegOperand(this,1); if(b==0)return std::make_shared<DADAOSyscallFault>(); if(_numDestRegs>=1)xc->setRegOperand(this,0,a%b); if(_numDestRegs>=2)xc->setRegOperand(this,1,a/b); return NoFault; }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; uint64_t a=xc->getRegOperand(this,0),b=xc->getRegOperand(this,1); if(b==0) RET_ILLI; if(_numDestRegs>=1)xc->setRegOperand(this,0,a%b); if(_numDestRegs>=2)xc->setRegOperand(this,1,a/b); return NoFault; } // spec §3.7: div0 → ILLI
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"divu";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // === Shift/extend (orrr: hb=dst, hc=src1, hd=src2) ===
+@@ -270,11 +313,11 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t b=x
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"sub.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // addi RB (rrii, op=0x49): rb[ha] = rb[hb] + sext(imm12), 48-bit truncation
+-class AddiRbInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; public:
+-AddiRbInst(uint8_t d, uint8_t s, int64_t i) : StaticInst("addi.rb", enums::No_OpClass), imm_(i) {
++class AddiRbInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; bool destZero; public:
++AddiRbInst(uint8_t d, uint8_t s, int64_t i) : StaticInst("addi.rb", enums::No_OpClass), imm_(i), destZero(d==0) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   if(s)srcRegs[_numSrcRegs++]=intRegId(RB_BASE+s); if(d)dstRegs[_numDestRegs++]=intRegId(RB_BASE+d); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { uint64_t a=(_numSrcRegs>0)?xc->getRegOperand(this,0)&0xFFFFFFFFFFFFULL:0; if(_numDestRegs)xc->setRegOperand(this,0,(a+imm_)&0xFFFFFFFFFFFFULL); return NoFault; }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(destZero) RET_ILLI; uint64_t a=(_numSrcRegs>0)?xc->getRegOperand(this,0)&0xFFFFFFFFFFFFULL:0; if(_numDestRegs)xc->setRegOperand(this,0,(a+imm_)&0xFFFFFFFFFFFFULL); return NoFault; } // spec §2.6.2: rbha=rb0 → ILLI
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"addi.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // rela (op=0x48, riii): rb[ha] = ((PC+4)&~0xFFF) + sext(imm18)<<12, spec 4.8
+@@ -325,19 +368,24 @@ sextN(uint64_t v, int N)
+     return (v ^ m) - m;                                // sign-extend N bytes
+ }
+ 
++// spec §3.1: N-byte access must be N-aligned (byte access always aligned).
++static inline bool aligned(Addr ea, int N) { return (ea & (N - 1)) == 0; }
++
+ // === RD/RB single load (rrii, spec §3.1 / §4.1) ===
+ // EA = (rbhb[47:0] + sext_12(imms12)) mod 2^48; rd/rb(ha) = extend_N(mem_be).
+ // destRb selects the destination bank (RD load vs RB ldo). rbha=0/rdha=0
+ // legality (ILLI) is DG-004c; here ha==0 simply performs no register write.
+-class LoadInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; int N; bool sgn; bool destRb; public:
++class LoadInst : public StaticInst { RegId srcRegs[1], dstRegs[1]; int64_t imm_; int N; bool sgn; bool destRb; bool destZero; public:
+ LoadInst(uint8_t ha, uint8_t hb, int64_t imm, int width, bool s, bool dRb)
+-  : StaticInst("ld", enums::MemRead), imm_(imm), N(width), sgn(s), destRb(dRb) {
++  : StaticInst("ld", enums::MemRead), imm_(imm), N(width), sgn(s), destRb(dRb), destZero(ha==0) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);
+   if (ha) dstRegs[_numDestRegs++] = intRegId((destRb ? RB_BASE : RD_BASE) + ha); }
+ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (destZero) RET_ILLI;                             // spec §2.6.1/§2.6.2: rdha/rbha=0 → ILLI
+   uint64_t base = xc->getRegOperand(this, 0) & MASK48;
+   Addr ea = (base + (uint64_t)imm_) & MASK48;
++  if (!aligned(ea, N)) RET_MALIGN;                    // spec §3.1
+   uint64_t v; Fault f = memReadBE(xc, this, ea, N, v); if (f != NoFault) return f;
+   if (sgn) v = sextN(v, N);
+   if (_numDestRegs) xc->setRegOperand(this, 0, v); return NoFault; }
+@@ -346,25 +394,28 @@ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{r
+ // === RD/RB single store (rrii, spec §3.2 / §4.1) ===
+ // mem_be[ea : ea+N-1] = data[N*8-1:0]. dataRb selects source bank (RD st vs RB
+ // sto). rdha=0 storing is ILLI (DG-004c); here it stores 0.
+-class StoreInst : public StaticInst { RegId srcRegs[2], dstRegs[0]; int64_t imm_; int N; int dataIdx; public:
++class StoreInst : public StaticInst { RegId srcRegs[2], dstRegs[0]; int64_t imm_; int N; int dataIdx; bool dataZero; public:
+ StoreInst(uint8_t ha, uint8_t hb, int64_t imm, int width, bool dataRb)
+-  : StaticInst("st", enums::MemWrite), imm_(imm), N(width) {
++  : StaticInst("st", enums::MemWrite), imm_(imm), N(width), dataZero(ha==0) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);   // operand 0 = base
+   dataIdx = -1;
+   if (ha) { srcRegs[_numSrcRegs] = intRegId((dataRb ? RB_BASE : RD_BASE) + ha); dataIdx = _numSrcRegs++; } }
+ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (dataZero) RET_ILLI;                             // spec §2.6.1/§2.6.2: store from rd0/rb0 → ILLI
+   uint64_t base = xc->getRegOperand(this, 0) & MASK48;
+   Addr ea = (base + (uint64_t)imm_) & MASK48;
++  if (!aligned(ea, N)) RET_MALIGN;                    // spec §3.1
+   uint64_t val = (dataIdx < 0) ? 0 : xc->getRegOperand(this, dataIdx);
+   return memWriteBE(xc, ea, N, val); }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"st";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // === RD/RB multi load (rrri, spec §3.3 / §4.2) ===
+ // EA_i = (rbhb[47:0] + rdhc[47:0] + i*N) mod 2^48; reg(ha+i)=extend_N(mem_be).
+-class MultiLoadInst : public StaticInst { RegId srcRegs[2], dstRegs[63]; int N; bool sgn; int count; int idxIdx; public:
++class MultiLoadInst : public StaticInst { RegId srcRegs[2], dstRegs[63]; int N; bool sgn; int count; int idxIdx; bool illegal; public:
+ MultiLoadInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t immu6, int width, bool s, bool destRb)
+-  : StaticInst("ldm", enums::MemRead), N(width), sgn(s), count(immu6) {
++  : StaticInst("ldm", enums::MemRead), N(width), sgn(s), count(immu6),
++    illegal(ha==0 || immu6==0 || ha+immu6>64) {       // spec §2.6.3/§3.3/§4.2
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);   // operand 0 = base
+   idxIdx = -1;
+@@ -372,10 +423,12 @@ MultiLoadInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t immu6, int width, bool
+   RegIndex destBase = destRb ? RB_BASE : RD_BASE;
+   for (int i = 0; i < count && i < 63; i++) dstRegs[_numDestRegs++] = intRegId(destBase + ha + i); }
+ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (illegal) RET_ILLI;
+   uint64_t base = xc->getRegOperand(this, 0) & MASK48;
+   uint64_t idx = (idxIdx < 0) ? 0 : (xc->getRegOperand(this, idxIdx) & MASK48);
+   for (int i = 0; i < _numDestRegs; i++) {
+     Addr ea = (base + idx + (uint64_t)i * N) & MASK48;
++    if (!aligned(ea, N)) RET_MALIGN;                  // spec §3.3 per-element alignment
+     uint64_t v; Fault f = memReadBE(xc, this, ea, N, v); if (f != NoFault) return f;
+     if (sgn) v = sextN(v, N);
+     xc->setRegOperand(this, i, v); }
+@@ -383,9 +436,10 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"ldm";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // === RD/RB multi store (rrri, spec §3.4 / §4.2) ===
+-class MultiStoreInst : public StaticInst { RegId srcRegs[65], dstRegs[0]; int N; int count; int idxIdx; int dataStart; public:
++class MultiStoreInst : public StaticInst { RegId srcRegs[65], dstRegs[0]; int N; int count; int idxIdx; int dataStart; bool illegal; public:
+ MultiStoreInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t immu6, int width, bool dataRb)
+-  : StaticInst("stm", enums::MemWrite), N(width), count(immu6) {
++  : StaticInst("stm", enums::MemWrite), N(width), count(immu6),
++    illegal(ha==0 || immu6==0 || ha+immu6>64) {       // spec §2.6.3/§3.4/§4.2
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);   // operand 0 = base
+   idxIdx = -1;
+@@ -394,11 +448,13 @@ MultiStoreInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t immu6, int width, boo
+   RegIndex dataBase = dataRb ? RB_BASE : RD_BASE;
+   for (int i = 0; i < count && i < 63; i++) srcRegs[_numSrcRegs++] = intRegId(dataBase + ha + i); }
+ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (illegal) RET_ILLI;
+   uint64_t base = xc->getRegOperand(this, 0) & MASK48;
+   uint64_t idx = (idxIdx < 0) ? 0 : (xc->getRegOperand(this, idxIdx) & MASK48);
+   int n = _numSrcRegs - dataStart;
+   for (int i = 0; i < n; i++) {
+     Addr ea = (base + idx + (uint64_t)i * N) & MASK48;
++    if (!aligned(ea, N)) RET_MALIGN;                  // spec §3.4 per-element alignment
+     uint64_t val = xc->getRegOperand(this, dataStart + i);
+     Fault f = memWriteBE(xc, ea, N, val); if (f != NoFault) return f; }
+   return NoFault; }
+@@ -463,14 +519,15 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+         case 0x1D: return StaticInstPtr(new ExtzIInst(hb(w), hc(w), hd(w)));
+         case 0x24: return StaticInstPtr(new CmpsInst(hb(w), hc(w), hd(w)));
+         case 0x25: return StaticInstPtr(new CmpuInst(hb(w), hc(w), hd(w)));
+-        case 0x28: return StaticInstPtr(new UnknownInst()); // rd2rd
+-        case 0x29: return StaticInstPtr(new UnknownInst()); // rd2rb
+-        case 0x2A: return StaticInstPtr(new UnknownInst()); // rb2rd
+-        case 0x2B: return StaticInstPtr(new UnknownInst()); // rb2rb
++        case 0x28: return StaticInstPtr(new BlockCopyStub(hb(w), hd(w))); // rd2rd (legality only, §4.7)
++        case 0x29: return StaticInstPtr(new BlockCopyStub(hb(w), hd(w))); // rd2rb
++        case 0x2A: return StaticInstPtr(new BlockCopyStub(hb(w), hd(w))); // rb2rd
++        case 0x2B: return StaticInstPtr(new BlockCopyStub(hb(w), hd(w))); // rb2rb
+         case 0x2D: return StaticInstPtr(new CmpRbInst(hb(w), hc(w), hd(w))); // cmp RB (spec §4.5)
+         case 0x2E: return StaticInstPtr(new AddRbInst(hb(w), hc(w), hd(w)));
+         case 0x2F: return StaticInstPtr(new SubRbInst(hb(w), hc(w), hd(w)));
+-        default:  return StaticInstPtr(new UnknownInst());
++        case 0x3F: return StaticInstPtr(new UnimpInst()); // unimp → ILLI (§2.8.1)
++        default:  return StaticInstPtr(new UnknownInst()); // reserved MISC-Norm minor → UNDI
+         }
+     }
+     case 0x12: return StaticInstPtr(new CmpsIInst(ha(w), hb(w), imm12s(w)));
+@@ -528,8 +585,16 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     case 0x4D: return StaticInstPtr(new AndnwRbInst(ha(w), ww(w), imm16u(w)));        // andnw-rb
+     case 0x4E: return StaticInstPtr(new SetzwRbInst(ha(w), ww(w), imm16u(w)));        // setzw-rb
+     case 0x4F: return StaticInstPtr(new MultiStoreInst(ha(w), hb(w), hc(w), hd(w), 8, true)); // stmo-rb
++    // Control flow beyond jump-iiii — defined but unimplemented (spec §2.8).
++    // Abstain (SKIP) rather than UNDI: these are not reserved encodings.
++    case 0x28: case 0x29: case 0x2A: case 0x2B: // brn/brnn/brz/brnz
++    case 0x2C: case 0x2D: case 0x2E: case 0x2F: // brp/brnp/breq/brne
++    case 0x65:                                  // jump-rrii (jump_r)
++    case 0x6C: case 0x6D:                        // call-iiii / call-rrii
++    case 0x6E:                                   // ret
++        return StaticInstPtr(new AbstainInst());
+     case 0x64: return StaticInstPtr(new JumpIIIIInst(imm24s(w)));
+-    default:   return StaticInstPtr(new UnknownInst());
++    default:   return StaticInstPtr(new UnknownInst()); // reserved major op → UNDI
+     }
+ }
+ 
+diff --git a/src/arch/dadao/faults.cc b/src/arch/dadao/faults.cc
+index 99f977edc0..6d4a489330 100644
+--- a/src/arch/dadao/faults.cc
++++ b/src/arch/dadao/faults.cc
+@@ -10,7 +10,10 @@ namespace DADAOISA
+ void
+ DADAOFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
+ {
+-    exitSimLoop("DADAO fault", 0);
++    // Precise exception: no architectural side effect. The faulting instruction
++    // already returned this Fault before writing any register/memory. Carry the
++    // fault's SE exit code out to the differential adapter.
++    exitSimLoop(name_, code_);
+ }
+ 
+ } // namespace DADAOISA
+diff --git a/src/arch/dadao/faults.hh b/src/arch/dadao/faults.hh
+index 3999f2cf77..6818041424 100644
+--- a/src/arch/dadao/faults.hh
++++ b/src/arch/dadao/faults.hh
+@@ -8,10 +8,21 @@ namespace gem5
+ namespace DADAOISA
+ {
+ 
++// DG-004c fault model. Each fault carries an SE exit code that the differential
++// adapter (and run_qemu_test.py) map back to the architectural fault:
++//   ILLI = 0x82, MALIGN = 0x81, UNDI = 0x83   (spec §2.5/§2.6/§3.1)
++// The exit codes are the single source of truth shared with the harness
++// FAULT_CODES; invoke() exits the sim loop carrying the code (no register or
++// memory side effect — the faulting instruction returns the Fault before any
++// write, per spec §2.7 precise-exception rule).
+ class DADAOFault : public FaultBase
+ {
++  protected:
++    const char *name_;
++    int code_;
+   public:
+-    FaultName name() const override { return "dadao_fault"; }
++    DADAOFault(const char *n = "dadao_fault", int c = 0) : name_(n), code_(c) {}
++    FaultName name() const override { return name_; }
+     void invoke(ThreadContext *tc, const StaticInstPtr &inst =
+                 nullStaticInstPtr) override;
+ };
+@@ -19,7 +30,42 @@ class DADAOFault : public FaultBase
+ class DADAOSyscallFault : public DADAOFault
+ {
+   public:
+-    FaultName name() const override { return "dadao_syscall"; }
++    DADAOSyscallFault() : DADAOFault("dadao_syscall", 0) {}
++};
++
++// Illegal instruction: known instruction with an illegal operand (rd0/rb0 as
++// destination, immu6=0, first+immu6>64, div-by-zero, INT64_MIN/-1) — spec §2.6.
++class IlliFault : public DADAOFault
++{
++  public:
++    IlliFault() : DADAOFault("ILLI", 0x82) {}
++};
++
++// Misaligned data access (spec §3.1): multi-byte load/store whose EA is not
++// naturally aligned to the access width.
++class MalignFault : public DADAOFault
++{
++  public:
++    MalignFault() : DADAOFault("MALIGN", 0x81) {}
++};
++
++// Undefined instruction: a *reserved* encoding (unallocated opcode / reserved
++// MISC-Norm minor) — spec §2.5/§2.8.1. Distinct from ILLI: reserved encoding =
++// UNDI, illegal operand of a known instruction = ILLI. Do not conflate.
++class UndiFault : public DADAOFault
++{
++  public:
++    UndiFault() : DADAOFault("UNDI", 0x83) {}
++};
++
++// Sentinel for opcodes DADAO gem5 has not implemented yet (control-flow beyond
++// jump-iiii, register-bank block copy semantics). NOT an architectural fault —
++// its private exit code lets the adapter report SKIP-unsupported rather than
++// mis-scoring the case. Kept out of FAULT_CODES.
++class UnimplFault : public DADAOFault
++{
++  public:
++    UnimplFault() : DADAOFault("UNIMPL", 0x7F) {}
+ };
+ 
+ } // namespace DADAOISA
+-- 
+2.43.0
+

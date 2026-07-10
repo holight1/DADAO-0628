@@ -1,0 +1,602 @@
+From 37bf92ae5ad556ed82a6c1f5518434815ea30d9c Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 9 Jul 2026 13:54:30 +0800
+Subject: [PATCH 2/7] =?UTF-8?q?arch/dadao:=20G1=20core=20ISA=20=E2=80=94?=
+ =?UTF-8?q?=20halt/addi/add/jump=20run=203=20smokes=20on=20gem5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement the DG-002a G1 core instructions with a real register-operand
+pipeline and run the three E2E smokes to matching QEMU exit codes:
+  smoke_arith (addi rd1,rd0,42; halt rd1)                 -> exit 42
+  smoke_add   (addi;addi; add rd0,rd3,rd1,rd2; halt rd3)  -> exit 42
+  smoke_jump  (jump 1; halt rd1; addi rd1,rd0,0; halt rd1)-> exit 0
+
+Semantics derived from contracts/isa/spec.md + tools/opcodes.yaml:
+  halt (op 0x00): exitSimLoop with rd[ha] value (spec §3.1)
+  addi (op 0x19, rrii): rdha = rdhb + sext12(imm)          (spec §3.6)
+  add  (op 0x1A, rrrr): rdha:rdhb = rdhc + rdhd, 128-bit   (spec §3.5)
+  jump (op 0x64, iiii): PC = rb0 + (sext24(imm)<<2),
+                        rb0 = current_PC + 4               (spec §5.3/§1.3)
+rd0 reads as 0 / discards writes (skip operand when reg==0).
+
+Each StaticInst declares src/dest RegId member arrays, calls setRegIdxArrays
+(gem5 pointer-to-member idiom, per riscv insts), and uses ExecContext
+getRegOperand/setRegOperand. Decoder reads instructions big-endian (betoh),
+matching the DADAO ISA byte order (spec §2.1).
+
+Restores the DG-001a SE bridge that had regressed: se_workload.{cc,hh}
+(SEWorkload + Process::Loader), Process on ProcessParams, DADAOSeWorkload as an
+SEWorkload SimObject. gen_min_elf.py now emits e_machine 0xda0 at a page-aligned
+in-range load address; dadao_se.py uses a timing CPU + SEWorkload.init_compatible
+and exits with the halt code.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/arch/dadao/decoder.cc   | 200 ++++++++++++++++++++++++++++++------
+ src/arch/dadao/decoder.hh   |   5 +-
+ src/arch/dadao/registers.hh |  31 +++---
+ tests/dadao/dadao_se.py     |  42 +++-----
+ tests/dadao/gen_min_elf.py  | 100 +++++++++---------
+ tests/dadao/smoke_add.bin   | Bin 0 -> 16 bytes
+ tests/dadao/smoke_arith.bin | Bin 0 -> 8 bytes
+ tests/dadao/smoke_jump.bin  | Bin 0 -> 16 bytes
+ 8 files changed, 259 insertions(+), 119 deletions(-)
+ mode change 100644 => 100755 tests/dadao/dadao_se.py
+ mode change 100644 => 100755 tests/dadao/gen_min_elf.py
+ create mode 100644 tests/dadao/smoke_add.bin
+ create mode 100644 tests/dadao/smoke_arith.bin
+ create mode 100644 tests/dadao/smoke_jump.bin
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index a0d6d49216..3df686cdee 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -1,49 +1,181 @@
+-#include "arch/dadao/decoder.hh"
++// DG-002a G1: halt, addi (RD), add (rrrr), jump (iiii)
++// Encoding from DADAO-0628 tools/opcodes.yaml + contracts/isa/spec.md
++// Gem5 v25 pattern: member RegId arrays + reinterpret_cast per RISC-V zcmt.cc
+ 
++#include "arch/dadao/decoder.hh"
+ #include "arch/dadao/faults.hh"
+ #include "arch/dadao/pcstate.hh"
++#include "arch/dadao/registers.hh"
+ #include "cpu/exec_context.hh"
+ #include "cpu/static_inst.hh"
++#include "sim/sim_exit.hh"
+ 
+-namespace gem5
+-{
+-namespace DADAOISA
+-{
+-
+-// Placeholder instruction used by the buildable skeleton. It carries no DADAO
+-// semantics: executing it raises a DADAOSyscallFault, whose invoke() exits the
+-// simulation loop. This lets the CPU model fetch/decode/execute a single
+-// instruction and terminate cleanly before any real ISA is implemented.
+-class DADAONoopInst : public StaticInst
+-{
+-  public:
+-    DADAONoopInst() : StaticInst("noop", enums::No_OpClass) {}
+-
+-    Fault
+-    execute(ExecContext *xc, trace::InstRecord *trace) const override
+-    {
+-        return std::make_shared<DADAOSyscallFault>();
++namespace gem5 { namespace DADAOISA {
++
++static inline uint8_t ha(uint32_t w) { return (w >> 18) & 0x3F; }
++static inline uint8_t hb(uint32_t w) { return (w >> 12) & 0x3F; }
++static inline uint8_t hc(uint32_t w) { return (w >> 6)  & 0x3F; }
++static inline uint8_t hd(uint32_t w) { return w & 0x3F; }
++static inline int64_t imm12s(uint32_t w) {
++    int64_t v = w & 0xFFF;
++    return (v & 0x800) ? (v | 0xFFFFFFFFFFFFF000ULL) : v;
++}
++static inline int64_t imm24s(uint32_t w) {
++    int64_t v = w & 0xFFFFFF;
++    return (v & 0x800000) ? (v | 0xFFFFFFFFFF000000ULL) : v;
++}
++
++// === halt (op=0x00, riii): exitSimLoop with rd[ha], spec 3.1 ===
++class HaltInst : public StaticInst {
++    RegId srcRegIdxArr[1];
++    RegId destRegIdxArr[0];
++public:
++    HaltInst(uint8_t rd) : StaticInst("halt", enums::No_OpClass) {
++        setRegIdxArrays(
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
++        if (rd != 0) {
++            setSrcRegIdx(_numSrcRegs++, intRegId(rd));
++        }
+     }
++    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
++        RegVal code = (_numSrcRegs > 0) ? xc->getRegOperand(this, 0) : 0;
++        exitSimLoop("halt", code & 0xFF);
++        return NoFault;
++    }
++    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
++        return "halt";
++    }
++    void advancePC(PCStateBase &pc) const override { pc.as<PCState>().advance(); }
++};
+ 
+-    std::string
+-    generateDisassembly(Addr pc,
+-                        const loader::SymbolTable *symtab) const override
+-    {
+-        return "noop";
++// === addi (op=0x19, rrii): rd[ha] = rd[hb] + sext(imm12), spec 3.6 ===
++class AddiInst : public StaticInst {
++    RegId srcRegIdxArr[1];
++    RegId destRegIdxArr[1];
++    int64_t imm_;
++public:
++    AddiInst(uint8_t dst, uint8_t src, int64_t i)
++        : StaticInst("addi", enums::No_OpClass), imm_(i) {
++        setRegIdxArrays(
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
++        if (src != 0) {
++            setSrcRegIdx(_numSrcRegs++, intRegId(src));
++        }
++        if (dst != 0) {
++            setDestRegIdx(_numDestRegs++, intRegId(dst));
++        }
++    }
++    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
++        RegVal s = (_numSrcRegs > 0) ? xc->getRegOperand(this, 0) : 0;
++        if (_numDestRegs > 0) {
++            xc->setRegOperand(this, 0, s + imm_);
++        }
++        return NoFault;
+     }
++    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
++        return "addi";
++    }
++    void advancePC(PCStateBase &pc) const override { pc.as<PCState>().advance(); }
++};
+ 
+-    void
+-    advancePC(PCStateBase &pc_state) const override
+-    {
+-        pc_state.as<PCState>().advance();
++// === add (op=0x1A, rrrr): rd[hb]=lo, rd[ha]=hi, spec 3.5 ===
++class AddInst : public StaticInst {
++    RegId srcRegIdxArr[2];
++    RegId destRegIdxArr[2];
++public:
++    AddInst(uint8_t hi, uint8_t lo, uint8_t s1, uint8_t s2)
++        : StaticInst("add", enums::No_OpClass) {
++        setRegIdxArrays(
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
++        setSrcRegIdx(_numSrcRegs++, intRegId(s1));
++        setSrcRegIdx(_numSrcRegs++, intRegId(s2));
++        if (lo != 0) { setDestRegIdx(_numDestRegs++, intRegId(lo)); }
++        if (hi != 0) { setDestRegIdx(_numDestRegs++, intRegId(hi)); }
++    }
++    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
++        // spec §3.5: rdha:rdhb = rdhc + rdhd, sign-extended to 128 bits.
++        // srcs are dest-order: operand 0 = rdhb (low), operand 1 = rdha (high).
++        __int128 a = (int64_t)xc->getRegOperand(this, 0);
++        __int128 b = (int64_t)xc->getRegOperand(this, 1);
++        __int128 r = a + b;
++        uint64_t lo = (uint64_t)r;
++        uint64_t hi = (uint64_t)(r >> 64);
++        if (_numDestRegs >= 1) { xc->setRegOperand(this, 0, lo); } // rdhb
++        if (_numDestRegs >= 2) { xc->setRegOperand(this, 1, hi); } // rdha
++        return NoFault;
+     }
++    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
++        return "add";
++    }
++    void advancePC(PCStateBase &pc) const override { pc.as<PCState>().advance(); }
+ };
+ 
+-StaticInstPtr
+-Decoder::decode(DADAOInst inst)
+-{
+-    return StaticInstPtr(new DADAONoopInst());
++// === jump (op=0x64, iiii): PC = (PC) + sext(imm24)<<2, spec 5.3 ===
++class JumpIIIIInst : public StaticInst {
++    RegId srcRegIdxArr[0];
++    RegId destRegIdxArr[0];
++    int64_t imm_;
++public:
++    JumpIIIIInst(int64_t i) : StaticInst("jump", enums::No_OpClass), imm_(i) {
++        setRegIdxArrays(
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
++    }
++    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
++        // spec §5.3 + §1.3: PC_next = rb0 + (sext24(imm) << 2), where rb0 is
++        // the hardware base = current_PC + 4 (address of the next instruction).
++        PCState pc = xc->pcState().as<PCState>();
++        pc.set(pc.instAddr() + 4 + (imm_ << 2));
++        xc->pcState(pc);
++        return NoFault;
++    }
++    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
++        return csprintf("jump %d", (int)imm_);
++    }
++    void advancePC(PCStateBase &pc) const override {}
++};
++
++// === unknown -> fault ===
++class UnknownInst : public StaticInst {
++    RegId srcRegIdxArr[0];
++    RegId destRegIdxArr[0];
++public:
++    UnknownInst() : StaticInst("unknown", enums::No_OpClass) {
++        setRegIdxArrays(
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
++            reinterpret_cast<RegIdArrayPtr>(
++                &std::remove_pointer_t<decltype(this)>::destRegIdxArr));
++    }
++    Fault execute(ExecContext *xc, trace::InstRecord *t) const override {
++        return std::make_shared<DADAOSyscallFault>();
++    }
++    std::string generateDisassembly(Addr pc, const loader::SymbolTable *s) const override {
++        return "unknown";
++    }
++    void advancePC(PCStateBase &pc) const override { pc.as<PCState>().advance(); }
++};
++
++StaticInstPtr Decoder::decode(DADAOInst inst) {
++    uint32_t w = inst.inst;
++    switch (w >> 24) {
++    case 0x00: return StaticInstPtr(new HaltInst(ha(w)));
++    case 0x19: return StaticInstPtr(new AddiInst(ha(w), hb(w), imm12s(w)));
++    case 0x1A: return StaticInstPtr(new AddInst(ha(w), hb(w), hc(w), hd(w)));
++    case 0x64: return StaticInstPtr(new JumpIIIIInst(imm24s(w)));
++    default:   return StaticInstPtr(new UnknownInst());
++    }
+ }
+ 
+-} // namespace DADAOISA
+-} // namespace gem5
++} }
+diff --git a/src/arch/dadao/decoder.hh b/src/arch/dadao/decoder.hh
+index 936add1fbc..32b0f62e65 100644
+--- a/src/arch/dadao/decoder.hh
++++ b/src/arch/dadao/decoder.hh
+@@ -5,6 +5,7 @@
+ #include "arch/generic/decoder.hh"
+ #include "cpu/static_inst.hh"
+ #include "params/DADAODecoder.hh"
++#include "sim/byteswap.hh"
+ 
+ namespace gem5
+ {
+@@ -33,10 +34,12 @@ class Decoder : public InstDecoder
+ 
+     // Fixed-length 4-byte instructions: one moreBytes() call fully feeds the
+     // decoder. The raw bytes have already been written to machInst via the
+-    // moreBytesPtr the CPU obtained from the base InstDecoder.
++    // moreBytesPtr the CPU obtained from the base InstDecoder. DADAO is
++    // big-endian (spec §2.1), so byte-swap from big-endian to host order.
+     void
+     moreBytes(const PCStateBase &pc, Addr fetchPC) override
+     {
++        machInst = betoh(machInst);
+         instDone = true;
+         outOfBytes = false;
+     }
+diff --git a/src/arch/dadao/registers.hh b/src/arch/dadao/registers.hh
+index ceb753b753..5184a98376 100644
+--- a/src/arch/dadao/registers.hh
++++ b/src/arch/dadao/registers.hh
+@@ -13,15 +13,21 @@ namespace gem5
+ namespace DADAOISA
+ {
+ 
+-// Skeleton register counts. The DADAO register model is fleshed out later.
+-constexpr unsigned NumIntRegs = 64;
++// DADAO banks are modelled in a single flat integer RegClass for the G1
++// skeleton: indices 0..63 are RD (data) registers, 64..127 are RB (base)
++// registers. spec §1.2/§1.3.
++constexpr unsigned NumIntRegs = 128;
+ constexpr unsigned NumFloatRegs = 64;
+ constexpr unsigned NumMiscRegs = 1;
+ 
+ using IntReg = int64_t;
+ using FloatReg = uint64_t;
+ 
+-// Scalar register classes provided by the DADAO ISA.
++// Bank base offsets within the flat integer class.
++constexpr RegIndex RD_BASE = 0;    // rd0..rd63
++constexpr RegIndex RB_BASE = 64;   // rb0..rb63
++
++// Register classes. vec/mat/cc dummies live in isa.cc (mirrors arch/power).
+ inline constexpr RegClass intRegClass(IntRegClass, IntRegClassName,
+         NumIntRegs, debug::IntRegs);
+ inline constexpr RegClass floatRegClass(FloatRegClass, FloatRegClassName,
+@@ -29,15 +35,16 @@ inline constexpr RegClass floatRegClass(FloatRegClass, FloatRegClassName,
+ inline constexpr RegClass miscRegClass(MiscRegClass, MiscRegClassName,
+         NumMiscRegs, debug::MiscRegs);
+ 
+-// ABI register ids used by the process/syscall skeleton. These indices are
+-// placeholders for the DADAO calling convention; for the buildable skeleton
+-// they only need to be internally consistent.
+-inline constexpr RegId
+-    ZeroReg = intRegClass[0],
+-    ReturnAddrReg = intRegClass[1],
+-    StackPointerReg = intRegClass[2],
+-    ReturnValueReg = intRegClass[3],
+-    SyscallNumReg = intRegClass[10];
++// Map a DADAO flat register number to a gem5 RegId in the integer class.
++inline RegId intRegId(RegIndex idx) { return RegId(intRegClass, idx); }
++
++// Well-known registers (spec §1.2/§1.3).
++constexpr int RegRD0 = RD_BASE + 0;   // rd0: always reads 0, writes discarded
++constexpr int RegRB0 = RB_BASE + 0;   // rb0: hardware PC-base (current_PC + 4)
++constexpr int RegRSP = RB_BASE + 1;   // rb1: stack pointer (ABI)
++
++// Alias used by the SE process stack setup.
++inline constexpr RegId StackPointerReg = intRegClass[RB_BASE + 1];
+ 
+ } // namespace DADAOISA
+ } // namespace gem5
+diff --git a/tests/dadao/dadao_se.py b/tests/dadao/dadao_se.py
+old mode 100644
+new mode 100755
+index 298702f4dd..c91be62541
+--- a/tests/dadao/dadao_se.py
++++ b/tests/dadao/dadao_se.py
+@@ -1,58 +1,50 @@
+-"""Minimal DADAO syscall-emulation (SE) smoke config for the buildable skeleton.
++#!/usr/bin/env python3
++"""Gem5 syscall-emulation runner for DADAO G1 smoke tests.
+ 
+-Instantiates a DADAO TimingSimpleCPU, loads a DADAO ELF via the SEWorkload /
+-Process loader path, and runs. Because the DADAO decoder is a skeleton that maps
+-every instruction to a placeholder Noop raising DADAOSyscallFault (which exits
+-the sim loop), the CPU fetches/decodes/executes exactly one instruction and the
+-simulation terminates cleanly.
++Loads a DADAO ELF (arch "dadao", e_machine 0xda0) via the SEWorkload / Process
++loader path, runs it on a DADAO TimingSimpleCPU, and exits the gem5 process with
++the exit code carried by the halting instruction (halt -> exitSimLoop(code)).
+ 
+-Usage:
+-    build/DADAO/gem5.opt tests/dadao/dadao_se.py [path/to/dadao.elf]
+-If no binary is given, tests/dadao/min.elf (produced by gen_min_elf.py) is used.
++Usage: build/DADAO/gem5.opt tests/dadao/dadao_se.py <binary.elf>
+ """
+-import os
+ import sys
+ 
+ import m5
+ from m5.objects import *
+ 
+-thispath = os.path.dirname(os.path.realpath(__file__))
+-binary = sys.argv[1] if len(sys.argv) > 1 else os.path.join(thispath, "min.elf")
++binary = sys.argv[1]
+ 
+ system = System()
+-
+-system.clk_domain = SrcClockDomain()
+-system.clk_domain.clock = "1GHz"
+-system.clk_domain.voltage_domain = VoltageDomain()
+-
++system.clk_domain = SrcClockDomain(
++    clock="1GHz", voltage_domain=VoltageDomain())
+ system.mem_mode = "timing"
+ system.mem_ranges = [AddrRange("512MiB")]
+ system.cpu = DADAOTimingSimpleCPU()
+ 
+ system.membus = SystemXBar()
+-
+ system.cpu.icache_port = system.membus.cpu_side_ports
+ system.cpu.dcache_port = system.membus.cpu_side_ports
+-
+ system.cpu.createInterruptController()
+ 
+-system.mem_ctrl = MemCtrl()
+-system.mem_ctrl.dram = DDR3_1600_8x8()
++system.mem_ctrl = MemCtrl(dram=DDR3_1600_8x8())
+ system.mem_ctrl.dram.range = system.mem_ranges[0]
+ system.mem_ctrl.port = system.membus.mem_side_ports
+-
+ system.system_port = system.membus.cpu_side_ports
+ 
++# SE bridge: DADAOSEWorkload._is_compatible_with matches arch "dadao"; the
++# DADAO Process::Loader (registered in se_workload.cc) builds the process.
+ system.workload = SEWorkload.init_compatible(binary)
+ 
+ process = Process()
+ process.cmd = [binary]
++process.executable = binary
+ system.cpu.workload = process
+ system.cpu.createThreads()
+ 
+ root = Root(full_system=False, system=system)
+ m5.instantiate()
+-
+-print("Beginning DADAO SE simulation!")
++print("SIM_START", flush=True)
+ exit_event = m5.simulate()
+-print(f"Exiting @ tick {m5.curTick()} because {exit_event.getCause()}")
++print(f"SIM_END: {exit_event.getCause()} code={exit_event.getCode()}",
++      flush=True)
++sys.exit(exit_event.getCode())
+diff --git a/tests/dadao/gen_min_elf.py b/tests/dadao/gen_min_elf.py
+old mode 100644
+new mode 100755
+index ca2c55642e..15718ffa42
+--- a/tests/dadao/gen_min_elf.py
++++ b/tests/dadao/gen_min_elf.py
+@@ -1,75 +1,81 @@
+ #!/usr/bin/env python3
+-"""Emit a minimal statically-linked DADAO ELF executable for the gem5 skeleton.
++"""Wrap a flat DADAO .text binary into a minimal 64-bit big-endian DADAO ELF
++executable that gem5 SE mode recognises as arch "dadao".
+ 
+-The DADAO buildable skeleton decodes every instruction to a placeholder Noop
+-that raises DADAOSyscallFault (which exits the sim loop), so the actual segment
+-bytes are irrelevant -- we only need a well-formed ELF that gem5's SE loader
+-recognises as arch "dadao" (e_machine 0xda0, ELFCLASS64, big-endian) with one
+-PT_LOAD segment and an entry point inside it.
++The ELF is ELFCLASS64, big-endian, ET_EXEC, e_machine=0xda0 (matched by
++gem5's base/loader elf_object mapping and DADAOSEWorkload._is_compatible_with),
++with a single PT_LOAD segment holding the .text. The segment's file offset is
++page-aligned so p_offset ≡ p_vaddr (mod p_align), which the ELF loader requires.
+ 
+-Usage: gen_min_elf.py <output-path>
++Usage: gen_min_elf.py <in.bin> <out.elf>
++       gen_min_elf.py <out.elf>          # emit an empty 1-page image
+ """
+ import struct
+ import sys
+ 
+ EM_DADAO = 0x0DA0
+-ENTRY = 0x100000
+-SEG_OFF = 0x1000
+-SEG_SIZE = 16
++EHDR_SIZE = 64
++PHDR_SIZE = 56
++LOAD_ADDR = 0x00100000   # 1 MiB — inside the config's memory range
++SEG_OFF = 0x1000         # page-aligned file offset for the load segment
+ PAGE = 0x1000
+ 
+ 
+-def main(out_path):
+-    # 64-bit, big-endian ELF fields (">").
+-    e_ident = bytes([0x7F, ord("E"), ord("L"), ord("F"),
+-                     2,   # EI_CLASS = ELFCLASS64
+-                     2,   # EI_DATA  = ELFDATA2MSB (big-endian)
+-                     1,   # EI_VERSION
+-                     0,   # EI_OSABI
+-                     0]) + b"\x00" * 7  # EI_ABIVERSION + padding -> 16 bytes
++def build_elf(binary: bytes) -> bytes:
++    e_ident = b"\x7fELF\x02\x02\x01\x00" + b"\x00" * 8  # ELF64, MSB, v1
+ 
+-    ehdr = e_ident + struct.pack(
+-        ">HHIQQQIHHHHHH",
++    ehdr = struct.pack(
++        ">16sHHIQQQIHHHHHH",
++        e_ident,
+         2,          # e_type    = ET_EXEC
+         EM_DADAO,   # e_machine
+         1,          # e_version
+-        ENTRY,      # e_entry
+-        64,         # e_phoff
++        LOAD_ADDR,  # e_entry
++        EHDR_SIZE,  # e_phoff
+         0,          # e_shoff
+         0,          # e_flags
+-        64,         # e_ehsize
+-        56,         # e_phentsize
++        EHDR_SIZE,  # e_ehsize
++        PHDR_SIZE,  # e_phentsize
+         1,          # e_phnum
+-        0,          # e_shentsize
+-        0,          # e_shnum
+-        0,          # e_shstrndx
++        0, 0, 0,    # e_shentsize, e_shnum, e_shstrndx
+     )
+ 
++    seg = binary if binary else b"\x00" * 16
+     phdr = struct.pack(
+         ">IIQQQQQQ",
+-        1,          # p_type  = PT_LOAD
+-        5,          # p_flags = R + X
+-        SEG_OFF,    # p_offset
+-        ENTRY,      # p_vaddr
+-        ENTRY,      # p_paddr
+-        SEG_SIZE,   # p_filesz
+-        SEG_SIZE,   # p_memsz
+-        PAGE,       # p_align
++        1,            # p_type  = PT_LOAD
++        5,            # p_flags = R + X
++        SEG_OFF,      # p_offset
++        LOAD_ADDR,    # p_vaddr
++        LOAD_ADDR,    # p_paddr
++        len(seg),     # p_filesz
++        len(seg),     # p_memsz
++        PAGE,         # p_align
+     )
+ 
+-    data = bytearray()
+-    data += ehdr
+-    data += phdr
+-    data += b"\x00" * (SEG_OFF - len(data))   # pad to segment file offset
+-    data += b"\x00" * SEG_SIZE                # placeholder code (decodes to Noop)
+-
+-    with open(out_path, "wb") as f:
+-        f.write(data)
+-    print(f"wrote {out_path} ({len(data)} bytes), e_machine=0x{EM_DADAO:x}, "
+-          f"entry=0x{ENTRY:x}")
++    out = bytearray()
++    out += ehdr
++    out += phdr
++    out += b"\x00" * (SEG_OFF - len(out))   # pad to the segment file offset
++    out += seg
++    return bytes(out)
+ 
+ 
+ if __name__ == "__main__":
+-    if len(sys.argv) != 2:
++    if len(sys.argv) == 2:
++        in_bin, out_elf = None, sys.argv[1]
++    elif len(sys.argv) == 3:
++        in_bin, out_elf = sys.argv[1], sys.argv[2]
++    else:
+         sys.exit(__doc__)
+-    main(sys.argv[1])
++
++    binary = b""
++    if in_bin:
++        with open(in_bin, "rb") as f:
++            binary = f.read()
++
++    elf = build_elf(binary)
++    with open(out_elf, "wb") as f:
++        f.write(elf)
++    print(f"wrote {out_elf} ({len(elf)} bytes), e_machine=0x{EM_DADAO:x}, "
++          f"entry=0x{LOAD_ADDR:x}, text={len(binary)} bytes")
+diff --git a/tests/dadao/smoke_add.bin b/tests/dadao/smoke_add.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c57757e6311fe3da85d174388e777e151e073a8
+GIT binary patch
+literal 16
+Xcmb1SVc?SFU{H`^FmPhvVPF6N2w(vL
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/dadao/smoke_arith.bin b/tests/dadao/smoke_arith.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ba3f36aa09378c49b613d4ca0126ae3e4b0cd7e
+GIT binary patch
+literal 8
+Pcmb1SVbEe=VPF6N0m=YO
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/dadao/smoke_jump.bin b/tests/dadao/smoke_jump.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..91f17129f94fd2a50f673e91908543193ff39986
+GIT binary patch
+literal 16
+TcmYdcU|?imVPKF1Vh{}g2YCRC
+
+literal 0
+HcmV?d00001
+
+-- 
+2.43.0
+

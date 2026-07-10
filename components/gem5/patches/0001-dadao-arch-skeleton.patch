@@ -1,0 +1,1519 @@
+From 5bf2e8e2106830f41d337068921eeab31949fda3 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 9 Jul 2026 12:09:17 +0800
+Subject: [PATCH 1/7] arch/dadao: buildable DADAO arch skeleton @ v25.1.0.1
+
+Add a minimal, buildable DADAO architecture to the gem5 fork (pinned at
+tag v25.1.0.1, commit c8222cc67a). gem5.opt builds with TARGET_ISA=dadao
+and a DADAO syscall-emulation workload starts and exits cleanly. No DADAO
+instruction semantics yet: every instruction decodes to a placeholder Noop
+that raises DADAOSyscallFault -> exitSimLoop.
+
+Arch (src/arch/dadao/): ISA/BaseISA with the 8 canonical reg classes,
+InstDecoder with moreBytes+decode, SE-only MMU/TLB (translate via the
+process page table), Process (ProcessParams) built by a Process::Loader,
+SEWorkload (arch=dadao, big-endian), interrupts/system/faults stubs, and
+the DADAO* Python SimObjects.
+
+Loader: register arch "dadao" (ELF e_machine 0xda0, ELFCLASS64) in
+base/loader (enum Arch, archToString, elf_object).
+
+Tooling: tests/dadao/gen_min_elf.py emits a minimal DADAO ELF and
+tests/dadao/dadao_se.py runs the SE smoke test. docs/gem5-arch-notes.md
+documents the layout, the v25.1 API shapes, how to add an instruction,
+and flat-binary loading options.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ build_opts/DADAO                  |   3 +
+ docs/gem5-arch-notes.md           | 149 ++++++++++++++++++++++++++++++
+ src/arch/Kconfig                  |   1 +
+ src/arch/SConscript               |   1 +
+ src/arch/dadao/DADAOCPU.py        |  26 ++++++
+ src/arch/dadao/DADAODecoder.py    |   6 ++
+ src/arch/dadao/DADAOISA.py        |   6 ++
+ src/arch/dadao/DADAOInterrupts.py |   6 ++
+ src/arch/dadao/DADAOMMU.py        |  11 +++
+ src/arch/dadao/DADAOSeWorkload.py |  11 +++
+ src/arch/dadao/DADAOSystem.py     |   7 ++
+ src/arch/dadao/DADAOTLB.py        |  10 ++
+ src/arch/dadao/Kconfig            |   2 +
+ src/arch/dadao/SConscript         |  26 ++++++
+ src/arch/dadao/decoder.cc         |  49 ++++++++++
+ src/arch/dadao/decoder.hh         |  57 ++++++++++++
+ src/arch/dadao/faults.cc          |  17 ++++
+ src/arch/dadao/faults.hh          |  28 ++++++
+ src/arch/dadao/interrupts.cc      |   2 +
+ src/arch/dadao/interrupts.hh      |  26 ++++++
+ src/arch/dadao/isa.cc             |  50 ++++++++++
+ src/arch/dadao/isa.hh             |  57 ++++++++++++
+ src/arch/dadao/mmu.hh             |  32 +++++++
+ src/arch/dadao/page_size.hh       |  15 +++
+ src/arch/dadao/pcstate.hh         |  15 +++
+ src/arch/dadao/process.cc         |  61 ++++++++++++
+ src/arch/dadao/process.hh         |  33 +++++++
+ src/arch/dadao/registers.hh       |  45 +++++++++
+ src/arch/dadao/se_workload.cc     |  47 ++++++++++
+ src/arch/dadao/se_workload.hh     |  32 +++++++
+ src/arch/dadao/system.cc          |   2 +
+ src/arch/dadao/system.hh          |  24 +++++
+ src/arch/dadao/tlb.cc             |  48 ++++++++++
+ src/arch/dadao/tlb.hh             |  40 ++++++++
+ src/arch/dadao/types.hh           |  22 +++++
+ src/arch/dadao/utility.hh         |  22 +++++
+ src/base/loader/elf_object.cc     |   2 +
+ src/base/loader/object_file.cc    |   2 +
+ src/base/loader/object_file.hh    |   3 +-
+ tests/dadao/.gitignore            |   2 +
+ tests/dadao/dadao_se.py           |  58 ++++++++++++
+ tests/dadao/gen_min_elf.py        |  75 +++++++++++++++
+ 42 files changed, 1130 insertions(+), 1 deletion(-)
+ create mode 100644 build_opts/DADAO
+ create mode 100644 docs/gem5-arch-notes.md
+ create mode 100644 src/arch/dadao/DADAOCPU.py
+ create mode 100644 src/arch/dadao/DADAODecoder.py
+ create mode 100644 src/arch/dadao/DADAOISA.py
+ create mode 100644 src/arch/dadao/DADAOInterrupts.py
+ create mode 100644 src/arch/dadao/DADAOMMU.py
+ create mode 100644 src/arch/dadao/DADAOSeWorkload.py
+ create mode 100644 src/arch/dadao/DADAOSystem.py
+ create mode 100644 src/arch/dadao/DADAOTLB.py
+ create mode 100644 src/arch/dadao/Kconfig
+ create mode 100644 src/arch/dadao/SConscript
+ create mode 100644 src/arch/dadao/decoder.cc
+ create mode 100644 src/arch/dadao/decoder.hh
+ create mode 100644 src/arch/dadao/faults.cc
+ create mode 100644 src/arch/dadao/faults.hh
+ create mode 100644 src/arch/dadao/interrupts.cc
+ create mode 100644 src/arch/dadao/interrupts.hh
+ create mode 100644 src/arch/dadao/isa.cc
+ create mode 100644 src/arch/dadao/isa.hh
+ create mode 100644 src/arch/dadao/mmu.hh
+ create mode 100644 src/arch/dadao/page_size.hh
+ create mode 100644 src/arch/dadao/pcstate.hh
+ create mode 100644 src/arch/dadao/process.cc
+ create mode 100644 src/arch/dadao/process.hh
+ create mode 100644 src/arch/dadao/registers.hh
+ create mode 100644 src/arch/dadao/se_workload.cc
+ create mode 100644 src/arch/dadao/se_workload.hh
+ create mode 100644 src/arch/dadao/system.cc
+ create mode 100644 src/arch/dadao/system.hh
+ create mode 100644 src/arch/dadao/tlb.cc
+ create mode 100644 src/arch/dadao/tlb.hh
+ create mode 100644 src/arch/dadao/types.hh
+ create mode 100644 src/arch/dadao/utility.hh
+ create mode 100644 tests/dadao/.gitignore
+ create mode 100644 tests/dadao/dadao_se.py
+ create mode 100644 tests/dadao/gen_min_elf.py
+
+diff --git a/build_opts/DADAO b/build_opts/DADAO
+new file mode 100644
+index 0000000000..f7479b64a8
+--- /dev/null
++++ b/build_opts/DADAO
+@@ -0,0 +1,3 @@
++TARGET_ISA = 'dadao'
++USE_DADAO_ISA=y
++BUILD_ISA=y
+diff --git a/docs/gem5-arch-notes.md b/docs/gem5-arch-notes.md
+new file mode 100644
+index 0000000000..e26d27bba7
+--- /dev/null
++++ b/docs/gem5-arch-notes.md
+@@ -0,0 +1,149 @@
++# gem5 DADAO Arch Notes
++
++**Date**: 2026-07-09
++**gem5 version**: tag `v25.1.0.1`, commit `c8222cc67a399bfc01e8658dd14b30d5bfd634f9`
++**Base**: upstream https://github.com/gem5/gem5.git (fork, pinned)
++**Status**: buildable skeleton — `gem5.opt` builds, a DADAO SE workload starts and
++exits cleanly. No DADAO instruction semantics are implemented yet (every
++instruction decodes to a placeholder Noop that exits the sim loop).
++
++## Build
++
++```bash
++cd ~/DADAO-gem5
++scons build/DADAO/gem5.opt -j$(nproc)     # ~2h cold; incremental relink is fast
++```
++
++`build_opts/DADAO` selects the target:
++
++```
++TARGET_ISA = 'dadao'
++USE_DADAO_ISA=y
++BUILD_ISA=y
++```
++
++## Run (SE smoke test — clean start + exit)
++
++```bash
++python3 tests/dadao/gen_min_elf.py tests/dadao/min.elf     # emit a DADAO ELF
++./build/DADAO/gem5.opt tests/dadao/dadao_se.py tests/dadao/min.elf
++```
++
++Expected tail:
++
++```
++Beginning DADAO SE simulation!
++Exiting @ tick 77000 because DADAO fault
++```
++
++Flow: SEWorkload.init_compatible() recognises the ELF as arch `dadao`
++(e_machine 0xda0) → the DADAO Process::Loader builds a DADAOISA::Process →
++the CPU fetches the entry instruction → decoder returns a Noop placeholder →
++`DADAONoopInst::execute` returns `DADAOSyscallFault` → `DADAOFault::invoke`
++calls `exitSimLoop`. Because decode ignores the raw bytes, the ELF segment
++contents are irrelevant — any well-formed DADAO ELF exits on its first fetch.
++
++## Arch directory layout — `src/arch/dadao/`
++
++| File | Role |
++|------|------|
++| `Kconfig`, `SConscript` | build wiring (`USE_DADAO_ISA`, Source/SimObject lists) |
++| `types.hh` | `DADAOInst { uint32_t inst }` |
++| `pcstate.hh` | `PCState = GenericISA::UPCState<4>` (4-byte insts) |
++| `page_size.hh` | `PageShift=12`, `PageBytes=4KiB` |
++| `registers.hh` | int/float/misc `RegClass`es + ABI RegIds (placeholders) |
++| `utility.hh` | small helpers (placeholder) |
++| `faults.{hh,cc}` | `DADAOFault` (invoke→`exitSimLoop`), `DADAOSyscallFault` |
++| `decoder.{hh,cc}` | `Decoder : InstDecoder`; every inst → `DADAONoopInst` |
++| `isa.{hh,cc}` | `ISA : BaseISA`; pushes the 8 canonical reg classes |
++| `interrupts.{hh,cc}` | `Interrupts : BaseInterrupts`, no interrupts |
++| `mmu.hh`, `tlb.{hh,cc}` | SE-only MMU/TLB, translation via process page table |
++| `process.{hh,cc}` | `Process : gem5::Process` (ProcessParams), minimal argsInit |
++| `se_workload.{hh,cc}` | `SEWorkload : gem5::SEWorkload` + `Process::Loader` registration |
++| `system.{hh,cc}` | `System : gem5::System` (SE uses generic System; this is a stub) |
++| `DADAO*.py` | SimObjects: CPU, Decoder, ISA, Interrupts, MMU, TLB, SeWorkload, System |
++
++### Non-arch touch points (every gem5 arch does this)
++- `build_opts/DADAO`, `src/arch/Kconfig`, `src/arch/SConscript` — target wiring.
++- `src/base/loader/object_file.hh` — `Dadao` added to `enum Arch`.
++- `src/base/loader/object_file.cc` — `archToString(Dadao) == "dadao"`.
++- `src/base/loader/elf_object.cc` — `e_machine 0xda0 && ELFCLASS64 → Dadao`.
++
++## v25.1 API shapes the skeleton must match (reference: `src/arch/riscv`, `src/arch/power`)
++
++- **ISA params namespace** — forward-declare `struct DADAOISAParams;` in
++  `namespace gem5` (NOT inside `DADAOISA`), and `#include "params/DADAOISA.hh"`
++  in isa.cc. A forward decl in the wrong namespace makes a distinct incomplete
++  type that is not derived from `SimObjectParams`.
++- **BaseISA pure virtuals** — must implement `newPCState`, `inUserMode`,
++  `copyRegsFrom` (in addition to the misc-reg accessors), and push the 8 reg
++  classes into `_regClasses` in canonical `RegClassType` order.
++- **Process vs SEWorkload are separate objects** — `SEWorkload` is a SimObject
++  (`gem5::SEWorkload` subclass, gives arch/byteOrder/syscall). `Process` is a
++  separate SimObject built from `ProcessParams` by a global `Process::Loader`
++  singleton (registered in se_workload.cc) keyed on `obj->getArch()`. Do not
++  give Process `SEWorkloadParams`.
++- **`Process::syscall`** is `void syscall(ThreadContext *tc)` in v25.
++- **`MemState`** ctor is 6-arg: `(owner, brk, stackBase, maxStackSize,
++  nextThreadStackBase, mmapEnd)`.
++- **`System(const Params&)`** needs `Params` derived from `SystemParams`, so the
++  Python `DADAOSystem` must subclass `System`, not bare `SimObject`.
++- **Decoder** — `arch/generic/decoder.hh :: InstDecoder` has two pure virtuals:
++  `moreBytes(const PCStateBase&, Addr)` and `decode(PCStateBase&)`; both must be
++  overridden or the SimObject is not constructible. `decoder.hh` also needs the
++  complete `StaticInst` type (`#include "cpu/static_inst.hh"`), not a forward
++  decl, because `decode` returns `StaticInstPtr` by value.
++- **Concrete SEWorkload must override `byteOrder()`** (pure virtual in Workload);
++  DADAO returns `ByteOrder::big`.
++- **CPU needs an MMU** — set `ArchMMU`/`mmu` on the Python CPU classes; the MMU
++  overrides `translateFunctional(start,size,...)` returning an
++  `MMUTranslationGen`, and its TLB delegates SE translation to
++  `tc->getProcessPtr()->pTable->translate(req)`.
++
++## How to add a real instruction (for G1 / DG-002a)
++
++1. **Decode** — in `decoder.cc`, replace the blanket `DADAONoopInst` return in
++   `Decoder::decode(DADAOInst)` with opcode dispatch on `inst.inst` bitfields.
++2. **Execute** — add a `StaticInst` subclass per instruction with:
++   - ctor `Inst(...) : StaticInst("name", enums::<OpClass>)` and populated
++     `_numSrcRegs`/`_numDestRegs`/`_srcRegIdx`/`_destRegIdx`;
++   - `Fault execute(ExecContext *xc, trace::InstRecord*) const override` using
++     `xc->getRegOperand/setRegOperand`, `xc->readMem/writeMem`, etc.;
++   - `generateDisassembly(...)` and `advancePC(...)` (`pc.as<PCState>().advance()`
++     for straight-line, or set npc for branches).
++3. **Register/decode file** — real arches use a `.isa` grammar compiled by the
++   ISA parser; the skeleton hand-writes StaticInsts in decoder.cc, which is the
++   simplest path until the ISA description is ported.
++4. **Registers / ABI** — flesh out `registers.hh` (real reg count, RegNames, ABI
++   RegIds), and give `SEWorkload` a real syscall ABI (`SyscallABI64` +
++   `guest_abi::Result` specialisation) so `Process::syscall` can dispatch to
++   `SyscallDescTable`.
++
++## Loading a flat binary @ 0x80000000 (research note for G1)
++
++The skeleton loads an **ELF** (SE path). To load a raw flat binary at a fixed
++address instead, three options, cheapest first:
++
++1. **Wrap the blob in a one-segment ELF** (what `tests/dadao/gen_min_elf.py`
++   does): a single `PT_LOAD` at `p_vaddr = 0x80000000`, `e_entry` in it,
++   `e_machine = 0xda0`, `ELFCLASS64`, big-endian. Then the existing SE
++   Process/Loader path just works — no gem5 changes. Recommended for bring-up.
++2. **FS-style memory image** — in a config, create the `System`, `memory.write()`
++   the blob at `0x80000000`, set the thread PC to `0x80000000`, and skip the SE
++   Process. Needs an FS-ish config and a DADAO `System`/workload that maps the
++   region; more plumbing than option 1.
++3. **Custom `Workload`/`SEWorkload::loadObject` for flat binaries** — teach
++   `base/loader` a "raw" object type or add a DADAO workload that memmaps the
++   blob and sets entry/PC. Most work; only worth it if the toolchain emits raw
++   images rather than ELFs.
++
++Since the DADAO LLVM toolchain already emits ELF objects (e_machine 0xda0), and
++`lld` can produce linked ELF executables, option 1 (or just using a real linked
++ELF) is the natural route once there is a linker script; a linked executable
++with real code replaces `min.elf` unchanged.
++
++## Verified (2026-07-09)
++
++- `scons build/DADAO/gem5.opt -j6` → `build/DADAO/gem5.opt` (699 MiB), exit 0.
++- `gem5.opt tests/dadao/dadao_se.py tests/dadao/min.elf` →
++  `Exiting @ tick 77000 because DADAO fault`, exit 0.
+diff --git a/src/arch/Kconfig b/src/arch/Kconfig
+index 729265c317..d038604c87 100644
+--- a/src/arch/Kconfig
++++ b/src/arch/Kconfig
+@@ -37,6 +37,7 @@ menu "ISA"
+ if BUILD_ISA
+ 
+ rsource "arm/Kconfig"
++rsource "dadao/Kconfig"
+ rsource "mips/Kconfig"
+ rsource "power/Kconfig"
+ rsource "riscv/Kconfig"
+diff --git a/src/arch/SConscript b/src/arch/SConscript
+index 630330f204..0ad11c26e2 100644
+--- a/src/arch/SConscript
++++ b/src/arch/SConscript
+@@ -59,6 +59,7 @@ Import('*')
+ if env['CONF']['BUILD_ISA']:
+     if (
+         not env['CONF']['USE_ARM_ISA'] and
++        not env['CONF'].get('USE_DADAO_ISA') and
+         not env['CONF']['USE_MIPS_ISA'] and
+         not env['CONF']['USE_POWER_ISA'] and
+         not env['CONF']['USE_RISCV_ISA'] and
+diff --git a/src/arch/dadao/DADAOCPU.py b/src/arch/dadao/DADAOCPU.py
+new file mode 100644
+index 0000000000..d6c51f5c0f
+--- /dev/null
++++ b/src/arch/dadao/DADAOCPU.py
+@@ -0,0 +1,26 @@
++from m5.objects.BaseAtomicSimpleCPU import BaseAtomicSimpleCPU
++from m5.objects.BaseTimingSimpleCPU import BaseTimingSimpleCPU
++from m5.objects.BaseO3CPU import BaseO3CPU
++from m5.objects.DADAODecoder import DADAODecoder
++from m5.objects.DADAOInterrupts import DADAOInterrupts
++from m5.objects.DADAOISA import DADAOISA
++from m5.objects.DADAOMMU import DADAOMMU
++
++
++class DADAOCPU:
++    ArchDecoder = DADAODecoder
++    ArchInterrupts = DADAOInterrupts
++    ArchISA = DADAOISA
++    ArchMMU = DADAOMMU
++
++
++class DADAOAtomicSimpleCPU(BaseAtomicSimpleCPU, DADAOCPU):
++    mmu = DADAOMMU()
++
++
++class DADAOTimingSimpleCPU(BaseTimingSimpleCPU, DADAOCPU):
++    mmu = DADAOMMU()
++
++
++class DADAOO3CPU(BaseO3CPU, DADAOCPU):
++    mmu = DADAOMMU()
+diff --git a/src/arch/dadao/DADAODecoder.py b/src/arch/dadao/DADAODecoder.py
+new file mode 100644
+index 0000000000..13c2600d47
+--- /dev/null
++++ b/src/arch/dadao/DADAODecoder.py
+@@ -0,0 +1,6 @@
++from m5.objects.InstDecoder import InstDecoder
++
++class DADAODecoder(InstDecoder):
++    type = 'DADAODecoder'
++    cxx_class = 'gem5::DADAOISA::Decoder'
++    cxx_header = 'arch/dadao/decoder.hh'
+diff --git a/src/arch/dadao/DADAOISA.py b/src/arch/dadao/DADAOISA.py
+new file mode 100644
+index 0000000000..bc2d2fbf30
+--- /dev/null
++++ b/src/arch/dadao/DADAOISA.py
+@@ -0,0 +1,6 @@
++from m5.objects.BaseISA import BaseISA
++
++class DADAOISA(BaseISA):
++    type = 'DADAOISA'
++    cxx_class = 'gem5::DADAOISA::ISA'
++    cxx_header = 'arch/dadao/isa.hh'
+diff --git a/src/arch/dadao/DADAOInterrupts.py b/src/arch/dadao/DADAOInterrupts.py
+new file mode 100644
+index 0000000000..8fe9e96135
+--- /dev/null
++++ b/src/arch/dadao/DADAOInterrupts.py
+@@ -0,0 +1,6 @@
++from m5.objects.BaseInterrupts import BaseInterrupts
++
++class DADAOInterrupts(BaseInterrupts):
++    type = 'DADAOInterrupts'
++    cxx_class = 'gem5::DADAOISA::Interrupts'
++    cxx_header = 'arch/dadao/interrupts.hh'
+diff --git a/src/arch/dadao/DADAOMMU.py b/src/arch/dadao/DADAOMMU.py
+new file mode 100644
+index 0000000000..14afb7d60c
+--- /dev/null
++++ b/src/arch/dadao/DADAOMMU.py
+@@ -0,0 +1,11 @@
++from m5.objects.BaseMMU import BaseMMU
++from m5.objects.DADAOTLB import DADAOTLB
++
++
++class DADAOMMU(BaseMMU):
++    type = "DADAOMMU"
++    cxx_class = "gem5::DADAOISA::MMU"
++    cxx_header = "arch/dadao/mmu.hh"
++
++    itb = DADAOTLB(entry_type="instruction")
++    dtb = DADAOTLB(entry_type="data")
+diff --git a/src/arch/dadao/DADAOSeWorkload.py b/src/arch/dadao/DADAOSeWorkload.py
+new file mode 100644
+index 0000000000..e2e717d674
+--- /dev/null
++++ b/src/arch/dadao/DADAOSeWorkload.py
+@@ -0,0 +1,11 @@
++from m5.objects.Workload import SEWorkload
++
++
++class DADAOSEWorkload(SEWorkload):
++    type = "DADAOSEWorkload"
++    cxx_class = "gem5::DADAOISA::SEWorkload"
++    cxx_header = "arch/dadao/se_workload.hh"
++
++    @classmethod
++    def _is_compatible_with(cls, obj):
++        return obj.get_arch() == "dadao"
+diff --git a/src/arch/dadao/DADAOSystem.py b/src/arch/dadao/DADAOSystem.py
+new file mode 100644
+index 0000000000..6953b7cd58
+--- /dev/null
++++ b/src/arch/dadao/DADAOSystem.py
+@@ -0,0 +1,7 @@
++from m5.objects.System import System
++
++
++class DADAOSystem(System):
++    type = "DADAOSystem"
++    cxx_class = "gem5::DADAOISA::System"
++    cxx_header = "arch/dadao/system.hh"
+diff --git a/src/arch/dadao/DADAOTLB.py b/src/arch/dadao/DADAOTLB.py
+new file mode 100644
+index 0000000000..a3d299a382
+--- /dev/null
++++ b/src/arch/dadao/DADAOTLB.py
+@@ -0,0 +1,10 @@
++from m5.objects.BaseTLB import BaseTLB
++from m5.params import *
++
++
++class DADAOTLB(BaseTLB):
++    type = "DADAOTLB"
++    cxx_class = "gem5::DADAOISA::TLB"
++    cxx_header = "arch/dadao/tlb.hh"
++
++    size = Param.Int(64, "TLB size")
+diff --git a/src/arch/dadao/Kconfig b/src/arch/dadao/Kconfig
+new file mode 100644
+index 0000000000..0c7167e847
+--- /dev/null
++++ b/src/arch/dadao/Kconfig
+@@ -0,0 +1,2 @@
++config USE_DADAO_ISA
++    bool "DADAO ISA support"
+diff --git a/src/arch/dadao/SConscript b/src/arch/dadao/SConscript
+new file mode 100644
+index 0000000000..f00fc8af40
+--- /dev/null
++++ b/src/arch/dadao/SConscript
+@@ -0,0 +1,26 @@
++# -*- mode:python -*-
++Import('*')
++
++if not env['CONF'].get('USE_DADAO_ISA'):
++    Return()
++
++env.TagImplies('dadao isa', 'gem5 lib')
++env.TagImplies('isa', 'dadao isa')
++
++Source('decoder.cc', tags=['dadao isa'])
++Source('faults.cc', tags=['dadao isa'])
++Source('interrupts.cc', tags=['dadao isa'])
++Source('isa.cc', tags=['dadao isa'])
++Source('process.cc', tags=['dadao isa'])
++Source('se_workload.cc', tags=['dadao isa'])
++Source('system.cc', tags=['dadao isa'])
++Source('tlb.cc', tags=['dadao isa'])
++
++SimObject('DADAOCPU.py', sim_objects=[], tags=['dadao isa'])
++SimObject('DADAODecoder.py', sim_objects=['DADAODecoder'], tags=['dadao isa'])
++SimObject('DADAOISA.py', sim_objects=['DADAOISA'], tags=['dadao isa'])
++SimObject('DADAOMMU.py', sim_objects=['DADAOMMU'], tags=['dadao isa'])
++SimObject('DADAOTLB.py', sim_objects=['DADAOTLB'], tags=['dadao isa'])
++SimObject('DADAOInterrupts.py', sim_objects=['DADAOInterrupts'], tags=['dadao isa'])
++SimObject('DADAOSeWorkload.py', sim_objects=['DADAOSEWorkload'], tags=['dadao isa'])
++SimObject('DADAOSystem.py', sim_objects=['DADAOSystem'], tags=['dadao isa'])
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+new file mode 100644
+index 0000000000..a0d6d49216
+--- /dev/null
++++ b/src/arch/dadao/decoder.cc
+@@ -0,0 +1,49 @@
++#include "arch/dadao/decoder.hh"
++
++#include "arch/dadao/faults.hh"
++#include "arch/dadao/pcstate.hh"
++#include "cpu/exec_context.hh"
++#include "cpu/static_inst.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++// Placeholder instruction used by the buildable skeleton. It carries no DADAO
++// semantics: executing it raises a DADAOSyscallFault, whose invoke() exits the
++// simulation loop. This lets the CPU model fetch/decode/execute a single
++// instruction and terminate cleanly before any real ISA is implemented.
++class DADAONoopInst : public StaticInst
++{
++  public:
++    DADAONoopInst() : StaticInst("noop", enums::No_OpClass) {}
++
++    Fault
++    execute(ExecContext *xc, trace::InstRecord *trace) const override
++    {
++        return std::make_shared<DADAOSyscallFault>();
++    }
++
++    std::string
++    generateDisassembly(Addr pc,
++                        const loader::SymbolTable *symtab) const override
++    {
++        return "noop";
++    }
++
++    void
++    advancePC(PCStateBase &pc_state) const override
++    {
++        pc_state.as<PCState>().advance();
++    }
++};
++
++StaticInstPtr
++Decoder::decode(DADAOInst inst)
++{
++    return StaticInstPtr(new DADAONoopInst());
++}
++
++} // namespace DADAOISA
++} // namespace gem5
+diff --git a/src/arch/dadao/decoder.hh b/src/arch/dadao/decoder.hh
+new file mode 100644
+index 0000000000..936add1fbc
+--- /dev/null
++++ b/src/arch/dadao/decoder.hh
+@@ -0,0 +1,57 @@
++#ifndef __ARCH_DADAO_DECODER_HH__
++#define __ARCH_DADAO_DECODER_HH__
++
++#include "arch/dadao/types.hh"
++#include "arch/generic/decoder.hh"
++#include "cpu/static_inst.hh"
++#include "params/DADAODecoder.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++class Decoder : public InstDecoder
++{
++  private:
++    uint32_t machInst;
++
++  public:
++    Decoder(const DADAODecoderParams &p) : InstDecoder(p, &machInst)
++    {
++        reset();
++    }
++
++    void
++    reset() override
++    {
++        InstDecoder::reset();
++        machInst = 0;
++    }
++
++    StaticInstPtr decode(DADAOInst inst);
++
++    // Fixed-length 4-byte instructions: one moreBytes() call fully feeds the
++    // decoder. The raw bytes have already been written to machInst via the
++    // moreBytesPtr the CPU obtained from the base InstDecoder.
++    void
++    moreBytes(const PCStateBase &pc, Addr fetchPC) override
++    {
++        instDone = true;
++        outOfBytes = false;
++    }
++
++    StaticInstPtr
++    decode(PCStateBase &nextPC) override
++    {
++        if (!instDone)
++            return nullptr;
++        instDone = false;
++        return decode(DADAOInst(machInst));
++    }
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_DECODER_HH__
+diff --git a/src/arch/dadao/faults.cc b/src/arch/dadao/faults.cc
+new file mode 100644
+index 0000000000..99f977edc0
+--- /dev/null
++++ b/src/arch/dadao/faults.cc
+@@ -0,0 +1,17 @@
++#include "arch/dadao/faults.hh"
++#include "cpu/thread_context.hh"
++#include "sim/sim_exit.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++void
++DADAOFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
++{
++    exitSimLoop("DADAO fault", 0);
++}
++
++} // namespace DADAOISA
++} // namespace gem5
+diff --git a/src/arch/dadao/faults.hh b/src/arch/dadao/faults.hh
+new file mode 100644
+index 0000000000..3999f2cf77
+--- /dev/null
++++ b/src/arch/dadao/faults.hh
+@@ -0,0 +1,28 @@
++#ifndef __ARCH_DADAO_FAULTS_HH__
++#define __ARCH_DADAO_FAULTS_HH__
++
++#include "sim/faults.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++class DADAOFault : public FaultBase
++{
++  public:
++    FaultName name() const override { return "dadao_fault"; }
++    void invoke(ThreadContext *tc, const StaticInstPtr &inst =
++                nullStaticInstPtr) override;
++};
++
++class DADAOSyscallFault : public DADAOFault
++{
++  public:
++    FaultName name() const override { return "dadao_syscall"; }
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif
+diff --git a/src/arch/dadao/interrupts.cc b/src/arch/dadao/interrupts.cc
+new file mode 100644
+index 0000000000..f9a1647c21
+--- /dev/null
++++ b/src/arch/dadao/interrupts.cc
+@@ -0,0 +1,2 @@
++#include "arch/dadao/interrupts.hh"
++namespace gem5 { namespace DADAOISA { /* impl in header */ } }
+diff --git a/src/arch/dadao/interrupts.hh b/src/arch/dadao/interrupts.hh
+new file mode 100644
+index 0000000000..cf1f47e334
+--- /dev/null
++++ b/src/arch/dadao/interrupts.hh
+@@ -0,0 +1,26 @@
++#ifndef __ARCH_DADAO_INTERRUPTS_HH__
++#define __ARCH_DADAO_INTERRUPTS_HH__
++
++#include "arch/generic/interrupts.hh"
++#include "params/DADAOInterrupts.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++class Interrupts : public BaseInterrupts
++{
++  public:
++    using Params = DADAOInterruptsParams;
++    Interrupts(const Params &p) : BaseInterrupts(p) {}
++
++    bool checkInterrupts() const override { return false; }
++    Fault getInterrupt() override { return NoFault; }
++    void updateIntrInfo() override {}
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+new file mode 100644
+index 0000000000..39a3c8d39b
+--- /dev/null
++++ b/src/arch/dadao/isa.cc
+@@ -0,0 +1,50 @@
++#include "arch/dadao/isa.hh"
++
++#include "cpu/reg_class.hh"
++#include "cpu/thread_context.hh"
++#include "debug/IntRegs.hh"
++#include "debug/MatRegs.hh"
++#include "params/DADAOISA.hh"
++
++namespace gem5
++{
++
++// Dummy vector/matrix/condition-code register classes. DADAO is a scalar
++// skeleton, but the CPU models expect the full set of register classes in the
++// canonical order, so provide minimal placeholders (mirrors arch/power).
++namespace DADAOISA
++{
++
++RegClass vecRegClass(VecRegClass, VecRegClassName, 1, debug::IntRegs);
++RegClass vecElemClass(VecElemClass, VecElemClassName, 2, debug::IntRegs);
++RegClass vecPredRegClass(VecPredRegClass, VecPredRegClassName, 1, debug::IntRegs);
++RegClass matRegClass(MatRegClass, MatRegClassName, 0, debug::MatRegs);
++RegClass ccRegClass(CCRegClass, CCRegClassName, 0, debug::IntRegs);
++
++ISA::ISA(const Params &p) : BaseISA(p, "dadao")
++{
++    _regClasses.push_back(&intRegClass);
++    _regClasses.push_back(&floatRegClass);
++    _regClasses.push_back(&vecRegClass);
++    _regClasses.push_back(&vecElemClass);
++    _regClasses.push_back(&vecPredRegClass);
++    _regClasses.push_back(&matRegClass);
++    _regClasses.push_back(&ccRegClass);
++    _regClasses.push_back(&miscRegClass);
++
++    miscRegFile.resize(NumMiscRegs);
++    clear();
++}
++
++void
++ISA::copyRegsFrom(ThreadContext *src)
++{
++    for (auto &id : intRegClass)
++        tc->setReg(id, src->getReg(id));
++    for (auto &id : floatRegClass)
++        tc->setReg(id, src->getReg(id));
++    tc->pcState(src->pcState());
++}
++
++} // namespace DADAOISA
++} // namespace gem5
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+new file mode 100644
+index 0000000000..6a4c35bd95
+--- /dev/null
++++ b/src/arch/dadao/isa.hh
+@@ -0,0 +1,57 @@
++#ifndef __ARCH_DADAO_ISA_HH__
++#define __ARCH_DADAO_ISA_HH__
++
++#include <vector>
++
++#include "arch/dadao/pcstate.hh"
++#include "arch/dadao/registers.hh"
++#include "arch/generic/isa.hh"
++#include "base/types.hh"
++
++namespace gem5
++{
++
++struct DADAOISAParams;
++
++namespace DADAOISA
++{
++
++class ISA : public BaseISA
++{
++  protected:
++    std::vector<RegVal> miscRegFile;
++
++  public:
++    using Params = DADAOISAParams;
++
++    ISA(const Params &p);
++
++    PCStateBase *
++    newPCState(Addr new_inst_addr=0) const override
++    {
++        return new PCState(new_inst_addr);
++    }
++
++    void clear() override { miscRegFile.assign(NumMiscRegs, 0); }
++
++    RegVal
++    readMiscRegNoEffect(RegIndex idx) const override
++    {
++        return miscRegFile[idx];
++    }
++    void
++    setMiscRegNoEffect(RegIndex idx, RegVal val) override
++    {
++        miscRegFile[idx] = val;
++    }
++    RegVal readMiscReg(RegIndex idx) override { return miscRegFile[idx]; }
++    void setMiscReg(RegIndex idx, RegVal val) override { miscRegFile[idx] = val; }
++
++    bool inUserMode() const override { return true; }
++    void copyRegsFrom(ThreadContext *src) override;
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_ISA_HH__
+diff --git a/src/arch/dadao/mmu.hh b/src/arch/dadao/mmu.hh
+new file mode 100644
+index 0000000000..03b8c5c5a9
+--- /dev/null
++++ b/src/arch/dadao/mmu.hh
+@@ -0,0 +1,32 @@
++#ifndef __ARCH_DADAO_MMU_HH__
++#define __ARCH_DADAO_MMU_HH__
++
++#include "arch/dadao/page_size.hh"
++#include "arch/generic/mmu.hh"
++#include "params/DADAOMMU.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++class MMU : public BaseMMU
++{
++  public:
++    using Params = DADAOMMUParams;
++
++    MMU(const Params &p) : BaseMMU(p) {}
++
++    TranslationGenPtr
++    translateFunctional(Addr start, Addr size, ThreadContext *tc,
++            Mode mode, Request::Flags flags) override
++    {
++        return TranslationGenPtr(new MMUTranslationGen(
++                PageBytes, start, size, tc, this, mode, flags));
++    }
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_MMU_HH__
+diff --git a/src/arch/dadao/page_size.hh b/src/arch/dadao/page_size.hh
+new file mode 100644
+index 0000000000..78e98feb41
+--- /dev/null
++++ b/src/arch/dadao/page_size.hh
+@@ -0,0 +1,15 @@
++#ifndef __ARCH_DADAO_PAGE_SIZE_HH__
++#define __ARCH_DADAO_PAGE_SIZE_HH__
++
++#include <cstdint>
++
++namespace gem5
++{
++namespace DADAOISA
++{
++constexpr unsigned PageShift = 12;
++constexpr uint64_t PageBytes = 1ULL << PageShift;
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif
+diff --git a/src/arch/dadao/pcstate.hh b/src/arch/dadao/pcstate.hh
+new file mode 100644
+index 0000000000..bfea86964e
+--- /dev/null
++++ b/src/arch/dadao/pcstate.hh
+@@ -0,0 +1,15 @@
++#ifndef __ARCH_DADAO_PCSTATE_HH__
++#define __ARCH_DADAO_PCSTATE_HH__
++
++#include "arch/generic/pcstate.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++// DADAO instructions are 4-byte (one "tetra") in the skeleton model.
++using PCState = GenericISA::UPCState<4>;
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_PCSTATE_HH__
+diff --git a/src/arch/dadao/process.cc b/src/arch/dadao/process.cc
+new file mode 100644
+index 0000000000..e0cdacb00b
+--- /dev/null
++++ b/src/arch/dadao/process.cc
+@@ -0,0 +1,61 @@
++#include "arch/dadao/process.hh"
++
++#include "arch/dadao/page_size.hh"
++#include "arch/dadao/registers.hh"
++#include "base/loader/object_file.hh"
++#include "base/logging.hh"
++#include "cpu/thread_context.hh"
++#include "mem/page_table.hh"
++#include "params/Process.hh"
++#include "sim/process_impl.hh"
++#include "sim/syscall_return.hh"
++#include "sim/system.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++Process::Process(const ProcessParams &params, loader::ObjectFile *objFile)
++    : gem5::Process(params,
++          new EmulationPageTable(params.name, params.pid, PageBytes),
++          objFile)
++{
++    fatal_if(params.useArchPT, "Arch page tables not implemented for DADAO.");
++
++    const Addr stack_base = 0x7FFFFFFFFFFFFFFFL;
++    const Addr max_stack_size = params.maxStackSize;
++    const Addr next_thread_stack_base = stack_base - max_stack_size;
++    const Addr brk_point = roundUp(image.maxAddr(), PageBytes);
++    const Addr mmap_end = 0x4000000000000000L;
++    memState = std::make_shared<MemState>(this, brk_point, stack_base,
++            max_stack_size, next_thread_stack_base, mmap_end);
++}
++
++void
++Process::initState()
++{
++    gem5::Process::initState();
++    argsInit(PageBytes);
++}
++
++// Minimal argv/stack setup for the skeleton. It maps a single stack page and
++// initialises SP and the PC so the CPU has a valid entry point to fetch from.
++// The DADAO ABI (argc/argv/envp/auxv layout) is filled in with the real ISA.
++void
++Process::argsInit(int pageSize)
++{
++    const Addr stack_base = memState->getStackBase();
++    const Addr stack_min = roundDown(stack_base - pageSize, pageSize);
++
++    memState->setStackSize(stack_base - stack_min);
++    memState->mapRegion(stack_min, pageSize, "stack");
++    memState->setStackMin(stack_min);
++
++    ThreadContext *tc = system->threads[contextIds[0]];
++    tc->setReg(StackPointerReg, memState->getStackMin());
++    tc->pcState(getStartPC());
++}
++
++} // namespace DADAOISA
++} // namespace gem5
+diff --git a/src/arch/dadao/process.hh b/src/arch/dadao/process.hh
+new file mode 100644
+index 0000000000..54c02965db
+--- /dev/null
++++ b/src/arch/dadao/process.hh
+@@ -0,0 +1,33 @@
++#ifndef __ARCH_DADAO_PROCESS_HH__
++#define __ARCH_DADAO_PROCESS_HH__
++
++#include "mem/page_table.hh"
++#include "sim/process.hh"
++
++namespace gem5
++{
++
++namespace loader
++{
++class ObjectFile;
++} // namespace loader
++
++namespace DADAOISA
++{
++
++class Process : public gem5::Process
++{
++  protected:
++    void argsInit(int pageSize);
++
++  public:
++    Process(const ProcessParams &params, loader::ObjectFile *objFile);
++
++    void initState() override;
++    bool mmapGrowsDown() const override { return false; }
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_PROCESS_HH__
+diff --git a/src/arch/dadao/registers.hh b/src/arch/dadao/registers.hh
+new file mode 100644
+index 0000000000..ceb753b753
+--- /dev/null
++++ b/src/arch/dadao/registers.hh
+@@ -0,0 +1,45 @@
++#ifndef __ARCH_DADAO_REGISTERS_HH__
++#define __ARCH_DADAO_REGISTERS_HH__
++
++#include <cstdint>
++
++#include "cpu/reg_class.hh"
++#include "debug/FloatRegs.hh"
++#include "debug/IntRegs.hh"
++#include "debug/MiscRegs.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++// Skeleton register counts. The DADAO register model is fleshed out later.
++constexpr unsigned NumIntRegs = 64;
++constexpr unsigned NumFloatRegs = 64;
++constexpr unsigned NumMiscRegs = 1;
++
++using IntReg = int64_t;
++using FloatReg = uint64_t;
++
++// Scalar register classes provided by the DADAO ISA.
++inline constexpr RegClass intRegClass(IntRegClass, IntRegClassName,
++        NumIntRegs, debug::IntRegs);
++inline constexpr RegClass floatRegClass(FloatRegClass, FloatRegClassName,
++        NumFloatRegs, debug::FloatRegs);
++inline constexpr RegClass miscRegClass(MiscRegClass, MiscRegClassName,
++        NumMiscRegs, debug::MiscRegs);
++
++// ABI register ids used by the process/syscall skeleton. These indices are
++// placeholders for the DADAO calling convention; for the buildable skeleton
++// they only need to be internally consistent.
++inline constexpr RegId
++    ZeroReg = intRegClass[0],
++    ReturnAddrReg = intRegClass[1],
++    StackPointerReg = intRegClass[2],
++    ReturnValueReg = intRegClass[3],
++    SyscallNumReg = intRegClass[10];
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_REGISTERS_HH__
+diff --git a/src/arch/dadao/se_workload.cc b/src/arch/dadao/se_workload.cc
+new file mode 100644
+index 0000000000..665d3042ab
+--- /dev/null
++++ b/src/arch/dadao/se_workload.cc
+@@ -0,0 +1,47 @@
++#include "arch/dadao/se_workload.hh"
++
++#include "arch/dadao/process.hh"
++#include "base/loader/object_file.hh"
++#include "sim/process.hh"
++#include "sim/sim_exit.hh"
++
++namespace gem5
++{
++
++namespace
++{
++
++// Registers a DADAO process loader with the global Process::Loader factory.
++// When SE mode loads an object file whose arch is loader::Dadao, this creates
++// the matching DADAOISA::Process.
++class DadaoProcessLoader : public Process::Loader
++{
++  public:
++    Process *
++    load(const ProcessParams &params, loader::ObjectFile *obj) override
++    {
++        if (obj->getArch() != loader::Dadao)
++            return nullptr;
++        return new DADAOISA::Process(params, obj);
++    }
++};
++
++DadaoProcessLoader dadaoProcessLoader;
++
++} // anonymous namespace
++
++namespace DADAOISA
++{
++
++// Skeleton syscall handling: no DADAO syscalls are implemented yet, so any
++// syscall simply terminates the simulation cleanly. In practice the placeholder
++// instruction raises DADAOSyscallFault (which exits directly), so this path is
++// a safety net.
++void
++SEWorkload::syscall(ThreadContext *tc)
++{
++    exitSimLoop("DADAO syscall (skeleton, unimplemented)", 0);
++}
++
++} // namespace DADAOISA
++} // namespace gem5
+diff --git a/src/arch/dadao/se_workload.hh b/src/arch/dadao/se_workload.hh
+new file mode 100644
+index 0000000000..36bce792a6
+--- /dev/null
++++ b/src/arch/dadao/se_workload.hh
+@@ -0,0 +1,32 @@
++#ifndef __ARCH_DADAO_SE_WORKLOAD_HH__
++#define __ARCH_DADAO_SE_WORKLOAD_HH__
++
++#include "arch/dadao/page_size.hh"
++#include "base/loader/object_file.hh"
++#include "params/DADAOSEWorkload.hh"
++#include "sim/se_workload.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++class SEWorkload : public gem5::SEWorkload
++{
++  public:
++    using Params = DADAOSEWorkloadParams;
++
++    SEWorkload(const Params &p) : gem5::SEWorkload(p, PageShift) {}
++
++    loader::Arch getArch() const override { return loader::Dadao; }
++
++    // DADAO is big-endian (per its ELF e_ident/EI_DATA).
++    ByteOrder byteOrder() const override { return ByteOrder::big; }
++
++    void syscall(ThreadContext *tc) override;
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_SE_WORKLOAD_HH__
+diff --git a/src/arch/dadao/system.cc b/src/arch/dadao/system.cc
+new file mode 100644
+index 0000000000..a438f74ecb
+--- /dev/null
++++ b/src/arch/dadao/system.cc
+@@ -0,0 +1,2 @@
++#include "arch/dadao/system.hh"
++namespace gem5 { namespace DADAOISA { /* impl in header */ } }
+diff --git a/src/arch/dadao/system.hh b/src/arch/dadao/system.hh
+new file mode 100644
+index 0000000000..00570a3c31
+--- /dev/null
++++ b/src/arch/dadao/system.hh
+@@ -0,0 +1,24 @@
++#ifndef __ARCH_DADAO_SYSTEM_HH__
++#define __ARCH_DADAO_SYSTEM_HH__
++
++#include "params/DADAOSystem.hh"
++#include "sim/system.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++class System : public gem5::System
++{
++  public:
++    using Params = DADAOSystemParams;
++    System(const Params &p) : gem5::System(p) {}
++
++    void initState() override {}
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif
+diff --git a/src/arch/dadao/tlb.cc b/src/arch/dadao/tlb.cc
+new file mode 100644
+index 0000000000..35654b0b8e
+--- /dev/null
++++ b/src/arch/dadao/tlb.cc
+@@ -0,0 +1,48 @@
++#include "arch/dadao/tlb.hh"
++
++#include "base/logging.hh"
++#include "cpu/thread_context.hh"
++#include "mem/page_table.hh"
++#include "sim/full_system.hh"
++#include "sim/process.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++Fault
++TLB::translateAtomic(const RequestPtr &req, ThreadContext *tc,
++                     BaseMMU::Mode mode)
++{
++    panic_if(FullSystem,
++             "DADAO skeleton TLB does not support full-system mode.");
++    return tc->getProcessPtr()->pTable->translate(req);
++}
++
++Fault
++TLB::translateFunctional(const RequestPtr &req, ThreadContext *tc,
++                         BaseMMU::Mode mode)
++{
++    panic_if(FullSystem,
++             "DADAO skeleton TLB does not support full-system mode.");
++    return tc->getProcessPtr()->pTable->translate(req);
++}
++
++void
++TLB::translateTiming(const RequestPtr &req, ThreadContext *tc,
++                     BaseMMU::Translation *translation, BaseMMU::Mode mode)
++{
++    assert(translation);
++    translation->finish(translateAtomic(req, tc, mode), req, tc, mode);
++}
++
++Fault
++TLB::finalizePhysical(const RequestPtr &req, ThreadContext *tc,
++                      BaseMMU::Mode mode) const
++{
++    return NoFault;
++}
++
++} // namespace DADAOISA
++} // namespace gem5
+diff --git a/src/arch/dadao/tlb.hh b/src/arch/dadao/tlb.hh
+new file mode 100644
+index 0000000000..712f596aee
+--- /dev/null
++++ b/src/arch/dadao/tlb.hh
+@@ -0,0 +1,40 @@
++#ifndef __ARCH_DADAO_TLB_HH__
++#define __ARCH_DADAO_TLB_HH__
++
++#include "arch/generic/mmu.hh"
++#include "arch/generic/tlb.hh"
++#include "params/DADAOTLB.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++// Minimal SE-mode TLB: translation is delegated to the process' emulation
++// page table. Full-system translation is not supported by the skeleton.
++class TLB : public BaseTLB
++{
++  public:
++    using Params = DADAOTLBParams;
++
++    TLB(const Params &p) : BaseTLB(p) {}
++
++    void demapPage(Addr vaddr, uint64_t asn) override {}
++    void flushAll() override {}
++    void takeOverFrom(BaseTLB *otlb) override {}
++
++    Fault translateAtomic(const RequestPtr &req, ThreadContext *tc,
++                          BaseMMU::Mode mode) override;
++    void translateTiming(const RequestPtr &req, ThreadContext *tc,
++                         BaseMMU::Translation *translation,
++                         BaseMMU::Mode mode) override;
++    Fault translateFunctional(const RequestPtr &req, ThreadContext *tc,
++                              BaseMMU::Mode mode) override;
++    Fault finalizePhysical(const RequestPtr &req, ThreadContext *tc,
++                           BaseMMU::Mode mode) const override;
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_TLB_HH__
+diff --git a/src/arch/dadao/types.hh b/src/arch/dadao/types.hh
+new file mode 100644
+index 0000000000..d5f74deed1
+--- /dev/null
++++ b/src/arch/dadao/types.hh
+@@ -0,0 +1,22 @@
++#ifndef __ARCH_DADAO_TYPES_HH__
++#define __ARCH_DADAO_TYPES_HH__
++
++#include <cstdint>
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++struct DADAOInst
++{
++    uint32_t inst;
++    DADAOInst() : inst(0) {}
++    explicit DADAOInst(uint32_t i) : inst(i) {}
++    explicit operator uint32_t() const { return inst; }
++} __attribute__((packed));
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif
+diff --git a/src/arch/dadao/utility.hh b/src/arch/dadao/utility.hh
+new file mode 100644
+index 0000000000..608989c9d1
+--- /dev/null
++++ b/src/arch/dadao/utility.hh
+@@ -0,0 +1,22 @@
++#ifndef __ARCH_DADAO_UTILITY_HH__
++#define __ARCH_DADAO_UTILITY_HH__
++
++#include "arch/dadao/registers.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++class ThreadContext;
++
++inline PCState
++buildRetPC(const PCState &cur_pc, const PCState &call_pc) { return cur_pc; }
++
++inline void
++startupCPU(ThreadContext *tc, int cpu_id);
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif
+diff --git a/src/base/loader/elf_object.cc b/src/base/loader/elf_object.cc
+index 26fb443c79..84a2bd77ed 100644
+--- a/src/base/loader/elf_object.cc
++++ b/src/base/loader/elf_object.cc
+@@ -278,6 +278,8 @@ ElfObject::determineArch()
+         arch = Power;
+     } else if (emach == EM_PPC64 && eclass == ELFCLASS64) {
+         arch = Power64;
++    } else if (emach == 0xda0 /* EM_DADAO */ && eclass == ELFCLASS64) {
++        arch = Dadao;
+     } else {
+         warn("Unknown architecture: %d\n", emach);
+     }
+diff --git a/src/base/loader/object_file.cc b/src/base/loader/object_file.cc
+index 287f9107a6..b72760dcaa 100644
+--- a/src/base/loader/object_file.cc
++++ b/src/base/loader/object_file.cc
+@@ -83,6 +83,8 @@ archToString(Arch arch)
+         return "riscv64";
+       case Riscv32:
+         return "riscv32";
++      case Dadao:
++        return "dadao";
+       default:
+         panic("Unrecognized arch %d.", arch);
+     }
+diff --git a/src/base/loader/object_file.hh b/src/base/loader/object_file.hh
+index 0215f6e87d..49e342bc60 100644
+--- a/src/base/loader/object_file.hh
++++ b/src/base/loader/object_file.hh
+@@ -72,7 +72,8 @@ enum Arch
+     Power,
+     Power64,
+     Riscv64,
+-    Riscv32
++    Riscv32,
++    Dadao
+ };
+ 
+ const char *archToString(Arch arch);
+diff --git a/tests/dadao/.gitignore b/tests/dadao/.gitignore
+new file mode 100644
+index 0000000000..5a79389356
+--- /dev/null
++++ b/tests/dadao/.gitignore
+@@ -0,0 +1,2 @@
++min.elf
++*.elf
+diff --git a/tests/dadao/dadao_se.py b/tests/dadao/dadao_se.py
+new file mode 100644
+index 0000000000..298702f4dd
+--- /dev/null
++++ b/tests/dadao/dadao_se.py
+@@ -0,0 +1,58 @@
++"""Minimal DADAO syscall-emulation (SE) smoke config for the buildable skeleton.
++
++Instantiates a DADAO TimingSimpleCPU, loads a DADAO ELF via the SEWorkload /
++Process loader path, and runs. Because the DADAO decoder is a skeleton that maps
++every instruction to a placeholder Noop raising DADAOSyscallFault (which exits
++the sim loop), the CPU fetches/decodes/executes exactly one instruction and the
++simulation terminates cleanly.
++
++Usage:
++    build/DADAO/gem5.opt tests/dadao/dadao_se.py [path/to/dadao.elf]
++If no binary is given, tests/dadao/min.elf (produced by gen_min_elf.py) is used.
++"""
++import os
++import sys
++
++import m5
++from m5.objects import *
++
++thispath = os.path.dirname(os.path.realpath(__file__))
++binary = sys.argv[1] if len(sys.argv) > 1 else os.path.join(thispath, "min.elf")
++
++system = System()
++
++system.clk_domain = SrcClockDomain()
++system.clk_domain.clock = "1GHz"
++system.clk_domain.voltage_domain = VoltageDomain()
++
++system.mem_mode = "timing"
++system.mem_ranges = [AddrRange("512MiB")]
++system.cpu = DADAOTimingSimpleCPU()
++
++system.membus = SystemXBar()
++
++system.cpu.icache_port = system.membus.cpu_side_ports
++system.cpu.dcache_port = system.membus.cpu_side_ports
++
++system.cpu.createInterruptController()
++
++system.mem_ctrl = MemCtrl()
++system.mem_ctrl.dram = DDR3_1600_8x8()
++system.mem_ctrl.dram.range = system.mem_ranges[0]
++system.mem_ctrl.port = system.membus.mem_side_ports
++
++system.system_port = system.membus.cpu_side_ports
++
++system.workload = SEWorkload.init_compatible(binary)
++
++process = Process()
++process.cmd = [binary]
++system.cpu.workload = process
++system.cpu.createThreads()
++
++root = Root(full_system=False, system=system)
++m5.instantiate()
++
++print("Beginning DADAO SE simulation!")
++exit_event = m5.simulate()
++print(f"Exiting @ tick {m5.curTick()} because {exit_event.getCause()}")
+diff --git a/tests/dadao/gen_min_elf.py b/tests/dadao/gen_min_elf.py
+new file mode 100644
+index 0000000000..ca2c55642e
+--- /dev/null
++++ b/tests/dadao/gen_min_elf.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""Emit a minimal statically-linked DADAO ELF executable for the gem5 skeleton.
++
++The DADAO buildable skeleton decodes every instruction to a placeholder Noop
++that raises DADAOSyscallFault (which exits the sim loop), so the actual segment
++bytes are irrelevant -- we only need a well-formed ELF that gem5's SE loader
++recognises as arch "dadao" (e_machine 0xda0, ELFCLASS64, big-endian) with one
++PT_LOAD segment and an entry point inside it.
++
++Usage: gen_min_elf.py <output-path>
++"""
++import struct
++import sys
++
++EM_DADAO = 0x0DA0
++ENTRY = 0x100000
++SEG_OFF = 0x1000
++SEG_SIZE = 16
++PAGE = 0x1000
++
++
++def main(out_path):
++    # 64-bit, big-endian ELF fields (">").
++    e_ident = bytes([0x7F, ord("E"), ord("L"), ord("F"),
++                     2,   # EI_CLASS = ELFCLASS64
++                     2,   # EI_DATA  = ELFDATA2MSB (big-endian)
++                     1,   # EI_VERSION
++                     0,   # EI_OSABI
++                     0]) + b"\x00" * 7  # EI_ABIVERSION + padding -> 16 bytes
++
++    ehdr = e_ident + struct.pack(
++        ">HHIQQQIHHHHHH",
++        2,          # e_type    = ET_EXEC
++        EM_DADAO,   # e_machine
++        1,          # e_version
++        ENTRY,      # e_entry
++        64,         # e_phoff
++        0,          # e_shoff
++        0,          # e_flags
++        64,         # e_ehsize
++        56,         # e_phentsize
++        1,          # e_phnum
++        0,          # e_shentsize
++        0,          # e_shnum
++        0,          # e_shstrndx
++    )
++
++    phdr = struct.pack(
++        ">IIQQQQQQ",
++        1,          # p_type  = PT_LOAD
++        5,          # p_flags = R + X
++        SEG_OFF,    # p_offset
++        ENTRY,      # p_vaddr
++        ENTRY,      # p_paddr
++        SEG_SIZE,   # p_filesz
++        SEG_SIZE,   # p_memsz
++        PAGE,       # p_align
++    )
++
++    data = bytearray()
++    data += ehdr
++    data += phdr
++    data += b"\x00" * (SEG_OFF - len(data))   # pad to segment file offset
++    data += b"\x00" * SEG_SIZE                # placeholder code (decodes to Noop)
++
++    with open(out_path, "wb") as f:
++        f.write(data)
++    print(f"wrote {out_path} ({len(data)} bytes), e_machine=0x{EM_DADAO:x}, "
++          f"entry=0x{ENTRY:x}")
++
++
++if __name__ == "__main__":
++    if len(sys.argv) != 2:
++        sys.exit(__doc__)
++    main(sys.argv[1])
+-- 
+2.43.0
+
