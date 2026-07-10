@@ -1,6 +1,8 @@
 // RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %s
 // RUN: %llvm-objcopy -O binary --only-section=.text %t.o %t.bin
 // RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: %gen_min_elf %t.bin %t.elf
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 42'
 .text
 addi rd1, rd0, 42
 halt rd1
