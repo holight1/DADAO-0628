@@ -96,6 +96,7 @@ DADAO-0628 是 DADAO 处理器软件栈的全新实现，从干净的上游 comm
 
 ## 工作规则（项目特有）
 
+- **CodeGen / E2E 任务的被测对象是编译器产物**：`.s` / `obj` / flat binary **必须来自 `llc`/编译流水**（IR/C → llc → .s → llvm-mc …）。**禁止手搓汇编替代**去过验收——那绕过了本该被测的 CodeGen（DS-common §5 反偷换的本项目实例）。真实产物跑不通就如实报卡在哪层。
 - **禁止**读取 `~/CLAUDE.md`、`~/.claude/CLAUDE.md` 等家目录配置文件
 - `~/DADAO-wiki/` 只读，不修改
 - 旧仓库 `~/toolchain/llvm-unicore/` 和 `~/toolchain/DADAO/` 只可查阅工程经验，**禁止复制实现代码**
