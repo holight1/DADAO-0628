@@ -175,3 +175,19 @@
   scope: [M1]
   blocks: null
   resolved_by: architect-direct（DL-042c 收口）
+
+# ── Found by dual-backend E2E (DL-056b/c) ────────────────────────────────────
+
+- id: qemu-no-ras-stack
+  title: "QEMU 把 ra[63] 当单槽 link register（call 覆写/ret 读），无 RegRAS 栈 → 嵌套调用第二层 call 覆写第一层返回地址→死循环。四方差分 198 AGREE 未抓到（call/ret 向量只测单层，interp 单指令模型不测嵌套序列）；真 llc 编译程序 crt0→main→callee(2层)在 QEMU 超时(124)、gem5 正确(42)才暴露——E2E 收口向量盲区的实例。"
+  status: closed
+  scope: [M1]
+  blocks: null
+  resolved_by: DL-056c（QEMU 补完整 RegRAS 栈 helper，spec §5.6；patch 0012）
+
+- id: rasof-rasuf-exit-code-unpinned
+  title: "RASOF/RASUF 退出码从未 pin（ADR-0004 当年定了 ILLI/MALIGN/UNDI 漏了 RAS）→ 四方各拍：QEMU 0x87/0x86、gem5 0x84/0x85、Sail 0x82(归 ILLI 类)、interp 命名未映射码、harness FAULT_CODES 无。故障类型来自 wiki §5.6，退出码数字是我们的测试机约定(spec 无码号)。→ 架构师 pin RASOF=0x84/RASUF=0x85(ADR-0004 §D5 扩展，连续于 0x81-0x83)；DS 对齐 QEMU/Sail/interp + 加 RASOF/RASUF 向量 + 嵌套 call E2E。"
+  status: open
+  scope: [M1]
+  blocks: null
+  resolved_by: null

@@ -188,6 +188,17 @@ Triggers include:
 - Reserved opcode (blank opcode table cells, §2.5)
 - Reserved MISC-Norm/RF/AMO minor-opcodes (§2.5)
 
+**RASOF / RASUF exit codes: 0x84 / 0x85.**
+The fault *types* are wiki/spec (§5.6: RegRAS overflow / underflow, precise);
+the numeric exit codes are **this test machine's convention — spec defines no
+exit-code numbers**. This ADR extends the 0x81–0x83 scheme contiguously (no wiki
+basis for the numbers, like ILLI/SBZ; decided 2026-07-11 after a four-way
+divergence was found — QEMU had used 0x86/0x87, gem5 0x84/0x85, Sail collapsed
+to 0x82; all reconciled to 0x84/0x85).
+- **RASOF (0x84):** a `call` when the RegRAS is full (`ra1[63:48] ≠ 0` before shift, §5.6).
+- **RASUF (0x85):** a `ret` on a cold/empty RegRAS (`ref == 0`, §5.6).
+Both precise (PC at the faulting call/ret, RA unchanged, §5.6).
+
 **SBZ behavior: ILLI (exit code 0x82).**
 No wiki basis; this ADR makes the decision. Rationale:
 

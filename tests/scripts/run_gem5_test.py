@@ -56,7 +56,7 @@ MEM_WINDOW_SIZE = 0x3000
 # DG-004c fault SE exit codes — must match arch/dadao/faults.hh and the QEMU
 # harness FAULT_CODES (run_qemu_test.py). ILLI=illegal operand of a known
 # instruction, MALIGN=misaligned access, UNDI=reserved encoding.
-FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83}
+FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83, 'RASOF': 0x84, 'RASUF': 0x85}
 # Private sentinel gem5 exits with for opcodes it has not implemented yet
 # (control flow beyond jump-iiii, register-bank block-copy semantics) → SKIP.
 UNIMPL_CODE = 0x7F

@@ -47,7 +47,7 @@ sys.path.insert(0, HERE)
 # semantics are in the .sail model, not here).
 import run_gem5_test as G                              # noqa: E402
 
-FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83}
+FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83, 'RASOF': 0x84, 'RASUF': 0x85}
 UNIMPL_CODE = 0x7F
 DEFAULT_SIM = os.path.join(C_HARNESS, 'dadao_sail_sim')
 

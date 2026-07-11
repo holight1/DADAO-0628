@@ -21,7 +21,7 @@ ALT_QEMU = os.path.expanduser(
 )
 
 
-FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83}
+FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83, 'RASOF': 0x84, 'RASUF': 0x85}
 
 
 def find_qemu():
