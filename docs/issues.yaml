@@ -200,3 +200,12 @@
   scope: [M1]
   blocks: null
   resolved_by: DL-058b（去掉误标 + 架构师判别性探针验证有符号无回归）
+
+# ── Found by Phase 5 stack-array CodeGen (DL-059a) ────────────────────────────
+
+- id: gem5-se-no-data-stack
+  title: "gem5 SE 模式不初始化 DADAO 数据栈指针 rb1。QEMU 靠 trampoline 设 rb1(SP)=0x87FF0000，gem5 SE 无 trampoline、Process/SEWorkload 模型没为 DADAO 设栈区+SP → 任何写 rb1 数据栈的程序页错误(0xffffffffdfd8)。DL-059a arr_sum(首个 alloca+store 到数据栈的 E2E)暴露；此前 gem5-过测试(loop_sum/nested_call)全在寄存器/RAS 不碰数据栈故未现。非 CodeGen bug(QEMU 已证代码对)。→ DG-006a：gem5 SE 映射栈区+初始化 rb1 SP + 恢复 arr_sum gem5 断言(禁 `|| true`)。阻塞 DG-005b(栈数组排序在 gem5 同样栈故障)。"
+  status: open
+  scope: [gem5, M1]
+  blocks: [DG-006a, DG-005b]
+  resolved_by: null

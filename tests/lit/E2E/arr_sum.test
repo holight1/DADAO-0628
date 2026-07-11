@@ -1,0 +1,11 @@
+// RUN: %llc -march=dadao -o %t.ll.s %S/Inputs/arr_sum.ll
+// RUN: cat %S/Inputs/crt0.s %t.ll.s > %t.full.s
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %t.full.s
+// RUN: %llvm-objcopy -O binary --only-section=.text %t.o %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 10'
+//
+// NOTE: QEMU-only for now. This is the first E2E to write the rb1 data stack;
+// gem5 SE mode does not initialize the DADAO stack pointer (issue
+// gem5-se-no-data-stack) so it page-faults at 0xffffffffdfd8. The gem5 dual-
+// backend assertion is restored by DG-006a (do NOT re-add with `|| true` —
+// that silently always-passes and defeats the check).

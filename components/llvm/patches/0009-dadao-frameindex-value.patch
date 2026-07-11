@@ -1,0 +1,394 @@
+From 4335c1692bbb339a7a111310a5558f251afe43d4 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 16:20:10 +0800
+Subject: [PATCH] =?UTF-8?q?target/dadao:=20FrameIndex=E2=86=92GPRB=20mater?=
+ =?UTF-8?q?ialization=20for=20variable-index=20stack=20access=20(DL-059a)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp | 164 ++++++++++++++++++++
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp |  11 ++
+ llvm/lib/Target/DADAO/DADAOISelLowering.h   |   2 +
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td     |   4 +
+ llvm/lib/Target/DADAO/DADAORegisterInfo.cpp |  96 +++++++++++-
+ 5 files changed, 273 insertions(+), 4 deletions(-)
+ create mode 100644 llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+new file mode 100644
+index 000000000000..781f50d438c8
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -0,0 +1,164 @@
++//===-- DADAOISelDAGToDAG.cpp - DADAO DAG to DAG Instruction Selector ------===//
++#include "DADAO.h"
++#include "DADAOISelLowering.h"
++#include "DADAOTargetMachine.h"
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/SelectionDAGISel.h"
++
++using namespace llvm;
++
++namespace {
++
++class DADAODAGToDAGISel : public SelectionDAGISel {
++public:
++  DADAODAGToDAGISel(DADAOTargetMachine &TM)
++      : SelectionDAGISel(TM) {}
++
++  void Select(SDNode *Node) override;
++  bool SelectInlineAsmMemoryOperand(const SDValue &Op,
++                                    InlineAsm::ConstraintCode ConstraintID,
++                                    std::vector<SDValue> &OutOps) override {
++    return false;
++  }
++
++// Provides SelectCode() from the generated matcher table.
++#include "DADAOGenDAGISel.inc"
++};
++
++void DADAODAGToDAGISel::Select(SDNode *Node) {
++  if (Node->isMachineOpcode()) {
++    Node->setNodeId(-1);
++    return;
++  }
++
++  unsigned Opc = Node->getOpcode();
++  if (Opc == ISD::CALLSEQ_START || Opc == ISD::CALLSEQ_END) {
++    ReplaceUses(SDValue(Node, 0), Node->getOperand(0));
++    CurDAG->RemoveDeadNode(Node);
++    return;
++  }
++
++  if (Opc == ISD::Constant) {
++    ConstantSDNode *C = cast<ConstantSDNode>(Node);
++    int64_t Val = C->getSExtValue();
++    SDNode *New = CurDAG->getMachineNode(DADAO::ADDI_RRII, SDLoc(Node),
++                                          MVT::i64,
++                                          {CurDAG->getRegister(DADAO::RD0, MVT::i64),
++                                           CurDAG->getTargetConstant(Val, SDLoc(Node), MVT::i64)});
++    ReplaceNode(Node, New);
++    return;
++  }
++
++  if (Opc == DADAOISD::FI_ADDR) {
++    SDLoc DL(Node);
++    SDValue TFI = Node->getOperand(0);
++    SDValue RB1 = CurDAG->getRegister(DADAO::RB1, MVT::i64);
++    SDNode *New = CurDAG->getMachineNode(DADAO::ADDI_RB_FI, DL, MVT::i64,
++                                          {RB1, TFI});
++    ReplaceNode(Node, New);
++    return;
++  }
++
++  if (Opc != ISD::LOAD && Opc != ISD::STORE) {
++    if (Opc == DADAOISD::CALL) {
++      SDLoc DLC(Node);
++      SDValue Chain = Node->getOperand(0);
++      SDValue Callee = Node->getOperand(1);
++      SDValue Glue = Node->getOperand(2);
++      MachineSDNode *Call = CurDAG->getMachineNode(
++          DADAO::CALL_IIII, DLC, MVT::Other, MVT::Glue,
++          {Callee, Chain, Glue});
++      ReplaceNode(Node, Call);
++      return;
++    }
++    SelectCode(Node);
++    return;
++  }
++
++  SDLoc DL(Node);
++  bool IsLoad = (Opc == ISD::LOAD);
++
++  SDValue Chain, Val, Addr;
++  if (IsLoad) {
++    LoadSDNode *LD = cast<LoadSDNode>(Node);
++    Chain = LD->getChain();
++    Addr = LD->getBasePtr();
++  } else {
++    StoreSDNode *ST = cast<StoreSDNode>(Node);
++    Chain = ST->getChain();
++    Val = ST->getValue();
++    Addr = ST->getBasePtr();
++  }
++
++  int64_t GEPOff = 0;
++  SDValue BaseAddr = Addr;
++
++  if (Addr.getOpcode() == ISD::ADD &&
++      isa<ConstantSDNode>(Addr.getOperand(1))) {
++    BaseAddr = Addr.getOperand(0);
++    GEPOff = cast<ConstantSDNode>(Addr.getOperand(1))->getSExtValue();
++  }
++
++  if (BaseAddr.getOpcode() == ISD::FrameIndex) {
++    int FI = cast<FrameIndexSDNode>(BaseAddr)->getIndex();
++    unsigned DADAOOpc = IsLoad ? DADAO::LDO_FI : DADAO::STO_FI;
++    SDValue BaseReg = CurDAG->getRegister(DADAO::RB1, MVT::i64);
++    SDValue FiOp = CurDAG->getTargetFrameIndex(FI, MVT::i64);
++
++    if (IsLoad) {
++      SDValue Ops[] = {BaseReg,
++                       CurDAG->getTargetConstant(GEPOff, DL, MVT::i64), FiOp,
++                       Chain};
++      SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::i64, MVT::Other,
++                                            Ops);
++      ReplaceNode(Node, New);
++    } else {
++      SDValue Ops[] = {Val, BaseReg,
++                       CurDAG->getTargetConstant(GEPOff, DL, MVT::i64), FiOp,
++                       Chain};
++      SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::Other, Ops);
++      ReplaceNode(Node, New);
++    }
++    return;
++  }
++
++  // Non-FrameIndex address: use real LDO/STO directly
++  unsigned DADAOOpc = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
++  SDValue ImmOp = CurDAG->getTargetConstant(GEPOff, DL, MVT::i64);
++
++  if (IsLoad) {
++    SDValue Ops[] = {BaseAddr, ImmOp, Chain};
++    SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::i64, MVT::Other,
++                                          Ops);
++    ReplaceNode(Node, New);
++  } else {
++    SDValue Ops[] = {Val, BaseAddr, ImmOp, Chain};
++    SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::Other, Ops);
++    ReplaceNode(Node, New);
++  }
++}
++
++class DADAODAGToDAGISelLegacy : public SelectionDAGISelLegacy {
++public:
++  static char ID;
++  explicit DADAODAGToDAGISelLegacy(DADAOTargetMachine &TM)
++      : SelectionDAGISelLegacy(ID,
++            std::make_unique<DADAODAGToDAGISel>(TM)) {}
++
++  StringRef getPassName() const override {
++    return "DADAO DAG->DAG Pattern Instruction Selection";
++  }
++};
++
++char DADAODAGToDAGISelLegacy::ID = 0;
++
++} // namespace
++
++INITIALIZE_PASS(DADAODAGToDAGISelLegacy, "dadao-isel",
++                "DADAO DAG->DAG Pattern Instruction Selection", false, false)
++
++FunctionPass *llvm::createDADAOISelDag(DADAOTargetMachine &TM) {
++  return new DADAODAGToDAGISelLegacy(TM);
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 5da43f9f5a7e..19a411080e4f 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -29,6 +29,7 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::BR_CC, MVT::Other, Custom);
+   setTargetDAGCombine(ISD::BR_CC);
+   setTargetDAGCombine(ISD::BRCOND);
++  setOperationAction(ISD::FrameIndex, MVT::i64, Custom);
+   setOperationAction(ISD::SELECT_CC, MVT::i64, Expand);
+   setOperationAction(ISD::GlobalAddress, MVT::i64, Expand);
+ 
+@@ -201,6 +202,8 @@ SDValue DADAOTargetLowering::LowerOperation(SDValue Op,
+   switch (Op.getOpcode()) {
+   case ISD::BR_CC:
+     return LowerBR_CC(Op, DAG);
++  case ISD::FrameIndex:
++    return lowerFrameIndex(Op, DAG);
+   default:
+     break;
+   }
+@@ -268,6 +271,14 @@ SDValue DADAOTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
+   return SDValue();
+ }
+ 
++SDValue DADAOTargetLowering::lowerFrameIndex(SDValue Op,
++                                             SelectionDAG &DAG) const {
++  SDLoc DL(Op);
++  int FI = cast<FrameIndexSDNode>(Op)->getIndex();
++  SDValue TFI = DAG.getTargetFrameIndex(FI, MVT::i64);
++  return DAG.getNode(DADAOISD::FI_ADDR, DL, MVT::i64, TFI);
++}
++
+ SDValue DADAOTargetLowering::PerformDAGCombine(SDNode *N,
+                                                 DAGCombinerInfo &DCI) const {
+   SelectionDAG &DAG = DCI.DAG;
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index 734d45f3cf11..a764468da467 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -21,6 +21,7 @@ enum NodeType {
+   BRNP,   // (chain, val, dest) — brnp  branch if val<=0 (non-positive)
+   CMP,    // (lhs, rhs) → i64  cmps result (−1/0/1)
+   CMPU,   // (lhs, rhs) → i64  cmpu result (−1/0/1)
++  FI_ADDR, // (TargetFrameIndex) → i64  frame address in GPRB
+ };
+ } // namespace DADAOISD
+ 
+@@ -52,6 +53,7 @@ public:
+ 
+ private:
+   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerFrameIndex(SDValue Op, SelectionDAG &DAG) const;
+ };
+ 
+ } // namespace llvm
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index ee01ff6df67c..b3383fbc7b3d 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -70,6 +70,7 @@ def DADAOBrp  : SDNode<"DADAOISD::BRP",  SDT_DADAOBr1, [SDNPHasChain]>;
+ def DADAOBrnp : SDNode<"DADAOISD::BRNP", SDT_DADAOBr1, [SDNPHasChain]>;
+ def DADAOCmp  : SDNode<"DADAOISD::CMP",  SDTIntBinOp>;
+ def DADAOCmpU : SDNode<"DADAOISD::CMPU", SDTIntBinOp>;
++def DADAOFiAddr : SDNode<"DADAOISD::FI_ADDR", SDTIntUnaryOp>;
+ 
+ // Minimal CodeGen-only pseudos (spike scaffold, throwaway).
+ // These bring GPRD-typed i64 add/return down to MIR so finalize-isel can
+@@ -103,6 +104,9 @@ def LDO_FI : DADAOPseudo<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12, i64i
+ let mayStore = 1 in
+ def STO_FI : DADAOPseudo<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12, i64imm:$fi), []>;
+ 
++// FrameIndex→GPRB materialization pseudo (eliminateFrameIndex resolves)
++def ADDI_RB_FI : DADAOPseudo<(outs GPRB:$rbha), (ins GPRB:$rbhb, i64imm:$fi), []>;
++
+ //===----------------------------------------------------------------------===//
+ // MISC-Norm (op=0x10)
+ //===----------------------------------------------------------------------===//
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+index afb7df5a788d..aa27d5747a39 100644
+--- a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+@@ -11,8 +11,15 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "DADAORegisterInfo.h"
++#include "DADAOFrameLowering.h"
++#include "DADAOInstrInfo.h"
++#include "DADAOSubtarget.h"
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
+ #include "llvm/ADT/BitVector.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/TargetSubtargetInfo.h"
+ #include "llvm/Support/ErrorHandling.h"
+ 
+ #define GET_REGINFO_TARGET_DESC
+@@ -24,7 +31,38 @@ DADAORegisterInfo::DADAORegisterInfo() : DADAOGenRegisterInfo(0) {}
+ 
+ const uint16_t *
+ DADAORegisterInfo::getCalleeSavedRegs(const MachineFunction * /*MF*/) const {
+-  return nullptr;
++  static const uint16_t CSRegs[] = {
++    DADAO::RD8,  DADAO::RD9,  DADAO::RD10, DADAO::RD11,
++    DADAO::RD12, DADAO::RD13, DADAO::RD14, DADAO::RD15,
++    0
++  };
++  return CSRegs;
++}
++
++const uint32_t *
++DADAORegisterInfo::getCallPreservedMask(const MachineFunction &MF,
++                                         CallingConv::ID /*CC*/) const {
++  // Compute mask: callee-saved + reserved registers are preserved across calls
++  BitVector Saved(getNumRegs());
++  const uint16_t *CS = getCalleeSavedRegs(&MF);
++  for (unsigned i = 0; CS[i]; ++i)
++    Saved.set(CS[i]);
++  BitVector Reserved = getReservedRegs(MF);
++  Saved |= Reserved;
++
++  static uint32_t Mask[10];
++  unsigned Count = (getNumRegs() + 31) / 32;
++  assert(Count <= 10 && "RegMask too small for DADAO");
++  for (unsigned i = 0; i < Count; ++i) {
++    uint32_t M = 0;
++    for (unsigned b = 0; b < 32; ++b) {
++      unsigned Reg = i * 32 + b;
++      if (Reg < getNumRegs() && Saved.test(Reg))
++        M |= (1U << b);
++    }
++    Mask[i] = M;
++  }
++  return Mask;
+ }
+ 
+ BitVector DADAORegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+@@ -53,9 +91,59 @@ BitVector DADAORegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+                                             int SPAdj, unsigned FIOperandNum,
+                                             RegScavenger *RS) const {
+-  llvm_unreachable("Not yet implemented");
++  MachineInstr &MI = *II;
++  MachineBasicBlock &MBB = *MI.getParent();
++  MachineFunction &MF = *MBB.getParent();
++  const DADAOInstrInfo *TII =
++      MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
++  DebugLoc DL = MI.getDebugLoc();
++
++  int FrameIndex = MI.getOperand(FIOperandNum).getIndex();
++  Register FrameReg = getFrameRegister(MF);
++
++  const DADAOSubtarget &ST = MF.getSubtarget<DADAOSubtarget>();
++  StackOffset StackOff = ST.getFrameLowering()->getFrameIndexReference(
++      MF, FrameIndex, FrameReg);
++  int64_t FrameOff = StackOff.getFixed() + SPAdj;
++
++  switch (MI.getOpcode()) {
++  default:
++    llvm_unreachable("eliminateFrameIndex: unexpected opcode");
++  case DADAO::LDO_FI: {
++    int64_t GEPOff = MI.getOperand(2).getImm();
++    int64_t Total = FrameOff + GEPOff;
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RRII))
++            .add(MI.getOperand(0))
++            .add(MI.getOperand(1))
++            .addImm(Total);
++    MIB.setMemRefs(MI.memoperands());
++    MI.eraseFromParent();
++    return true;
++  }
++  case DADAO::STO_FI: {
++    int64_t GEPOff = MI.getOperand(2).getImm();
++    int64_t Total = FrameOff + GEPOff;
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, II, DL, TII->get(DADAO::STO_RRII))
++            .add(MI.getOperand(0))
++            .add(MI.getOperand(1))
++            .addImm(Total);
++    MIB.setMemRefs(MI.memoperands());
++    MI.eraseFromParent();
++    return true;
++  }
++  case DADAO::ADDI_RB_FI: {
++    BuildMI(MBB, II, DL, TII->get(DADAO::ADDI_RBRRII))
++        .add(MI.getOperand(0))  // rbha (dest)
++        .add(MI.getOperand(1))  // rbhb (base = RB1)
++        .addImm(FrameOff);
++    MI.eraseFromParent();
++    return true;
++  }
++  }
+ }
+ 
+ Register DADAORegisterInfo::getFrameRegister(const MachineFunction &MF) const {
+-  return DADAO::RBSP;
+-}
++  return DADAO::RB1;
++}
+\ No newline at end of file
+-- 
+2.43.0
+

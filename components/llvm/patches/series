@@ -6,3 +6,4 @@
 0006-dadao-disassembler.patch
 0007-dadao-control-flow.patch
 0008-dadao-unsigned-cmp.patch
+0009-dadao-frameindex-value.patch
