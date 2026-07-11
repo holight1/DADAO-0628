@@ -11,6 +11,24 @@ four executables, all derived only from the spec, and cross-checked on one share
 vector corpus. As of the current state they **agree on all 198 spec-semantic
 vectors with zero divergence**.
 
+## Spec provenance (pinned wiki version)
+
+The ISA contract `contracts/isa/spec.md` is derived from the **DADAO wiki**
+([`github.com/gxt/DADAO.wiki`](https://github.com/gxt/DADAO.wiki)), **pinned** at
+commit [`13a414da158dc780ae5501c1443acbffd15cbf4a`](https://github.com/gxt/DADAO.wiki/commit/13a414da158dc780ae5501c1443acbffd15cbf4a):
+
+| Component | Version |
+|-----------|---------|
+| SimRISC (ISA) | 0.4.1 |
+| AEE-ABI | 0.9.2 |
+| SEE-SBI | 0.7.1 |
+| HEE-HBI | 0.1.2 |
+
+The machine-readable lock is `manifests/spec.lock.toml` (`status = frozen`). The
+wiki has continued to evolve upstream; **this repository is intentionally pinned to
+that frozen version and does not yet integrate later wiki updates**. Re-basing onto
+a newer wiki revision is a deliberate future step, not an automatic follow.
+
 ## Verification chain (what makes this repo unusual)
 
 ```
