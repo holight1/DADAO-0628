@@ -8,3 +8,4 @@
 0008-dadao-unsigned-cmp.patch
 0009-dadao-frameindex-value.patch
 0010-dadao-shift-mul.patch
+0011-dadao-div-rem.patch

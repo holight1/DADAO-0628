@@ -7,3 +7,4 @@
 0006-dadao-faults.patch
 0007-dadao-controlflow-ras.patch
 0008-dadao-se-stack-base.patch
+0009-dadao-divs-quotient-fix.patch

@@ -109,6 +109,40 @@
 
 - mnemonic: divs
   format: rrrr
+  class: semantic
+  encoding:
+    word: "0x1E004042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000011"
+      rd2: "0x0000000000000004"
+  expected_state:
+    rd:
+      rd4: "0x0000000000000004"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "divs rd0,rd4,rd1,rd2; rem discarded to rd0, quot rd4=17÷4=4. Covers gem5-divs-quotient-swap: when rem=rd0 the quotient must still reach rdhb (blind spot in the rd3/rd4 vector above)."
+
+- mnemonic: divu
+  format: rrrr
+  class: semantic
+  encoding:
+    word: "0x1F004042"
+  input_state:
+    rd:
+      rd1: "0x0000000000000011"
+      rd2: "0x0000000000000004"
+  expected_state:
+    rd:
+      rd4: "0x0000000000000004"
+  expected_fault: null
+  status: active
+  wiki_cite: "spec.md §3.7"
+  notes: "divu rd0,rd4,rd1,rd2; rem discarded to rd0, quot rd4=17÷4=4. Covers gem5-divs-quotient-swap (quotient-only path)."
+
+- mnemonic: divs
+  format: rrrr
   class: legality
   encoding:
     word: "0x1E0C43FF"

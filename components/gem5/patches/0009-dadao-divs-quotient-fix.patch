@@ -1,0 +1,63 @@
+From 57689dbc232f9caa8b19ef09a17edca4f77faa43 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 18:43:46 +0800
+Subject: [PATCH] arch/dadao: fix divs/divu quotient when rem=rd0 (DG-006b)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DivsInst/DivuInst build dstRegs conditionally (if(rem)push; if(quo)push) to
+omit rd0 destinations, but execute() wrote remainder to dstRegs[0] and quotient
+to dstRegs[1] by position. When rem=rd0 (the common quotient-only case, e.g.
+LLVM's SDIV/UDIV), the quotient register lands at index 0 and wrongly received
+the remainder.
+
+Track hasRem and write by identity: remainder -> dst[0] only when present,
+quotient -> the next slot. QEMU was already correct (rdhb=quot regardless of
+rd0), spec §3.7 says rdhb=quot.
+
+Exposed by DADAO-0628 DL-060b runtime div probes: sdiv(-7,2) QEMU=-3/gem5=-1,
+udiv(100,7) QEMU=14/gem5=2. Four-way differential missed it (divs vectors only
+used nonzero rem/quo regs); new rem=rd0 vectors added, AGREE(4-way) 198->200.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/arch/dadao/decoder.cc | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 318ccb8001..5dfe61a13a 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -324,20 +324,22 @@ DECL_RR2R(XorInst,"xor", a^b)
+ DECL_RR2R(XnorInst,"xnor", ~(a^b))
+ 
+ // divs: signed division with truncation toward zero (spec 3.7)
+-class DivsInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; public:
+-DivsInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divs", enums::No_OpClass), badDst(dualBadDst(rem,quo)) {
++class DivsInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; bool hasRem; public:
++DivsInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divs", enums::No_OpClass), badDst(dualBadDst(rem,quo)), hasRem(rem!=0) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++]=intRegId(num); srcRegs[_numSrcRegs++]=intRegId(den);
+   if(rem)dstRegs[_numDestRegs++]=intRegId(rem); if(quo)dstRegs[_numDestRegs++]=intRegId(quo); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; int64_t a=xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); if(b==0) RET_ILLI; if(a==INT64_MIN&&b==-1) RET_ILLI; int64_t q=a/b, r=a%b; if(_numDestRegs>=1)xc->setRegOperand(this,0,r); if(_numDestRegs>=2)xc->setRegOperand(this,1,q); return NoFault; } // spec §3.7: div0 / INT64_MIN÷-1 → ILLI
++// dstRegs omits rd0 dests (if(rem)/if(quo)), so write by identity: rem→dst[0] when present, quot→next slot (spec §3.7 rdha=rem, rdhb=quot)
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; int64_t a=xc->getRegOperand(this,0), b=xc->getRegOperand(this,1); if(b==0) RET_ILLI; if(a==INT64_MIN&&b==-1) RET_ILLI; int64_t q=a/b, r=a%b; int i=0; if(hasRem)xc->setRegOperand(this,i++,r); if(i<(int)_numDestRegs)xc->setRegOperand(this,i,q); return NoFault; } // spec §3.7: div0 / INT64_MIN÷-1 → ILLI
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"divs";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+-class DivuInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; public:
+-DivuInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divu", enums::No_OpClass), badDst(dualBadDst(rem,quo)) {
++class DivuInst : public StaticInst { RegId srcRegs[2], dstRegs[2]; bool badDst; bool hasRem; public:
++DivuInst(uint8_t rem, uint8_t quo, uint8_t num, uint8_t den) : StaticInst("divu", enums::No_OpClass), badDst(dualBadDst(rem,quo)), hasRem(rem!=0) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   srcRegs[_numSrcRegs++]=intRegId(num); srcRegs[_numSrcRegs++]=intRegId(den);
+   if(rem)dstRegs[_numDestRegs++]=intRegId(rem); if(quo)dstRegs[_numDestRegs++]=intRegId(quo); }
+-Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; uint64_t a=xc->getRegOperand(this,0),b=xc->getRegOperand(this,1); if(b==0) RET_ILLI; if(_numDestRegs>=1)xc->setRegOperand(this,0,a%b); if(_numDestRegs>=2)xc->setRegOperand(this,1,a/b); return NoFault; } // spec §3.7: div0 → ILLI
++// dstRegs omits rd0 dests, so write by identity (spec §3.7 rdha=rem, rdhb=quot)
++Fault execute(ExecContext *xc, trace::InstRecord*) const override { if(badDst) RET_ILLI; uint64_t a=xc->getRegOperand(this,0),b=xc->getRegOperand(this,1); if(b==0) RET_ILLI; uint64_t q=a/b, r=a%b; int i=0; if(hasRem)xc->setRegOperand(this,i++,r); if(i<(int)_numDestRegs)xc->setRegOperand(this,i,q); return NoFault; } // spec §3.7: div0 → ILLI
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"divu";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // === Shift/extend (orrr: hb=dst, hc=src1, hd=src2) ===
+-- 
+2.43.0
+

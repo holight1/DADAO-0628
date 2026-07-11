@@ -209,3 +209,12 @@
   scope: [gem5, M1]
   blocks: [DG-005b]
   resolved_by: DG-006a（架构师直修 stack_base 63→48bit；gem5 arr_sum=10 双后端验证；patch gem5/0008）
+
+# ── Found by div/rem E2E (DL-060b) ────────────────────────────────────────────
+
+- id: gem5-divs-quotient-swap
+  title: "gem5 DivsInst/DivuInst：仅取商(rem=rd0)时商寄存器拿到余数。构造 `if(rem)dstRegs[push]; if(quo)dstRegs[push]` 条件压栈，但 execute 按位置写 dst[0]=余/dst[1]=商；SDIV/UDIV 的 rem=rd0 被跳过→商寄存器落 dst[0]→execute 写余数。QEMU 正确(rdhb=商，不受 rd0 影响)、spec §3.7 站 QEMU。DL-060b div/rem E2E 真运行时探针(sdiv(-7,2) QEMU=-3/gem5=-1、udiv(100,7) QEMU=14/gem5=2)逮住；**四方差分 198 AGREE 漏掉**(divs 向量没测仅商 rem=rd0)；div_rem.test 常量折叠也藏了它。→ 修 gem5 execute 按寄存器身份写商/余 + 补差分 divs 向量覆盖 rem=rd0。E2E 收口向量盲区再一例(同 qemu-no-ras-stack)。"
+  status: closed
+  scope: [gem5, M1]
+  blocks: null
+  resolved_by: DG-006b（架构师直修 execute 按寄存器身份写商/余 + 补 rem=rd0 向量，AGREE 198→200；gem5 patch 0009）

@@ -1,0 +1,95 @@
+From dcb84902d5b1c04108817fb9539e4907f29e7921 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 18:18:38 +0800
+Subject: [PATCH] =?UTF-8?q?target/dadao:=20SDIV/UDIV/SREM/UREM=20pseudos?=
+ =?UTF-8?q?=20+=20div0=E2=86=92ILLI=20(DL-060b)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp | 48 ++++++++++++++++++++++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td  |  8 ++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index a9bb396b6143..568124b21271 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -95,6 +95,54 @@ bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+     MI.eraseFromParent();
+     return true;
+   }
++  case DADAO::SDIV_PSEUDO: {
++    Register Dst = MI.getOperand(0).getReg();
++    Register Src1 = MI.getOperand(1).getReg();
++    Register Src2 = MI.getOperand(2).getReg();
++    BuildMI(MBB, MI, DL, get(DADAO::DIVS_RRRR))
++        .addReg(DADAO::RD0) // rdha = rd0 (discard remainder)
++        .addReg(Dst)        // rdhb = dst (quotient)
++        .addReg(Src1)       // rdhc = dividend
++        .addReg(Src2);      // rdhd = divisor
++    MI.eraseFromParent();
++    return true;
++  }
++  case DADAO::SREM_PSEUDO: {
++    Register Dst = MI.getOperand(0).getReg();
++    Register Src1 = MI.getOperand(1).getReg();
++    Register Src2 = MI.getOperand(2).getReg();
++    BuildMI(MBB, MI, DL, get(DADAO::DIVS_RRRR))
++        .addReg(Dst)        // rdha = dst (remainder)
++        .addReg(DADAO::RD0) // rdhb = rd0 (discard quotient)
++        .addReg(Src1)       // rdhc = dividend
++        .addReg(Src2);      // rdhd = divisor
++    MI.eraseFromParent();
++    return true;
++  }
++  case DADAO::UDIV_PSEUDO: {
++    Register Dst = MI.getOperand(0).getReg();
++    Register Src1 = MI.getOperand(1).getReg();
++    Register Src2 = MI.getOperand(2).getReg();
++    BuildMI(MBB, MI, DL, get(DADAO::DIVU_RRRR))
++        .addReg(DADAO::RD0) // rdha = rd0 (discard remainder)
++        .addReg(Dst)        // rdhb = dst (quotient)
++        .addReg(Src1)       // rdhc = dividend
++        .addReg(Src2);      // rdhd = divisor
++    MI.eraseFromParent();
++    return true;
++  }
++  case DADAO::UREM_PSEUDO: {
++    Register Dst = MI.getOperand(0).getReg();
++    Register Src1 = MI.getOperand(1).getReg();
++    Register Src2 = MI.getOperand(2).getReg();
++    BuildMI(MBB, MI, DL, get(DADAO::DIVU_RRRR))
++        .addReg(Dst)        // rdha = dst (remainder)
++        .addReg(DADAO::RD0) // rdhb = rd0 (discard quotient)
++        .addReg(Src1)       // rdhc = dividend
++        .addReg(Src2);      // rdhd = divisor
++    MI.eraseFromParent();
++    return true;
++  }
+   case DADAO::RET_PSEUDO: {
+     BuildMI(MBB, MI, DL, get(DADAO::RET_RIII))
+         .addReg(DADAO::RD0) // rdha = rd0 (value already in $rd31)
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 4f3324770adc..a8361e7e4ef5 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -94,6 +94,14 @@ def SUB_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
+                              [(set GPRD:$dst, (sub GPRD:$a, GPRD:$b))]>;
+ def MUL_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
+                              [(set GPRD:$dst, (mul GPRD:$a, GPRD:$b))]>;
++def SDIV_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
++                              [(set GPRD:$dst, (sdiv GPRD:$a, GPRD:$b))]>;
++def UDIV_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
++                              [(set GPRD:$dst, (udiv GPRD:$a, GPRD:$b))]>;
++def SREM_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
++                              [(set GPRD:$dst, (srem GPRD:$a, GPRD:$b))]>;
++def UREM_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
++                              [(set GPRD:$dst, (urem GPRD:$a, GPRD:$b))]>;
+ 
+ let isReturn = 1, isTerminator = 1, isBarrier = 1 in
+ def RET_PSEUDO : DADAOPseudo<(outs), (ins), [(DADAORetGlue)]>;
+-- 
+2.43.0
+

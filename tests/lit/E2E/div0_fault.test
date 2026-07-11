@@ -1,0 +1,7 @@
+// RUN: %llc -march=dadao -o %t.ll.s %S/Inputs/div0_fault.ll
+// RUN: cat %S/Inputs/crt0.s %t.ll.s > %t.full.s
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %t.full.s
+// RUN: %llvm-objcopy -O binary --only-section=.text %t.o %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 130'
+// RUN: %gen_min_elf %t.bin %t.elf
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 130'
