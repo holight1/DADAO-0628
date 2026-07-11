@@ -1,0 +1,185 @@
+From c20a10491dfc1ca8c93e78cd7a2fda09da62f37b Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 07:40:29 +0800
+Subject: [PATCH 15/15] =?UTF-8?q?target/dadao:=20DL-061c=20rework=20?=
+ =?UTF-8?q?=E2=80=94=20lld=20build=20(AsmPrinter=20dep=20+=20rm=20stray)?=
+ =?UTF-8?q?=20+=20RELA=5FLO=20absolute=20(R=5FABS)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ lld/ELF/Arch/DADAO.cpp                               | 12 +++++-------
+ lld/ELF/Target.cpp                                   |  2 +-
+ lld/ELF/Target.h                                     |  1 +
+ llvm/lib/Target/DADAO/CMakeLists.txt                 |  3 +++
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp          |  2 +-
+ .../Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp    |  8 ++++++++
+ .../DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp      |  2 ++
+ .../lib/Target/DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp |  0
+ .../Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp |  2 ++
+ .../Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h    |  1 +
+ llvm/lib/TargetParser/TargetDataLayout.cpp           |  2 ++
+ 11 files changed, 26 insertions(+), 9 deletions(-)
+ delete mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp
+
+diff --git a/lld/ELF/Arch/DADAO.cpp b/lld/ELF/Arch/DADAO.cpp
+index dc9c5095ebc6..1180466ce220 100644
+--- a/lld/ELF/Arch/DADAO.cpp
++++ b/lld/ELF/Arch/DADAO.cpp
+@@ -68,10 +68,11 @@ RelExpr DADAO::getRelExpr(RelType type, const Symbol &s,
+   case R_DADAO_BRANCH18:
+   case R_DADAO_BRANCH12:
+   case R_DADAO_RELA_PAGE:
+-  case R_DADAO_RELA_LO:
+     return R_PC;
++  case R_DADAO_RELA_LO:
++    return R_ABS;
+   default:
+-    Err(ctx) << getErrorLoc(loc) << "unknown relocation: " << type;
++    Err(ctx) << getErrorLoc(ctx, loc) << "unknown relocation: " << type;
+     return R_NONE;
+   }
+ }
+@@ -128,11 +129,8 @@ void DADAO::relocate(uint8_t *loc, const Relocation &rel,
+   }
+ 
+   default:
+-    Err(ctx) << getErrorLoc(loc) << "unrecognized relocation " << rel.type;
++    Err(ctx) << getErrorLoc(ctx, loc) << "unrecognized relocation " << rel.type;
+   }
+ }
+ 
+-TargetInfo *elf::getDADAOTargetInfo(Ctx &ctx) {
+-  static DADAO t(ctx);
+-  return &t;
+-}
++void elf::setDADAOTargetInfo(Ctx &ctx) { ctx.target.reset(new DADAO(ctx)); }
+diff --git a/lld/ELF/Target.cpp b/lld/ELF/Target.cpp
+index 791555bdfdb0..b50a82cce627 100644
+--- a/lld/ELF/Target.cpp
++++ b/lld/ELF/Target.cpp
+@@ -87,7 +87,7 @@ void elf::setTarget(Ctx &ctx) {
+   case EM_RISCV:
+     return setRISCVTargetInfo(ctx);
+   case EM_DADAO:
+-    return getDADAOTargetInfo(ctx);
++    return setDADAOTargetInfo(ctx);
+   case EM_SPARCV9:
+     return setSPARCV9TargetInfo(ctx);
+   case EM_S390:
+diff --git a/lld/ELF/Target.h b/lld/ELF/Target.h
+index 30fcb02b43fb..9ff24e5de8b0 100644
+--- a/lld/ELF/Target.h
++++ b/lld/ELF/Target.h
+@@ -206,6 +206,7 @@ void setMipsTargetInfo(Ctx &);
+ void setPPC64TargetInfo(Ctx &);
+ void setPPCTargetInfo(Ctx &);
+ void setRISCVTargetInfo(Ctx &);
++void setDADAOTargetInfo(Ctx &);
+ void setSPARCV9TargetInfo(Ctx &);
+ void setSystemZTargetInfo(Ctx &);
+ void setX86TargetInfo(Ctx &);
+diff --git a/llvm/lib/Target/DADAO/CMakeLists.txt b/llvm/lib/Target/DADAO/CMakeLists.txt
+index 202c4aad984f..18d91b88cc8f 100644
+--- a/llvm/lib/Target/DADAO/CMakeLists.txt
++++ b/llvm/lib/Target/DADAO/CMakeLists.txt
+@@ -25,6 +25,9 @@ add_llvm_target(DADAOCodeGen
+   DADAOTargetMachine.cpp
+ 
+   LINK_COMPONENTS
++  AsmPrinter
++  CodeGen
++  CodeGenTypes
+   Core
+   DADAODesc
+   MC
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index 434e5ce67627..6ce326775d2f 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -146,7 +146,7 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+     SDNode *Rela = CurDAG->getMachineNode(DADAO::RELA_RIII, DL, MVT::i64, GA);
+     unsigned DADAOOpc = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
+     SDValue BaseReg = SDValue(Rela, 0);
+-    SDValue LoOff = CurDAG->getTargetConstant(GEPOff, DL, MVT::i64);
++    SDValue LoOff = GA; // use the same GlobalAddress for lo fixup
+ 
+     if (IsLoad) {
+       SDValue Ops[] = {BaseReg, LoOff, Chain};
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index ccd6f0ca4a43..69403d545bef 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -131,6 +131,14 @@ public:
+       Info.Flags = 0;
+       return Info;
+     }
++    if (Kind == DADAO::fixup_dadao_rela_lo) {
++      MCFixupKindInfo Info;
++      Info.Name = "fixup_dadao_rela_lo";
++      Info.TargetOffset = 0;
++      Info.TargetSize = 12;
++      Info.Flags = 0;
++      return Info;
++    }
+     llvm_unreachable("Unknown fixup kind");
+   }
+ 
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+index fad8c490b15c..f11fa5524fa7 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+@@ -40,6 +40,8 @@ protected:
+       return unsigned(DADAO::R_DADAO_BRANCH12);
+     case DADAO::fixup_dadao_rela_page:
+       return unsigned(DADAO::R_DADAO_RELA_PAGE);
++    case DADAO::fixup_dadao_rela_lo:
++      return unsigned(DADAO::R_DADAO_RELA_LO);
+     }
+   }
+ 
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp
+deleted file mode 100644
+index e69de29bb2d1..000000000000
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+index 34fabc90f4df..b8f40081437c 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+@@ -159,6 +159,8 @@ unsigned DADAOMCCodeEmitter::getMachineOpValue(
+       Kind = MCFixupKind(DADAO::fixup_dadao_call24);
+     else if (Opcode == DADAO::RELA_RIII)
+       Kind = MCFixupKind(DADAO::fixup_dadao_rela_page);
++    else if (Opcode == DADAO::LDO_RRII || Opcode == DADAO::STO_RRII)
++      Kind = MCFixupKind(DADAO::fixup_dadao_rela_lo);
+     else if (Opcode == DADAO::BRN_RIII || Opcode == DADAO::BRNN_RIII ||
+              Opcode == DADAO::BRZ_RIII || Opcode == DADAO::BRNZ_RIII ||
+              Opcode == DADAO::BRP_RIII || Opcode == DADAO::BRNP_RIII)
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+index ee1b78e55913..4f6aced18bed 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+@@ -47,6 +47,7 @@ enum {
+   R_DADAO_BRANCH18 = 2,
+   R_DADAO_BRANCH12 = 3,
+   R_DADAO_RELA_PAGE = 4,
++  R_DADAO_RELA_LO = 5,
+   R_DADAO_NUM,
+ };
+ } // namespace DADAO
+diff --git a/llvm/lib/TargetParser/TargetDataLayout.cpp b/llvm/lib/TargetParser/TargetDataLayout.cpp
+index b8c3b4325558..0b5b482c630e 100644
+--- a/llvm/lib/TargetParser/TargetDataLayout.cpp
++++ b/llvm/lib/TargetParser/TargetDataLayout.cpp
+@@ -618,6 +618,8 @@ std::string Triple::computeDataLayout(StringRef ABIName) const {
+   case Triple::spirv32:
+   case Triple::spirv64:
+     return computeSPIRVDataLayout(*this);
++  case Triple::dadao:
++    return "E-m:e-i64:64-n64-S64";
+   case Triple::lanai:
+     return computeLanaiDataLayout();
+   case Triple::wasm32:
+-- 
+2.43.0
+

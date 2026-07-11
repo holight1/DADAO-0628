@@ -1,0 +1,1465 @@
+From bb5415abcd13577585e3aec0437ad42be60aa9bc Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 20:08:04 +0800
+Subject: [PATCH 13/15] target/dadao: GlobalAddress lowering via rela
+ PC-relative (DL-061b)
+
+---
+ .../Target/DADAO/AsmParser/DADAOAsmParser.cpp |  18 +-
+ llvm/lib/Target/DADAO/CMakeLists.txt          |  14 +-
+ llvm/lib/Target/DADAO/DADAO.h                 |  20 +-
+ llvm/lib/Target/DADAO/DADAO.td                |  24 +-
+ llvm/lib/Target/DADAO/DADAOCallingConv.td     |  13 +
+ llvm/lib/Target/DADAO/DADAOFrameLowering.cpp  |  60 +++++
+ llvm/lib/Target/DADAO/DADAOFrameLowering.h    |  30 +++
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp   |  27 ++
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   |  13 +-
+ llvm/lib/Target/DADAO/DADAOISelLowering.h     |   2 +
+ llvm/lib/Target/DADAO/DADAOInstrFormats.td    | 254 ++++++++++++++----
+ llvm/lib/Target/DADAO/DADAOInstrInfo.h        |  46 ++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       |   1 +
+ llvm/lib/Target/DADAO/DADAORegisterInfo.h     |   4 +
+ llvm/lib/Target/DADAO/DADAORegisterInfo.td    |  20 +-
+ llvm/lib/Target/DADAO/DADAOSubtarget.cpp      |  17 ++
+ llvm/lib/Target/DADAO/DADAOSubtarget.h        |  52 ++++
+ llvm/lib/Target/DADAO/DADAOTargetMachine.cpp  |  81 ++++--
+ llvm/lib/Target/DADAO/DADAOTargetMachine.h    |  32 ++-
+ .../Target/DADAO/Disassembler/CMakeLists.txt  |  10 +
+ .../DADAO/Disassembler/DADAODisassembler.cpp  | 106 ++++++++
+ .../Target/DADAO/MCTargetDesc/CMakeLists.txt  |   1 +
+ .../DADAO/MCTargetDesc/DADAOAsmBackend.cpp    |  27 ++
+ .../DADAO/MCTargetDesc/DADAOAsmInfo.cpp       |   1 +
+ .../MCTargetDesc/DADAOELFObjectWriter.cpp     |   2 +
+ .../DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp     |   0
+ .../DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp |   2 +
+ .../DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp  |  14 +
+ .../DADAO/MCTargetDesc/DADAOMCTargetDesc.h    |   3 +
+ 29 files changed, 763 insertions(+), 131 deletions(-)
+ create mode 100644 llvm/lib/Target/DADAO/DADAOCallingConv.td
+ create mode 100644 llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+ create mode 100644 llvm/lib/Target/DADAO/DADAOFrameLowering.h
+ create mode 100644 llvm/lib/Target/DADAO/DADAOInstrInfo.h
+ create mode 100644 llvm/lib/Target/DADAO/DADAOSubtarget.cpp
+ create mode 100644 llvm/lib/Target/DADAO/DADAOSubtarget.h
+ create mode 100644 llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp
+
+diff --git a/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp b/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
+index 74540f99fd3c..bd048a66fb31 100644
+--- a/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
++++ b/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
+@@ -7,9 +7,11 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "TargetInfo/DADAOTargetInfo.h"
+ #include "llvm/MC/MCContext.h"
+ #include "llvm/MC/MCExpr.h"
+ #include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCInstrInfo.h"
+ #include "llvm/MC/MCParser/AsmLexer.h"
+ #include "llvm/MC/MCParser/MCAsmParser.h"
+ #include "llvm/MC/MCParser/MCParsedAsmOperand.h"
+@@ -27,6 +29,8 @@
+ 
+ using namespace llvm;
+ 
++static MCRegister MatchRegisterName(StringRef Name);
++
+ namespace {
+ 
+ struct DADAOOperand;
+@@ -114,6 +118,7 @@ public:
+   bool isReg() const override { return Kind == Register; }
+   bool isImm() const override { return Kind == Immediate; }
+   bool isToken() const override { return Kind == Token; }
++  bool isMem() const override { return false; }
+ 
+   bool isImms12() const {
+     if (!isImm()) return false;
+@@ -176,6 +181,11 @@ public:
+     Inst.addOperand(MCOperand::createReg(getReg()));
+   }
+ 
++  void addImmOperands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands!");
++    addExpr(Inst, getImm());
++  }
++
+   void addImms12Operands(MCInst &Inst, unsigned N) const {
+     assert(N == 1 && "Invalid number of operands!");
+     addExpr(Inst, getImm());
+@@ -214,7 +224,11 @@ public:
+   void print(raw_ostream &OS, const MCAsmInfo &) const override {
+     switch (Kind) {
+     case Immediate:
+-      OS << "Imm: " << *getImm();
++      OS << "Imm: ";
++      if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
++        OS << CE->getValue();
++      else
++        OS << Imm.Value;
+       break;
+     case Token:
+       OS << "Token: " << getToken();
+@@ -265,7 +279,7 @@ bool DADAOAsmParser::matchAndEmitInstruction(SMLoc IdLoc, unsigned &Opcode,
+ 
+   switch (MatchInstructionImpl(Operands, Inst, ErrorInfo, MatchingInlineAsm)) {
+   case Match_Success:
+-    Out.emitInstruction(Inst, STI);
++    Out.emitInstruction(Inst, getSTI());
+     Opcode = Inst.getOpcode();
+     return false;
+   case Match_MissingFeature:
+diff --git a/llvm/lib/Target/DADAO/CMakeLists.txt b/llvm/lib/Target/DADAO/CMakeLists.txt
+index 08db6fd37cd6..202c4aad984f 100644
+--- a/llvm/lib/Target/DADAO/CMakeLists.txt
++++ b/llvm/lib/Target/DADAO/CMakeLists.txt
+@@ -5,19 +5,30 @@ set(LLVM_TARGET_DEFINITIONS DADAO.td)
+ tablegen(LLVM DADAOGenRegisterInfo.inc -gen-register-info)
+ tablegen(LLVM DADAOGenInstrInfo.inc -gen-instr-info)
+ tablegen(LLVM DADAOGenAsmMatcher.inc -gen-asm-matcher)
+-tablegen(LLVM DADAOGenMCCodeEmitter.inc -gen-emitter)
+ tablegen(LLVM DADAOGenAsmWriter.inc -gen-asm-writer)
++tablegen(LLVM DADAOGenMCCodeEmitter.inc -gen-emitter)
++tablegen(LLVM DADAOGenDisassemblerTables.inc -gen-disassembler)
++tablegen(LLVM DADAOGenDAGISel.inc -gen-dag-isel)
++tablegen(LLVM DADAOGenSubtargetInfo.inc -gen-subtarget)
++tablegen(LLVM DADAOGenCallingConv.inc -gen-callingconv)
+ 
+ add_public_tablegen_target(DADAOCommonTableGen)
+ 
+ add_llvm_target(DADAOCodeGen
++  DADAOAsmPrinter.cpp
++  DADAOFrameLowering.cpp
++  DADAOISelDAGToDAG.cpp
++  DADAOISelLowering.cpp
++  DADAOInstrInfo.cpp
+   DADAORegisterInfo.cpp
++  DADAOSubtarget.cpp
+   DADAOTargetMachine.cpp
+ 
+   LINK_COMPONENTS
+   Core
+   DADAODesc
+   MC
++  SelectionDAG
+   Support
+   Target
+   TargetParser
+@@ -27,5 +38,6 @@ add_llvm_target(DADAOCodeGen
+   )
+ 
+ add_subdirectory(AsmParser)
++add_subdirectory(Disassembler)
+ add_subdirectory(MCTargetDesc)
+ add_subdirectory(TargetInfo)
+diff --git a/llvm/lib/Target/DADAO/DADAO.h b/llvm/lib/Target/DADAO/DADAO.h
+index a5d4263f2624..a05e71b89ffc 100644
+--- a/llvm/lib/Target/DADAO/DADAO.h
++++ b/llvm/lib/Target/DADAO/DADAO.h
+@@ -1,16 +1,4 @@
+ //===-- DADAO.h - Top-level interface for DADAO representation --*- C++ -*-===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+-//===----------------------------------------------------------------------===//
+-//
+-// This file contains the entry points for global functions defined in the LLVM
+-// DADAO back-end.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef LLVM_LIB_TARGET_DADAO_DADAO_H
+ #define LLVM_LIB_TARGET_DADAO_DADAO_H
+ 
+@@ -18,8 +6,12 @@
+ 
+ namespace llvm {
+ class DADAOTargetMachine;
++class FunctionPass;
+ class PassRegistry;
+ 
+-} // namespace llvm
++FunctionPass *createDADAOISelDag(DADAOTargetMachine &TM);
++FunctionPass *createDADAORegMaskPass();
++void initializeDADAODAGToDAGISelLegacyPass(PassRegistry &);
+ 
+-#endif // LLVM_LIB_TARGET_DADAO_DADAO_H
++} // namespace llvm
++#endif
+diff --git a/llvm/lib/Target/DADAO/DADAO.td b/llvm/lib/Target/DADAO/DADAO.td
+index 86f36095cdb9..fdd21dd6a148 100644
+--- a/llvm/lib/Target/DADAO/DADAO.td
++++ b/llvm/lib/Target/DADAO/DADAO.td
+@@ -1,30 +1,14 @@
+ //===- DADAO.td - Describe the DADAO Target Machine ----------*- tablegen -*-===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+ //===----------------------------------------------------------------------===//
+-
+-//===----------------------------------------------------------------------===//
+-// Target-independent interfaces which we are implementing
+-//===----------------------------------------------------------------------===//
+-
+ include "llvm/Target/Target.td"
+ 
+-//===----------------------------------------------------------------------===//
+-// Register File, Calling Conv, Instruction Descriptions
+-//===----------------------------------------------------------------------===//
+-
+ include "DADAORegisterInfo.td"
++include "DADAOCallingConv.td"
++include "DADAOInstrInfo.td"
+ 
+ def DADAOInstrInfo : InstrInfo;
+ defm : RemapAllTargetPseudoPointerOperands<GPRD>;
+ 
+-//===----------------------------------------------------------------------===//
+-// DADAO processors supported.
+-//===----------------------------------------------------------------------===//
+-
+ def : ProcessorModel<"generic", NoSchedModel, []>;
+ 
+ def DADAOInstPrinter : AsmWriter {
+@@ -32,10 +16,6 @@ def DADAOInstPrinter : AsmWriter {
+   bit isMCAsmWriter = 1;
+ }
+ 
+-//===----------------------------------------------------------------------===//
+-// Declare the target which we are implementing
+-//===----------------------------------------------------------------------===//
+-
+ def DADAO : Target {
+   let InstructionSet = DADAOInstrInfo;
+   let AssemblyWriters = [DADAOInstPrinter];
+diff --git a/llvm/lib/Target/DADAO/DADAOCallingConv.td b/llvm/lib/Target/DADAO/DADAOCallingConv.td
+new file mode 100644
+index 000000000000..660b3a25139d
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOCallingConv.td
+@@ -0,0 +1,13 @@
++//===-- DADAOCallingConv.td - Calling Conventions for DADAO --*- tablegen -*-===//
++// DADAO Calling Conventions — GPRD only (Phase 5 spike)
++//===----------------------------------------------------------------------===//
++
++def CC_DADAO : CallingConv<[
++  CCIfType<[i64], CCAssignToReg<[RD16, RD17, RD18, RD19, RD20, RD21, RD22, RD23,
++                                  RD24, RD25, RD26, RD27, RD28, RD29, RD30, RD31]>>,
++  CCIfType<[i64], CCAssignToStack<8, 8>>
++]>;
++
++def RetCC_DADAO : CallingConv<[
++  CCIfType<[i64], CCAssignToReg<[RD31]>>
++]>;
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+new file mode 100644
+index 000000000000..ce0ff4ab45dc
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+@@ -0,0 +1,60 @@
++//===-- DADAOFrameLowering.cpp - DADAO Frame Lowering ---------------------===//
++#include "DADAOFrameLowering.h"
++#include "DADAOSubtarget.h"
++#include "DADAOInstrInfo.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++
++#define GET_REGINFO_ENUM
++#include "DADAOGenRegisterInfo.inc"
++
++#define GET_INSTRINFO_ENUM
++#include "DADAOGenInstrInfo.inc"
++
++using namespace llvm;
++
++void DADAOFrameLowering::emitPrologue(MachineFunction &MF,
++                                       MachineBasicBlock &MBB) const {
++  MachineFrameInfo &MFI = MF.getFrameInfo();
++  const DADAOInstrInfo *TII =
++      MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
++
++  uint64_t StackSize = MFI.getStackSize();
++  if (StackSize == 0)
++    return;
++
++  MachineBasicBlock::iterator MBBI = MBB.begin();
++  DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
++
++  BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++      .addReg(DADAO::RB1)
++      .addImm(-static_cast<int64_t>(StackSize));
++}
++
++void DADAOFrameLowering::emitEpilogue(MachineFunction &MF,
++                                       MachineBasicBlock &MBB) const {
++  MachineFrameInfo &MFI = MF.getFrameInfo();
++  const DADAOInstrInfo *TII =
++      MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
++
++  uint64_t StackSize = MFI.getStackSize();
++  if (StackSize == 0)
++    return;
++
++  MachineBasicBlock::iterator MBBI = MBB.getFirstTerminator();
++  DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
++
++  BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++      .addReg(DADAO::RB1)
++      .addImm(static_cast<int64_t>(StackSize));
++}
++
++StackOffset DADAOFrameLowering::getFrameIndexReference(
++    const MachineFunction &MF, int FI, Register &FrameReg) const {
++  const MachineFrameInfo &MFI = MF.getFrameInfo();
++  FrameReg = DADAO::RB1;
++  return StackOffset::getFixed(MFI.getObjectOffset(FI) +
++                                MFI.getStackSize());
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.h b/llvm/lib/Target/DADAO/DADAOFrameLowering.h
+new file mode 100644
+index 000000000000..f3ac73707901
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.h
+@@ -0,0 +1,30 @@
++//===-- DADAOFrameLowering.h - DADAO Frame Lowering -------------*- C++ -*-===//
++#ifndef LLVM_LIB_TARGET_DADAO_DADAOFRAMELOWERING_H
++#define LLVM_LIB_TARGET_DADAO_DADAOFRAMELOWERING_H
++
++#include "llvm/CodeGen/TargetFrameLowering.h"
++
++namespace llvm {
++
++class DADAOFrameLowering : public TargetFrameLowering {
++public:
++  explicit DADAOFrameLowering()
++      : TargetFrameLowering(TargetFrameLowering::StackGrowsDown, Align(8), 0) {}
++
++  void emitPrologue(MachineFunction &MF, MachineBasicBlock &MBB) const override;
++  void emitEpilogue(MachineFunction &MF, MachineBasicBlock &MBB) const override;
++
++  bool hasFPImpl(const MachineFunction &MF) const override { return false; }
++
++  StackOffset getFrameIndexReference(const MachineFunction &MF, int FI,
++                                     Register &FrameReg) const override;
++
++  MachineBasicBlock::iterator
++  eliminateCallFramePseudoInstr(MachineFunction &MF, MachineBasicBlock &MBB,
++                                MachineBasicBlock::iterator MI) const override {
++    return MBB.erase(MI);
++  }
++};
++
++} // namespace llvm
++#endif
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index f59d301ca419..434e5ce67627 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -71,6 +71,13 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+     return;
+   }
+ 
++  if (Opc == DADAOISD::PCREL_HI) {
++    // Handled together with load/store below — do not select standalone
++    // (standalone PCREL_HI means address is used as a value, not load/store)
++    SelectCode(Node);
++    return;
++  }
++
+   if (Opc != ISD::LOAD && Opc != ISD::STORE) {
+     if (Opc == DADAOISD::CALL) {
+       SDLoc DLC(Node);
+@@ -134,6 +141,26 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+     return;
+   }
+ 
++  if (BaseAddr.getOpcode() == DADAOISD::PCREL_HI) {
++    SDValue GA = BaseAddr.getOperand(0);
++    SDNode *Rela = CurDAG->getMachineNode(DADAO::RELA_RIII, DL, MVT::i64, GA);
++    unsigned DADAOOpc = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
++    SDValue BaseReg = SDValue(Rela, 0);
++    SDValue LoOff = CurDAG->getTargetConstant(GEPOff, DL, MVT::i64);
++
++    if (IsLoad) {
++      SDValue Ops[] = {BaseReg, LoOff, Chain};
++      SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::i64, MVT::Other,
++                                            Ops);
++      ReplaceNode(Node, New);
++    } else {
++      SDValue Ops[] = {Val, BaseReg, LoOff, Chain};
++      SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::Other, Ops);
++      ReplaceNode(Node, New);
++    }
++    return;
++  }
++
+   // Non-FrameIndex address: use real LDO/STO directly
+   unsigned DADAOOpc = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
+   SDValue ImmOp = CurDAG->getTargetConstant(GEPOff, DL, MVT::i64);
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index e84ac1ab9359..b2a7ad6402ac 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -32,7 +32,7 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::FrameIndex, MVT::i64, Custom);
+   setOperationAction(ISD::SETCC, MVT::i64, Custom);
+   setOperationAction(ISD::SELECT_CC, MVT::i64, Expand);
+-  setOperationAction(ISD::GlobalAddress, MVT::i64, Expand);
++  setOperationAction(ISD::GlobalAddress, MVT::i64, Custom);
+ 
+   setMaxAtomicSizeInBitsSupported(0);
+ 
+@@ -207,6 +207,8 @@ SDValue DADAOTargetLowering::LowerOperation(SDValue Op,
+     return lowerFrameIndex(Op, DAG);
+   case ISD::SETCC:
+     return lowerSETCC(Op, DAG);
++  case ISD::GlobalAddress:
++    return lowerGlobalAddress(Op, DAG);
+   default:
+     break;
+   }
+@@ -368,6 +370,15 @@ SDValue DADAOTargetLowering::lowerSETCC(SDValue Op,
+   return SDValue();
+ }
+ 
++SDValue DADAOTargetLowering::lowerGlobalAddress(SDValue Op,
++                                                SelectionDAG &DAG) const {
++  SDLoc DL(Op);
++  GlobalAddressSDNode *GN = cast<GlobalAddressSDNode>(Op);
++  SDValue GA = DAG.getTargetGlobalAddress(GN->getGlobal(), DL, MVT::i64,
++                                          GN->getOffset());
++  return DAG.getNode(DADAOISD::PCREL_HI, DL, MVT::i64, GA);
++}
++
+ SDValue DADAOTargetLowering::PerformDAGCombine(SDNode *N,
+                                                 DAGCombinerInfo &DCI) const {
+   SelectionDAG &DAG = DCI.DAG;
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index 892f12890be2..fc7b0885bcb2 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -22,6 +22,7 @@ enum NodeType {
+   CMP,    // (lhs, rhs) → i64  cmps result (−1/0/1)
+   CMPU,   // (lhs, rhs) → i64  cmpu result (−1/0/1)
+   FI_ADDR, // (TargetFrameIndex) → i64  frame address in GPRB
++  PCREL_HI, // (GlobalAddress) → i64  page-aligned PC-relative address in RB
+ };
+ } // namespace DADAOISD
+ 
+@@ -55,6 +56,7 @@ private:
+   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerFrameIndex(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerSETCC(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
+ };
+ 
+ } // namespace llvm
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrFormats.td b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
+index 10ebcdd254b0..7bceb8a9f5c4 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrFormats.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
+@@ -11,6 +11,7 @@ class InstDADAO<dag outs, dag ins, string asmstr, list<dag> pattern>
+   field bits<32> Inst;
+   let Size = 4;
+   let Namespace = "DADAO";
++  let DecoderNamespace = "DADAO";
+ 
+   bits<8> op;
+   bits<6> ha;
+@@ -30,7 +31,7 @@ class InstDADAO<dag outs, dag ins, string asmstr, list<dag> pattern>
+   let Pattern = pattern;
+ }
+ 
+-// 24-bit immediate (iiii)
++// 24-bit immediate (iiii) - no operands
+ class F_IIII<dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+   bits<24> imm24;
+@@ -50,99 +51,246 @@ class F_OIII<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> patte
+   let hd = imm18{5-0};
+ }
+ 
+-// minor-op + reg + 12-bit immediate (orii)
+-class F_ORII<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++// minor-op + 2 RD regs + 6-bit immediate (orri) - rdhb, rdhc, imm6
++class F_ORRI<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+-  bits<6> reg;
+-  bits<12> imm12;
++  bits<6> rdhb;
++  bits<6> rdhc;
++  bits<6> imm6;
+   let ha = minor_op;
+-  let hb = reg;
+-  let hc = imm12{11-6};
+-  let hd = imm12{5-0};
++  let hb = rdhb;
++  let hc = rdhc;
++  let hd = imm6;
+ }
+ 
+-// minor-op + 2 regs + 6-bit immediate (orri)
+-class F_ORRI<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++// minor-op + RB + RD + 6-bit imm (orri_rd2rb) - rbhb, rdhc, imm6
++class F_ORRI_RD2RB<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rbhb;
++  bits<6> rdhc;
++  bits<6> imm6;
++  let ha = minor_op;
++  let hb = rbhb;
++  let hc = rdhc;
++  let hd = imm6;
++}
++
++// minor-op + RD + RB + 6-bit imm (orri_rb2rd) - rdhb, rbhc, imm6
++class F_ORRI_RB2RD<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rdhb;
++  bits<6> rbhc;
++  bits<6> imm6;
++  let ha = minor_op;
++  let hb = rdhb;
++  let hc = rbhc;
++  let hd = imm6;
++}
++
++// minor-op + 2 RB regs + 6-bit imm (orri_rb2rb) - rbhb, rbhc, imm6
++class F_ORRI_RB2RB<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+-  bits<6> reg1;
+-  bits<6> reg2;
++  bits<6> rbhb;
++  bits<6> rbhc;
+   bits<6> imm6;
+   let ha = minor_op;
+-  let hb = reg1;
+-  let hc = reg2;
++  let hb = rbhb;
++  let hc = rbhc;
+   let hd = imm6;
+ }
+ 
+-// minor-op + 3 regs (orrr)
++// minor-op + 3 RD regs (orrr) - rdhb, rdhc, rdhd
+ class F_ORRR<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+-  bits<6> reg1;
+-  bits<6> reg2;
+-  bits<6> reg3;
++  bits<6> rdhb;
++  bits<6> rdhc;
++  bits<6> rdhd;
+   let ha = minor_op;
+-  let hb = reg1;
+-  let hc = reg2;
+-  let hd = reg3;
++  let hb = rdhb;
++  let hc = rdhc;
++  let hd = rdhd;
+ }
+ 
+-// 4 regs (rrrr)
++// minor-op + RD + 2 RB regs (orrr_cmprb) - rdhb, rbhc, rbhd
++class F_ORRR_CMPRB<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rdhb;
++  bits<6> rbhc;
++  bits<6> rbhd;
++  let ha = minor_op;
++  let hb = rdhb;
++  let hc = rbhc;
++  let hd = rbhd;
++}
++
++// minor-op + RB + RB + RD (orrr_addr)
++class F_ORRR_ADDRB<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rbhb;
++  bits<6> rbhc;
++  bits<6> rdhd;
++  let ha = minor_op;
++  let hb = rbhb;
++  let hc = rbhc;
++  let hd = rdhd;
++}
++
++// 4 RD regs (rrrr) - rdha, rdhb, rdhc, rdhd
+ class F_RRRR<dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+-  bits<6> reg1;
+-  bits<6> reg2;
+-  bits<6> reg3;
+-  bits<6> reg4;
+-  let ha = reg1;
+-  let hb = reg2;
+-  let hc = reg3;
+-  let hd = reg4;
++  bits<6> rdha;
++  bits<6> rdhb;
++  bits<6> rdhc;
++  bits<6> rdhd;
++  let ha = rdha;
++  let hb = rdhb;
++  let hc = rdhc;
++  let hd = rdhd;
+ }
+ 
+-// 3 regs + 6-bit immediate (rrri)
+-class F_RRRI<dag outs, dag ins, string asmstr, list<dag> pattern>
++// 2 RD regs + 12-bit immediate (rrii_rd) - rdha, rdhb, imm12
++class F_RRII_RD<dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+-  bits<6> reg1;
+-  bits<6> reg2;
+-  bits<6> reg3;
+-  bits<6> imm6;
+-  let ha = reg1;
+-  let hb = reg2;
+-  let hc = reg3;
+-  let hd = imm6;
++  bits<6> rdha;
++  bits<6> rdhb;
++  bits<12> imm12;
++  let ha = rdha;
++  let hb = rdhb;
++  let hc = imm12{11-6};
++  let hd = imm12{5-0};
+ }
+ 
+-// 2 regs + 12-bit immediate (rrii)
+-class F_RRII<dag outs, dag ins, string asmstr, list<dag> pattern>
++// RD + RB + 12-bit immediate (rrii_load) - rdha, rbhb, imm12
++class F_RRII_LOAD<dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+-  bits<6> reg1;
+-  bits<6> reg2;
++  bits<6> rdha;
++  bits<6> rbhb;
+   bits<12> imm12;
+-  let ha = reg1;
+-  let hb = reg2;
++  let ha = rdha;
++  let hb = rbhb;
+   let hc = imm12{11-6};
+   let hd = imm12{5-0};
++  let mayLoad = 1;
+ }
+ 
+-// 1 reg + 18-bit immediate (riii)
+-class F_RIII<dag outs, dag ins, string asmstr, list<dag> pattern>
++// RD + RB + 12-bit immediate (rrii_store) - rdha, rbhb, imm12
++class F_RRII_STORE<dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+-  bits<6> reg;
++  bits<6> rdha;
++  bits<6> rbhb;
++  bits<12> imm12;
++  let ha = rdha;
++  let hb = rbhb;
++  let hc = imm12{11-6};
++  let hd = imm12{5-0};
++  let mayStore = 1;
++}
++
++// 2 RB regs + 12-bit immediate (rrii_rb) - rbha, rbhb, imm12
++class F_RRII_RB<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rbha;
++  bits<6> rbhb;
++  bits<12> imm12;
++  let ha = rbha;
++  let hb = rbhb;
++  let hc = imm12{11-6};
++  let hd = imm12{5-0};
++}
++
++// RB + RD + 12-bit immediate (rrii_jump) - rbha, rdhb, imm12
++class F_RRII_JUMP<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rbha;
++  bits<6> rdhb;
++  bits<12> imm12;
++  let ha = rbha;
++  let hb = rdhb;
++  let hc = imm12{11-6};
++  let hd = imm12{5-0};
++}
++
++// 1 RD reg + 18-bit immediate (riii_rd) - rdha, imm18
++class F_RIII_RD<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rdha;
+   bits<18> imm18;
+-  let ha = reg;
++  let ha = rdha;
+   let hb = imm18{17-12};
+   let hc = imm18{11-6};
+   let hd = imm18{5-0};
+ }
+ 
+-// reg + wyde-pos + 16-bit unsigned immediate (rwii)
++// 1 RB reg + 18-bit immediate (riii_rb) - rbha, imm18
++class F_RIII_RB<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rbha;
++  bits<18> imm18;
++  let ha = rbha;
++  let hb = imm18{17-12};
++  let hc = imm18{11-6};
++  let hd = imm18{5-0};
++}
++
++// RD + RB + RD + 6-bit imm (rrri) - rdha, rbhb, rdhc, imm6
++class F_RRRI<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rdha;
++  bits<6> rbhb;
++  bits<6> rdhc;
++  bits<6> imm6;
++  let ha = rdha;
++  let hb = rbhb;
++  let hc = rdhc;
++  let hd = imm6;
++}
++
++// RB + RB + RD + 6-bit imm (rrri_rb) - rbha, rbhb, rdhc, imm6
++class F_RRRI_RB<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rbha;
++  bits<6> rbhb;
++  bits<6> rdhc;
++  bits<6> imm6;
++  let ha = rbha;
++  let hb = rbhb;
++  let hc = rdhc;
++  let hd = imm6;
++}
++
++// RD reg + ww + 16-bit imm (rwii) - rdha, ww, imm16
+ class F_RWII<dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+-  bits<6> reg;
++  bits<6> rdha;
+   bits<2> ww;
+   bits<16> imm16;
+-  let ha = reg;
++  let ha = rdha;
+   let hb{5-4} = ww;
+   let hb{3-0} = imm16{15-12};
+   let hc = imm16{11-6};
+   let hd = imm16{5-0};
+ }
++
++// RB reg + ww + 16-bit imm (rwii_rb) - rbha, ww, imm16
++class F_RWII_RB<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> rbha;
++  bits<2> ww;
++  bits<16> imm16;
++  let ha = rbha;
++  let hb{5-4} = ww;
++  let hb{3-0} = imm16{15-12};
++  let hc = imm16{11-6};
++  let hd = imm16{5-0};
++}
++
++// minor-op + reg + 12-bit immediate (orii) - reg, imm12
++class F_ORII<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> reg;
++  bits<12> imm12;
++  let ha = minor_op;
++  let hb = reg;
++  let hc = imm12{11-6};
++  let hd = imm12{5-0};
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.h b/llvm/lib/Target/DADAO/DADAOInstrInfo.h
+new file mode 100644
+index 000000000000..d2cf1eff65ec
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.h
+@@ -0,0 +1,46 @@
++//===-- DADAOInstrInfo.h - DADAO Instruction Information --------*- C++ -*-===//
++#ifndef LLVM_LIB_TARGET_DADAO_DADAOINSTRINFO_H
++#define LLVM_LIB_TARGET_DADAO_DADAOINSTRINFO_H
++
++#include "DADAORegisterInfo.h"
++#include "llvm/CodeGen/TargetInstrInfo.h"
++
++#define GET_INSTRINFO_HEADER
++#include "DADAOGenInstrInfo.inc"
++
++namespace llvm {
++
++class DADAOSubtarget;
++
++class DADAOInstrInfo : public DADAOGenInstrInfo {
++  DADAORegisterInfo RI;
++
++public:
++  DADAOInstrInfo(const DADAOSubtarget &STI);
++
++  const DADAORegisterInfo &getRegisterInfo() const { return RI; }
++
++  using TargetInstrInfo::copyPhysReg;
++
++  void copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
++                   const DebugLoc &DL, Register DstReg, Register SrcReg,
++                   bool KillSrc, bool RenamableDest = false,
++                   bool RenamableSrc = false) const override;
++
++  bool expandPostRAPseudo(MachineInstr &MI) const override;
++
++  void storeRegToStackSlot(MachineBasicBlock &MBB,
++                           MachineBasicBlock::iterator MBBI, Register SrcReg,
++                           bool IsKill, int FrameIndex,
++                           const TargetRegisterClass *RC, Register VReg,
++                           MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
++
++  void loadRegFromStackSlot(MachineBasicBlock &MBB,
++                            MachineBasicBlock::iterator MBBI, Register DstReg,
++                            int FrameIndex, const TargetRegisterClass *RC,
++                            Register VReg, unsigned SubReg = 0,
++                            MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
++};
++
++} // namespace llvm
++#endif
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 48ec2ee71ec0..11a8d6df3883 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -71,6 +71,7 @@ def DADAOBrnp : SDNode<"DADAOISD::BRNP", SDT_DADAOBr1, [SDNPHasChain]>;
+ def DADAOCmp  : SDNode<"DADAOISD::CMP",  SDTIntBinOp>;
+ def DADAOCmpU : SDNode<"DADAOISD::CMPU", SDTIntBinOp>;
+ def DADAOFiAddr : SDNode<"DADAOISD::FI_ADDR", SDTIntUnaryOp>;
++def DADAOPCRelHi : SDNode<"DADAOISD::PCREL_HI", SDTIntUnaryOp>;
+ 
+ // Minimal CodeGen-only pseudos (spike scaffold, throwaway).
+ // These bring GPRD-typed i64 add/return down to MIR so finalize-isel can
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.h b/llvm/lib/Target/DADAO/DADAORegisterInfo.h
+index ab81ce1ee5da..7983c3996168 100644
+--- a/llvm/lib/Target/DADAO/DADAORegisterInfo.h
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.h
+@@ -26,6 +26,10 @@ struct DADAORegisterInfo : public DADAOGenRegisterInfo {
+   const uint16_t *
+   getCalleeSavedRegs(const MachineFunction *MF = nullptr) const override;
+ 
++  const uint32_t *
++  getCallPreservedMask(const MachineFunction &MF,
++                       CallingConv::ID CC) const override;
++
+   BitVector getReservedRegs(const MachineFunction &MF) const override;
+ 
+   bool eliminateFrameIndex(MachineBasicBlock::iterator II, int SPAdj,
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.td b/llvm/lib/Target/DADAO/DADAORegisterInfo.td
+index d570895f9330..5f38ca43a31e 100644
+--- a/llvm/lib/Target/DADAO/DADAORegisterInfo.td
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.td
+@@ -16,22 +16,22 @@ let Namespace = "DADAO" in {
+ 
+ // RD bank: 64 data registers
+ foreach i = 0-63 in {
+-  def RD#i : DADAOReg<i, "rd"#i>;
++  def RD#i : DADAOReg<i, "rd"#i>, DwarfRegNum<[i]>;
+ }
+ 
+ // RB bank: 64 base registers
+ foreach i = 0-63 in {
+-  def RB#i : DADAOReg<i, "rb"#i>;
++  def RB#i : DADAOReg<i, "rb"#i>, DwarfRegNum<[i]>;
+ }
+ 
+ // RF bank: 64 float registers
+ foreach i = 0-63 in {
+-  def RF#i : DADAOReg<i, "rf"#i>;
++  def RF#i : DADAOReg<i, "rf"#i>, DwarfRegNum<[i]>;
+ }
+ 
+ // RA bank: 64 return address registers
+ foreach i = 0-63 in {
+-  def RA#i : DADAOReg<i, "ra"#i>;
++  def RA#i : DADAOReg<i, "ra"#i>, DwarfRegNum<[i]>;
+ }
+ 
+ // Register aliases
+@@ -39,32 +39,32 @@ def RBSP : DADAOReg<1, "rbsp">;
+ def RBFP : DADAOReg<2, "rbfp">;
+ 
+ // Register classes - RD bank
+-def GPRD : RegisterClass<"DADAO", [i64], 0, (add
++def GPRD : RegisterClass<"DADAO", [i64], 64, (add
+   (sequence "RD%u", 0, 63)
+ )>;
+ 
+-def GPRD_Allocatable : RegisterClass<"DADAO", [i64], 0, (add
++def GPRD_Allocatable : RegisterClass<"DADAO", [i64], 64, (add
+   (sequence "RD%u", 8, 63)
+ )>;
+ 
+ // Register classes - RB bank
+-def GPRB : RegisterClass<"DADAO", [i64], 0, (add
++def GPRB : RegisterClass<"DADAO", [i64], 64, (add
+   (sequence "RB%u", 0, 63)
+ )>;
+ 
+-def GPRB_Allocatable : RegisterClass<"DADAO", [i64], 0, (add
++def GPRB_Allocatable : RegisterClass<"DADAO", [i64], 64, (add
+   (sequence "RB%u", 8, 63)
+ )>;
+ 
+ // Register classes - RF bank (all non-allocatable)
+-def GPRF : RegisterClass<"DADAO", [i64], 0, (add
++def GPRF : RegisterClass<"DADAO", [i64], 64, (add
+   (sequence "RF%u", 0, 63)
+ )> {
+   let isAllocatable = 0;
+ }
+ 
+ // Register classes - RA bank (not used by register allocator)
+-def GPRA : RegisterClass<"DADAO", [i64], 0, (add
++def GPRA : RegisterClass<"DADAO", [i64], 64, (add
+   (sequence "RA%u", 0, 63)
+ )> {
+   let isAllocatable = 0;
+diff --git a/llvm/lib/Target/DADAO/DADAOSubtarget.cpp b/llvm/lib/Target/DADAO/DADAOSubtarget.cpp
+new file mode 100644
+index 000000000000..8fbf57811e51
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOSubtarget.cpp
+@@ -0,0 +1,17 @@
++//===-- DADAOSubtarget.cpp - DADAO Subtarget Information ------------------===//
++#include "DADAOSubtarget.h"
++#include "DADAOTargetMachine.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "dadao-subtarget"
++#define GET_SUBTARGETINFO_TARGET_DESC
++#define GET_SUBTARGETINFO_CTOR
++#include "DADAOGenSubtargetInfo.inc"
++
++DADAOSubtarget::DADAOSubtarget(const Triple &TT, StringRef CPU, StringRef FS,
++                               const DADAOTargetMachine &TM)
++    : DADAOGenSubtargetInfo(TT, CPU, /*TuneCPU=*/CPU, FS),
++      InstrInfo(*this) {
++  TLInfo = std::make_unique<DADAOTargetLowering>(TM, *this);
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOSubtarget.h b/llvm/lib/Target/DADAO/DADAOSubtarget.h
+new file mode 100644
+index 000000000000..0c1cc7c8dc35
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOSubtarget.h
+@@ -0,0 +1,52 @@
++//===-- DADAOSubtarget.h - DADAO Subtarget Information ---------*- C++ -*-===//
++#ifndef LLVM_LIB_TARGET_DADAO_DADAOSUBTARGET_H
++#define LLVM_LIB_TARGET_DADAO_DADAOSUBTARGET_H
++
++#include "DADAOFrameLowering.h"
++#include "DADAOISelLowering.h"
++#include "DADAOInstrInfo.h"
++#include "llvm/CodeGen/SelectionDAGTargetInfo.h"
++#include "llvm/CodeGen/TargetSubtargetInfo.h"
++
++#define GET_SUBTARGETINFO_HEADER
++#include "DADAOGenSubtargetInfo.inc"
++
++namespace llvm {
++
++class DADAOTargetMachine;
++
++class DADAOSubtarget : public DADAOGenSubtargetInfo {
++  DADAOFrameLowering FrameLowering;
++  DADAOInstrInfo InstrInfo;
++
++public:
++  DADAOSubtarget(const Triple &TT, StringRef CPU, StringRef FS,
++                 const DADAOTargetMachine &TM);
++
++  void ParseSubtargetFeatures(StringRef CPU, StringRef TuneCPU, StringRef FS);
++
++  const DADAOInstrInfo *getInstrInfo() const override { return &InstrInfo; }
++  const DADAORegisterInfo *getRegisterInfo() const override {
++    return &InstrInfo.getRegisterInfo();
++  }
++  const DADAOFrameLowering *getFrameLowering() const override {
++    return &FrameLowering;
++  }
++  const DADAOTargetLowering *getTargetLowering() const override {
++    return TLInfo.get();
++  }
++  const SelectionDAGTargetInfo *getSelectionDAGInfo() const override {
++    return &TSInfo;
++  }
++
++  void setTargetLowering(std::unique_ptr<DADAOTargetLowering> TL) {
++    TLInfo = std::move(TL);
++  }
++
++private:
++  SelectionDAGTargetInfo TSInfo;
++  std::unique_ptr<DADAOTargetLowering> TLInfo;
++};
++
++} // namespace llvm
++#endif
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+index 814a8c4049fe..6d7682bde6f1 100644
+--- a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+@@ -1,27 +1,27 @@
+ //===-- DADAOTargetMachine.cpp - Define TargetMachine for DADAO ---------===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+-//===----------------------------------------------------------------------===//
+-//
+-// Implements the info about DADAO target spec.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#include "DADAORegisterInfo.h"
+ #include "DADAOTargetMachine.h"
++#include "DADAO.h"
++#include "DADAOISelLowering.h"
++#include "DADAORegisterInfo.h"
++#include "DADAOSubtarget.h"
+ #include "TargetInfo/DADAOTargetInfo.h"
++#include "llvm/CodeGen/Passes.h"
++#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
++#include "llvm/CodeGen/TargetPassConfig.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/InitializePasses.h"
+ #include "llvm/MC/TargetRegistry.h"
+-#include "llvm/Support/Compiler.h"
+-#include "llvm/Target/TargetOptions.h"
++#include "llvm/Pass.h"
+ #include <optional>
+ 
+ using namespace llvm;
+ 
+ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeDADAOTarget() {
+   RegisterTargetMachine<DADAOTargetMachine> X(getTheDADAOTarget());
++  auto &PR = *PassRegistry::getPassRegistry();
++  initializeDADAODAGToDAGISelLegacyPass(PR);
+ }
+ 
+ static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {
+@@ -37,6 +37,57 @@ DADAOTargetMachine::DADAOTargetMachine(
+                                FeatureString, Options,
+                                getEffectiveRelocModel(RM),
+                                getEffectiveCodeModel(CodeModel, CodeModel::Small),
+-                               OptLevel) {
++                               OptLevel),
++      Subtarget(TT, Cpu, FeatureString, *this),
++      TLOF(std::make_unique<TargetLoweringObjectFileELF>()) {
+   initAsmInfo();
+ }
++
++namespace {
++class DADAOPassConfig : public TargetPassConfig {
++public:
++  DADAOPassConfig(DADAOTargetMachine &TM, PassManagerBase &PM)
++      : TargetPassConfig(TM, PM) {}
++
++  DADAOTargetMachine &getDADAOTargetMachine() const {
++    return getTM<DADAOTargetMachine>();
++  }
++
++  bool addInstSelector() override {
++    addPass(createDADAOISelDag(getDADAOTargetMachine()));
++    return false;
++  }
++
++  void addPreRegAlloc() override {
++    addPass(createDADAORegMaskPass());
++  }
++};
++
++class DADAORegMaskPass : public MachineFunctionPass {
++public:
++  DADAORegMaskPass() : MachineFunctionPass(ID) {}
++
++  bool runOnMachineFunction(MachineFunction &MF) override {
++    const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
++    const uint32_t *Mask =
++        TRI->getCallPreservedMask(MF, MF.getFunction().getCallingConv());
++    for (MachineBasicBlock &MBB : MF)
++      for (MachineInstr &MI : MBB)
++        if (MI.isCall())
++          MI.addOperand(MF, MachineOperand::CreateRegMask(Mask));
++    return true;
++  }
++
++  static char ID;
++};
++char DADAORegMaskPass::ID = 0;
++
++} // namespace
++
++FunctionPass *llvm::createDADAORegMaskPass() {
++  return new DADAORegMaskPass();
++}
++
++TargetPassConfig *DADAOTargetMachine::createPassConfig(PassManagerBase &PM) {
++  return new DADAOPassConfig(*this, PM);
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.h b/llvm/lib/Target/DADAO/DADAOTargetMachine.h
+index 3b63f61cae98..fc81d35763cd 100644
+--- a/llvm/lib/Target/DADAO/DADAOTargetMachine.h
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.h
+@@ -1,22 +1,14 @@
+ //===-- DADAOTargetMachine.h - Define TargetMachine for DADAO ---*- C++ -*-===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+-//===----------------------------------------------------------------------===//
+-//
+-// This file declares the DADAO specific subclass of TargetMachine.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef LLVM_LIB_TARGET_DADAO_DADAOTARGETMACHINE_H
+ #define LLVM_LIB_TARGET_DADAO_DADAOTARGETMACHINE_H
+ 
++#include "DADAOSubtarget.h"
+ #include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
++#include "llvm/CodeGen/TargetPassConfig.h"
+ #include <optional>
+ 
+ namespace llvm {
++class DADAOTargetLowering;
+ 
+ class DADAOTargetMachine : public CodeGenTargetMachineImpl {
+ public:
+@@ -26,8 +18,22 @@ public:
+                      std::optional<Reloc::Model> RM,
+                      std::optional<CodeModel::Model> CodeModel,
+                      CodeGenOptLevel OptLevel, bool JIT);
++
++  const DADAOSubtarget *
++  getSubtargetImpl(const llvm::Function & /*Fn*/) const override {
++    return &Subtarget;
++  }
++
++  TargetLoweringObjectFile *getObjFileLowering() const override {
++    return TLOF.get();
++  }
++
++  TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
++
++private:
++  DADAOSubtarget Subtarget;
++  std::unique_ptr<TargetLoweringObjectFile> TLOF;
+ };
+ 
+ } // namespace llvm
+-
+-#endif // LLVM_LIB_TARGET_DADAO_DADAOTARGETMACHINE_H
++#endif
+diff --git a/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt b/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
+new file mode 100644
+index 000000000000..8bb9b25edd23
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
+@@ -0,0 +1,10 @@
++add_llvm_component_library(LLVMDADAODisassembler
++  DADAODisassembler.cpp
++
++  LINK_COMPONENTS
++  MCDisassembler
++  Support
++
++  ADD_TO_COMPONENT
++  DADAO
++)
+diff --git a/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp b/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
+new file mode 100644
+index 000000000000..3220fd99d201
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
+@@ -0,0 +1,106 @@
++//===- DADAODisassembler.cpp - Disassembler for DADAO -----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is part of the DADAO Disassembler.
++//
++//===----------------------------------------------------------------------===//
++
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "TargetInfo/DADAOTargetInfo.h"
++#include "llvm/MC/MCDecoder.h"
++#include "llvm/MC/MCDecoderOps.h"
++#include "llvm/MC/MCDisassembler/MCDisassembler.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/Compiler.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/Endian.h"
++#include "llvm/Support/MathExtras.h"
++
++#define DEBUG_TYPE "dadao-disassembler"
++
++using namespace llvm;
++using namespace llvm::MCD;
++
++typedef MCDisassembler::DecodeStatus DecodeStatus;
++
++class DADAODisassembler : public MCDisassembler {
++public:
++  DADAODisassembler(const MCSubtargetInfo &STI, MCContext &Ctx)
++      : MCDisassembler(STI, Ctx) {}
++
++  DecodeStatus getInstruction(MCInst &Instr, uint64_t &Size,
++                              ArrayRef<uint8_t> Bytes, uint64_t Address,
++                              raw_ostream &CStream) const override;
++};
++
++static DecodeStatus DecodeGPRDRegisterClass(MCInst &Inst, unsigned RegNo,
++                                             uint64_t /*Address*/,
++                                             const MCDisassembler * /*Decoder*/) {
++  if (RegNo > 63)
++    return MCDisassembler::Fail;
++  Inst.addOperand(MCOperand::createReg(DADAO::RD0 + RegNo));
++  return MCDisassembler::Success;
++}
++
++static DecodeStatus DecodeGPRBRegisterClass(MCInst &Inst, unsigned RegNo,
++                                             uint64_t /*Address*/,
++                                             const MCDisassembler * /*Decoder*/) {
++  if (RegNo > 63)
++    return MCDisassembler::Fail;
++  Inst.addOperand(MCOperand::createReg(DADAO::RB0 + RegNo));
++  return MCDisassembler::Success;
++}
++
++static DecodeStatus decodeS12Imm(MCInst &Inst, unsigned Imm,
++                                  uint64_t /*Address*/,
++                                  const MCDisassembler * /*Decoder*/) {
++  Inst.addOperand(MCOperand::createImm(SignExtend64<12>(Imm)));
++  return MCDisassembler::Success;
++}
++
++static DecodeStatus decodeS18Imm(MCInst &Inst, unsigned Imm,
++                                  uint64_t /*Address*/,
++                                  const MCDisassembler * /*Decoder*/) {
++  Inst.addOperand(MCOperand::createImm(SignExtend64<18>(Imm)));
++  return MCDisassembler::Success;
++}
++
++static DecodeStatus decodeS24Imm(MCInst &Inst, unsigned Imm,
++                                  uint64_t /*Address*/,
++                                  const MCDisassembler * /*Decoder*/) {
++  Inst.addOperand(MCOperand::createImm(SignExtend64<24>(Imm)));
++  return MCDisassembler::Success;
++}
++
++#include "DADAOGenDisassemblerTables.inc"
++
++DecodeStatus DADAODisassembler::getInstruction(
++    MCInst &Instr, uint64_t &Size, ArrayRef<uint8_t> Bytes,
++    uint64_t Address, raw_ostream &CStream) const {
++  if (Bytes.size() < 4) {
++    Size = 0;
++    return MCDisassembler::Fail;
++  }
++  uint32_t Insn = support::endian::read32be(Bytes.data());
++  Size = 4;
++
++  return decodeInstruction(DecoderTableDADAO32, Instr, Insn, Address, this, STI);
++}
++
++static MCDisassembler *createDADAODisassembler(const Target &T,
++                                                const MCSubtargetInfo &STI,
++                                                MCContext &Ctx) {
++  return new DADAODisassembler(STI, Ctx);
++}
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeDADAODisassembler() {
++  TargetRegistry::RegisterMCDisassembler(getTheDADAOTarget(),
++                                          createDADAODisassembler);
++}
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt b/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
+index 7d73a99b2c75..07c4d6a06237 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
+@@ -2,6 +2,7 @@ add_llvm_component_library(LLVMDADAODesc
+   DADAOInstPrinter.cpp
+   DADAOMCCodeEmitter.cpp
+   DADAOMCTargetDesc.cpp
++  DADAOAsmBackend.cpp
+   DADAOAsmInfo.cpp
+   DADAOELFObjectWriter.cpp
+ 
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index 8a4dcc0ce4ec..5ad470cd53c3 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -56,6 +56,25 @@ public:
+       return;
+     }
+ 
++    if (Kind == DADAO::fixup_dadao_rela_page) {
++      int64_t Target = static_cast<int64_t>(Value);
++      int64_t Page = Target & ~0xFFFULL;
++      int64_t Imm18 = Page >> 12;
++      uint32_t Mask = 0x3FFFF;
++      uint32_t Enc = (Imm18 & Mask) | (support::endian::read32be(Data) & ~Mask);
++      support::endian::write32be(Data, Enc);
++      return;
++    }
++
++    if (Kind == DADAO::fixup_dadao_rela_lo) {
++      int64_t Target = static_cast<int64_t>(Value);
++      int64_t Lo = Target & 0xFFF;
++      uint32_t Mask = 0xFFF;
++      uint32_t Enc = (Lo & Mask) | (support::endian::read32be(Data) & ~Mask);
++      support::endian::write32be(Data, Enc);
++      return;
++    }
++
+     if (IsResolved)
+       support::endian::write32be(Data + Offset,
+                                   static_cast<uint32_t>(Value) & 0xFFFFFFFF);
+@@ -93,6 +112,14 @@ public:
+       Info.Flags = 0;
+       return Info;
+     }
++    if (Kind == DADAO::fixup_dadao_rela_page) {
++      MCFixupKindInfo Info;
++      Info.Name = "fixup_dadao_rela_page";
++      Info.TargetOffset = 0;
++      Info.TargetSize = 18;
++      Info.Flags = 0;
++      return Info;
++    }
+     llvm_unreachable("Unknown fixup kind");
+   }
+ 
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.cpp
+index 802de00dab25..bce989e3de5c 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmInfo.cpp
+@@ -21,4 +21,5 @@ DADAOAsmInfo::DADAOAsmInfo(const Triple & /*TheTriple*/,
+                            const MCTargetOptions &Options) {
+   IsLittleEndian = false;
+   CommentString = "#";
++  ExceptionsType = ExceptionHandling::DwarfCFI;
+ }
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+index 54a656c9dac6..fad8c490b15c 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+@@ -38,6 +38,8 @@ protected:
+       return unsigned(DADAO::R_DADAO_BRANCH18);
+     case DADAO::fixup_dadao_branch12:
+       return unsigned(DADAO::R_DADAO_BRANCH12);
++    case DADAO::fixup_dadao_rela_page:
++      return unsigned(DADAO::R_DADAO_RELA_PAGE);
+     }
+   }
+ 
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+index 1fb58c72060d..294a665ed1ed 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+@@ -135,6 +135,8 @@ unsigned DADAOMCCodeEmitter::getMachineOpValue(
+     MCFixupKind Kind;
+     if (Opcode == DADAO::CALL_IIII || Opcode == DADAO::JUMP_IIII)
+       Kind = MCFixupKind(DADAO::fixup_dadao_call24);
++    else if (Opcode == DADAO::RELA_RIII)
++      Kind = MCFixupKind(DADAO::fixup_dadao_rela_page);
+     else if (Opcode == DADAO::BRN_RIII || Opcode == DADAO::BRNN_RIII ||
+              Opcode == DADAO::BRZ_RIII || Opcode == DADAO::BRNZ_RIII ||
+              Opcode == DADAO::BRP_RIII || Opcode == DADAO::BRNP_RIII)
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
+index 0ffe732e9426..a539ec1eec40 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp
+@@ -22,15 +22,26 @@
+ #include "llvm/Support/Compiler.h"
+ #include "llvm/TargetParser/Triple.h"
+ 
++#define GET_REGINFO_MC_DESC
++#include "DADAOGenRegisterInfo.inc"
++
++#define GET_INSTRINFO_MC_DESC
++#include "DADAOGenInstrInfo.inc"
++
++#define GET_SUBTARGETINFO_MC_DESC
++#include "DADAOGenSubtargetInfo.inc"
++
+ using namespace llvm;
+ 
+ static MCInstrInfo *createDADAOMCInstrInfo() {
+   MCInstrInfo *X = new MCInstrInfo();
++  InitDADAOMCInstrInfo(X);
+   return X;
+ }
+ 
+ static MCRegisterInfo *createDADAOMCRegisterInfo(const Triple & /*TT*/) {
+   MCRegisterInfo *X = new MCRegisterInfo();
++  InitDADAOMCRegisterInfo(X, DADAO::RA0, 0, 0, 0);
+   return X;
+ }
+ 
+@@ -68,4 +79,7 @@ LLVMInitializeDADAOTargetMC() {
+ 
+   TargetRegistry::RegisterMCCodeEmitter(getTheDADAOTarget(),
+                                         createDADAOMCCodeEmitter);
++
++  TargetRegistry::RegisterMCAsmBackend(getTheDADAOTarget(),
++                                       createDADAOAsmBackend);
+ }
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+index c57b26420b01..ee1b78e55913 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+@@ -34,6 +34,8 @@ enum Fixups {
+   fixup_dadao_call24 = FirstTargetFixupKind,
+   fixup_dadao_branch18,
+   fixup_dadao_branch12,
++  fixup_dadao_rela_page,
++  fixup_dadao_rela_lo,
+   LastTargetFixupKind,
+   NumTargetFixupKinds = LastTargetFixupKind - FirstTargetFixupKind
+ };
+@@ -44,6 +46,7 @@ enum {
+   R_DADAO_CALL24 = 1,
+   R_DADAO_BRANCH18 = 2,
+   R_DADAO_BRANCH12 = 3,
++  R_DADAO_RELA_PAGE = 4,
+   R_DADAO_NUM,
+ };
+ } // namespace DADAO
+-- 
+2.43.0
+

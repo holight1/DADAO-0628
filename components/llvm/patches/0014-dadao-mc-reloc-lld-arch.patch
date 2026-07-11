@@ -1,0 +1,275 @@
+From 35eb110a1daeac29a42d444ab635a88396a3b5e9 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 20:50:00 +0800
+Subject: [PATCH 14/15] target/dadao: MC reloc emit (maybeAddReloc) + DADAO lld
+ Arch + EM_DADAO (DL-061c)
+
+---
+ lld/ELF/Arch/DADAO.cpp                        | 138 ++++++++++++++++++
+ lld/ELF/CMakeLists.txt                        |   1 +
+ lld/ELF/Target.cpp                            |   2 +
+ llvm/include/llvm/BinaryFormat/ELF.h          |   1 +
+ .../DADAO/MCTargetDesc/DADAOAsmBackend.cpp    |  17 ++-
+ .../DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp |  22 +++
+ 6 files changed, 178 insertions(+), 3 deletions(-)
+ create mode 100644 lld/ELF/Arch/DADAO.cpp
+
+diff --git a/lld/ELF/Arch/DADAO.cpp b/lld/ELF/Arch/DADAO.cpp
+new file mode 100644
+index 000000000000..dc9c5095ebc6
+--- /dev/null
++++ b/lld/ELF/Arch/DADAO.cpp
+@@ -0,0 +1,138 @@
++//===- lld/ELF/Arch/DADAO.cpp - DADAO ELF Linker Target ----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "InputFiles.h"
++#include "Symbols.h"
++#include "SyntheticSections.h"
++#include "Target.h"
++#include "llvm/BinaryFormat/ELF.h"
++#include "llvm/Support/Endian.h"
++#include "llvm/Support/LEB128.h"
++
++using namespace llvm;
++using namespace llvm::object;
++using namespace llvm::ELF;
++using namespace llvm::support::endian;
++using namespace lld;
++using namespace lld::elf;
++
++namespace {
++
++enum {
++  R_DADAO_32 = 0,
++  R_DADAO_CALL24 = 1,
++  R_DADAO_BRANCH18 = 2,
++  R_DADAO_BRANCH12 = 3,
++  R_DADAO_RELA_PAGE = 4,
++  R_DADAO_RELA_LO = 5,
++  R_DADAO_NUM = 6,
++};
++
++class DADAO final : public TargetInfo {
++public:
++  DADAO(Ctx &ctx);
++  RelExpr getRelExpr(RelType type, const Symbol &s,
++                     const uint8_t *loc) const override;
++  void relocate(uint8_t *loc, const Relocation &rel,
++                uint64_t val) const override;
++};
++
++} // namespace
++
++DADAO::DADAO(Ctx &ctx) : TargetInfo(ctx) {
++  copyRel = R_DADAO_32;
++  gotRel = R_DADAO_32;
++  pltRel = R_DADAO_32;
++  relativeRel = R_DADAO_32;
++  symbolicRel = R_DADAO_32;
++
++  pltHeaderSize = 0;
++  pltEntrySize = 0;
++  ipltEntrySize = 0;
++
++  defaultMaxPageSize = 4096;
++  defaultCommonPageSize = 4096;
++}
++
++RelExpr DADAO::getRelExpr(RelType type, const Symbol &s,
++                          const uint8_t *loc) const {
++  switch (type) {
++  case R_DADAO_32:
++    return R_ABS;
++  case R_DADAO_CALL24:
++  case R_DADAO_BRANCH18:
++  case R_DADAO_BRANCH12:
++  case R_DADAO_RELA_PAGE:
++  case R_DADAO_RELA_LO:
++    return R_PC;
++  default:
++    Err(ctx) << getErrorLoc(loc) << "unknown relocation: " << type;
++    return R_NONE;
++  }
++}
++
++void DADAO::relocate(uint8_t *loc, const Relocation &rel,
++                     uint64_t val) const {
++  switch (rel.type) {
++  case R_DADAO_32:
++    write32be(loc, static_cast<uint32_t>(val));
++    return;
++
++  case R_DADAO_CALL24: {
++    int64_t imm = (static_cast<int64_t>(val) - 4) >> 2;
++    checkInt(ctx, loc, imm, 24, rel);
++    uint32_t mask = 0xFFFFFF;
++    uint32_t insn = read32be(loc);
++    write32be(loc, (insn & ~mask) | (static_cast<uint32_t>(imm) & mask));
++    return;
++  }
++
++  case R_DADAO_BRANCH18: {
++    int64_t imm = (static_cast<int64_t>(val) - 4) >> 2;
++    checkInt(ctx, loc, imm, 18, rel);
++    uint32_t mask = 0x3FFFF;
++    uint32_t insn = read32be(loc);
++    write32be(loc, (insn & ~mask) | (static_cast<uint32_t>(imm) & mask));
++    return;
++  }
++
++  case R_DADAO_BRANCH12: {
++    int64_t imm = (static_cast<int64_t>(val) - 4) >> 2;
++    checkInt(ctx, loc, imm, 12, rel);
++    uint32_t mask = 0xFFF;
++    uint32_t insn = read32be(loc);
++    write32be(loc, (insn & ~mask) | (static_cast<uint32_t>(imm) & mask));
++    return;
++  }
++
++  case R_DADAO_RELA_PAGE: {
++    int64_t page = (static_cast<int64_t>(val) + 0x800) >> 12;
++    checkInt(ctx, loc, page, 18, rel);
++    uint32_t mask = 0x3FFFF;
++    uint32_t insn = read32be(loc);
++    write32be(loc, (insn & ~mask) | (static_cast<uint32_t>(page) & mask));
++    return;
++  }
++
++  case R_DADAO_RELA_LO: {
++    int64_t lo = static_cast<int64_t>(val) & 0xFFF;
++    uint32_t mask = 0xFFF;
++    uint32_t insn = read32be(loc);
++    write32be(loc, (insn & ~mask) | (static_cast<uint32_t>(lo) & mask));
++    return;
++  }
++
++  default:
++    Err(ctx) << getErrorLoc(loc) << "unrecognized relocation " << rel.type;
++  }
++}
++
++TargetInfo *elf::getDADAOTargetInfo(Ctx &ctx) {
++  static DADAO t(ctx);
++  return &t;
++}
+diff --git a/lld/ELF/CMakeLists.txt b/lld/ELF/CMakeLists.txt
+index e22897c2789d..32c67597a6c5 100644
+--- a/lld/ELF/CMakeLists.txt
++++ b/lld/ELF/CMakeLists.txt
+@@ -32,6 +32,7 @@ add_lld_library(lldELF
+   Arch/PPC.cpp
+   Arch/PPC64.cpp
+   Arch/RISCV.cpp
++  Arch/DADAO.cpp
+   Arch/SPARCV9.cpp
+   Arch/SystemZ.cpp
+   Arch/X86.cpp
+diff --git a/lld/ELF/Target.cpp b/lld/ELF/Target.cpp
+index 3fc3e3f16e9e..791555bdfdb0 100644
+--- a/lld/ELF/Target.cpp
++++ b/lld/ELF/Target.cpp
+@@ -86,6 +86,8 @@ void elf::setTarget(Ctx &ctx) {
+     return setPPC64TargetInfo(ctx);
+   case EM_RISCV:
+     return setRISCVTargetInfo(ctx);
++  case EM_DADAO:
++    return getDADAOTargetInfo(ctx);
+   case EM_SPARCV9:
+     return setSPARCV9TargetInfo(ctx);
+   case EM_S390:
+diff --git a/llvm/include/llvm/BinaryFormat/ELF.h b/llvm/include/llvm/BinaryFormat/ELF.h
+index bfcf5dab4772..d4689ac27459 100644
+--- a/llvm/include/llvm/BinaryFormat/ELF.h
++++ b/llvm/include/llvm/BinaryFormat/ELF.h
+@@ -325,6 +325,7 @@ enum {
+   EM_VE = 251,            // NEC SX-Aurora VE
+   EM_CSKY = 252,          // C-SKY 32-bit processor
+   EM_LOONGARCH = 258,     // LoongArch
++  EM_DADAO = 3488,        // DADAO SimRISC (0x0DA0)
+ };
+ 
+ // Object file classes.
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index 5ad470cd53c3..ccd6f0ca4a43 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -57,9 +57,15 @@ public:
+     }
+ 
+     if (Kind == DADAO::fixup_dadao_rela_page) {
+-      int64_t Target = static_cast<int64_t>(Value);
+-      int64_t Page = Target & ~0xFFFULL;
+-      int64_t Imm18 = Page >> 12;
++      if (!IsResolved) {
++        Value = 0;
++        maybeAddReloc(F, Fixup, Target, Value, IsResolved);
++        return;
++      }
++      int64_t Target = static_cast<int64_t>(Value) + Fixup.getOffset() + 4;
++      int64_t Aligned = Target & ~0xFFFULL;
++      int64_t Imm = static_cast<int64_t>(Aligned) - static_cast<int64_t>(Fixup.getOffset() + 4);
++      int64_t Imm18 = Imm >> 12;
+       uint32_t Mask = 0x3FFFF;
+       uint32_t Enc = (Imm18 & Mask) | (support::endian::read32be(Data) & ~Mask);
+       support::endian::write32be(Data, Enc);
+@@ -67,6 +73,11 @@ public:
+     }
+ 
+     if (Kind == DADAO::fixup_dadao_rela_lo) {
++      if (!IsResolved) {
++        Value = 0;
++        maybeAddReloc(F, Fixup, Target, Value, IsResolved);
++        return;
++      }
+       int64_t Target = static_cast<int64_t>(Value);
+       int64_t Lo = Target & 0xFFF;
+       uint32_t Mask = 0xFFF;
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+index 294a665ed1ed..34fabc90f4df 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+@@ -61,6 +61,10 @@ public:
+   unsigned getImm12OpValue(const MCInst &MI, unsigned OpNo,
+                             SmallVectorImpl<MCFixup> &Fixups,
+                             const MCSubtargetInfo &STI) const;
++
++  unsigned getRelaOpValue(const MCInst &MI, unsigned OpNo,
++                           SmallVectorImpl<MCFixup> &Fixups,
++                           const MCSubtargetInfo &STI) const;
+ };
+ 
+ void DADAOMCCodeEmitter::encodeInstruction(
+@@ -122,6 +126,24 @@ unsigned DADAOMCCodeEmitter::getImm12OpValue(
+   return 0;
+ }
+ 
++unsigned DADAOMCCodeEmitter::getRelaOpValue(
++    const MCInst &MI, unsigned OpNo,
++    SmallVectorImpl<MCFixup> &Fixups,
++    const MCSubtargetInfo &STI) const {
++  const MCOperand &MO = MI.getOperand(OpNo);
++  if (MO.isImm())
++    return static_cast<unsigned>(MO.getImm());
++
++  const MCExpr *Expr = MO.isExpr() ? MO.getExpr() : nullptr;
++  if (!Expr)
++    llvm_unreachable("getRelaOpValue expects expression or immediate");
++
++  MCFixup Fixup = MCFixup::create(0, Expr,
++                                   MCFixupKind(DADAO::fixup_dadao_rela_page));
++  Fixups.push_back(Fixup);
++  return 0;
++}
++
+ unsigned DADAOMCCodeEmitter::getMachineOpValue(
+     const MCInst &MI, const MCOperand &MO,
+     SmallVectorImpl<MCFixup> &Fixups,
+-- 
+2.43.0
+

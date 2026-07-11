@@ -10,3 +10,6 @@
 0010-dadao-shift-mul.patch
 0011-dadao-div-rem.patch
 0012-dadao-wyde-const.patch
+0013-dadao-globals-lowering.patch
+0014-dadao-mc-reloc-lld-arch.patch
+0015-dadao-globals-lld-rework.patch
