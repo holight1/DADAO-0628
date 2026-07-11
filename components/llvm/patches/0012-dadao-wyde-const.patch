@@ -1,0 +1,91 @@
+From 3331d3340ffafb63efdbd0c6b4775658a30f6e0a Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 19:44:04 +0800
+Subject: [PATCH] target/dadao: large constant materialization via setzw+orw
+ wyde sequence (DL-061a)
+
+---
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp | 18 +++++++++++++----
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp    | 22 +++++++++++++++++++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td     |  3 +++
+ 3 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index 781f50d438c8..f59d301ca419 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -43,10 +43,20 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+   if (Opc == ISD::Constant) {
+     ConstantSDNode *C = cast<ConstantSDNode>(Node);
+     int64_t Val = C->getSExtValue();
+-    SDNode *New = CurDAG->getMachineNode(DADAO::ADDI_RRII, SDLoc(Node),
+-                                          MVT::i64,
+-                                          {CurDAG->getRegister(DADAO::RD0, MVT::i64),
+-                                           CurDAG->getTargetConstant(Val, SDLoc(Node), MVT::i64)});
++    SDLoc DL(Node);
++
++    if (Val >= -2048 && Val <= 2047) {
++      SDNode *New = CurDAG->getMachineNode(DADAO::ADDI_RRII, DL,
++                                            MVT::i64,
++                                            {CurDAG->getRegister(DADAO::RD0, MVT::i64),
++                                             CurDAG->getTargetConstant(Val, DL, MVT::i64)});
++      ReplaceNode(Node, New);
++      return;
++    }
++
++    // Large constant — defer to CONST_WYDE pseudo → setzw + orw in expander
++    SDNode *New = CurDAG->getMachineNode(DADAO::CONST_WYDE, DL, MVT::i64,
++                                          CurDAG->getTargetConstant(Val, DL, MVT::i64));
+     ReplaceNode(Node, New);
+     return;
+   }
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index 568124b21271..91ae9d1b8ae7 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -143,6 +143,28 @@ bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+     MI.eraseFromParent();
+     return true;
+   }
++  case DADAO::CONST_WYDE: {
++    Register Dst = MI.getOperand(0).getReg();
++    int64_t Val = MI.getOperand(1).getImm();
++    uint64_t UVal = static_cast<uint64_t>(Val);
++    bool First = true;
++
++    for (int w = 0; w < 4; w++) {
++      uint16_t Wyde = static_cast<uint16_t>((UVal >> (w * 16)) & 0xFFFF);
++      if (Wyde == 0)
++        continue;
++      if (First) {
++        BuildMI(MBB, MI, DL, get(DADAO::SETZW_RWII), Dst)
++            .addImm(w).addImm(Wyde);
++        First = false;
++      } else {
++        BuildMI(MBB, MI, DL, get(DADAO::ORW_RWII), Dst)
++            .addImm(w).addImm(Wyde);
++      }
++    }
++    MI.eraseFromParent();
++    return true;
++  }
+   case DADAO::RET_PSEUDO: {
+     BuildMI(MBB, MI, DL, get(DADAO::RET_RIII))
+         .addReg(DADAO::RD0) // rdha = rd0 (value already in $rd31)
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index a8361e7e4ef5..48ec2ee71ec0 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -117,6 +117,9 @@ def STO_FI : DADAOPseudo<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12, i64
+ // FrameIndex→GPRB materialization pseudo (eliminateFrameIndex resolves)
+ def ADDI_RB_FI : DADAOPseudo<(outs GPRB:$rbha), (ins GPRB:$rbhb, i64imm:$fi), []>;
+ 
++// Large constant materialization via setzw + orw wyde sequence
++def CONST_WYDE : DADAOPseudo<(outs GPRD:$dst), (ins i64imm:$val), []>;
++
+ //===----------------------------------------------------------------------===//
+ // MISC-Norm (op=0x10)
+ //===----------------------------------------------------------------------===//
+-- 
+2.43.0
+
