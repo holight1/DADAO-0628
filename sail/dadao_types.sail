@@ -34,8 +34,8 @@ function fault_code(k : fault_kind) -> bits(8) =
     F_ILLI   => 0x82,
     F_MALIGN => 0x81,
     F_UNDI   => 0x83,
-    F_RASOF  => 0x82,   /* RAS overflow surfaces as ILLI-class in M1 harness */
-    F_RASUF  => 0x82    /* RAS underflow surfaces as ILLI-class in M1 harness */
+    F_RASOF  => 0x84,
+    F_RASUF  => 0x85
   }
 
 /* Control outcome of executing one instruction. */
