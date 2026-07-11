@@ -1,0 +1,116 @@
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 16d35af..e6e84e1 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -30,3 +30,57 @@ void helper_exit(CPUDADAOState *env, uint64_t code)
+     cs->exception_index = EXCP_EXIT;
+     cpu_loop_exit(cs);
+ }
++
++void helper_ras_push(CPUDADAOState *env, uint64_t ret_addr)
++{
++    assert((ret_addr & 0xFFFF000000000000ULL) == 0);
++    uint64_t entry = (1ULL << 48) | (ret_addr & 0x0000FFFFFFFFFFFFULL);
++
++    if (env->ra[63] == 0) {
++        env->ra[63] = entry;
++        return;
++    }
++
++    if ((env->ra[63] & 0x0000FFFFFFFFFFFFULL) == (ret_addr & 0x0000FFFFFFFFFFFFULL)) {
++        uint64_t ref = (env->ra[63] >> 48) & 0xFFFF;
++        if (ref < 0xFFFF) {
++            env->ra[63] = ((ref + 1) << 48) | (ret_addr & 0x0000FFFFFFFFFFFFULL);
++            return;
++        }
++    }
++
++    if (env->ra[1] != 0) {
++        dadao_raise_exception(env, 0x87, 0);
++        return;
++    }
++
++    for (int i = 1; i < 63; i++) {
++        env->ra[i] = env->ra[i + 1];
++    }
++    env->ra[63] = entry;
++}
++
++uint64_t helper_ras_pop(CPUDADAOState *env)
++{
++    uint64_t top = env->ra[63];
++    uint64_t ref = (top >> 48) & 0xFFFF;
++
++    if (ref == 0) {
++        dadao_raise_exception(env, 0x86, 0);
++        return 0;
++    }
++
++    if (ref > 1) {
++        env->ra[63] = ((ref - 1) << 48) | (top & 0x0000FFFFFFFFFFFFULL);
++        return top & 0x0000FFFFFFFFFFFFULL;
++    }
++
++    uint64_t ret_addr = top & 0x0000FFFFFFFFFFFFULL;
++
++    for (int i = 63; i > 1; i--) {
++        env->ra[i] = env->ra[i - 1];
++    }
++    env->ra[1] = 0;
++
++    return ret_addr;
++}
+diff --git a/target/dadao/helper.h b/target/dadao/helper.h
+index aaed336..7358422 100644
+--- a/target/dadao/helper.h
++++ b/target/dadao/helper.h
+@@ -1,2 +1,4 @@
+ DEF_HELPER_2(raise_exception, noreturn, env, i32)
+ DEF_HELPER_2(exit, noreturn, env, i64)
++DEF_HELPER_2(ras_push, void, env, i64)
++DEF_HELPER_1(ras_pop, i64, env)
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 9754014..42d5421 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -740,8 +740,8 @@ static bool trans_jump_r(DisasContext *ctx, arg_jump_r *a)
+ 
+ static bool trans_call_i(DisasContext *ctx, arg_call_i *a)
+ {
+-    /* push return address: ra[63] = PC+4 */
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, ra[63]));
++    TCGv_i64 ret_addr = tcg_constant_i64(ctx->base.pc_next + 4);
++    gen_helper_ras_push(tcg_env, ret_addr);
+     uint64_t target = (ctx->base.pc_next + 4) + (int64_t)a->imm24 * 4;
+     tcg_gen_st_i64(tcg_constant_i64(target), tcg_env, offsetof(CPUDADAOState, pc));
+     ctx->base.is_jmp = DISAS_JUMP;
+@@ -750,8 +750,8 @@ static bool trans_call_i(DisasContext *ctx, arg_call_i *a)
+ 
+ static bool trans_call_r(DisasContext *ctx, arg_call_r *a)
+ {
+-    /* push return address: ra[63] = PC+4 */
+-    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env, offsetof(CPUDADAOState, ra[63]));
++    TCGv_i64 ret_addr = tcg_constant_i64(ctx->base.pc_next + 4);
++    gen_helper_ras_push(tcg_env, ret_addr);
+     TCGv_i64 base = tcg_temp_new_i64();
+     tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->ha]));
+     tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
+@@ -769,13 +769,12 @@ static bool trans_call_r(DisasContext *ctx, arg_call_r *a)
+ 
+ static bool trans_ret(DisasContext *ctx, arg_ret *a)
+ {
+-    /* PC = ra[63] */
+-    TCGv_i64 ra = tcg_temp_new_i64();
+-    tcg_gen_ld_i64(ra, tcg_env, offsetof(CPUDADAOState, ra[63]));
+-    tcg_gen_st_i64(ra, tcg_env, offsetof(CPUDADAOState, pc));
+-    /* rd[ha] = imm18 (sign-extended) */
++    TCGv_i64 ret_addr = tcg_temp_new_i64();
++    gen_helper_ras_pop(ret_addr, tcg_env);
++    tcg_gen_st_i64(ret_addr, tcg_env, offsetof(CPUDADAOState, pc));
+     if (a->ha != 0) {
+-        tcg_gen_st_i64(tcg_constant_i64(a->imm18), tcg_env, offsetof(CPUDADAOState, rd[a->ha]));
++        tcg_gen_st_i64(tcg_constant_i64(a->imm18), tcg_env,
++                        offsetof(CPUDADAOState, rd[a->ha]));
+     }
+     ctx->base.is_jmp = DISAS_JUMP;
+     return true;
