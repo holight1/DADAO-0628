@@ -196,7 +196,7 @@
 
 - id: codegen-cmp-commutative-mismark
   title: "DADAOInstrInfo.td 的 DADAOISD::CMP SDNode 标了 [SDNPCommutative]，但 cmps 非交换（sign(a-b)≠sign(b-a)）——语义错误注解。DL-058a subagent 自标 + 架构师激进探针（有序比较+常量/两非常量、正反定义序 9 例）证实【当前不触发误编译】（LowerBR_CC 下降时分支谓词与 cmps 操作数序烘死配对，post-lowering 无实际交换）。属潜在 landmine（未来 combiner/LLVM 版本变更可能交换 commutative 自定义节点）。→ DL-058b 去掉误标 + 加无符号比较时一并回归验证。"
-  status: open
+  status: closed
   scope: [M1]
-  blocks: [DL-058b]
-  resolved_by: null
+  blocks: null
+  resolved_by: DL-058b（去掉误标 + 架构师判别性探针验证有符号无回归）

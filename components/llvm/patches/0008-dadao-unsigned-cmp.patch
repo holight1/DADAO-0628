@@ -1,0 +1,79 @@
+From cb661466dcaad6d2050fef033c81e99e54f91564 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 15:54:40 +0800
+Subject: [PATCH] target/dadao: unsigned compare ISel + remove CMP
+ commutativity mislabel (DL-058b)
+
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp | 16 ++++++++++++++++
+ llvm/lib/Target/DADAO/DADAOISelLowering.h   |  1 +
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td     |  7 ++++++-
+ 3 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 2faeab078020..5da43f9f5a7e 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -248,6 +248,22 @@ SDValue DADAOTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
+     SDValue Cmp = DAG.getNode(DADAOISD::CMP, DL, MVT::i64, LHS, RHS);
+     return DAG.getNode(DADAOISD::BRNN, DL, MVT::Other, Chain, Cmp, Dest);
+   }
++  case ISD::SETULT: {
++    SDValue Cmp = DAG.getNode(DADAOISD::CMPU, DL, MVT::i64, LHS, RHS);
++    return DAG.getNode(DADAOISD::BRN, DL, MVT::Other, Chain, Cmp, Dest);
++  }
++  case ISD::SETULE: {
++    SDValue Cmp = DAG.getNode(DADAOISD::CMPU, DL, MVT::i64, LHS, RHS);
++    return DAG.getNode(DADAOISD::BRNP, DL, MVT::Other, Chain, Cmp, Dest);
++  }
++  case ISD::SETUGT: {
++    SDValue Cmp = DAG.getNode(DADAOISD::CMPU, DL, MVT::i64, LHS, RHS);
++    return DAG.getNode(DADAOISD::BRP, DL, MVT::Other, Chain, Cmp, Dest);
++  }
++  case ISD::SETUGE: {
++    SDValue Cmp = DAG.getNode(DADAOISD::CMPU, DL, MVT::i64, LHS, RHS);
++    return DAG.getNode(DADAOISD::BRNN, DL, MVT::Other, Chain, Cmp, Dest);
++  }
+   }
+   return SDValue();
+ }
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index 04f6c21bdc55..734d45f3cf11 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -20,6 +20,7 @@ enum NodeType {
+   BRP,    // (chain, val, dest) — brp   branch if val>0  (positive)
+   BRNP,   // (chain, val, dest) — brnp  branch if val<=0 (non-positive)
+   CMP,    // (lhs, rhs) → i64  cmps result (−1/0/1)
++  CMPU,   // (lhs, rhs) → i64  cmpu result (−1/0/1)
+ };
+ } // namespace DADAOISD
+ 
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 6ea5e385cb0a..ee01ff6df67c 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -68,7 +68,8 @@ def DADAOBrn  : SDNode<"DADAOISD::BRN",  SDT_DADAOBr1, [SDNPHasChain]>;
+ def DADAOBrnn : SDNode<"DADAOISD::BRNN", SDT_DADAOBr1, [SDNPHasChain]>;
+ def DADAOBrp  : SDNode<"DADAOISD::BRP",  SDT_DADAOBr1, [SDNPHasChain]>;
+ def DADAOBrnp : SDNode<"DADAOISD::BRNP", SDT_DADAOBr1, [SDNPHasChain]>;
+-def DADAOCmp  : SDNode<"DADAOISD::CMP",  SDTIntBinOp, [SDNPCommutative]>;
++def DADAOCmp  : SDNode<"DADAOISD::CMP",  SDTIntBinOp>;
++def DADAOCmpU : SDNode<"DADAOISD::CMPU", SDTIntBinOp>;
+ 
+ // Minimal CodeGen-only pseudos (spike scaffold, throwaway).
+ // These bring GPRD-typed i64 add/return down to MIR so finalize-isel can
+@@ -265,6 +266,10 @@ def : Pat<(DADAOBrne GPRD:$lhs, GPRD:$rhs, bb:$target),
+ def : Pat<(DADAOCmp GPRD:$lhs, GPRD:$rhs),
+           (CMPS_ORRR GPRD:$lhs, GPRD:$rhs)>;
+ 
++// cmpu (unsigned compare) — maps CMPU node to CMPU_ORRR
++def : Pat<(DADAOCmpU GPRD:$lhs, GPRD:$rhs),
++          (CMPU_ORRR GPRD:$lhs, GPRD:$rhs)>;
++
+ // Single-register conditional branches (on cmps result: -1/0/1)
+ def : Pat<(DADAOBrn  GPRD:$val, bb:$target), (BRN_RIII  GPRD:$val, bb:$target)>;
+ def : Pat<(DADAOBrnn GPRD:$val, bb:$target), (BRNN_RIII GPRD:$val, bb:$target)>;
+-- 
+2.43.0
+

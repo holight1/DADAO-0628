@@ -5,3 +5,4 @@
 0005-dadao-asmparser.patch
 0006-dadao-disassembler.patch
 0007-dadao-control-flow.patch
+0008-dadao-unsigned-cmp.patch
