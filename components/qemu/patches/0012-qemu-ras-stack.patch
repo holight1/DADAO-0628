@@ -1,5 +1,35 @@
+From 21cfb18d3232855125260b65ee159631cb8286cd Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 14:39:56 +0800
+Subject: [PATCH] target/dadao: RAS stack overflow/underflow exception handling
+ (RASOF=0x84/RASUF=0x85)
+
+---
+ target/dadao/cpu.c       |  6 +++++
+ target/dadao/helper.c    | 54 ++++++++++++++++++++++++++++++++++++++++
+ target/dadao/helper.h    |  2 ++
+ target/dadao/translate.c | 19 +++++++-------
+ 4 files changed, 71 insertions(+), 10 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 013c9f9..15d8e0a 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -117,6 +117,12 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+     case EXCP_UNDI:
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x83);
+         break;
++    case 0x84: /* RASOF — RAS overflow */
++        qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x84);
++        break;
++    case 0x85: /* RASUF — RAS underflow */
++        qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x85);
++        break;
+     default:
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
+         break;
 diff --git a/target/dadao/helper.c b/target/dadao/helper.c
-index 16d35af..e6e84e1 100644
+index 16d35af..07aa7a3 100644
 --- a/target/dadao/helper.c
 +++ b/target/dadao/helper.c
 @@ -30,3 +30,57 @@ void helper_exit(CPUDADAOState *env, uint64_t code)
@@ -26,7 +56,7 @@ index 16d35af..e6e84e1 100644
 +    }
 +
 +    if (env->ra[1] != 0) {
-+        dadao_raise_exception(env, 0x87, 0);
++        dadao_raise_exception(env, 0x84, 0);
 +        return;
 +    }
 +
@@ -42,7 +72,7 @@ index 16d35af..e6e84e1 100644
 +    uint64_t ref = (top >> 48) & 0xFFFF;
 +
 +    if (ref == 0) {
-+        dadao_raise_exception(env, 0x86, 0);
++        dadao_raise_exception(env, 0x85, 0);
 +        return 0;
 +    }
 +
@@ -114,3 +144,6 @@ index 9754014..42d5421 100644
      }
      ctx->base.is_jmp = DISAS_JUMP;
      return true;
+-- 
+2.43.0
+

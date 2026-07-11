@@ -124,11 +124,11 @@
   resolved_by: DL-042b
 
 - id: RASUF-cold-ret
-  title: "冷 RegRAS（ra0 低48位=0）ret 单指令语义 = RASUF（spec §5.6），但 QEMU 落到 halt→ILLI，疑 RASUF 未实现。建议 M3 legality 矩阵覆盖 RASOF/RASUF。→ DL-057a ground-truth 复跑【确认仍坏】：QEMU 冷 ret 实测 0x82(ILLI)，非 0x85；helper_ras_pop 的 RASUF(0x85)分支在冷 bare-ret 上到不了（DL-056c 只修了非冷嵌套 call/ret）。DL-057b 修：冷 ret→RASUF(0x85)。"
-  status: open
+  title: "冷 RegRAS（ra0 低48位=0）ret 单指令语义 = RASUF（spec §5.6），但 QEMU 落到 halt→ILLI，疑 RASUF 未实现。建议 M3 legality 矩阵覆盖 RASOF/RASUF。→ DL-057a ground-truth 复跑【确认仍坏】：QEMU 冷 ret 实测 0x82(ILLI)，非 0x85；helper_ras_pop 的 RASUF(0x85)分支在冷 bare-ret 上到不了（DL-056c 只修了非冷嵌套 call/ret）。→ DL-057b【已修】：根因=helper 抛 exception_index=0x85 但 cpu.c do_interrupt 无对应 case→落 default→0x82；补 case 0x84/0x85 路由到 shutdown code。架构师双后端独立复跑：冷 ret QEMU=gem5=133(0x85) ✓。"
+  status: closed
   scope: [M1]
-  blocks: [DL-057b]
-  resolved_by: null
+  blocks: null
+  resolved_by: DL-057b
 
 - id: opcodes-store-legality
   title: "opcodes.yaml 中 stb/stw/stt/sto/stm* 的 legality 为空，但 spec §2.6.1/§3.2 要求 store-from-rd0(rdha=rd0)→ILLI。编码契约不完备，建议回填。"
@@ -186,8 +186,8 @@
   resolved_by: DL-056c（QEMU 补完整 RegRAS 栈 helper，spec §5.6；patch 0012）
 
 - id: rasof-rasuf-exit-code-unpinned
-  title: "RASOF/RASUF 退出码从未 pin（ADR-0004 当年定了 ILLI/MALIGN/UNDI 漏了 RAS）→ 四方各拍：QEMU 0x87/0x86、gem5 0x84/0x85、Sail 0x82(归 ILLI 类)、interp 命名未映射码、harness FAULT_CODES 无。故障类型来自 wiki §5.6，退出码数字是我们的测试机约定(spec 无码号)。→ 架构师 pin RASOF=0x84/RASUF=0x85(ADR-0004 §D5 扩展，连续于 0x81-0x83)。DL-057a【部分】：ADR/issues/3 runner FAULT_CODES/gem5 faults.hh/Sail 源码 = 0x84/0x85 落地；嵌套 call E2E 入 lit(双后端 42)。DL-057a【打回】：单指令 RASOF/RASUF 向量令 DIVERGE 0→2(interp build_state 不加载 ra、QEMU 冷 ret 仍 0x82)、patch 0012 未重生成(仍 0x86/0x87)——向量已撤回复 DIVERGE=0，QEMU 行为对齐留 DL-057b(E2E 测 RASUF/RASOF)。"
-  status: open
+  title: "RASOF/RASUF 退出码从未 pin（ADR-0004 当年定了 ILLI/MALIGN/UNDI 漏了 RAS）→ 四方各拍：QEMU 0x87/0x86、gem5 0x84/0x85、Sail 0x82(归 ILLI 类)、interp 命名未映射码、harness FAULT_CODES 无。故障类型来自 wiki §5.6，退出码数字是我们的测试机约定(spec 无码号)。→ 架构师 pin RASOF=0x84/RASUF=0x85(ADR-0004 §D5 扩展，连续于 0x81-0x83)。DL-057a【部分】：ADR/issues/3 runner FAULT_CODES/gem5 faults.hh/Sail 源码 = 0x84/0x85 落地；嵌套 call E2E 入 lit(双后端 42)。DL-057a【打回】：单指令 RASOF/RASUF 向量令 DIVERGE 0→2(interp build_state 不加载 ra、QEMU 冷 ret 仍 0x82)、patch 0012 未重生成(仍 0x86/0x87)——向量已撤回复 DIVERGE=0，QEMU 行为对齐留 DL-057b(E2E 测 RASUF/RASOF)。→ DL-057b【已修】：修 QEMU do_interrupt 补 case 0x84/0x85、patch 0012 重生成(无 0x86/0x87)、RASOF/RASUF 改用双后端 E2E(rasuf_cold=bare ret 冷栈、rasof_overflow=64 层嵌套溢出)。架构师独立复跑：QEMU+gem5 各 RASUF=133/RASOF=132，DIVERGE=0/AGREE(4-way)=198/lit 6/6。四方码号一致落地。"
+  status: closed
   scope: [M1]
-  blocks: [DL-057b]
-  resolved_by: null
+  blocks: null
+  resolved_by: DL-057b
