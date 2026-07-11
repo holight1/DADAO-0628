@@ -1,0 +1,1325 @@
+From e99cb0d2f275434f780858300b974f9b281d163c Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 15:32:34 +0800
+Subject: [PATCH] =?UTF-8?q?target/dadao:=20conditional=20control=20flow=20?=
+ =?UTF-8?q?=E2=80=94=20branch=20ISel=20+=20MC=20fixups=20(DL-058a)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp     |  85 ++++++
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   | 276 ++++++++++++++++++
+ llvm/lib/Target/DADAO/DADAOISelLowering.h     |  57 ++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp      | 141 +++++++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       | 210 ++++++++++---
+ .../DADAO/MCTargetDesc/DADAOAsmBackend.cpp    | 119 ++++++++
+ .../MCTargetDesc/DADAOELFObjectWriter.cpp     |  19 +-
+ .../DADAO/MCTargetDesc/DADAOInstPrinter.cpp   |  10 +-
+ .../DADAO/MCTargetDesc/DADAOInstPrinter.h     |   2 +
+ .../DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp | 137 +++++++--
+ .../DADAO/MCTargetDesc/DADAOMCTargetDesc.h    |  20 ++
+ 11 files changed, 994 insertions(+), 82 deletions(-)
+ create mode 100644 llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+ create mode 100644 llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+ create mode 100644 llvm/lib/Target/DADAO/DADAOISelLowering.h
+ create mode 100644 llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+ create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+
+diff --git a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+new file mode 100644
+index 000000000000..de11e9f077ce
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+@@ -0,0 +1,85 @@
++//===-- DADAOAsmPrinter.cpp - DADAO LLVM assembly writer -------------------===//
++#include "DADAO.h"
++#include "MCTargetDesc/DADAOInstPrinter.h"
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "TargetInfo/DADAOTargetInfo.h"
++#include "llvm/CodeGen/AsmPrinter.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCStreamer.h"
++#include "llvm/MC/TargetRegistry.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "asm-printer"
++
++namespace {
++
++class DADAOAsmPrinter : public AsmPrinter {
++public:
++  explicit DADAOAsmPrinter(TargetMachine &TM,
++                            std::unique_ptr<MCStreamer> Streamer)
++      : AsmPrinter(TM, std::move(Streamer)) {}
++
++  StringRef getPassName() const override { return "DADAO Assembly Printer"; }
++
++  bool runOnMachineFunction(MachineFunction &MF) override {
++    SetupMachineFunction(MF);
++    emitFunctionBody();
++    return false;
++  }
++
++  void emitInstruction(const MachineInstr *MI) override {
++    if (MI->isCFIInstruction())
++      return;
++    MCInst TmpInst;
++    lowerToMCInst(MI, TmpInst);
++    EmitToStreamer(*OutStreamer, TmpInst);
++  }
++
++private:
++  void lowerToMCInst(const MachineInstr *MI, MCInst &OutMI) {
++    OutMI.setOpcode(MI->getOpcode());
++
++    for (unsigned i = 0, e = MI->getNumOperands(); i != e; ++i) {
++      const MachineOperand &MO = MI->getOperand(i);
++
++      MCOperand MCOp;
++      switch (MO.getType()) {
++      default:
++        MI->print(errs());
++        llvm_unreachable("lowerToMCInst: unknown operand type");
++      case MachineOperand::MO_RegisterMask:
++        continue;
++      case MachineOperand::MO_MachineBasicBlock: {
++        MCOp = MCOperand::createExpr(
++            MCSymbolRefExpr::create(MO.getMBB()->getSymbol(), OutContext));
++        break;
++      }
++      case MachineOperand::MO_Register:
++        if (MO.isImplicit())
++          continue;
++        MCOp = MCOperand::createReg(MO.getReg());
++        break;
++      case MachineOperand::MO_Immediate:
++        MCOp = MCOperand::createImm(MO.getImm());
++        break;
++      case MachineOperand::MO_GlobalAddress:
++        MCOp = MCOperand::createExpr(
++            MCSymbolRefExpr::create(
++                getSymbol(MO.getGlobal()), OutContext));
++        break;
++      }
++      OutMI.addOperand(MCOp);
++    }
++  }
++};
++
++} // end anonymous namespace
++
++extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void
++LLVMInitializeDADAOAsmPrinter() {
++  RegisterAsmPrinter<DADAOAsmPrinter> X(getTheDADAOTarget());
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+new file mode 100644
+index 000000000000..2faeab078020
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -0,0 +1,276 @@
++//===-- DADAOISelLowering.cpp - DADAO DAG Lowering Implementation ---------===//
++#include "DADAOISelLowering.h"
++#include "DADAOSubtarget.h"
++#include "DADAOTargetMachine.h"
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "llvm/CodeGen/CallingConvLower.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/SelectionDAG.h"
++#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
++#include "llvm/IR/Function.h"
++#include "llvm/Support/ErrorHandling.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "dadao-lower"
++
++#include "DADAOGenCallingConv.inc"
++
++DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
++                                         const DADAOSubtarget &STI)
++    : TargetLowering(TM, STI) {
++  addRegisterClass(MVT::i64, &DADAO::GPRDRegClass);
++
++  setOperationAction(ISD::ADD, MVT::i64, Legal);
++  setOperationAction(ISD::SUB, MVT::i64, Legal);
++
++  setOperationAction(ISD::BR_CC, MVT::Other, Custom);
++  setTargetDAGCombine(ISD::BR_CC);
++  setTargetDAGCombine(ISD::BRCOND);
++  setOperationAction(ISD::SELECT_CC, MVT::i64, Expand);
++  setOperationAction(ISD::GlobalAddress, MVT::i64, Expand);
++
++  setMaxAtomicSizeInBitsSupported(0);
++
++  computeRegisterProperties(STI.getRegisterInfo());
++}
++
++static DADAOISD::NodeType getDADAOCallOp(SDValue Callee) {
++  if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee))
++    if (G->getGlobal()->isDeclaration() || G->getGlobal()->hasExternalLinkage())
++      return DADAOISD::CALL;
++  return DADAOISD::CALL;
++}
++
++SDValue DADAOTargetLowering::LowerCall(
++    TargetLowering::CallLoweringInfo &CLI,
++    SmallVectorImpl<SDValue> &InVals) const {
++  SelectionDAG &DAG = CLI.DAG;
++  SDLoc DL = CLI.DL;
++  SmallVectorImpl<ISD::OutputArg> &Outs = CLI.Outs;
++  SmallVectorImpl<SDValue> &OutVals = CLI.OutVals;
++  SmallVectorImpl<ISD::InputArg> &Ins = CLI.Ins;
++  SDValue Chain = CLI.Chain;
++  SDValue Callee = CLI.Callee;
++  CallingConv::ID CallConv = CLI.CallConv;
++  bool IsVarArg = CLI.IsVarArg;
++
++  MachineFunction &MF = DAG.getMachineFunction();
++
++  SmallVector<CCValAssign, 16> ArgLocs;
++  CCState CCInfo(CallConv, IsVarArg, MF, ArgLocs, *DAG.getContext());
++  CCInfo.AnalyzeCallOperands(Outs, CC_DADAO);
++
++  unsigned NumBytes = CCInfo.getStackSize();
++
++  Chain = DAG.getCALLSEQ_START(Chain, NumBytes, 0, DL);
++
++  SmallVector<SDValue, 16> MemOpChains;
++  SmallVector<std::pair<unsigned, SDValue>, 16> RegsToPass;
++
++  for (unsigned i = 0; i < ArgLocs.size(); ++i) {
++    CCValAssign &VA = ArgLocs[i];
++    SDValue Arg = OutVals[i];
++
++    if (VA.isRegLoc()) {
++      RegsToPass.push_back({VA.getLocReg(), Arg});
++    } else {
++      assert(VA.isMemLoc() && "Argument must be register or memory");
++      unsigned LocMemOffset = VA.getLocMemOffset();
++      SDValue PtrOff = DAG.getIntPtrConstant(
++          LocMemOffset, DL);
++      SDValue DstAddr = DAG.getNode(ISD::ADD, DL, MVT::i64,
++                                     DAG.getRegister(DADAO::RB1, MVT::i64),
++                                     PtrOff);
++      SDValue Store = DAG.getStore(Chain, DL, Arg, DstAddr,
++                                    MachinePointerInfo::getStack(MF, LocMemOffset));
++      MemOpChains.push_back(Store);
++    }
++  }
++
++  if (!MemOpChains.empty())
++    Chain = DAG.getNode(ISD::TokenFactor, DL, MVT::Other, MemOpChains);
++
++  SDValue ArgGlue;
++  for (auto &Reg : RegsToPass) {
++    Chain = DAG.getCopyToReg(Chain, DL, Reg.first, Reg.second, ArgGlue);
++    ArgGlue = Chain.getValue(1);
++  }
++
++  if (GlobalAddressSDNode *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
++    Callee = DAG.getTargetGlobalAddress(G->getGlobal(), DL, MVT::i64);
++  }
++
++  SDVTList NodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
++  SmallVector<SDValue, 4> CallOps;
++  CallOps.push_back(Chain);
++  CallOps.push_back(Callee);
++  if (ArgGlue.getNode())
++    CallOps.push_back(ArgGlue);
++  Chain = DAG.getNode(getDADAOCallOp(Callee), DL, NodeTys, CallOps);
++  SDValue Glue = Chain.getValue(1);
++
++  Chain = DAG.getCALLSEQ_END(Chain, DAG.getIntPtrConstant(NumBytes, DL, true),
++                              DAG.getIntPtrConstant(0, DL, true), Glue, DL);
++  Glue = Chain.getValue(1);
++
++  SmallVector<CCValAssign, 16> RVLocs;
++  CCState RVInfo(CallConv, IsVarArg, MF, RVLocs, *DAG.getContext());
++  RVInfo.AnalyzeCallResult(Ins, RetCC_DADAO);
++
++  SmallVector<SDValue, 4> RetVals;
++  for (unsigned i = 0; i < RVLocs.size(); ++i) {
++    CCValAssign &VA = RVLocs[i];
++    assert(VA.isRegLoc() && "Return values must be in registers");
++    SDValue Copy = DAG.getCopyFromReg(Chain, DL, VA.getLocReg(),
++                                       VA.getLocVT(), Glue);
++    Chain = Copy.getValue(1);
++    InVals.push_back(Copy.getValue(0));
++  }
++
++  return Chain;
++}
++
++SDValue DADAOTargetLowering::LowerFormalArguments(
++    SDValue Chain, CallingConv::ID CallConv, bool IsVarArg,
++    const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
++    SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals) const {
++  MachineFunction &MF = DAG.getMachineFunction();
++  MachineRegisterInfo &RegInfo = MF.getRegInfo();
++  const Function &F = MF.getFunction();
++
++  SmallVector<CCValAssign, 16> ArgLocs;
++  CCState CCInfo(CallConv, IsVarArg, MF, ArgLocs, *DAG.getContext());
++  CCInfo.AnalyzeFormalArguments(Ins, CC_DADAO);
++
++  for (unsigned i = 0; i < ArgLocs.size(); ++i) {
++    CCValAssign &VA = ArgLocs[i];
++    if (VA.isRegLoc()) {
++      EVT RegVT = VA.getLocVT();
++      const TargetRegisterClass *RC = &DADAO::GPRDRegClass;
++      if (i < F.arg_size() && F.getArg(i)->getType()->isPointerTy())
++        RC = &DADAO::GPRBRegClass;
++      Register VReg = RegInfo.createVirtualRegister(RC);
++      RegInfo.addLiveIn(VA.getLocReg(), VReg);
++      SDValue Arg = DAG.getCopyFromReg(Chain, DL, VReg, RegVT);
++      InVals.push_back(Arg);
++    } else {
++      assert(VA.isMemLoc() && "Argument must be register or memory");
++      unsigned Offset = VA.getLocMemOffset();
++      MachineFrameInfo &MFI = MF.getFrameInfo();
++      int FI = MFI.CreateFixedObject(8, Offset, true);
++      SDValue FIN = DAG.getFrameIndex(FI, MVT::i64);
++      InVals.push_back(
++          DAG.getLoad(VA.getValVT(), DL, Chain, FIN,
++                      MachinePointerInfo::getFixedStack(MF, FI)));
++    }
++  }
++  return Chain;
++}
++
++SDValue DADAOTargetLowering::LowerReturn(
++    SDValue Chain, CallingConv::ID CallConv, bool IsVarArg,
++    const SmallVectorImpl<ISD::OutputArg> &Outs,
++    const SmallVectorImpl<SDValue> &OutVals, const SDLoc &DL,
++    SelectionDAG &DAG) const {
++  SmallVector<CCValAssign, 16> RVLocs;
++  CCState CCInfo(CallConv, IsVarArg, DAG.getMachineFunction(), RVLocs,
++                 *DAG.getContext());
++  CCInfo.AnalyzeReturn(Outs, RetCC_DADAO);
++
++  SDValue Glue;
++  SmallVector<SDValue, 4> RetOps(1, Chain);
++
++  for (unsigned i = 0; i < RVLocs.size(); ++i) {
++    CCValAssign &VA = RVLocs[i];
++    assert(VA.isRegLoc() && "Can only return in registers");
++    Chain = DAG.getCopyToReg(Chain, DL, VA.getLocReg(), OutVals[i], Glue);
++    Glue = Chain.getValue(1);
++    RetOps.push_back(DAG.getRegister(VA.getLocReg(), VA.getLocVT()));
++  }
++
++  if (Glue.getNode())
++    RetOps.push_back(Glue);
++  return DAG.getNode(DADAOISD::RET_GLUE, DL, MVT::Other, RetOps);
++}
++
++SDValue DADAOTargetLowering::LowerOperation(SDValue Op,
++                                            SelectionDAG &DAG) const {
++  switch (Op.getOpcode()) {
++  case ISD::BR_CC:
++    return LowerBR_CC(Op, DAG);
++  default:
++    break;
++  }
++  return SDValue();
++}
++
++SDValue DADAOTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
++  SDValue Chain = Op.getOperand(0);
++  ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(1))->get();
++  SDValue LHS = Op.getOperand(2);
++  SDValue RHS = Op.getOperand(3);
++  SDValue Dest = Op.getOperand(4);
++  SDLoc DL(Op);
++
++  auto IsZero = [](SDValue V) {
++    if (auto *C = dyn_cast<ConstantSDNode>(V))
++      return C->isZero();
++    return false;
++  };
++
++  switch (CC) {
++  default:
++    break;
++  case ISD::SETEQ:
++    if (IsZero(RHS))
++      return DAG.getNode(DADAOISD::BRZ, DL, MVT::Other, Chain, LHS, Dest);
++    return DAG.getNode(DADAOISD::BREQ, DL, MVT::Other, Chain, LHS, RHS, Dest);
++  case ISD::SETNE:
++    if (IsZero(RHS))
++      return DAG.getNode(DADAOISD::BRNZ, DL, MVT::Other, Chain, LHS, Dest);
++    return DAG.getNode(DADAOISD::BRNE, DL, MVT::Other, Chain, LHS, RHS, Dest);
++  case ISD::SETLT: {
++    SDValue Cmp = DAG.getNode(DADAOISD::CMP, DL, MVT::i64, LHS, RHS);
++    return DAG.getNode(DADAOISD::BRN, DL, MVT::Other, Chain, Cmp, Dest);
++  }
++  case ISD::SETLE: {
++    SDValue Cmp = DAG.getNode(DADAOISD::CMP, DL, MVT::i64, LHS, RHS);
++    return DAG.getNode(DADAOISD::BRNP, DL, MVT::Other, Chain, Cmp, Dest);
++  }
++  case ISD::SETGT: {
++    SDValue Cmp = DAG.getNode(DADAOISD::CMP, DL, MVT::i64, LHS, RHS);
++    return DAG.getNode(DADAOISD::BRP, DL, MVT::Other, Chain, Cmp, Dest);
++  }
++  case ISD::SETGE: {
++    SDValue Cmp = DAG.getNode(DADAOISD::CMP, DL, MVT::i64, LHS, RHS);
++    return DAG.getNode(DADAOISD::BRNN, DL, MVT::Other, Chain, Cmp, Dest);
++  }
++  }
++  return SDValue();
++}
++
++SDValue DADAOTargetLowering::PerformDAGCombine(SDNode *N,
++                                                DAGCombinerInfo &DCI) const {
++  SelectionDAG &DAG = DCI.DAG;
++  SDLoc DL(N);
++  switch (N->getOpcode()) {
++  case ISD::BRCOND: {
++    SDValue Cond = N->getOperand(1);
++    if (auto *C = dyn_cast<ConstantSDNode>(Cond)) {
++      if (C->isZero()) {
++        DCI.CombineTo(N, N->getOperand(0));
++        return SDValue(N, 0);
++      }
++    }
++    break;
++  }
++  case ISD::BR_CC:
++    return LowerBR_CC(SDValue(N, 0), DAG);
++  default:
++    break;
++  }
++  return SDValue();
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+new file mode 100644
+index 000000000000..04f6c21bdc55
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -0,0 +1,57 @@
++//===-- DADAOISelLowering.h - DADAO DAG Lowering Interface ------*- C++ -*-===//
++#ifndef LLVM_LIB_TARGET_DADAO_DADAOISELLOWERING_H
++#define LLVM_LIB_TARGET_DADAO_DADAOISELLOWERING_H
++
++#include "llvm/CodeGen/TargetLowering.h"
++
++namespace llvm {
++
++namespace DADAOISD {
++enum NodeType {
++  FIRST_NUMBER = ISD::BUILTIN_OP_END,
++  RET_GLUE,
++  CALL,
++  BREQ,   // (chain, lhs, rhs, dest) — breq  two-reg compare-equal branch
++  BRNE,   // (chain, lhs, rhs, dest) — brne  two-reg compare-not-equal branch
++  BRZ,    // (chain, val, dest) — brz   branch if val==0
++  BRNZ,   // (chain, val, dest) — brnz  branch if val!=0
++  BRN,    // (chain, val, dest) — brn   branch if val<0  (negative)
++  BRNN,   // (chain, val, dest) — brnn  branch if val>=0 (non-negative)
++  BRP,    // (chain, val, dest) — brp   branch if val>0  (positive)
++  BRNP,   // (chain, val, dest) — brnp  branch if val<=0 (non-positive)
++  CMP,    // (lhs, rhs) → i64  cmps result (−1/0/1)
++};
++} // namespace DADAOISD
++
++class DADAOSubtarget;
++class DADAOTargetMachine;
++
++class DADAOTargetLowering : public TargetLowering {
++public:
++  explicit DADAOTargetLowering(const TargetMachine &TM,
++                               const DADAOSubtarget &STI);
++
++  SDValue LowerFormalArguments(SDValue Chain, CallingConv::ID CallConv,
++                               bool IsVarArg,
++                               const SmallVectorImpl<ISD::InputArg> &Ins,
++                               const SDLoc &DL, SelectionDAG &DAG,
++                               SmallVectorImpl<SDValue> &InVals) const override;
++
++  SDValue LowerReturn(SDValue Chain, CallingConv::ID CallConv, bool IsVarArg,
++                      const SmallVectorImpl<ISD::OutputArg> &Outs,
++                      const SmallVectorImpl<SDValue> &OutVals,
++                      const SDLoc &DL, SelectionDAG &DAG) const override;
++
++  SDValue LowerCall(TargetLowering::CallLoweringInfo &CLI,
++                    SmallVectorImpl<SDValue> &InVals) const override;
++
++  SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
++
++  SDValue PerformDAGCombine(SDNode *N, DAGCombinerInfo &DCI) const override;
++
++private:
++  SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
++};
++
++} // namespace llvm
++#endif
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+new file mode 100644
+index 000000000000..9ded0d0cb3df
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -0,0 +1,141 @@
++//===-- DADAOInstrInfo.cpp - DADAO Instruction Information ----------------===//
++#include "DADAOInstrInfo.h"
++#include "DADAOSubtarget.h"
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineMemOperand.h"
++
++using namespace llvm;
++
++#define GET_INSTRINFO_CTOR_DTOR
++#include "DADAOGenInstrInfo.inc"
++
++DADAOInstrInfo::DADAOInstrInfo(const DADAOSubtarget &STI)
++    : DADAOGenInstrInfo(STI, RI, /*CFSetup=*/0, /*CFDestroy=*/0,
++                        /*CatchRet=*/0, /*ReturnOpcode=*/0) {}
++
++void DADAOInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
++                                  MachineBasicBlock::iterator MBBI,
++                                  const DebugLoc &DL, Register DstReg,
++                                  Register SrcReg, bool KillSrc,
++                                  bool RenamableDest,
++                                  bool RenamableSrc) const {
++  if (DADAO::GPRBRegClass.contains(DstReg) &&
++      DADAO::GPRDRegClass.contains(SrcReg)) {
++    BuildMI(MBB, MBBI, DL, get(DADAO::RD2RB_ORRI), DstReg)
++        .addReg(SrcReg, getKillRegState(KillSrc))
++        .addImm(1);
++    return;
++  }
++  if (DADAO::GPRDRegClass.contains(DstReg) &&
++      DADAO::GPRBRegClass.contains(SrcReg)) {
++    BuildMI(MBB, MBBI, DL, get(DADAO::RB2RD_ORRI), DstReg)
++        .addReg(SrcReg, getKillRegState(KillSrc))
++        .addImm(1);
++    return;
++  }
++  if (DADAO::GPRDRegClass.contains(DstReg) &&
++      DADAO::GPRDRegClass.contains(SrcReg)) {
++    BuildMI(MBB, MBBI, DL, get(DADAO::ADDI_RRII), DstReg)
++        .addReg(SrcReg, getKillRegState(KillSrc))
++        .addImm(0);
++    return;
++  }
++  if (DADAO::GPRBRegClass.contains(DstReg) &&
++      DADAO::GPRBRegClass.contains(SrcReg)) {
++    BuildMI(MBB, MBBI, DL, get(DADAO::ADDI_RBRRII), DstReg)
++        .addReg(SrcReg, getKillRegState(KillSrc))
++        .addImm(0);
++    return;
++  }
++  llvm_unreachable("copyPhysReg: unsupported register class pair");
++}
++
++bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
++  MachineBasicBlock &MBB = *MI.getParent();
++  DebugLoc DL = MI.getDebugLoc();
++
++  switch (MI.getOpcode()) {
++  case DADAO::ADD_PSEUDO: {
++    Register Dst = MI.getOperand(0).getReg();
++    Register Src1 = MI.getOperand(1).getReg();
++    Register Src2 = MI.getOperand(2).getReg();
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, MI, DL, get(DADAO::ADD_RRRR))
++            .addReg(DADAO::RD0) // rdha = rd0 (discard high)
++            .addReg(Dst)        // rdhb = dst
++            .addReg(Src1)       // rdhc = src1
++            .addReg(Src2);      // rdhd = src2
++    MI.eraseFromParent();
++    return true;
++  }
++  case DADAO::SUB_PSEUDO: {
++    Register Dst = MI.getOperand(0).getReg();
++    Register Src1 = MI.getOperand(1).getReg();
++    Register Src2 = MI.getOperand(2).getReg();
++    BuildMI(MBB, MI, DL, get(DADAO::SUB_RRRR))
++        .addReg(DADAO::RD0) // rdha = rd0 (discard high)
++        .addReg(Dst)        // rdhb = dst
++        .addReg(Src1)       // rdhc = src1
++        .addReg(Src2);      // rdhd = src2
++    MI.eraseFromParent();
++    return true;
++  }
++  case DADAO::RET_PSEUDO: {
++    BuildMI(MBB, MI, DL, get(DADAO::RET_RIII))
++        .addReg(DADAO::RD0) // rdha = rd0 (value already in $rd31)
++        .addImm(0);          // imm18 = 0
++    MI.eraseFromParent();
++    return true;
++  }
++  }
++  return false;
++}
++
++void DADAOInstrInfo::storeRegToStackSlot(
++    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI, Register SrcReg,
++    bool IsKill, int FrameIndex, const TargetRegisterClass *RC, Register VReg,
++    MachineInstr::MIFlag Flags) const {
++  DebugLoc DL = MBB.findDebugLoc(MBBI);
++  MachineFunction &MF = *MBB.getParent();
++  MachineFrameInfo &MFI = MF.getFrameInfo();
++  MachineMemOperand *MMO = MF.getMachineMemOperand(
++      MachinePointerInfo::getFixedStack(MF, FrameIndex),
++      MachineMemOperand::MOStore, MFI.getObjectSize(FrameIndex),
++      Align(8));
++  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass) {
++    BuildMI(MBB, MBBI, DL, get(DADAO::STO_FI))
++        .addReg(SrcReg, getKillRegState(IsKill))
++        .addReg(DADAO::RB1)
++        .addImm(0)
++        .addFrameIndex(FrameIndex)
++        .addMemOperand(MMO);
++  } else {
++    llvm_unreachable("storeRegToStackSlot: unsupported register class");
++  }
++}
++
++void DADAOInstrInfo::loadRegFromStackSlot(
++    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI, Register DstReg,
++    int FrameIndex, const TargetRegisterClass *RC, Register VReg,
++    unsigned SubReg, MachineInstr::MIFlag Flags) const {
++  DebugLoc DL = MBB.findDebugLoc(MBBI);
++  MachineFunction &MF = *MBB.getParent();
++  MachineFrameInfo &MFI = MF.getFrameInfo();
++  MachineMemOperand *MMO = MF.getMachineMemOperand(
++      MachinePointerInfo::getFixedStack(MF, FrameIndex),
++      MachineMemOperand::MOLoad, MFI.getObjectSize(FrameIndex),
++      Align(8));
++  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass) {
++    BuildMI(MBB, MBBI, DL, get(DADAO::LDO_FI))
++        .addDef(DstReg)
++        .addReg(DADAO::RB1)
++        .addImm(0)
++        .addFrameIndex(FrameIndex)
++        .addMemOperand(MMO);
++  } else {
++    llvm_unreachable("loadRegFromStackSlot: unsupported register class");
++  }
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index db600d7a70d9..6ea5e385cb0a 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -9,21 +9,105 @@
+ include "DADAOInstrFormats.td"
+ 
+ // Immediate operand types
+-def imms12 : Operand<i64>;
++def imms12 : Operand<i64> {
++  let DecoderMethod = "decodeS12Imm";
++}
+ def immu12 : Operand<i64>;
+-def imms18 : Operand<i64>;
++def imms18 : Operand<i64> {
++  let DecoderMethod = "decodeS18Imm";
++}
+ def immu16 : Operand<i64>;
+ def immu6  : Operand<i64>;
+-def imms24 : Operand<i64>;
++def imms24 : Operand<i64> {
++  let DecoderMethod = "decodeS24Imm";
++  let EncoderMethod = "getImm24OpValue";
++}
+ def wydepos : Operand<i64>;
+ 
++def brtarget24 : Operand<OtherVT> {
++  let EncoderMethod = "getImm24OpValue";
++  let DecoderMethod = "decodeS24Imm";
++  let OperandType = "OPERAND_PCREL";
++}
++def brtarget18 : Operand<OtherVT> {
++  let EncoderMethod = "getImm18OpValue";
++  let DecoderMethod = "decodeS18Imm";
++  let OperandType = "OPERAND_PCREL";
++}
++def brtarget12 : Operand<OtherVT> {
++  let EncoderMethod = "getImm12OpValue";
++  let DecoderMethod = "decodeS12Imm";
++  let OperandType = "OPERAND_PCREL";
++}
++
++//===----------------------------------------------------------------------===//
++// halt (op=0x00) — riii format, rdha=exit code, imm18=0
++//===----------------------------------------------------------------------===//
++let op = 0x00 in
++def HALT_RIII : F_RIII_RD<(outs), (ins GPRD:$rdha), "halt", []> {
++  let imm18 = 0;
++  let AsmString = "halt $rdha";
++}
++
++//===----------------------------------------------------------------------===//
++// Custom SDNodes (Phase 5 codegen)
++//===----------------------------------------------------------------------===//
++def DADAORetGlue : SDNode<"DADAOISD::RET_GLUE", SDTNone,
++                           [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
++
++def SDT_DADAOBr1 : SDTypeProfile<0, 2,
++    [SDTCisVT<0, i64>, SDTCisVT<1, OtherVT>]>;
++def SDT_DADAOBr2 : SDTypeProfile<0, 3,
++    [SDTCisVT<0, i64>, SDTCisVT<1, i64>, SDTCisVT<2, OtherVT>]>;
++
++def DADAOBreq : SDNode<"DADAOISD::BREQ", SDT_DADAOBr2, [SDNPHasChain]>;
++def DADAOBrne : SDNode<"DADAOISD::BRNE", SDT_DADAOBr2, [SDNPHasChain]>;
++def DADAOBrz  : SDNode<"DADAOISD::BRZ",  SDT_DADAOBr1, [SDNPHasChain]>;
++def DADAOBrnz : SDNode<"DADAOISD::BRNZ", SDT_DADAOBr1, [SDNPHasChain]>;
++def DADAOBrn  : SDNode<"DADAOISD::BRN",  SDT_DADAOBr1, [SDNPHasChain]>;
++def DADAOBrnn : SDNode<"DADAOISD::BRNN", SDT_DADAOBr1, [SDNPHasChain]>;
++def DADAOBrp  : SDNode<"DADAOISD::BRP",  SDT_DADAOBr1, [SDNPHasChain]>;
++def DADAOBrnp : SDNode<"DADAOISD::BRNP", SDT_DADAOBr1, [SDNPHasChain]>;
++def DADAOCmp  : SDNode<"DADAOISD::CMP",  SDTIntBinOp, [SDNPCommutative]>;
++
++// Minimal CodeGen-only pseudos (spike scaffold, throwaway).
++// These bring GPRD-typed i64 add/return down to MIR so finalize-isel can
++// answer the dual-bank survival question. The real single-vs-dual-output
++// ADD_RRRR selection and the concrete return sequence / AsmPrinter lowering
++// are deferred to Phase 5 (DL-040+); these pseudos are never expanded/emitted.
++class DADAOPseudo<dag outs, dag ins, list<dag> pattern> : Instruction {
++  let Namespace = "DADAO";
++  let OutOperandList = outs;
++  let InOperandList = ins;
++  let AsmString = "";
++  let Pattern = pattern;
++  let isPseudo = 1;
++  let isCodeGenOnly = 1;
++  let Size = 4;
++}
++
++def ADD_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
++                             [(set GPRD:$dst, (add GPRD:$a, GPRD:$b))]>;
++def SUB_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
++                             [(set GPRD:$dst, (sub GPRD:$a, GPRD:$b))]>;
++
++let isReturn = 1, isTerminator = 1, isBarrier = 1 in
++def RET_PSEUDO : DADAOPseudo<(outs), (ins), [(DADAORetGlue)]>;
++
++// FrameIndex pseudo-instructions (PEI resolves to real LDO/STO).
++// The $fi operand holds the FrameIndex index, resolved by eliminateFrameIndex.
++// $imm12 holds the GEP/add constant (0 for direct FrameIndex references).
++let mayLoad = 1 in
++def LDO_FI : DADAOPseudo<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12, i64imm:$fi), []>;
++let mayStore = 1 in
++def STO_FI : DADAOPseudo<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12, i64imm:$fi), []>;
++
+ //===----------------------------------------------------------------------===//
+ // MISC-Norm (op=0x10)
+ //===----------------------------------------------------------------------===//
++let op = 0x10 in {
+ def SWYM_OIII  : F_OIII<0x00, (outs), (ins imms18:$imm18), "swym $imm18", []>;
+ def UNIMP_OIII : F_OIII<0x3F, (outs), (ins imms18:$imm18), "unimp $imm18", []>;
+-
+-let op = 0x10 in {
+ def AND_ORRR   : F_ORRR<0x08, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "and $rdhb, $rdhc, $rdhd", []>;
+ def ORR_ORRR   : F_ORRR<0x09, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "orr $rdhb, $rdhc, $rdhd", []>;
+ def XOR_ORRR   : F_ORRR<0x0A, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "xor $rdhb, $rdhc, $rdhd", []>;
+@@ -45,27 +129,27 @@ def CMPS_ORRR  : F_ORRR<0x24, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "
+ def CMPU_ORRR  : F_ORRR<0x25, (outs GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "cmpu $rdhb, $rdhc, $rdhd", []>;
+ 
+ def RD2RD_ORRI : F_ORRI<0x28, (outs GPRD:$rdhb), (ins GPRD:$rdhc, immu6:$imm6), "rd2rd $rdhb, $rdhc, $imm6", []>;
+-def RD2RB_ORRI : F_ORRI<0x29, (outs GPRB:$rbhb), (ins GPRD:$rdhc, immu6:$imm6), "rd2rb $rbhb, $rdhc, $imm6", []>;
+-def RB2RD_ORRI : F_ORRI<0x2A, (outs GPRD:$rdhb), (ins GPRB:$rbhc, immu6:$imm6), "rb2rd $rdhb, $rbhc, $imm6", []>;
+-def RB2RB_ORRI : F_ORRI<0x2B, (outs GPRB:$rbhb), (ins GPRB:$rbhc, immu6:$imm6), "rb2rb $rbhb, $rbhc, $imm6", []>;
++def RD2RB_ORRI : F_ORRI_RD2RB<0x29, (outs GPRB:$rbhb), (ins GPRD:$rdhc, immu6:$imm6), "rd2rb $rbhb, $rdhc, $imm6", []>;
++def RB2RD_ORRI : F_ORRI_RB2RD<0x2A, (outs GPRD:$rdhb), (ins GPRB:$rbhc, immu6:$imm6), "rb2rd $rdhb, $rbhc, $imm6", []>;
++def RB2RB_ORRI : F_ORRI_RB2RB<0x2B, (outs GPRB:$rbhb), (ins GPRB:$rbhc, immu6:$imm6), "rb2rb $rbhb, $rbhc, $imm6", []>;
+ 
+-def CMPRB_ORRR : F_ORRR<0x2D, (outs GPRD:$rdhb), (ins GPRB:$rbhc, GPRB:$rbhd), "cmp $rdhb, $rbhc, $rbhd", []>;
+-def ADDRB_ORRR : F_ORRR<0x2E, (outs GPRB:$rbhb), (ins GPRB:$rbhc, GPRD:$rdhd), "add $rbhb, $rbhc, $rdhd", []>;
+-def SUBRB_ORRR : F_ORRR<0x2F, (outs GPRB:$rbhb), (ins GPRB:$rbhc, GPRD:$rdhd), "sub $rbhb, $rbhc, $rdhd", []>;
++def CMPRB_ORRR : F_ORRR_CMPRB<0x2D, (outs GPRD:$rdhb), (ins GPRB:$rbhc, GPRB:$rbhd), "cmp $rdhb, $rbhc, $rbhd", []>;
++def ADDRB_ORRR : F_ORRR_ADDRB<0x2E, (outs GPRB:$rbhb), (ins GPRB:$rbhc, GPRD:$rdhd), "add $rbhb, $rbhc, $rdhd", []>;
++def SUBRB_ORRR : F_ORRR_ADDRB<0x2F, (outs GPRB:$rbhb), (ins GPRB:$rbhc, GPRD:$rdhd), "sub $rbhb, $rbhc, $rdhd", []>;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+ // Integer arithmetic (op=0x12-0x1F)
+ //===----------------------------------------------------------------------===//
+-let op = 0x12 in def CMPS_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRD:$rdhb, imms12:$imm12), "cmps $rdha, $rdhb, $imm12", []>;
+-let op = 0x13 in def CMPU_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRD:$rdhb, immu12:$imm12), "cmpu $rdha, $rdhb, $imm12", []>;
++let op = 0x12 in def CMPS_RRII : F_RRII_RD<(outs GPRD:$rdha), (ins GPRD:$rdhb, imms12:$imm12), "cmps $rdha, $rdhb, $imm12", []>;
++let op = 0x13 in def CMPU_RRII : F_RRII_RD<(outs GPRD:$rdha), (ins GPRD:$rdhb, immu12:$imm12), "cmpu $rdha, $rdhb, $imm12", []>;
+ 
+ let op = 0x14 in def ORW_RWII   : F_RWII<(outs GPRD:$rdha), (ins wydepos:$ww, immu16:$imm16), "orw $rdha, $ww, $imm16", []>;
+ let op = 0x15 in def ANDNW_RWII  : F_RWII<(outs GPRD:$rdha), (ins wydepos:$ww, immu16:$imm16), "andnw $rdha, $ww, $imm16", []>;
+ let op = 0x16 in def SETZW_RWII  : F_RWII<(outs GPRD:$rdha), (ins wydepos:$ww, immu16:$imm16), "setzw $rdha, $ww, $imm16", []>;
+ let op = 0x17 in def SETOW_RWII  : F_RWII<(outs GPRD:$rdha), (ins wydepos:$ww, immu16:$imm16), "setow $rdha, $ww, $imm16", []>;
+ 
+-let op = 0x19 in def ADDI_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRD:$rdhb, imms12:$imm12), "addi $rdha, $rdhb, $imm12", []>;
++let op = 0x19 in def ADDI_RRII  : F_RRII_RD<(outs GPRD:$rdha), (ins GPRD:$rdhb, imms12:$imm12), "addi $rdha, $rdhb, $imm12", []>;
+ let op = 0x1A in def ADD_RRRR   : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "add $rdha, $rdhb, $rdhc, $rdhd", []>;
+ let op = 0x1B in def SUB_RRRR   : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "sub $rdha, $rdhb, $rdhc, $rdhd", []>;
+ let op = 0x1C in def MULS_RRRR  : F_RRRR<(outs GPRD:$rdha, GPRD:$rdhb), (ins GPRD:$rdhc, GPRD:$rdhd), "muls $rdha, $rdhb, $rdhc, $rdhd", []>;
+@@ -85,22 +169,25 @@ let op = 0x27 in def CSNE_RRRR : F_RRRR<(outs GPRD:$rdhc), (ins GPRD:$rdha, GPRD
+ //===----------------------------------------------------------------------===//
+ // Branch (op=0x28-0x2F)
+ //===----------------------------------------------------------------------===//
+-let op = 0x28 in def BRN_RIII  : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brn $rdha, $imm18", []>;
+-let op = 0x29 in def BRNN_RIII : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brnn $rdha, $imm18", []>;
+-let op = 0x2A in def BRZ_RIII  : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brz $rdha, $imm18", []>;
+-let op = 0x2B in def BRNZ_RIII : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brnz $rdha, $imm18", []>;
+-let op = 0x2C in def BRP_RIII  : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brp $rdha, $imm18", []>;
+-let op = 0x2D in def BRNP_RIII : F_RIII<(outs), (ins GPRD:$rdha, imms18:$imm18), "brnp $rdha, $imm18", []>;
+-let op = 0x2E in def BREQ_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRD:$rdhb, imms12:$imm12), "breq $rdha, $rdhb, $imm12", []>;
+-let op = 0x2F in def BRNE_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRD:$rdhb, imms12:$imm12), "brne $rdha, $rdhb, $imm12", []>;
++let isBranch = 1, isTerminator = 1 in {
++let op = 0x28 in def BRN_RIII  : F_RIII_RD<(outs), (ins GPRD:$rdha, brtarget18:$imm18), "brn $rdha, $imm18", []>;
++let op = 0x29 in def BRNN_RIII : F_RIII_RD<(outs), (ins GPRD:$rdha, brtarget18:$imm18), "brnn $rdha, $imm18", []>;
++let op = 0x2A in def BRZ_RIII  : F_RIII_RD<(outs), (ins GPRD:$rdha, brtarget18:$imm18), "brz $rdha, $imm18", []>;
++let op = 0x2B in def BRNZ_RIII : F_RIII_RD<(outs), (ins GPRD:$rdha, brtarget18:$imm18), "brnz $rdha, $imm18", []>;
++let op = 0x2C in def BRP_RIII  : F_RIII_RD<(outs), (ins GPRD:$rdha, brtarget18:$imm18), "brp $rdha, $imm18", []>;
++let op = 0x2D in def BRNP_RIII : F_RIII_RD<(outs), (ins GPRD:$rdha, brtarget18:$imm18), "brnp $rdha, $imm18", []>;
++let op = 0x2E in def BREQ_RRII : F_RRII_RD<(outs), (ins GPRD:$rdha, GPRD:$rdhb, brtarget12:$imm12), "breq $rdha, $rdhb, $imm12", []>;
++let op = 0x2F in def BRNE_RRII : F_RRII_RD<(outs), (ins GPRD:$rdha, GPRD:$rdhb, brtarget12:$imm12), "brne $rdha, $rdhb, $imm12", []>;
++}
+ 
+ //===----------------------------------------------------------------------===//
+ // RD load (op=0x30-0x37)
+ //===----------------------------------------------------------------------===//
+-let op = 0x30 in def LDBS_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldbs $rdha, $rbhb, $imm12", []>;
+-let op = 0x31 in def LDWS_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldws $rdha, $rbhb, $imm12", []>;
+-let op = 0x32 in def LDTS_RRII : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldts $rdha, $rbhb, $imm12", []>;
+-let op = 0x33 in def LDO_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldo $rdha, $rbhb, $imm12", []>;
++let op = 0x30 in def LDBS_RRII : F_RRII_LOAD<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldbs $rdha, $rbhb, $imm12", []>;
++let op = 0x31 in def LDWS_RRII : F_RRII_LOAD<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldws $rdha, $rbhb, $imm12", []>;
++let op = 0x32 in def LDTS_RRII : F_RRII_LOAD<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldts $rdha, $rbhb, $imm12", []>;
++let op = 0x33 in def LDO_RRII  : F_RRII_LOAD<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldo $rdha, $rbhb, $imm12", []>;
++def : Pat<(load GPRB:$rbhb), (LDO_RRII GPRB:$rbhb, 0)>;
+ 
+ let op = 0x34 in def LDMBS_RRRI : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmbs $rdha, $rbhb, $rdhc, $imm6", []>;
+ let op = 0x35 in def LDMWS_RRRI : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmws $rdha, $rbhb, $rdhc, $imm6", []>;
+@@ -110,10 +197,11 @@ let op = 0x37 in def LDMO_RRRI : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD
+ //===----------------------------------------------------------------------===//
+ // RD store (op=0x38-0x3F)
+ //===----------------------------------------------------------------------===//
+-let op = 0x38 in def STB_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stb $rdha, $rbhb, $imm12", []>;
+-let op = 0x39 in def STW_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stw $rdha, $rbhb, $imm12", []>;
+-let op = 0x3A in def STT_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stt $rdha, $rbhb, $imm12", []>;
+-let op = 0x3B in def STO_RRII : F_RRII<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "sto $rdha, $rbhb, $imm12", []>;
++let op = 0x38 in def STB_RRII : F_RRII_STORE<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stb $rdha, $rbhb, $imm12", []>;
++let op = 0x39 in def STW_RRII : F_RRII_STORE<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stw $rdha, $rbhb, $imm12", []>;
++let op = 0x3A in def STT_RRII : F_RRII_STORE<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "stt $rdha, $rbhb, $imm12", []>;
++let op = 0x3B in def STO_RRII : F_RRII_STORE<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12), "sto $rdha, $rbhb, $imm12", []>;
++def : Pat<(store GPRD:$rdha, GPRB:$rbhb), (STO_RRII GPRD:$rdha, GPRB:$rbhb, 0)>;
+ 
+ let op = 0x3C in def STMB_RRRI  : F_RRRI<(outs), (ins GPRD:$rdha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmb $rdha, $rbhb, $rdhc, $imm6", []>;
+ let op = 0x3D in def STMW_RRRI  : F_RRRI<(outs), (ins GPRD:$rdha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmw $rdha, $rbhb, $rdhc, $imm6", []>;
+@@ -123,34 +211,64 @@ let op = 0x3F in def STMO_RRRI : F_RRRI<(outs), (ins GPRD:$rdha, GPRB:$rbhb, GPR
+ //===----------------------------------------------------------------------===//
+ // RD load unsigned + RB load (op=0x40-0x47)
+ //===----------------------------------------------------------------------===//
+-let op = 0x40 in def LDBU_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldbu $rdha, $rbhb, $imm12", []>;
+-let op = 0x41 in def LDWU_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldwu $rdha, $rbhb, $imm12", []>;
+-let op = 0x42 in def LDTU_RRII  : F_RRII<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldtu $rdha, $rbhb, $imm12", []>;
+-let op = 0x43 in def LDO_RBRRII : F_RRII<(outs GPRB:$rbha), (ins GPRB:$rbhb, imms12:$imm12), "ldo $rbha, $rbhb, $imm12", []>;
++let op = 0x40 in def LDBU_RRII  : F_RRII_LOAD<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldbu $rdha, $rbhb, $imm12", []>;
++let op = 0x41 in def LDWU_RRII  : F_RRII_LOAD<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldwu $rdha, $rbhb, $imm12", []>;
++let op = 0x42 in def LDTU_RRII  : F_RRII_LOAD<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12), "ldtu $rdha, $rbhb, $imm12", []>;
++let op = 0x43 in def LDO_RBRRII : F_RRII_RB<(outs GPRB:$rbha), (ins GPRB:$rbhb, imms12:$imm12), "ldo $rbha, $rbhb, $imm12", []>;
+ 
+ let op = 0x44 in def LDMBU_RRRI  : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmbu $rdha, $rbhb, $rdhc, $imm6", []>;
+ let op = 0x45 in def LDMWU_RRRI  : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmwu $rdha, $rbhb, $rdhc, $imm6", []>;
+ let op = 0x46 in def LDMTU_RRRI  : F_RRRI<(outs GPRD:$rdha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmtu $rdha, $rbhb, $rdhc, $imm6", []>;
+-let op = 0x47 in def LDMO_RBRRRI : F_RRRI<(outs GPRB:$rbha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmo $rbha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x47 in def LDMO_RBRRRI : F_RRRI_RB<(outs GPRB:$rbha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmo $rbha, $rbhb, $rdhc, $imm6", []>;
+ 
+ //===----------------------------------------------------------------------===//
+ // RB operations (op=0x48-0x4F)
+ //===----------------------------------------------------------------------===//
+-let op = 0x48 in def RELA_RIII   : F_RIII<(outs GPRB:$rbha), (ins imms18:$imm18), "rela $rbha, $imm18", []>;
+-let op = 0x49 in def ADDI_RBRRII : F_RRII<(outs GPRB:$rbha), (ins GPRB:$rbhb, imms12:$imm12), "addi $rbha, $rbhb, $imm12", []>;
+-let op = 0x4B in def STO_RBRRII  : F_RRII<(outs), (ins GPRB:$rbha, GPRB:$rbhb, imms12:$imm12), "sto $rbha, $rbhb, $imm12", []>;
++let op = 0x48 in def RELA_RIII   : F_RIII_RB<(outs GPRB:$rbha), (ins imms18:$imm18), "rela $rbha, $imm18", []>;
++let op = 0x49 in def ADDI_RBRRII : F_RRII_RB<(outs GPRB:$rbha), (ins GPRB:$rbhb, imms12:$imm12), "addi $rbha, $rbhb, $imm12", []>;
++let op = 0x4B in def STO_RBRRII  : F_RRII_RB<(outs), (ins GPRB:$rbha, GPRB:$rbhb, imms12:$imm12), "sto $rbha, $rbhb, $imm12", []>;
+ 
+-let op = 0x4C in def ORW_RB_RWII   : F_RWII<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "orw $rbha, $ww, $imm16", []>;
+-let op = 0x4D in def ANDNW_RB_RWII : F_RWII<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "andnw $rbha, $ww, $imm16", []>;
+-let op = 0x4E in def SETZW_RB_RWII : F_RWII<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "setzw $rbha, $ww, $imm16", []>;
++let op = 0x4C in def ORW_RB_RWII   : F_RWII_RB<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "orw $rbha, $ww, $imm16", []>;
++let op = 0x4D in def ANDNW_RB_RWII : F_RWII_RB<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "andnw $rbha, $ww, $imm16", []>;
++let op = 0x4E in def SETZW_RB_RWII : F_RWII_RB<(outs GPRB:$rbha), (ins wydepos:$ww, immu16:$imm16), "setzw $rbha, $ww, $imm16", []>;
+ 
+-let op = 0x4F in def STMO_RB_RRRI : F_RRRI<(outs), (ins GPRB:$rbha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmo $rbha, $rbhb, $rdhc, $imm6", []>;
++let op = 0x4F in def STMO_RB_RRRI : F_RRRI_RB<(outs), (ins GPRB:$rbha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmo $rbha, $rbhb, $rdhc, $imm6", []>;
+ 
+ //===----------------------------------------------------------------------===//
+ // Jump / Call / Ret (op=0x64-0x6E)
+ //===----------------------------------------------------------------------===//
+-let op = 0x64 in def JUMP_IIII : F_IIII<(outs), (ins imms24:$imm24), "jump $imm24", []>;
+-let op = 0x65 in def JUMP_RRII : F_RRII<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "jump $rbha, $rdhb, $imm12", []>;
++let isBranch = 1, isTerminator = 1, isBarrier = 1 in
++let op = 0x64 in def JUMP_IIII : F_IIII<(outs), (ins brtarget24:$imm24), "jump $imm24", []>;
++let op = 0x65 in def JUMP_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "jump $rbha, $rdhb, $imm12", []>;
++let isCall = 1,
++    Defs = [RD31],
++    Uses = [RD16, RD17, RD18, RD19, RD20, RD21, RD22, RD23,
++            RD24, RD25, RD26, RD27, RD28, RD29, RD30] in
+ let op = 0x6C in def CALL_IIII : F_IIII<(outs), (ins imms24:$imm24), "call $imm24", []>;
+-let op = 0x6D in def CALL_RRII : F_RRII<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "call $rbha, $rdhb, $imm12", []>;
+-let op = 0x6E in def RET_RIII  : F_RIII<(outs GPRD:$rdha), (ins imms18:$imm18), "ret $rdha, $imm18", []>;
++let op = 0x6D in def CALL_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "call $rbha, $rdhb, $imm12", []>;
++let op = 0x6E in def RET_RIII  : F_RIII_RD<(outs GPRD:$rdha), (ins imms18:$imm18), "ret $rdha, $imm18", []>;
++
++//===----------------------------------------------------------------------===//
++// CodeGen patterns — conditional branches (spec §5.1 / §5.2)
++//===----------------------------------------------------------------------===//
++
++// Unconditional br → jump
++def : Pat<(br bb:$target), (JUMP_IIII bb:$target)>;
++
++// breq / brne — two-register direct compare-and-branch
++def : Pat<(DADAOBreq GPRD:$lhs, GPRD:$rhs, bb:$target),
++          (BREQ_RRII GPRD:$lhs, GPRD:$rhs, bb:$target)>;
++def : Pat<(DADAOBrne GPRD:$lhs, GPRD:$rhs, bb:$target),
++          (BRNE_RRII GPRD:$lhs, GPRD:$rhs, bb:$target)>;
++
++// cmps (signed compare) — maps CMP node to CMPS_ORRR
++def : Pat<(DADAOCmp GPRD:$lhs, GPRD:$rhs),
++          (CMPS_ORRR GPRD:$lhs, GPRD:$rhs)>;
++
++// Single-register conditional branches (on cmps result: -1/0/1)
++def : Pat<(DADAOBrn  GPRD:$val, bb:$target), (BRN_RIII  GPRD:$val, bb:$target)>;
++def : Pat<(DADAOBrnn GPRD:$val, bb:$target), (BRNN_RIII GPRD:$val, bb:$target)>;
++def : Pat<(DADAOBrz  GPRD:$val, bb:$target), (BRZ_RIII  GPRD:$val, bb:$target)>;
++def : Pat<(DADAOBrnz GPRD:$val, bb:$target), (BRNZ_RIII GPRD:$val, bb:$target)>;
++def : Pat<(DADAOBrp  GPRD:$val, bb:$target), (BRP_RIII  GPRD:$val, bb:$target)>;
++def : Pat<(DADAOBrnp GPRD:$val, bb:$target), (BRNP_RIII GPRD:$val, bb:$target)>;
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+new file mode 100644
+index 000000000000..8a4dcc0ce4ec
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -0,0 +1,119 @@
++//===-- DADAOAsmBackend.cpp - DADAO Assembler Backend ---------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
++#include "llvm/MC/MCAsmBackend.h"
++#include "llvm/MC/MCELFObjectWriter.h"
++#include "llvm/MC/MCFixup.h"
++#include "llvm/BinaryFormat/ELF.h"
++#include "llvm/MC/MCObjectWriter.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/Support/EndianStream.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/raw_ostream.h"
++
++using namespace llvm;
++
++namespace {
++
++class DADAOAsmBackend : public MCAsmBackend {
++public:
++  DADAOAsmBackend(const Target &T, Triple::OSType OST)
++      : MCAsmBackend(llvm::endianness::big) {}
++
++  void applyFixup(const MCFragment &F, const MCFixup &Fixup,
++                  const MCValue &Target, uint8_t *Data, uint64_t Value,
++                  bool IsResolved) override {
++    unsigned Offset = Fixup.getOffset();
++    unsigned Kind = Fixup.getKind();
++
++    if (Kind == DADAO::fixup_dadao_call24) {
++      int64_t Imm24 = (static_cast<int64_t>(Value) - 4) >> 2;
++      uint32_t Mask = 0xFFFFFF;
++      uint32_t Enc = (Imm24 & Mask) | (support::endian::read32be(Data) & ~Mask);
++      support::endian::write32be(Data, Enc);
++      return;
++    }
++
++    if (Kind == DADAO::fixup_dadao_branch18) {
++      int64_t Imm18 = (static_cast<int64_t>(Value) - 4) >> 2;
++      uint32_t Mask = 0x3FFFF;
++      uint32_t Enc = (Imm18 & Mask) | (support::endian::read32be(Data) & ~Mask);
++      support::endian::write32be(Data, Enc);
++      return;
++    }
++
++    if (Kind == DADAO::fixup_dadao_branch12) {
++      int64_t Imm12 = (static_cast<int64_t>(Value) - 4) >> 2;
++      uint32_t Mask = 0xFFF;
++      uint32_t Enc = (Imm12 & Mask) | (support::endian::read32be(Data) & ~Mask);
++      support::endian::write32be(Data, Enc);
++      return;
++    }
++
++    if (IsResolved)
++      support::endian::write32be(Data + Offset,
++                                  static_cast<uint32_t>(Value) & 0xFFFFFFFF);
++  }
++
++  std::unique_ptr<MCObjectTargetWriter>
++  createObjectTargetWriter() const override {
++    return createDADAOELFObjectWriter(ELF::ELFOSABI_NONE);
++  }
++
++  MCFixupKindInfo getFixupKindInfo(MCFixupKind Kind) const override {
++    if (Kind < FirstTargetFixupKind)
++      return MCAsmBackend::getFixupKindInfo(Kind);
++    if (Kind == DADAO::fixup_dadao_call24) {
++      MCFixupKindInfo Info;
++      Info.Name = "fixup_dadao_call24";
++      Info.TargetOffset = 0;
++      Info.TargetSize = 24;
++      Info.Flags = 0;
++      return Info;
++    }
++    if (Kind == DADAO::fixup_dadao_branch18) {
++      MCFixupKindInfo Info;
++      Info.Name = "fixup_dadao_branch18";
++      Info.TargetOffset = 0;
++      Info.TargetSize = 18;
++      Info.Flags = 0;
++      return Info;
++    }
++    if (Kind == DADAO::fixup_dadao_branch12) {
++      MCFixupKindInfo Info;
++      Info.Name = "fixup_dadao_branch12";
++      Info.TargetOffset = 0;
++      Info.TargetSize = 12;
++      Info.Flags = 0;
++      return Info;
++    }
++    llvm_unreachable("Unknown fixup kind");
++  }
++
++  bool writeNopData(raw_ostream &OS, uint64_t Count,
++                    const MCSubtargetInfo *STI) const override {
++    if ((Count % 4) != 0)
++      return false;
++    for (uint64_t i = 0; i < Count; i += 4)
++      OS.write("\x15\x00\x00\x00", 4);
++    return true;
++  }
++};
++
++} // end anonymous namespace
++
++MCAsmBackend *llvm::createDADAOAsmBackend(const Target &T,
++                                          const MCSubtargetInfo &STI,
++                                          const MCRegisterInfo &,
++                                          const MCTargetOptions &) {
++  const Triple &TT = STI.getTargetTriple();
++  if (!TT.isOSBinFormatELF())
++    llvm_unreachable("OS not supported");
++  return new DADAOAsmBackend(T, TT.getOS());
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+index 4fdf0a569cc8..54a656c9dac6 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+@@ -25,9 +25,20 @@ public:
+   ~DADAOELFObjectWriter() override = default;
+ 
+ protected:
+-  unsigned getRelocType(const MCFixup &, const MCValue &,
+-                        bool IsPCRel) const override {
+-    return 0;
++  unsigned getRelocType(const MCFixup &Fixup, const MCValue &,
++                         bool IsPCRel) const override {
++    switch (unsigned(Fixup.getKind())) {
++    default:
++      llvm_unreachable("Unknown fixup kind");
++    case FK_SecRel_4:
++      return unsigned(DADAO::R_DADAO_32);
++    case DADAO::fixup_dadao_call24:
++      return unsigned(DADAO::R_DADAO_CALL24);
++    case DADAO::fixup_dadao_branch18:
++      return unsigned(DADAO::R_DADAO_BRANCH18);
++    case DADAO::fixup_dadao_branch12:
++      return unsigned(DADAO::R_DADAO_BRANCH12);
++    }
+   }
+ 
+   bool needsRelocateWithSymbol(const MCValue &, unsigned Type) const override {
+@@ -40,4 +51,4 @@ protected:
+ std::unique_ptr<MCObjectTargetWriter>
+ llvm::createDADAOELFObjectWriter(uint8_t OSABI) {
+   return std::make_unique<DADAOELFObjectWriter>(OSABI);
+-}
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
+index b64a1b737afc..aeb08331b60a 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.cpp
+@@ -31,11 +31,6 @@ void DADAOInstPrinter::printInst(const MCInst *MI, uint64_t Address,
+   printAnnotation(O, Annot);
+ }
+ 
+-std::pair<const char *, uint64_t>
+-DADAOInstPrinter::getMnemonic(const MCInst &MI) const {
+-  return {"<unknown>", 0};
+-}
+-
+ void DADAOInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
+                                     raw_ostream &O) {
+   const MCOperand &Op = MI->getOperand(OpNo);
+@@ -48,3 +43,8 @@ void DADAOInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
+     MAI.printExpr(O, *Op.getExpr());
+   }
+ }
++
++void DADAOInstPrinter::printOperand(const MCInst *MI, uint64_t Address,
++                                    int OpNo, raw_ostream &O) {
++  printOperand(MI, static_cast<unsigned>(OpNo), O);
++}
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
+index c0f1a3e8cfc4..b688c0efd7b0 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOInstPrinter.h
+@@ -28,6 +28,8 @@ public:
+   void printRegName(raw_ostream &OS, MCRegister Reg) override;
+ 
+   void printOperand(const MCInst *MI, unsigned OpNo, raw_ostream &O);
++  void printOperand(const MCInst *MI, uint64_t Address, int OpNo,
++                    raw_ostream &O);
+ 
+   std::pair<const char *, uint64_t>
+   getMnemonic(const MCInst &MI) const override;
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+index 8c62185573ba..1fb58c72060d 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+@@ -6,7 +6,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
+-#include "DADAOMCTargetDesc.h"
++#include "MCTargetDesc/DADAOMCTargetDesc.h"
+ #include "llvm/MC/MCCodeEmitter.h"
+ #include "llvm/MC/MCContext.h"
+ #include "llvm/MC/MCExpr.h"
+@@ -15,15 +15,19 @@
+ #include "llvm/MC/MCInstrInfo.h"
+ #include "llvm/MC/MCRegisterInfo.h"
+ #include "llvm/MC/MCSubtargetInfo.h"
+-#include "llvm/Support/Casting.h"
++#include "llvm/Support/Endian.h"
+ #include "llvm/Support/EndianStream.h"
+ 
+-using namespace llvm;
+-
+ #define DEBUG_TYPE "mccodeemitter"
+ 
++using namespace llvm;
++
+ namespace {
+ 
++static void reportUnsupportedInst(const MCInst &) {
++  llvm_unreachable("Unsupported instruction");
++}
++
+ class DADAOMCCodeEmitter : public MCCodeEmitter {
+   DADAOMCCodeEmitter(const DADAOMCCodeEmitter &) = delete;
+   void operator=(const DADAOMCCodeEmitter &) = delete;
+@@ -35,43 +39,122 @@ public:
+   ~DADAOMCCodeEmitter() override = default;
+ 
+   void encodeInstruction(const MCInst &MI, SmallVectorImpl<char> &CB,
+-                         SmallVectorImpl<MCFixup> &Fixups,
+-                         const MCSubtargetInfo &STI) const override;
++                          SmallVectorImpl<MCFixup> &Fixups,
++                          const MCSubtargetInfo &STI) const override;
+ 
+   uint64_t getBinaryCodeForInstr(const MCInst &MI,
+-                                 SmallVectorImpl<MCFixup> &Fixups,
+-                                 const MCSubtargetInfo &STI) const;
++                                  SmallVectorImpl<MCFixup> &Fixups,
++                                  const MCSubtargetInfo &STI) const;
+ 
+-  uint64_t getMachineOpValue(const MCInst &MI, const MCOperand &MO,
+-                             SmallVectorImpl<MCFixup> &Fixups,
+-                             const MCSubtargetInfo &STI) const;
+-};
++  unsigned getMachineOpValue(const MCInst &MI, const MCOperand &MO,
++                              SmallVectorImpl<MCFixup> &Fixups,
++                              const MCSubtargetInfo &STI) const;
+ 
+-} // end anonymous namespace
++  unsigned getImm24OpValue(const MCInst &MI, unsigned OpNo,
++                            SmallVectorImpl<MCFixup> &Fixups,
++                            const MCSubtargetInfo &STI) const;
+ 
+-void DADAOMCCodeEmitter::encodeInstruction(const MCInst &MI,
+-                                           SmallVectorImpl<char> &CB,
+-                                           SmallVectorImpl<MCFixup> &Fixups,
+-                                           const MCSubtargetInfo &STI) const {
+-  uint64_t Bits = getBinaryCodeForInstr(MI, Fixups, STI);
++  unsigned getImm18OpValue(const MCInst &MI, unsigned OpNo,
++                            SmallVectorImpl<MCFixup> &Fixups,
++                            const MCSubtargetInfo &STI) const;
++
++  unsigned getImm12OpValue(const MCInst &MI, unsigned OpNo,
++                            SmallVectorImpl<MCFixup> &Fixups,
++                            const MCSubtargetInfo &STI) const;
++};
++
++void DADAOMCCodeEmitter::encodeInstruction(
++    const MCInst &MI, SmallVectorImpl<char> &CB,
++    SmallVectorImpl<MCFixup> &Fixups,
++    const MCSubtargetInfo &STI) const {
++  uint32_t Bits = getBinaryCodeForInstr(MI, Fixups, STI);
+   support::endian::write<uint32_t>(CB, Bits, llvm::endianness::big);
+ }
+ 
+-uint64_t
+-DADAOMCCodeEmitter::getMachineOpValue(const MCInst &MI, const MCOperand &MO,
+-                                      SmallVectorImpl<MCFixup> &Fixups,
+-                                      const MCSubtargetInfo &STI) const {
++unsigned DADAOMCCodeEmitter::getImm24OpValue(
++    const MCInst &MI, unsigned OpNo,
++    SmallVectorImpl<MCFixup> &Fixups,
++    const MCSubtargetInfo &STI) const {
++  const MCOperand &MO = MI.getOperand(OpNo);
++  if (MO.isImm())
++    return static_cast<unsigned>(MO.getImm());
++  assert(MO.isExpr() && "getImm24OpValue expects expression or immediate");
++
++  const MCExpr *Expr = MO.getExpr();
++  MCFixupKind Kind = MCFixupKind(DADAO::fixup_dadao_call24);
++  MCFixup Fixup = MCFixup::create(0, Expr, Kind);
++  Fixup.setPCRel();
++  Fixups.push_back(Fixup);
++  return 0;
++}
++
++unsigned DADAOMCCodeEmitter::getImm18OpValue(
++    const MCInst &MI, unsigned OpNo,
++    SmallVectorImpl<MCFixup> &Fixups,
++    const MCSubtargetInfo &STI) const {
++  const MCOperand &MO = MI.getOperand(OpNo);
++  if (MO.isImm())
++    return static_cast<unsigned>(MO.getImm());
++  assert(MO.isExpr() && "getImm18OpValue expects expression or immediate");
++
++  const MCExpr *Expr = MO.getExpr();
++  MCFixup Fixup = MCFixup::create(0, Expr,
++                                   MCFixupKind(DADAO::fixup_dadao_branch18));
++  Fixup.setPCRel();
++  Fixups.push_back(Fixup);
++  return 0;
++}
++
++unsigned DADAOMCCodeEmitter::getImm12OpValue(
++    const MCInst &MI, unsigned OpNo,
++    SmallVectorImpl<MCFixup> &Fixups,
++    const MCSubtargetInfo &STI) const {
++  const MCOperand &MO = MI.getOperand(OpNo);
++  if (MO.isImm())
++    return static_cast<unsigned>(MO.getImm());
++  assert(MO.isExpr() && "getImm12OpValue expects expression or immediate");
++
++  const MCExpr *Expr = MO.getExpr();
++  MCFixup Fixup = MCFixup::create(0, Expr,
++                                   MCFixupKind(DADAO::fixup_dadao_branch12));
++  Fixup.setPCRel();
++  Fixups.push_back(Fixup);
++  return 0;
++}
++
++unsigned DADAOMCCodeEmitter::getMachineOpValue(
++    const MCInst &MI, const MCOperand &MO,
++    SmallVectorImpl<MCFixup> &Fixups,
++    const MCSubtargetInfo &STI) const {
+   if (MO.isReg())
+     return Ctx.getRegisterInfo()->getEncodingValue(MO.getReg());
+   if (MO.isImm())
+-    return static_cast<uint64_t>(MO.getImm());
+-  llvm_unreachable("Unhandled expression!");
+-  return 0;
++    return static_cast<unsigned>(MO.getImm());
++  if (MO.isExpr()) {
++    unsigned Opcode = MI.getOpcode();
++    MCFixupKind Kind;
++    if (Opcode == DADAO::CALL_IIII || Opcode == DADAO::JUMP_IIII)
++      Kind = MCFixupKind(DADAO::fixup_dadao_call24);
++    else if (Opcode == DADAO::BRN_RIII || Opcode == DADAO::BRNN_RIII ||
++             Opcode == DADAO::BRZ_RIII || Opcode == DADAO::BRNZ_RIII ||
++             Opcode == DADAO::BRP_RIII || Opcode == DADAO::BRNP_RIII)
++      Kind = MCFixupKind(DADAO::fixup_dadao_branch18);
++    else if (Opcode == DADAO::BREQ_RRII || Opcode == DADAO::BRNE_RRII)
++      Kind = MCFixupKind(DADAO::fixup_dadao_branch12);
++    else
++      Kind = MCFixupKind(FK_SecRel_4);
++    Fixups.push_back(MCFixup::create(0, MO.getExpr(), Kind));
++    return 0;
++  }
++  llvm_unreachable("Unknown operand type");
+ }
+ 
++#define ENABLE_INSTR_PREDICATE_VERIFIER
+ #include "DADAOGenMCCodeEmitter.inc"
+ 
++} // end anonymous namespace
++
+ MCCodeEmitter *llvm::createDADAOMCCodeEmitter(const MCInstrInfo &,
+-                                              MCContext &Ctx) {
++                                               MCContext &Ctx) {
+   return new DADAOMCCodeEmitter(Ctx);
+-}
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+index cc7e3a73ff4e..c57b26420b01 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+@@ -13,6 +13,7 @@
+ #ifndef LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOMCTARGETDESC_H
+ #define LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOMCTARGETDESC_H
+ 
++#include "llvm/MC/MCFixup.h"
+ #include "llvm/MC/MCTargetOptions.h"
+ #include "llvm/Support/Compiler.h"
+ #include "llvm/Support/DataTypes.h"
+@@ -28,6 +29,25 @@ class MCRegisterInfo;
+ class MCSubtargetInfo;
+ class Target;
+ 
++namespace DADAO {
++enum Fixups {
++  fixup_dadao_call24 = FirstTargetFixupKind,
++  fixup_dadao_branch18,
++  fixup_dadao_branch12,
++  LastTargetFixupKind,
++  NumTargetFixupKinds = LastTargetFixupKind - FirstTargetFixupKind
++};
++
++// ELF relocation types for DADAO
++enum {
++  R_DADAO_32 = 0,
++  R_DADAO_CALL24 = 1,
++  R_DADAO_BRANCH18 = 2,
++  R_DADAO_BRANCH12 = 3,
++  R_DADAO_NUM,
++};
++} // namespace DADAO
++
+ MCCodeEmitter *createDADAOMCCodeEmitter(const MCInstrInfo &MCII,
+                                         MCContext &Ctx);
+ 
+-- 
+2.43.0
+

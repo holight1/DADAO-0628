@@ -1,5 +1,5 @@
 .text
 .globl _start
 _start:
-    call 1
+    call main
     halt rd31
