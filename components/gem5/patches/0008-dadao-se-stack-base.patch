@@ -1,0 +1,50 @@
+From 61a033d31e275ece27e26e7f7745217c27e147c2 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 16:54:23 +0800
+Subject: [PATCH] arch/dadao: SE mode 48-bit stack base (DG-006a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The DADAO SE process used stack_base = 0x7FFFFFFFFFFFFFFF (63-bit), but DADAO RB
+effective addresses are 48-bit and rb1 (the ABI stack pointer) is masked to 48
+bits on every access. argsInit set rb1 = stack_min (a 63-bit address), so the
+CPU accessed the masked-low address (0xFFFFFFFF_xxxx) while the stack page was
+mapped high (0x7FFFFFFF_FFFF_xxxx) — map never matched access, and the generic
+stack-growth fault fixup could not recognise it, so any program writing the rb1
+data stack page-faulted (0xffffffffdfd8).
+
+Move the stack base inside the 48-bit space (0x00007FFFFFFFF000) so the mask is
+a no-op and mapped == accessed. Exposed by DADAO-0628 DL-059a arr_sum (first
+E2E to write the rb1 data stack; prior gem5-passing tests stayed in
+registers/RegRAS). QEMU was unaffected (its trampoline sets rb1 in-range).
+
+Verified: DADAO-0628 arr_sum E2E now exits 10 on gem5 (was fatal fault);
+four-way differential AGREE=198/DIVERGE=0, lit E2E 10/10 dual-backend.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/arch/dadao/process.cc | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/arch/dadao/process.cc b/src/arch/dadao/process.cc
+index e0cdacb00b..715c89f3b6 100644
+--- a/src/arch/dadao/process.cc
++++ b/src/arch/dadao/process.cc
+@@ -23,7 +23,12 @@ Process::Process(const ProcessParams &params, loader::ObjectFile *objFile)
+ {
+     fatal_if(params.useArchPT, "Arch page tables not implemented for DADAO.");
+ 
+-    const Addr stack_base = 0x7FFFFFFFFFFFFFFFL;
++    // DADAO RB effective addresses are 48-bit; the stack pointer (rb1) is
++    // masked to 48 bits on every memory access. A 63-bit stack base would be
++    // mapped high but accessed masked-low, so the mapped page never matches
++    // the accessed page and the stack-growth fault fixup can't recognise it.
++    // Keep the base inside the 48-bit space so mask is a no-op (map == access).
++    const Addr stack_base = 0x00007FFFFFFFF000L;
+     const Addr max_stack_size = params.maxStackSize;
+     const Addr next_thread_stack_base = stack_base - max_stack_size;
+     const Addr brk_point = roundUp(image.maxAddr(), PageBytes);
+-- 
+2.43.0
+

@@ -6,3 +6,4 @@
 0005-dadao-memory.patch
 0006-dadao-faults.patch
 0007-dadao-controlflow-ras.patch
+0008-dadao-se-stack-base.patch

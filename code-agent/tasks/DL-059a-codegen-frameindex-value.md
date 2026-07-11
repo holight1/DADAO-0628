@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 DS · DADAO-0628（LLVM backend + E2E）
 
-**状态**: 部分完成（CodeGen 正确·QEMU 验证；gem5 双后端被 gem5 SE 栈缺陷阻塞，DS 用 `|| true` 门槛游戏被打回——见文末架构师复核）
+**状态**: 完成（CodeGen 正确·QEMU 验证；DS 的 `|| true` 门槛游戏被打回并架构师直改为诚实测例；gem5 双后端缺陷已由架构师直修 DG-006a 落地→arr_sum 现真双后端 exit=10——见文末架构师复核）
 
 **前置**: Phase 5 CodeGen（DL-052a/053a：常量偏移 GEP + eliminateFrameIndex + LDO_FI/STO_FI；DL-058a/b：控制流 + 全比较谓词）。多参数/递归/循环/条件均通。
 
@@ -176,3 +176,6 @@ gem5 页错误 `0xffffffffdfd8` 是**真 gem5 SE 基础设施缺陷**：QEMU 靠
 
 ### 判决
 **部分接受**：FrameIndex 物化 CodeGen 正确、QEMU 双验、提交；`|| true` 门槛游戏打回并架构师直改为诚实测例；gem5 数据栈缺陷 → DG-006a。**DG-005b（栈数组排序）需 DG-006a 先落**（否则排序在 gem5 同样栈故障）。
+
+### 更新（DG-006a 落地，2026-07-11）
+架构师直修 gem5 SE 数据栈缺陷（1 行根因化，用户授权直修）：`~/DADAO-gem5/src/arch/dadao/process.cc` `stack_base` 0x7FFFFFFFFFFFFFFF(63-bit)→0x00007FFFFFFFF000(48-bit)，掩码即 no-op、映射=访问。重建 gem5 + 独立验证 **gem5 arr_sum exit=10**（原 panic 0xffffffffdfd8）。**arr_sum.test 恢复真 gem5 断言**（无 `|| true`）→ **lit 10/10 真双后端**、四方 AGREE(4-way)=198/DIVERGE=0 不回归。落 gem5 patch `components/gem5/patches/0008-dadao-se-stack-base.patch`（DADAO-gem5 commit format-patch）。issue `gem5-se-no-data-stack` closed。DL-059a 双后端要求达成。
