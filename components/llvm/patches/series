@@ -7,3 +7,4 @@
 0007-dadao-control-flow.patch
 0008-dadao-unsigned-cmp.patch
 0009-dadao-frameindex-value.patch
+0010-dadao-shift-mul.patch

@@ -1,0 +1,204 @@
+From bd774ae036e964ae5bb5ba30de1175fdcfa1ace5 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 11 Jul 2026 17:18:17 +0800
+Subject: [PATCH] target/dadao: shift + multiply lowering + three-valued SETCC
+ fix + OR/XOR (DL-060a redo)
+
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp | 89 +++++++++++++++++++++
+ llvm/lib/Target/DADAO/DADAOISelLowering.h   |  1 +
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp    | 12 +++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td     | 24 ++++++
+ 4 files changed, 126 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 19a411080e4f..e84ac1ab9359 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -30,6 +30,7 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setTargetDAGCombine(ISD::BR_CC);
+   setTargetDAGCombine(ISD::BRCOND);
+   setOperationAction(ISD::FrameIndex, MVT::i64, Custom);
++  setOperationAction(ISD::SETCC, MVT::i64, Custom);
+   setOperationAction(ISD::SELECT_CC, MVT::i64, Expand);
+   setOperationAction(ISD::GlobalAddress, MVT::i64, Expand);
+ 
+@@ -204,6 +205,8 @@ SDValue DADAOTargetLowering::LowerOperation(SDValue Op,
+     return LowerBR_CC(Op, DAG);
+   case ISD::FrameIndex:
+     return lowerFrameIndex(Op, DAG);
++  case ISD::SETCC:
++    return lowerSETCC(Op, DAG);
+   default:
+     break;
+   }
+@@ -279,6 +282,92 @@ SDValue DADAOTargetLowering::lowerFrameIndex(SDValue Op,
+   return DAG.getNode(DADAOISD::FI_ADDR, DL, MVT::i64, TFI);
+ }
+ 
++SDValue DADAOTargetLowering::lowerSETCC(SDValue Op,
++                                        SelectionDAG &DAG) const {
++  SDValue LHS = Op.getOperand(0);
++  SDValue RHS = Op.getOperand(1);
++  ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(2))->get();
++  SDLoc DL(Op);
++
++  // Pick cmps or cmpu based on signedness
++  auto CmpOp = [&](bool isSigned) {
++    return DAG.getNode(isSigned ? DADAOISD::CMP : DADAOISD::CMPU,
++                       DL, MVT::i64, LHS, RHS);
++  };
++
++  SDValue Cmp, Zero, One;
++  Zero = DAG.getConstant(0, DL, MVT::i64);
++  One = DAG.getConstant(1, DL, MVT::i64);
++  SDValue SixtyThree = DAG.getConstant(63, DL, MVT::i64);
++
++  switch (CC) {
++  default:
++    break;
++
++  case ISD::SETLT: {
++    // cmps(a,b) ∈ {-1,0,+1}; shru(x,63) extracts sign: x<0→1, x≥0→0
++    Cmp = CmpOp(true);
++    return DAG.getNode(ISD::SRL, DL, MVT::i64, Cmp, SixtyThree);
++  }
++  case ISD::SETLE: {
++    // cmps(a,b) ∈ {-1,0,+1}; x-1 < 0 iff x≤0 (x=-1→-2; x=0→-1; x=+1→0)
++    Cmp = CmpOp(true);
++    SDValue SubOne = DAG.getNode(ISD::SUB, DL, MVT::i64, Cmp, One);
++    return DAG.getNode(ISD::SRL, DL, MVT::i64, SubOne, SixtyThree);
++  }
++  case ISD::SETGT: {
++    // cmps(a,b) ∈ {-1,0,+1}; neg(x)=sub(0,x): +1→-1,0→0,-1→+1; shru→0,0,1
++    Cmp = CmpOp(true);
++    SDValue Neg = DAG.getNode(ISD::SUB, DL, MVT::i64, Zero, Cmp);
++    return DAG.getNode(ISD::SRL, DL, MVT::i64, Neg, SixtyThree);
++  }
++  case ISD::SETGE: {
++    // cmps(a,b) ∈ {-1,0,+1}; sge = not(slt) = sub(1, shru(cmp,63))
++    Cmp = CmpOp(true);
++    SDValue Slt = DAG.getNode(ISD::SRL, DL, MVT::i64, Cmp, SixtyThree);
++    return DAG.getNode(ISD::SUB, DL, MVT::i64, One, Slt);
++  }
++  case ISD::SETEQ: {
++    // eq = not(slt or sgt) = sub(1, or(shru(cmp,63), shru(neg(cmp),63)))
++    Cmp = CmpOp(true);
++    SDValue Neg = DAG.getNode(ISD::SUB, DL, MVT::i64, Zero, Cmp);
++    SDValue Slt = DAG.getNode(ISD::SRL, DL, MVT::i64, Cmp, SixtyThree);
++    SDValue Sgt = DAG.getNode(ISD::SRL, DL, MVT::i64, Neg, SixtyThree);
++    SDValue Neq = DAG.getNode(ISD::OR, DL, MVT::i64, Slt, Sgt);
++    return DAG.getNode(ISD::SUB, DL, MVT::i64, One, Neq);
++  }
++  case ISD::SETNE: {
++    // ne = or(shru(cmp,63), shru(neg(cmp),63))
++    Cmp = CmpOp(true);
++    SDValue Neg = DAG.getNode(ISD::SUB, DL, MVT::i64, Zero, Cmp);
++    SDValue Slt = DAG.getNode(ISD::SRL, DL, MVT::i64, Cmp, SixtyThree);
++    SDValue Sgt = DAG.getNode(ISD::SRL, DL, MVT::i64, Neg, SixtyThree);
++    return DAG.getNode(ISD::OR, DL, MVT::i64, Slt, Sgt);
++  }
++
++  case ISD::SETULT: {
++    Cmp = CmpOp(false);
++    return DAG.getNode(ISD::SRL, DL, MVT::i64, Cmp, SixtyThree);
++  }
++  case ISD::SETULE: {
++    Cmp = CmpOp(false);
++    SDValue SubOne = DAG.getNode(ISD::SUB, DL, MVT::i64, Cmp, One);
++    return DAG.getNode(ISD::SRL, DL, MVT::i64, SubOne, SixtyThree);
++  }
++  case ISD::SETUGT: {
++    Cmp = CmpOp(false);
++    SDValue Neg = DAG.getNode(ISD::SUB, DL, MVT::i64, Zero, Cmp);
++    return DAG.getNode(ISD::SRL, DL, MVT::i64, Neg, SixtyThree);
++  }
++  case ISD::SETUGE: {
++    Cmp = CmpOp(false);
++    SDValue Slt = DAG.getNode(ISD::SRL, DL, MVT::i64, Cmp, SixtyThree);
++    return DAG.getNode(ISD::SUB, DL, MVT::i64, One, Slt);
++  }
++  }
++  return SDValue();
++}
++
+ SDValue DADAOTargetLowering::PerformDAGCombine(SDNode *N,
+                                                 DAGCombinerInfo &DCI) const {
+   SelectionDAG &DAG = DCI.DAG;
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index a764468da467..892f12890be2 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -54,6 +54,7 @@ public:
+ private:
+   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerFrameIndex(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerSETCC(SDValue Op, SelectionDAG &DAG) const;
+ };
+ 
+ } // namespace llvm
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index 9ded0d0cb3df..a9bb396b6143 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -83,6 +83,18 @@ bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+     MI.eraseFromParent();
+     return true;
+   }
++  case DADAO::MUL_PSEUDO: {
++    Register Dst = MI.getOperand(0).getReg();
++    Register Src1 = MI.getOperand(1).getReg();
++    Register Src2 = MI.getOperand(2).getReg();
++    BuildMI(MBB, MI, DL, get(DADAO::MULU_RRRR))
++        .addReg(DADAO::RD0) // rdha = rd0 (discard high)
++        .addReg(Dst)        // rdhb = dst (low 64-bit)
++        .addReg(Src1)       // rdhc = src1
++        .addReg(Src2);      // rdhd = src2
++    MI.eraseFromParent();
++    return true;
++  }
+   case DADAO::RET_PSEUDO: {
+     BuildMI(MBB, MI, DL, get(DADAO::RET_RIII))
+         .addReg(DADAO::RD0) // rdha = rd0 (value already in $rd31)
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index b3383fbc7b3d..4f3324770adc 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -92,6 +92,8 @@ def ADD_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
+                              [(set GPRD:$dst, (add GPRD:$a, GPRD:$b))]>;
+ def SUB_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
+                              [(set GPRD:$dst, (sub GPRD:$a, GPRD:$b))]>;
++def MUL_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
++                             [(set GPRD:$dst, (mul GPRD:$a, GPRD:$b))]>;
+ 
+ let isReturn = 1, isTerminator = 1, isBarrier = 1 in
+ def RET_PSEUDO : DADAOPseudo<(outs), (ins), [(DADAORetGlue)]>;
+@@ -281,3 +283,25 @@ def : Pat<(DADAOBrz  GPRD:$val, bb:$target), (BRZ_RIII  GPRD:$val, bb:$target)>;
+ def : Pat<(DADAOBrnz GPRD:$val, bb:$target), (BRNZ_RIII GPRD:$val, bb:$target)>;
+ def : Pat<(DADAOBrp  GPRD:$val, bb:$target), (BRP_RIII  GPRD:$val, bb:$target)>;
+ def : Pat<(DADAOBrnp GPRD:$val, bb:$target), (BRNP_RIII GPRD:$val, bb:$target)>;
++
++//===----------------------------------------------------------------------===//
++// CodeGen patterns — shifts (spec §3.11)
++//===----------------------------------------------------------------------===//
++
++// Register shift amount
++def : Pat<(shl GPRD:$src, GPRD:$amt),
++          (SHLU_ORRR GPRD:$src, GPRD:$amt)>;
++def : Pat<(sra GPRD:$src, GPRD:$amt),
++          (SHRS_ORRR GPRD:$src, GPRD:$amt)>;
++def : Pat<(srl GPRD:$src, GPRD:$amt),
++          (SHRU_ORRR GPRD:$src, GPRD:$amt)>;
++
++// Logical AND (needed for zext i1→i64 expansion)
++def : Pat<(and GPRD:$a, GPRD:$b),
++          (AND_ORRR GPRD:$a, GPRD:$b)>;
++// Logical OR (needed for SETEQ/SETNE extraction from three-valued cmps)
++def : Pat<(or GPRD:$a, GPRD:$b),
++          (ORR_ORRR GPRD:$a, GPRD:$b)>;
++// Logical XOR (needed for SETGE/SETUGE sub(1, X) → xor(X, -1) expansion)
++def : Pat<(xor GPRD:$a, GPRD:$b),
++          (XOR_ORRR GPRD:$a, GPRD:$b)>;
+-- 
+2.43.0
+
