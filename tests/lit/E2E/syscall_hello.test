@@ -1,0 +1,25 @@
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %s
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld %t.o -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: grep -c "hi" %t.out | xargs test 1 -eq
+// gem5: not yet (ML-002c — gem5 syscall responder TBD)
+.text
+.globl _start
+_start:
+    # SYS_write(fd=1, buf=msg, len=3)
+    addi rd16, rd0, 64      # sysno = SYS_write
+    addi rd17, rd0, 1       # fd = stdout
+    rela rb8, msg_data       # page base of msg
+    addi rb8, rb8, msg_data  # lo offset → full addr in rb8
+    rb2rd rd18, rb8, 1       # copy to rd18
+    addi rd19, rd0, 3       # len
+    trap 2, 0               # trap cfx_smon
+
+    # SYS_exit(42)
+    addi rd16, rd0, 93      # sysno = SYS_exit
+    addi rd17, rd0, 42      # status
+    trap 2, 0               # trap cfx_smon
+
+msg_data:
+    .asciz "hi\n"

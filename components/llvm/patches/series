@@ -20,3 +20,4 @@
 0020-clang-dadao-targetinfo.patch
 0021-clang-driver-toolchain.patch
 0022-mc-call24-external-reloc.patch
+0023-dadao-trap-llvm-mc.patch

@@ -1,0 +1,40 @@
+From 39ffa0b0cceba18fb20b9af066f63597396f586c Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Mon, 13 Jul 2026 06:25:38 +0800
+Subject: [PATCH] target/dadao: trap instruction (op=0x76, ciii) in llvm-mc
+ (ML-002b)
+
+---
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 2a226f7f2820..a950d4d5d3f2 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -24,6 +24,10 @@ def imms24 : Operand<i64> {
+ }
+ def wydepos : Operand<i64>;
+ 
++def cfxcode6 : Operand<i64> {
++  let OperandType = "OPERAND_IMMEDIATE";
++}
++
+ def brtarget24 : Operand<OtherVT> {
+   let EncoderMethod = "getImm24OpValue";
+   let DecoderMethod = "decodeS24Imm";
+@@ -267,6 +271,11 @@ let op = 0x6C in def CALL_IIII : F_IIII<(outs), (ins imms24:$imm24), "call $imm2
+ let op = 0x6D in def CALL_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "call $rbha, $rdhb, $imm12", []>;
+ let op = 0x6E in def RET_RIII  : F_RIII_RD<(outs GPRD:$rdha), (ins imms18:$imm18), "ret $rdha, $imm18", []>;
+ 
++// trap (op=0x76) — ciii format: cfxcode in ha, imm18 in hb+hc+hd
++let op = 0x76, hasSideEffects = 1 in
++def TRAP_CIII : F_RIII_RD<(outs), (ins cfxcode6:$rdha, imms18:$imm18),
++                           "trap $rdha, $imm18", []>;
++
+ //===----------------------------------------------------------------------===//
+ // CodeGen patterns — conditional branches (spec §5.1 / §5.2)
+ //===----------------------------------------------------------------------===//
+-- 
+2.43.0
+
