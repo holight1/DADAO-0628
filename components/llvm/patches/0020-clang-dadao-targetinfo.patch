@@ -1,0 +1,214 @@
+From 7fd04a4caa3d45ee5fec65949da7e0ac87741622 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 14:14:12 +0800
+Subject: [PATCH] =?UTF-8?q?clang:=20DADAO=20TargetInfo=20=E2=80=94=20big-e?=
+ =?UTF-8?q?ndian=20LP64=20+=20i128:128=20fix=20(DL-064a)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ clang/lib/Basic/CMakeLists.txt             |  1 +
+ clang/lib/Basic/Targets.cpp                |  3 +
+ clang/lib/Basic/Targets/DADAO.cpp          | 60 ++++++++++++++++++
+ clang/lib/Basic/Targets/DADAO.h            | 74 ++++++++++++++++++++++
+ llvm/lib/TargetParser/TargetDataLayout.cpp |  2 +-
+ 5 files changed, 139 insertions(+), 1 deletion(-)
+ create mode 100644 clang/lib/Basic/Targets/DADAO.cpp
+ create mode 100644 clang/lib/Basic/Targets/DADAO.h
+
+diff --git a/clang/lib/Basic/CMakeLists.txt b/clang/lib/Basic/CMakeLists.txt
+index adfc6ee326b5..2048b2e0c3fe 100644
+--- a/clang/lib/Basic/CMakeLists.txt
++++ b/clang/lib/Basic/CMakeLists.txt
+@@ -108,6 +108,7 @@ add_clang_library(clangBasic
+   Targets/LoongArch.cpp
+   Targets/M68k.cpp
+   Targets/MSP430.cpp
++  Targets/DADAO.cpp
+   Targets/Mips.cpp
+   Targets/NVPTX.cpp
+   Targets/OSTargets.cpp
+diff --git a/clang/lib/Basic/Targets.cpp b/clang/lib/Basic/Targets.cpp
+index 263253918d96..6d03b8193792 100644
+--- a/clang/lib/Basic/Targets.cpp
++++ b/clang/lib/Basic/Targets.cpp
+@@ -26,6 +26,7 @@
+ #include "Targets/LoongArch.h"
+ #include "Targets/M68k.h"
+ #include "Targets/MSP430.h"
++#include "Targets/DADAO.h"
+ #include "Targets/Mips.h"
+ #include "Targets/NVPTX.h"
+ #include "Targets/OSTargets.h"
+@@ -276,6 +277,8 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
+ 
+   case llvm::Triple::msp430:
+     return std::make_unique<MSP430TargetInfo>(Triple, Opts);
++  case llvm::Triple::dadao:
++    return std::make_unique<DADAOTargetInfo>(Triple, Opts);
+ 
+   case llvm::Triple::mips:
+     switch (os) {
+diff --git a/clang/lib/Basic/Targets/DADAO.cpp b/clang/lib/Basic/Targets/DADAO.cpp
+new file mode 100644
+index 000000000000..e4be81ca1d21
+--- /dev/null
++++ b/clang/lib/Basic/Targets/DADAO.cpp
+@@ -0,0 +1,60 @@
++//===--- DADAO.cpp - Implement DADAO target feature support ----------------===//
++#include "DADAO.h"
++#include "clang/Basic/MacroBuilder.h"
++#include "llvm/ADT/StringRef.h"
++
++using namespace clang;
++using namespace clang::targets;
++
++void DADAOTargetInfo::getTargetDefines(const LangOptions &Opts,
++                                       MacroBuilder &Builder) const {
++  Builder.defineMacro("__dadao__");
++  Builder.defineMacro("__DADAO__");
++  Builder.defineMacro("__ELF__");
++
++  Builder.defineMacro("_LP64", "1");
++  Builder.defineMacro("__LP64__", "1");
++
++  Builder.defineMacro("__SIZEOF_SIZE_T__", "8");
++  Builder.defineMacro("__SIZEOF_POINTER__", "8");
++  Builder.defineMacro("__SIZEOF_LONG__", "8");
++  Builder.defineMacro("__SIZEOF_INT__", "4");
++  Builder.defineMacro("__SIZEOF_SHORT__", "2");
++  Builder.defineMacro("__SIZEOF_WCHAR_T__", "4");
++  Builder.defineMacro("__SIZEOF_WINT_T__", "4");
++
++  Builder.defineMacro("__BYTE_ORDER__", "__ORDER_BIG_ENDIAN__");
++  Builder.defineMacro("__ORDER_LITTLE_ENDIAN__", "1234");
++  Builder.defineMacro("__ORDER_BIG_ENDIAN__", "4321");
++  Builder.defineMacro("__FLOAT_WORD_ORDER__", "__ORDER_BIG_ENDIAN__");
++
++  Builder.defineMacro("__CHAR_BIT__", "8");
++  Builder.defineMacro("__INT_MAX__", "2147483647");
++  Builder.defineMacro("__LONG_MAX__", "9223372036854775807L");
++  Builder.defineMacro("__LONG_LONG_MAX__", "9223372036854775807LL");
++
++  Builder.defineMacro("__WCHAR_MAX__", "4294967295U");
++  Builder.defineMacro("__WCHAR_UNSIGNED__");
++  Builder.defineMacro("__WINT_MAX__", "4294967295U");
++  Builder.defineMacro("__WINT_UNSIGNED__");
++
++  Builder.defineMacro("__PTRDIFF_TYPE__", "long");
++  Builder.defineMacro("__SIZE_TYPE__", "unsigned long");
++  Builder.defineMacro("__INTPTR_TYPE__", "long");
++  Builder.defineMacro("__UINTPTR_TYPE__", "unsigned long");
++
++  Builder.defineMacro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1");
++  Builder.defineMacro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2");
++  Builder.defineMacro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4");
++  Builder.defineMacro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8");
++}
++
++ArrayRef<const char *> DADAOTargetInfo::getGCCRegNames() const {
++  static const char *const GCCRegNames[] = {
++      "rd0",  "rd1",  "rd2",  "rd3",  "rd4",  "rd5",  "rd6",  "rd7",
++      "rd8",  "rd9",  "rd10", "rd11", "rd12", "rd13", "rd14", "rd15",
++      "rd16", "rd17", "rd18", "rd19", "rd20", "rd21", "rd22", "rd23",
++      "rd24", "rd25", "rd26", "rd27", "rd28", "rd29", "rd30", "rd31",
++  };
++  return llvm::ArrayRef(GCCRegNames);
++}
+diff --git a/clang/lib/Basic/Targets/DADAO.h b/clang/lib/Basic/Targets/DADAO.h
+new file mode 100644
+index 000000000000..2008126382e1
+--- /dev/null
++++ b/clang/lib/Basic/Targets/DADAO.h
+@@ -0,0 +1,74 @@
++//===--- DADAO.h - Declare DADAO target feature support ---------*- C++ -*-===//
++#ifndef LLVM_CLANG_LIB_BASIC_TARGETS_DADAO_H
++#define LLVM_CLANG_LIB_BASIC_TARGETS_DADAO_H
++
++#include "clang/Basic/TargetInfo.h"
++#include "clang/Basic/TargetOptions.h"
++#include "llvm/Support/Compiler.h"
++#include "llvm/TargetParser/Triple.h"
++
++namespace clang {
++namespace targets {
++
++class LLVM_LIBRARY_VISIBILITY DADAOTargetInfo : public TargetInfo {
++public:
++  DADAOTargetInfo(const llvm::Triple &Triple, const TargetOptions &)
++      : TargetInfo(Triple) {
++    BigEndian = true;
++    NoAsmVariants = true;
++    TLSSupported = false;
++    IntWidth = 32;
++    IntAlign = 32;
++    LongWidth = 64;
++    LongLongWidth = 64;
++    LongAlign = LongLongAlign = 64;
++    PointerWidth = 64;
++    PointerAlign = 64;
++    SuitableAlign = 64;
++    SizeType = UnsignedLong;
++    IntMaxType = SignedLong;
++    IntPtrType = SignedLong;
++    PtrDiffType = SignedLong;
++    SigAtomicType = SignedLong;
++    FloatWidth = 32;
++    FloatAlign = 32;
++    DoubleWidth = DoubleAlign = 64;
++    LongDoubleWidth = LongDoubleAlign = 64;
++    WCharType = UnsignedInt;
++    WIntType = UnsignedInt;
++    resetDataLayout("E-m:e-i64:64-i128:128-n64-S64");
++  }
++
++  void getTargetDefines(const LangOptions &Opts,
++                        MacroBuilder &Builder) const override;
++
++  llvm::SmallVector<Builtin::InfosShard> getTargetBuiltins() const override {
++    return {};
++  }
++
++  bool allowsLargerPreferedTypeAlignment() const override { return false; }
++
++  bool hasFeature(StringRef Feature) const override {
++    return Feature == "dadao";
++  }
++
++  BuiltinVaListKind getBuiltinVaListKind() const override {
++    return TargetInfo::CharPtrBuiltinVaList;
++  }
++
++  std::string_view getClobbers() const override { return ""; }
++
++  bool validateAsmConstraint(const char *&Name,
++                             TargetInfo::ConstraintInfo &info) const override {
++    return false;
++  }
++
++  ArrayRef<const char *> getGCCRegNames() const override;
++  ArrayRef<GCCRegAlias> getGCCRegAliases() const override {
++    return {};
++  }
++};
++
++} // namespace targets
++} // namespace clang
++#endif
+diff --git a/llvm/lib/TargetParser/TargetDataLayout.cpp b/llvm/lib/TargetParser/TargetDataLayout.cpp
+index 0b5b482c630e..1441eb5192a1 100644
+--- a/llvm/lib/TargetParser/TargetDataLayout.cpp
++++ b/llvm/lib/TargetParser/TargetDataLayout.cpp
+@@ -619,7 +619,7 @@ std::string Triple::computeDataLayout(StringRef ABIName) const {
+   case Triple::spirv64:
+     return computeSPIRVDataLayout(*this);
+   case Triple::dadao:
+-    return "E-m:e-i64:64-n64-S64";
++    return "E-m:e-i64:64-i128:128-n64-S64";
+   case Triple::lanai:
+     return computeLanaiDataLayout();
+   case Triple::wasm32:
+-- 
+2.43.0
+

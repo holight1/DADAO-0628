@@ -1,0 +1,13 @@
+// Clang integration (DL-064a): real C compiled by clang for dadao, through the
+// existing llc -> llvm-mc -> lld pipeline, run on BOTH backends. Proves the
+// clang TargetInfo (data layout, int=i32/long=i64, big-endian) matches the
+// backend ABI. Requires the clang binary (LLVM_ENABLE_PROJECTS includes clang).
+// RUN: %clang --target=dadao-unknown-elf -S -emit-llvm -O1 %S/Inputs/clang_hello.c -o %t.ll
+// RUN: grep -q 'target datalayout = "E-m:e-i64:64-i128:128-n64-S64"' %t.ll
+// RUN: %llc -march=dadao -o %t.ll.s %t.ll
+// RUN: cat %S/Inputs/crt0.s %t.ll.s > %t.full.s
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %t.full.s
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld %t.o -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 42'
