@@ -17,5 +17,4 @@
 0017-dadao-exts-imm-fix.patch
 0018-dadao-global-addr-value.patch
 0019-dadao-select.patch
-0020-dadao-clang-targetinfo.patch
 0020-clang-dadao-targetinfo.patch
