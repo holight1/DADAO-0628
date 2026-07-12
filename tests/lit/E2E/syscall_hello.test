@@ -3,7 +3,9 @@
 // RUN: %llvm-objcopy -O binary %t.elf %t.bin
 // RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
 // RUN: grep -c "hi" %t.out | xargs test 1 -eq
-// gem5: not yet (ML-002c — gem5 syscall responder TBD)
+// RUN: %gen_min_elf %t.bin %t.elf
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: grep -c "hi" %t.gout | xargs test 1 -eq
 .text
 .globl _start
 _start:

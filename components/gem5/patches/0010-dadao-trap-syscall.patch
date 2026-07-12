@@ -1,0 +1,58 @@
+From 61fe302bf256913a7c08209d1896b074aa8e00bd Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Mon, 13 Jul 2026 07:05:26 +0800
+Subject: [PATCH] arch-dadao: trap instruction + cfx_smon syscall responder
+ (ML-002c)
+
+---
+ src/arch/dadao/decoder.cc | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 5dfe61a13a..fddfce6afd 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -627,6 +627,32 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+   if(_numDestRegs) xc->setRegOperand(this,0,(a<b)?-1ULL:(a>b)?1ULL:0); return NoFault; }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"cmp.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
++// === trap (ciii, op=0x76, spec §系统类指令): cfx_smon(cfxcode=2) responder ===
++class TrapInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; uint8_t cfxcode; public:
++TrapInst(uint8_t ha) : StaticInst("trap", enums::No_OpClass), cfxcode(ha) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (cfxcode == 2) {
++    ThreadContext *tc = xc->tcBase();
++    uint64_t sysno = tc->getReg(intRegId(RD_BASE + 16));
++    uint64_t arg0  = tc->getReg(intRegId(RD_BASE + 17));
++    uint64_t arg1  = tc->getReg(intRegId(RD_BASE + 18));
++    uint64_t arg2  = tc->getReg(intRegId(RD_BASE + 19));
++    uint64_t ret = 0;
++    switch (sysno) {
++    case 64: { uint64_t len=arg2; std::vector<uint8_t> d(len);
++      SETranslatingPortProxy(tc).tryReadBlob(arg1,d.data(),len);
++      for(uint64_t i=0;i<len;i++) std::cout.put(d[i]); ret=len; break; }
++    case 93: case 94: exitSimLoop("trap-exit",arg0&0xFF); return NoFault;
++    case 214: { static uint64_t brk=0x90000000; ret=(arg0==0)?brk:arg0; if(arg0)brk=arg0+0x100000; break; }
++    default: ret=(uint64_t)-(int64_t)38; break;
++    }
++    tc->setReg(intRegId(RD_BASE+31),ret);
++  }
++  return NoFault;
++}
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"trap";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
+ // === Decoder ===
+ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     uint32_t w = inst.inst; uint8_t op = w >> 24;
+@@ -732,6 +758,7 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     case 0x6C: return StaticInstPtr(new CallIInst(imm24s(w)));        // call  §5.4
+     case 0x6D: return StaticInstPtr(new CallRInst(ha(w), hb(w), imm12s(w))); // call_r §5.4
+     case 0x6E: return StaticInstPtr(new RetInst(ha(w), imm18s(w)));   // ret   §5.5
++    case 0x76: return StaticInstPtr(new TrapInst(ha(w)));              // trap  §系统
+     default:   return StaticInstPtr(new UnknownInst()); // reserved major op → UNDI
+     }
+ }
+-- 
+2.43.0
+
