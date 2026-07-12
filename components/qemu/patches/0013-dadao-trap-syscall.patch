@@ -1,0 +1,227 @@
+From 27d3fafd4ac5b1d087f5a67daa22ef200e01e9d6 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 15:57:34 +0800
+Subject: [PATCH] target/dadao: trap instruction + cfx_smon syscall responder
+ (ML-002a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+trap cfx_smon -> CFXTRAP -> cfx_smon responder: SYS_write (cfx_uart -> host
+stdout), SYS_exit (cfx_power -> exit code), SYS_brk. syscall ABI per ADR-0014
+(rd16=number, rd17-22=args, rd31=return, asm-generic numbers).
+
+Architect fix folded in (two real bugs DS had left):
+- trans_trap now saves the next PC (tcg_gen_st pc_next+4) before the helper,
+  mirroring the branch/jump trans. Without it helper_trap advanced a stale
+  env->pc and the trap re-executed (write fired 6x). Now fires exactly once.
+- cfxcode/func are passed to the responder via dedicated env scratch
+  (trap_cfxcode/trap_func), not env->rb[1]/rb[2] — rb1 is the stack pointer
+  (ADR-0004), so the old code clobbered SP on every syscall.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ target/dadao/cpu.c       | 72 ++++++++++++++++++++++++++++++++++++++--
+ target/dadao/cpu.h       |  5 +++
+ target/dadao/helper.c    | 12 +++++++
+ target/dadao/helper.h    |  1 +
+ target/dadao/insn.decode |  4 +++
+ target/dadao/translate.c | 14 ++++++++
+ 6 files changed, 105 insertions(+), 3 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 15d8e0a..b9c029a 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -13,6 +13,8 @@
+ #include "exec/cputlb.h"
+ #include "exec/address-spaces.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
+ extern const TCGCPUOps dadao_tcg_ops;
+ 
+ void cpu_get_tb_cpu_state(CPUDADAOState *env, vaddr *pc,
+@@ -106,9 +108,11 @@ void dadao_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+ 
+ void dadao_cpu_do_interrupt(CPUState *cs)
+ {
++    DADAOCPU *cpu = DADAO_CPU(cs);
++    CPUDADAOState *env = &cpu->env;
++
+     switch (cs->exception_index) {
+     case EXCP_EXIT:
+-        /* Exit already handled via helper; if we get here just shutdown */
+         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+         break;
+     case EXCP_MALIGN:
+@@ -117,10 +121,72 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+     case EXCP_UNDI:
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x83);
+         break;
+-    case 0x84: /* RASOF — RAS overflow */
++    case EXCP_CFXTRAP: {
++        uint64_t cfxcode = env->trap_cfxcode;
++        uint64_t func = env->trap_func;
++        env->trap_cfxcode = 0;
++        env->trap_func = 0;
++        (void)func;
++        if (cfxcode == 2) {
++            /* cfx_smon responder */
++            uint64_t sysno = env->rd[16];
++            uint64_t arg0 = env->rd[17];
++            uint64_t arg1 = env->rd[18];
++            uint64_t arg2 = env->rd[19];
++            uint64_t ret = 0;
++
++            switch (sysno) {
++            case 64: { /* SYS_write: fd=arg0, buf=arg1, len=arg2 */
++                uint64_t fd = arg0;
++                uint64_t buf_addr = arg1;
++                uint64_t len = arg2;
++                uint64_t written = 0;
++                uint8_t byte;
++                FILE *out = (fd == 1 || fd == 2) ? (fd == 1 ? stdout : stderr) : NULL;
++                if (out) {
++                    for (uint64_t i = 0; i < len; i++) {
++                        cpu_physical_memory_read(buf_addr + i, &byte, 1);
++                        if (byte == 0 && i > 0 && len > 100) break;
++                        fputc(byte, out);
++                        written++;
++                    }
++                    fflush(out);
++                }
++                ret = written;
++                break;
++            }
++            case 93: /* SYS_exit */
++            case 94: /* SYS_exit_group */
++                qemu_system_shutdown_request_with_code(
++                    SHUTDOWN_CAUSE_GUEST_SHUTDOWN, arg0 & 0xFF);
++                exit(arg0 & 0xFF);
++            case 214: { /* SYS_brk: set program break */
++                static uint64_t brk_base = 0x90000000;
++                if (arg0 == 0)
++                    ret = brk_base;
++                else {
++                    ret = arg0;
++                    brk_base = arg0 + 0x100000;
++                }
++                break;
++            }
++            default:
++                ret = (uint64_t)(-(int64_t)38); /* -ENOSYS */
++                break;
++            }
++            env->rd[31] = ret;
++        } else {
++            /* unknown cfxcode → ILLI */
++            qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
++            return;
++        }
++        cs->exception_index = -1;
++        return;
++    }
++    case 0x84: /* RASOF */
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x84);
+         break;
+-    case 0x85: /* RASUF — RAS underflow */
++    case 0x85: /* RASUF */
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x85);
+         break;
+     default:
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index b70866d..8ca4c7d 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -9,6 +9,7 @@
+ #define EXCP_UNDI   2
+ #define EXCP_MALIGN 3
+ #define EXCP_EXIT   4
++#define EXCP_CFXTRAP 5
+ 
+ #define CPU_RESOLVING_TYPE TYPE_DADAO_CPU
+ 
+@@ -35,6 +36,10 @@ struct CPUArchState {
+     target_ulong rf[64];
+     target_ulong ra[64];
+     target_ulong pc;
++    /* Scratch for a pending trap (cfx) syscall, passed helper -> do_interrupt.
++       Must NOT reuse rb[1]/rb[2] — rb1 is the stack pointer (ADR-0004). */
++    target_ulong trap_cfxcode;
++    target_ulong trap_func;
+ };
+ 
+ struct ArchCPU {
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 07aa7a3..3e2aa39 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -84,3 +84,15 @@ uint64_t helper_ras_pop(CPUDADAOState *env)
+ 
+     return ret_addr;
+ }
++
++void helper_trap(CPUDADAOState *env, uint64_t cfxcode, uint64_t func)
++{
++    CPUState *cs = env_cpu(env);
++    /* Pass cfxcode/func to the responder via dedicated scratch — NOT rb[1]/rb[2]
++       (rb1 is the stack pointer). env->pc was already set to the next
++       instruction by trans_trap, so do not advance it here. */
++    env->trap_cfxcode = cfxcode;
++    env->trap_func = func;
++    cs->exception_index = EXCP_CFXTRAP;
++    cpu_loop_exit(cs);
++}
+diff --git a/target/dadao/helper.h b/target/dadao/helper.h
+index 7358422..6b2b111 100644
+--- a/target/dadao/helper.h
++++ b/target/dadao/helper.h
+@@ -2,3 +2,4 @@ DEF_HELPER_2(raise_exception, noreturn, env, i32)
+ DEF_HELPER_2(exit, noreturn, env, i64)
+ DEF_HELPER_2(ras_push, void, env, i64)
+ DEF_HELPER_1(ras_pop, i64, env)
++DEF_HELPER_3(trap, noreturn, env, i64, i64)
+diff --git a/target/dadao/insn.decode b/target/dadao/insn.decode
+index 38ea21b..ac7db47 100644
+--- a/target/dadao/insn.decode
++++ b/target/dadao/insn.decode
+@@ -162,6 +162,10 @@ call_r     01101101 ...... ...... ...... ...... @rrii
+ # op=0x6E: return (riii)
+ ret        01101110 ...... ...... ...... ...... @riii
+ 
++# *** System / cfx instructions (SimRISC §系统类指令) ***
++# op=0x76: trap-ciii — trap cfxcode, immu18
++trap       01110110 ...... ...... ...... ...... @riii
++
+ # *** MISC-Norm (op=0x10, sub-decode by ha[5:0]) ***
+ # ha is encoded in the fixed pattern, not extracted as a field
+ {
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 42d5421..789dcaf 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -449,6 +449,20 @@ static bool trans_halt(DisasContext *ctx, arg_riii *a)
+     return true;
+ }
+ 
++static bool trans_trap(DisasContext *ctx, arg_riii *a)
++{
++    TCGv_i64 cfxcode = tcg_constant_i64(a->ha & 0x3F);
++    TCGv_i64 imm = tcg_constant_i64(a->imm18 & 0x3FFFF);
++    /* Save the PC of the instruction after trap so the cfx responder resumes
++       there exactly once (mirrors the branch/jump trans above). Without this
++       helper_trap advances a stale env->pc and the trap re-executes. */
++    tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next + 4), tcg_env,
++                   offsetof(CPUDADAOState, pc));
++    gen_helper_trap(tcg_env, cfxcode, imm);
++    ctx->base.is_jmp = DISAS_NORETURN;
++    return true;
++}
++
+ /* === §3.16 RD Load/Store — Multi (rrri) === */
+ 
+ static bool do_ldm(DisasContext *ctx, int ha, int hb, int hc, int hd,
+-- 
+2.43.0
+

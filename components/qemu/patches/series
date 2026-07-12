@@ -11,3 +11,4 @@
 0010-dadao-reserved-undi.patch
 0011-dadao-rela-pc-base.patch
 0012-qemu-ras-stack.patch
+0013-dadao-trap-syscall.patch
