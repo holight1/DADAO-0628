@@ -1,0 +1,36 @@
+From a9db77f94fc845ccfbe0bd3bd13671b6a15da741 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 08:30:06 +0800
+Subject: [PATCH 17/17] =?UTF-8?q?target/dadao:=20fix=20exts=20immediates?=
+ =?UTF-8?q?=20for=20sext=5Finreg=20=E2=80=94=20i8=E2=86=9256,=20i16?=
+ =?UTF-8?q?=E2=86=9248=20per=20spec=20=C2=A73.11=20(DL-062a=20redo)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 9f0e9440346d..2d50e93902e4 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -347,10 +347,11 @@ def : Pat<(truncstorei32 GPRD:$val, GPRB:$addr),
+ // CodeGen patterns — sign/zero extend (spec §3.11)
+ //===----------------------------------------------------------------------===//
+ 
+-// sign_extend_inreg using exts
++// sign_extend_inreg using exts: exts(x,N) = (x<<N)>>s N, preserves low (64-N) bits
++// i8: N=56 (64-8), i16: N=48 (64-16), i32: N=32 (64-32)
+ def : Pat<(sext_inreg GPRD:$src, i8),
+-          (EXTS_ORRI GPRD:$src, 8)>;
++          (EXTS_ORRI GPRD:$src, 56)>;
+ def : Pat<(sext_inreg GPRD:$src, i16),
+-          (EXTS_ORRI GPRD:$src, 16)>;
++          (EXTS_ORRI GPRD:$src, 48)>;
+ def : Pat<(sext_inreg GPRD:$src, i32),
+           (EXTS_ORRI GPRD:$src, 32)>;
+-- 
+2.43.0
+

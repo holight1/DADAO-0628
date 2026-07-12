@@ -13,3 +13,5 @@
 0013-dadao-globals-lowering.patch
 0014-dadao-mc-reloc-lld-arch.patch
 0015-dadao-globals-lld-rework.patch
+0016-dadao-sub-i64-narrow.patch
+0017-dadao-exts-imm-fix.patch

@@ -1,0 +1,256 @@
+From c8d5f857d161195319535182f02531734f70459a Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 08:05:02 +0800
+Subject: [PATCH 16/17] =?UTF-8?q?target/dadao:=20sub-i64=20type=20support?=
+ =?UTF-8?q?=20=E2=80=94=20narrow=20load/store=20+=20sign=5Fextend=5Finreg?=
+ =?UTF-8?q?=20(DL-062a)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp | 141 ++++++++++++++++----
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp |   8 ++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td     |  37 +++++
+ 3 files changed, 162 insertions(+), 24 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index 6ce326775d2f..800aa3cfb5a9 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -118,51 +118,144 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+     GEPOff = cast<ConstantSDNode>(Addr.getOperand(1))->getSExtValue();
+   }
+ 
+-  if (BaseAddr.getOpcode() == ISD::FrameIndex) {
+-    int FI = cast<FrameIndexSDNode>(BaseAddr)->getIndex();
+-    unsigned DADAOOpc = IsLoad ? DADAO::LDO_FI : DADAO::STO_FI;
+-    SDValue BaseReg = CurDAG->getRegister(DADAO::RB1, MVT::i64);
+-    SDValue FiOp = CurDAG->getTargetFrameIndex(FI, MVT::i64);
++  if (BaseAddr.getOpcode() == ISD::FrameIndex ||
++      BaseAddr.getOpcode() == DADAOISD::FI_ADDR) {
++    int FI;
++    if (BaseAddr.getOpcode() == ISD::FrameIndex)
++      FI = cast<FrameIndexSDNode>(BaseAddr)->getIndex();
++    else
++      FI = cast<FrameIndexSDNode>(BaseAddr.getOperand(0))->getIndex();
++    EVT MemVT = IsLoad ? cast<LoadSDNode>(Node)->getMemoryVT()
++                       : cast<StoreSDNode>(Node)->getMemoryVT();
++
++    if (MemVT == MVT::i64) {
++      // 8-byte access: use LDO_FI/STO_FI pseudo
++      unsigned DADAOOpc = IsLoad ? DADAO::LDO_FI : DADAO::STO_FI;
++      SDValue BaseReg = CurDAG->getRegister(DADAO::RB1, MVT::i64);
++      SDValue FiOp = CurDAG->getTargetFrameIndex(FI, MVT::i64);
++      if (IsLoad) {
++        SDValue Ops[] = {BaseReg,
++                         CurDAG->getTargetConstant(GEPOff, DL, MVT::i64), FiOp,
++                         Chain};
++        SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::i64, MVT::Other,
++                                              Ops);
++        ReplaceNode(Node, New);
++      } else {
++        SDValue Ops[] = {Val, BaseReg,
++                         CurDAG->getTargetConstant(GEPOff, DL, MVT::i64), FiOp,
++                         Chain};
++        SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::Other, Ops);
++        ReplaceNode(Node, New);
++      }
++      return;
++    }
++
++    // Narrow width: materialize FI to GPRB + emit narrow load/store
++    SDValue FiOpMat = CurDAG->getTargetFrameIndex(FI, MVT::i64);
++    SDValue RB1 = CurDAG->getRegister(DADAO::RB1, MVT::i64);
++    SDNode *FiAddr = CurDAG->getMachineNode(DADAO::ADDI_RB_FI, DL, MVT::i64,
++                                             {RB1, FiOpMat});
++    SDValue NewAddr(FiAddr, 0);
++    SDValue Offset = CurDAG->getTargetConstant(GEPOff, DL, MVT::i64);
++    SDValue Zero = CurDAG->getTargetConstant(0, DL, MVT::i64);
++
++    // Map MemVT to narrow load/store opcodes
++    unsigned NarrowOpcode;
++    switch (MemVT.getSimpleVT().SimpleTy) {
++    case MVT::i8:
++      NarrowOpcode = IsLoad     ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                                       ? DADAO::LDBS_RRII : DADAO::LDBU_RRII)
++                     : DADAO::STB_RRII;
++      break;
++    case MVT::i16:
++      NarrowOpcode = IsLoad     ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                                       ? DADAO::LDWS_RRII : DADAO::LDWU_RRII)
++                     : DADAO::STW_RRII;
++      break;
++    case MVT::i32:
++      NarrowOpcode = IsLoad     ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                                       ? DADAO::LDTS_RRII : DADAO::LDTU_RRII)
++                     : DADAO::STT_RRII;
++      break;
++    default:
++      NarrowOpcode = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
++      break;
++    }
+ 
+     if (IsLoad) {
+-      SDValue Ops[] = {BaseReg,
+-                       CurDAG->getTargetConstant(GEPOff, DL, MVT::i64), FiOp,
+-                       Chain};
+-      SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::i64, MVT::Other,
+-                                            Ops);
++      SDValue Ops[] = {NewAddr, GEPOff ? Offset : Zero, Chain};
++      SDNode *New = CurDAG->getMachineNode(NarrowOpcode, DL, MVT::i64, MVT::Other, Ops);
+       ReplaceNode(Node, New);
+     } else {
+-      SDValue Ops[] = {Val, BaseReg,
+-                       CurDAG->getTargetConstant(GEPOff, DL, MVT::i64), FiOp,
+-                       Chain};
+-      SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::Other, Ops);
++      SDValue Ops[] = {Val, NewAddr, GEPOff ? Offset : Zero, Chain};
++      SDNode *New = CurDAG->getMachineNode(NarrowOpcode, DL, MVT::Other, Ops);
+       ReplaceNode(Node, New);
+     }
+     return;
+-  }
+-
+-  if (BaseAddr.getOpcode() == DADAOISD::PCREL_HI) {
++  } else   if (BaseAddr.getOpcode() == DADAOISD::PCREL_HI) {
+     SDValue GA = BaseAddr.getOperand(0);
+     SDNode *Rela = CurDAG->getMachineNode(DADAO::RELA_RIII, DL, MVT::i64, GA);
+-    unsigned DADAOOpc = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
++    EVT MemVT = IsLoad ? cast<LoadSDNode>(Node)->getMemoryVT()
++                       : cast<StoreSDNode>(Node)->getMemoryVT();
+     SDValue BaseReg = SDValue(Rela, 0);
+-    SDValue LoOff = GA; // use the same GlobalAddress for lo fixup
++    SDValue LoOff = GA;
++    unsigned WideOp = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
++
++    if (MemVT != MVT::i64) {
++      unsigned NarrowOp;
++      switch (MemVT.getSimpleVT().SimpleTy) {
++      case MVT::i8:
++        NarrowOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                                 ? DADAO::LDBS_RRII : DADAO::LDBU_RRII)
++                          : DADAO::STB_RRII; break;
++      case MVT::i16:
++        NarrowOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                                 ? DADAO::LDWS_RRII : DADAO::LDWU_RRII)
++                          : DADAO::STW_RRII; break;
++      case MVT::i32:
++        NarrowOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                                 ? DADAO::LDTS_RRII : DADAO::LDTU_RRII)
++                          : DADAO::STT_RRII; break;
++      default: NarrowOp = WideOp; break;
++      }
++      WideOp = NarrowOp;
++    }
+ 
+     if (IsLoad) {
+       SDValue Ops[] = {BaseReg, LoOff, Chain};
+-      SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::i64, MVT::Other,
+-                                            Ops);
++      SDNode *New = CurDAG->getMachineNode(WideOp, DL, MVT::i64, MVT::Other, Ops);
+       ReplaceNode(Node, New);
+     } else {
+       SDValue Ops[] = {Val, BaseReg, LoOff, Chain};
+-      SDNode *New = CurDAG->getMachineNode(DADAOOpc, DL, MVT::Other, Ops);
++      SDNode *New = CurDAG->getMachineNode(WideOp, DL, MVT::Other, Ops);
+       ReplaceNode(Node, New);
+     }
+     return;
+   }
+ 
+-  // Non-FrameIndex address: use real LDO/STO directly
+-  unsigned DADAOOpc = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
++  // Non-FrameIndex, non-PCREL_HI address: use real ld/st with correct width
++  EVT MemVT = IsLoad ? cast<LoadSDNode>(Node)->getMemoryVT()
++                     : cast<StoreSDNode>(Node)->getMemoryVT();
++  unsigned DADAOOpc;
++  if (MemVT != MVT::i64) {
++    switch (MemVT.getSimpleVT().SimpleTy) {
++    case MVT::i8:
++      DADAOOpc = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                               ? DADAO::LDBS_RRII : DADAO::LDBU_RRII)
++                        : DADAO::STB_RRII; break;
++    case MVT::i16:
++      DADAOOpc = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                               ? DADAO::LDWS_RRII : DADAO::LDWU_RRII)
++                        : DADAO::STW_RRII; break;
++    case MVT::i32:
++      DADAOOpc = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                               ? DADAO::LDTS_RRII : DADAO::LDTU_RRII)
++                        : DADAO::STT_RRII; break;
++    default: DADAOOpc = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII; break;
++    }
++  } else {
++    DADAOOpc = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
++  }
+   SDValue ImmOp = CurDAG->getTargetConstant(GEPOff, DL, MVT::i64);
+ 
+   if (IsLoad) {
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index b2a7ad6402ac..611f66369e51 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -36,6 +36,14 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+ 
+   setMaxAtomicSizeInBitsSupported(0);
+ 
++  // Narrow load/store type actions
++  for (MVT VT : {MVT::i8, MVT::i16, MVT::i32}) {
++    setLoadExtAction(ISD::EXTLOAD, MVT::i64, VT, Legal);
++    setLoadExtAction(ISD::SEXTLOAD, MVT::i64, VT, Legal);
++    setLoadExtAction(ISD::ZEXTLOAD, MVT::i64, VT, Legal);
++    setTruncStoreAction(MVT::i64, VT, Legal);
++  }
++
+   computeRegisterProperties(STI.getRegisterInfo());
+ }
+ 
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 11a8d6df3883..9f0e9440346d 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -317,3 +317,40 @@ def : Pat<(or GPRD:$a, GPRD:$b),
+ // Logical XOR (needed for SETGE/SETUGE sub(1, X) → xor(X, -1) expansion)
+ def : Pat<(xor GPRD:$a, GPRD:$b),
+           (XOR_ORRR GPRD:$a, GPRD:$b)>;
++
++//===----------------------------------------------------------------------===//
++// CodeGen patterns — narrow load/store (spec §3.1 / §3.2)
++//===----------------------------------------------------------------------===//
++
++// i8 narrow loads
++def : Pat<(i64 (extloadi8  GPRB:$addr)), (LDBU_RRII GPRB:$addr, 0)>;
++def : Pat<(i64 (sextloadi8 GPRB:$addr)), (LDBS_RRII GPRB:$addr, 0)>;
++def : Pat<(i64 (zextloadi8 GPRB:$addr)), (LDBU_RRII GPRB:$addr, 0)>;
++def : Pat<(truncstorei8 GPRD:$val, GPRB:$addr),
++          (STB_RRII GPRD:$val, GPRB:$addr, 0)>;
++
++// i16 narrow loads
++def : Pat<(i64 (extloadi16  GPRB:$addr)), (LDWU_RRII GPRB:$addr, 0)>;
++def : Pat<(i64 (sextloadi16 GPRB:$addr)), (LDWS_RRII GPRB:$addr, 0)>;
++def : Pat<(i64 (zextloadi16 GPRB:$addr)), (LDWU_RRII GPRB:$addr, 0)>;
++def : Pat<(truncstorei16 GPRD:$val, GPRB:$addr),
++          (STW_RRII GPRD:$val, GPRB:$addr, 0)>;
++
++// i32 narrow loads
++def : Pat<(i64 (extloadi32  GPRB:$addr)), (LDTU_RRII GPRB:$addr, 0)>;
++def : Pat<(i64 (sextloadi32 GPRB:$addr)), (LDTS_RRII GPRB:$addr, 0)>;
++def : Pat<(i64 (zextloadi32 GPRB:$addr)), (LDTU_RRII GPRB:$addr, 0)>;
++def : Pat<(truncstorei32 GPRD:$val, GPRB:$addr),
++          (STT_RRII GPRD:$val, GPRB:$addr, 0)>;
++
++//===----------------------------------------------------------------------===//
++// CodeGen patterns — sign/zero extend (spec §3.11)
++//===----------------------------------------------------------------------===//
++
++// sign_extend_inreg using exts
++def : Pat<(sext_inreg GPRD:$src, i8),
++          (EXTS_ORRI GPRD:$src, 8)>;
++def : Pat<(sext_inreg GPRD:$src, i16),
++          (EXTS_ORRI GPRD:$src, 16)>;
++def : Pat<(sext_inreg GPRD:$src, i32),
++          (EXTS_ORRI GPRD:$src, 32)>;
+-- 
+2.43.0
+
