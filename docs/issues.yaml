@@ -218,3 +218,12 @@
   scope: [gem5, M1]
   blocks: null
   resolved_by: DG-006b（架构师直修 execute 按寄存器身份写商/余 + 补 rem=rd0 向量，AGREE 198→200；gem5 patch 0009）
+
+# ── Found by wiki 升级审计 (WU-001a, ADR-0013 首次执行) ────────────────────────
+
+- id: wiki-9f378f4-sbi-see-deferred-delta
+  title: "wiki 13a414d→9f378f4（8 commits）B 桶 delta 记入 deferred 域未来基线（ADR-0013 Phase 2·B 桶策略，该域启动时吸收）。A 桶(M1 核心 SimRISC-01/02)空——SimRISC-01/02/03 零 diff、差分 AGREE(4-way)=200/DIVERGE=0 不回归、pin 已推进至 9f378f4。**SBI 域**(DADAO-22)：PTBR/PTHI/PAHI 走 rb→rd 中转+跳转表(10929f7)、SBI_PHYMEM_ALLOC_PAGE 失败返回值 0→-1(b1a5f7f)、popcnt 实现改 TODO(popcnt 不在 SimRISC ISA)——是未来 musl 系统调用落地(ML-001a recon)的上游依赖。**异常/SEE 域**(DADAO-12)：excp_num 拆 sync_num+async_num/escape_num→rc5(b3d6c82)、CFXMEM 增内部储存块非法访问触发(ea10f5e)、异常进出伪代码统一+cfxld/cfxst 路由简化(6079ecd)、§5 重构+FE→FPEXCP+中断模型前移(defdd96)——异常域启动时须回放吸收。**FP 域**(SimRISC-00 MISC-RF)：浮点指令补 -orrr/-orri 后缀(bc39c7c/b1a5f7f)。C 桶(装饰)已随 pin 吸收无需跟踪：add 示例补 rd0 4 操作数、CSR 名去重、phymem→pmem 全局重命名。"
+  status: open
+  scope: [SEE, SBI, FP]
+  blocks: null
+  resolved_by: null  # 各 deferred 域启动时回放吸收；见 docs/reviews/wiki-upgrade-9f378f4.md
