@@ -15,3 +15,4 @@
 0015-dadao-globals-lld-rework.patch
 0016-dadao-sub-i64-narrow.patch
 0017-dadao-exts-imm-fix.patch
+0018-dadao-global-addr-value.patch

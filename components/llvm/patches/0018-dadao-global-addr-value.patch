@@ -1,0 +1,147 @@
+From a41157e9470433a2d72e36be9028648d2406791d Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 08:58:53 +0800
+Subject: [PATCH] target/dadao: standalone PCREL_HI for global address as value
+ (DL-062b)
+
+---
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp   | 61 ++++++++++++-------
+ .../DADAO/MCTargetDesc/DADAOAsmBackend.cpp    | 13 +---
+ .../DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp |  3 +-
+ 3 files changed, 45 insertions(+), 32 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index 800aa3cfb5a9..067c470d29db 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -72,9 +72,12 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+   }
+ 
+   if (Opc == DADAOISD::PCREL_HI) {
+-    // Handled together with load/store below — do not select standalone
+-    // (standalone PCREL_HI means address is used as a value, not load/store)
+-    SelectCode(Node);
++    SDLoc DL(Node);
++    SDValue GA = Node->getOperand(0);
++    SDNode *Rela = CurDAG->getMachineNode(DADAO::RELA_RIII, DL, MVT::i64, GA);
++    SDNode *New = CurDAG->getMachineNode(DADAO::ADDI_RBRRII, DL, MVT::i64,
++                                          {SDValue(Rela, 0), GA});
++    ReplaceNode(Node, New);
+     return;
+   }
+ 
+@@ -194,39 +197,55 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+     return;
+   } else   if (BaseAddr.getOpcode() == DADAOISD::PCREL_HI) {
+     SDValue GA = BaseAddr.getOperand(0);
++    // Materialize full global address: rela(page) + addi_rb(lo + GEPOff)
+     SDNode *Rela = CurDAG->getMachineNode(DADAO::RELA_RIII, DL, MVT::i64, GA);
++    SDValue BaseReg(Rela, 0);
++    // For non-zero GEPOff, emit an addi_rb to add it; otherwise use the lo fixup directly
++    if (GEPOff != 0 && GEPOff >= -2048 && GEPOff <= 2047) {
++      SDValue OffImm = CurDAG->getTargetConstant(GEPOff, DL, MVT::i64);
++      SDNode *Add = CurDAG->getMachineNode(DADAO::ADDI_RBRRII, DL, MVT::i64,
++                                            {BaseReg, GA});
++      // Then another addi for the GEP constant
++      SDNode *Add2 = CurDAG->getMachineNode(DADAO::ADDI_RBRRII, DL, MVT::i64,
++                                             {SDValue(Add, 0), OffImm});
++      BaseReg = SDValue(Add2, 0);
++      GEPOff = 0; // now embedded in BaseReg
++    } else {
++      SDNode *Add = CurDAG->getMachineNode(DADAO::ADDI_RBRRII, DL, MVT::i64,
++                                            {BaseReg, GA});
++      BaseReg = SDValue(Add, 0);
++    }
++
+     EVT MemVT = IsLoad ? cast<LoadSDNode>(Node)->getMemoryVT()
+                        : cast<StoreSDNode>(Node)->getMemoryVT();
+-    SDValue BaseReg = SDValue(Rela, 0);
+-    SDValue LoOff = GA;
+-    unsigned WideOp = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
+-
++    unsigned WideOp;
+     if (MemVT != MVT::i64) {
+-      unsigned NarrowOp;
+       switch (MemVT.getSimpleVT().SimpleTy) {
+       case MVT::i8:
+-        NarrowOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
+-                                 ? DADAO::LDBS_RRII : DADAO::LDBU_RRII)
+-                          : DADAO::STB_RRII; break;
++        WideOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                               ? DADAO::LDBS_RRII : DADAO::LDBU_RRII)
++                        : DADAO::STB_RRII; break;
+       case MVT::i16:
+-        NarrowOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
+-                                 ? DADAO::LDWS_RRII : DADAO::LDWU_RRII)
+-                          : DADAO::STW_RRII; break;
++        WideOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                               ? DADAO::LDWS_RRII : DADAO::LDWU_RRII)
++                        : DADAO::STW_RRII; break;
+       case MVT::i32:
+-        NarrowOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
+-                                 ? DADAO::LDTS_RRII : DADAO::LDTU_RRII)
+-                          : DADAO::STT_RRII; break;
+-      default: NarrowOp = WideOp; break;
++        WideOp = IsLoad ? (cast<LoadSDNode>(Node)->getExtensionType() == ISD::SEXTLOAD
++                               ? DADAO::LDTS_RRII : DADAO::LDTU_RRII)
++                        : DADAO::STT_RRII; break;
++      default: WideOp = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII; break;
+       }
+-      WideOp = NarrowOp;
++    } else {
++      WideOp = IsLoad ? DADAO::LDO_RRII : DADAO::STO_RRII;
+     }
++    SDValue ZeroOff = CurDAG->getTargetConstant(0, DL, MVT::i64);
+ 
+     if (IsLoad) {
+-      SDValue Ops[] = {BaseReg, LoOff, Chain};
++      SDValue Ops[] = {BaseReg, ZeroOff, Chain};
+       SDNode *New = CurDAG->getMachineNode(WideOp, DL, MVT::i64, MVT::Other, Ops);
+       ReplaceNode(Node, New);
+     } else {
+-      SDValue Ops[] = {Val, BaseReg, LoOff, Chain};
++      SDValue Ops[] = {Val, BaseReg, ZeroOff, Chain};
+       SDNode *New = CurDAG->getMachineNode(WideOp, DL, MVT::Other, Ops);
+       ReplaceNode(Node, New);
+     }
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index 69403d545bef..1caf0c7439e6 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -73,16 +73,9 @@ public:
+     }
+ 
+     if (Kind == DADAO::fixup_dadao_rela_lo) {
+-      if (!IsResolved) {
+-        Value = 0;
+-        maybeAddReloc(F, Fixup, Target, Value, IsResolved);
+-        return;
+-      }
+-      int64_t Target = static_cast<int64_t>(Value);
+-      int64_t Lo = Target & 0xFFF;
+-      uint32_t Mask = 0xFFF;
+-      uint32_t Enc = (Lo & Mask) | (support::endian::read32be(Data) & ~Mask);
+-      support::endian::write32be(Data, Enc);
++      // Always defer to linker — section-relative Value != absolute address
++      Value = 0;
++      maybeAddReloc(F, Fixup, Target, Value, IsResolved);
+       return;
+     }
+ 
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+index b8f40081437c..3028d79194cf 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
+@@ -159,7 +159,8 @@ unsigned DADAOMCCodeEmitter::getMachineOpValue(
+       Kind = MCFixupKind(DADAO::fixup_dadao_call24);
+     else if (Opcode == DADAO::RELA_RIII)
+       Kind = MCFixupKind(DADAO::fixup_dadao_rela_page);
+-    else if (Opcode == DADAO::LDO_RRII || Opcode == DADAO::STO_RRII)
++    else if (Opcode == DADAO::LDO_RRII || Opcode == DADAO::STO_RRII ||
++             Opcode == DADAO::ADDI_RBRRII)
+       Kind = MCFixupKind(DADAO::fixup_dadao_rela_lo);
+     else if (Opcode == DADAO::BRN_RIII || Opcode == DADAO::BRNN_RIII ||
+              Opcode == DADAO::BRZ_RIII || Opcode == DADAO::BRNZ_RIII ||
+-- 
+2.43.0
+
