@@ -1,0 +1,24 @@
+From b4f88e5f98ad390b3eb6e5971c876df4f7ad437f Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 09:36:46 +0800
+Subject: [PATCH] target/dadao: select -> cs* conditional assign (DL-063a)
+
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index fc7b0885bcb2..e5b58b639739 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -21,6 +21,7 @@ enum NodeType {
+   BRNP,   // (chain, val, dest) — brnp  branch if val<=0 (non-positive)
+   CMP,    // (lhs, rhs) → i64  cmps result (−1/0/1)
+   CMPU,   // (lhs, rhs) → i64  cmpu result (−1/0/1)
++  SEL,    // (cond, false, true) → i64  conditional select via csz
+   FI_ADDR, // (TargetFrameIndex) → i64  frame address in GPRB
+   PCREL_HI, // (GlobalAddress) → i64  page-aligned PC-relative address in RB
+ };
+-- 
+2.43.0
+
