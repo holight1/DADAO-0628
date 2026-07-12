@@ -18,3 +18,5 @@
 0018-dadao-global-addr-value.patch
 0019-dadao-select.patch
 0020-clang-dadao-targetinfo.patch
+0021-clang-driver-toolchain.patch
+0022-mc-call24-external-reloc.patch

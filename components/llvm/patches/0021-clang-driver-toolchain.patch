@@ -1,0 +1,163 @@
+From 5f4408abfba5d50fe2de92e09fe1f3373560cb33 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 14:52:55 +0800
+Subject: [PATCH 21/22] =?UTF-8?q?clang:=20DADAO=20driver=20toolchain=20?=
+ =?UTF-8?q?=E2=80=94=20freestanding=20ld.lld=20linker=20(DL-064b)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ clang/lib/Driver/CMakeLists.txt       |  1 +
+ clang/lib/Driver/Driver.cpp           |  4 +++
+ clang/lib/Driver/ToolChains/DADAO.cpp | 46 ++++++++++++++++++++++++
+ clang/lib/Driver/ToolChains/DADAO.h   | 50 +++++++++++++++++++++++++++
+ 4 files changed, 101 insertions(+)
+ create mode 100644 clang/lib/Driver/ToolChains/DADAO.cpp
+ create mode 100644 clang/lib/Driver/ToolChains/DADAO.h
+
+diff --git a/clang/lib/Driver/CMakeLists.txt b/clang/lib/Driver/CMakeLists.txt
+index 0026ba899171..15cf0977277e 100644
+--- a/clang/lib/Driver/CMakeLists.txt
++++ b/clang/lib/Driver/CMakeLists.txt
+@@ -71,6 +71,7 @@ add_clang_library(clangDriver
+   ToolChains/MipsLinux.cpp
+   ToolChains/MinGW.cpp
+   ToolChains/MSP430.cpp
++  ToolChains/DADAO.cpp
+   ToolChains/MSVC.cpp
+   ToolChains/NetBSD.cpp
+   ToolChains/OHOS.cpp
+diff --git a/clang/lib/Driver/Driver.cpp b/clang/lib/Driver/Driver.cpp
+index eb3f9cbea284..ad7de32b261d 100644
+--- a/clang/lib/Driver/Driver.cpp
++++ b/clang/lib/Driver/Driver.cpp
+@@ -33,6 +33,7 @@
+ #include "ToolChains/Lanai.h"
+ #include "ToolChains/Linux.h"
+ #include "ToolChains/MSP430.h"
++#include "ToolChains/DADAO.h"
+ #include "ToolChains/MSVC.h"
+ #include "ToolChains/Managarm.h"
+ #include "ToolChains/MinGW.h"
+@@ -6991,6 +6992,9 @@ const ToolChain &Driver::getToolChain(const ArgList &Args,
+       case llvm::Triple::msp430:
+         TC = std::make_unique<toolchains::MSP430ToolChain>(*this, Target, Args);
+         break;
++      case llvm::Triple::dadao:
++        TC = std::make_unique<toolchains::DADAOToolChain>(*this, Target, Args);
++        break;
+       case llvm::Triple::riscv32:
+       case llvm::Triple::riscv64:
+         TC = std::make_unique<toolchains::BareMetal>(*this, Target, Args);
+diff --git a/clang/lib/Driver/ToolChains/DADAO.cpp b/clang/lib/Driver/ToolChains/DADAO.cpp
+new file mode 100644
+index 000000000000..b20062c8be24
+--- /dev/null
++++ b/clang/lib/Driver/ToolChains/DADAO.cpp
+@@ -0,0 +1,46 @@
++#include "DADAO.h"
++#include "clang/Driver/Compilation.h"
++#include "clang/Driver/InputInfo.h"
++#include "clang/Options/Options.h"
++
++using namespace clang::driver;
++using namespace clang::driver::toolchains;
++using namespace clang::driver::tools;
++using namespace clang;
++using namespace llvm::opt;
++
++DADAOToolChain::DADAOToolChain(const Driver &D, const llvm::Triple &Triple,
++                                 const ArgList &Args)
++    : Generic_ELF(D, Triple, Args) {
++  getProgramPaths().push_back(getDriver().Dir);
++}
++
++Tool *DADAOToolChain::buildLinker() const {
++  return new tools::dadao::Linker(*this);
++}
++
++void dadao::Linker::ConstructJob(Compilation &C, const JobAction &JA,
++                                  const InputInfo &Output,
++                                  const InputInfoList &Inputs,
++                                  const ArgList &Args,
++                                  const char *LinkingOutput) const {
++  const ToolChain &TC = getToolChain();
++  const Driver &D = TC.getDriver();
++  ArgStringList CmdArgs;
++
++  for (const auto &II : Inputs) {
++    if (II.isFilename())
++      CmdArgs.push_back(II.getFilename());
++    else
++      II.getInputArg().renderAsInput(Args, CmdArgs);
++  }
++
++  CmdArgs.push_back("-o");
++  CmdArgs.push_back(Output.getFilename());
++
++  std::string LLD = D.GetProgramPath("ld.lld", TC);
++  C.addCommand(std::make_unique<Command>(JA, *this,
++                                         ResponseFileSupport::AtFileCurCP(),
++                                         Args.MakeArgString(LLD), CmdArgs,
++                                         Inputs, Output, nullptr));
++}
+diff --git a/clang/lib/Driver/ToolChains/DADAO.h b/clang/lib/Driver/ToolChains/DADAO.h
+new file mode 100644
+index 000000000000..5c3db5ee9e50
+--- /dev/null
++++ b/clang/lib/Driver/ToolChains/DADAO.h
+@@ -0,0 +1,50 @@
++//===--- DADAO.h - DADAO ToolChain Implementations --------------*- C++ -*-===//
++#ifndef LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_DADAO_H
++#define LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_DADAO_H
++
++#include "Gnu.h"
++#include "clang/Driver/InputInfo.h"
++#include "clang/Driver/Tool.h"
++#include "clang/Driver/ToolChain.h"
++#include "llvm/Option/Option.h"
++
++namespace clang {
++namespace driver {
++namespace toolchains {
++
++class LLVM_LIBRARY_VISIBILITY DADAOToolChain : public Generic_ELF {
++public:
++  DADAOToolChain(const Driver &D, const llvm::Triple &Triple,
++                  const llvm::opt::ArgList &Args);
++  bool isPICDefault() const override { return false; }
++  bool isPIEDefault(const llvm::opt::ArgList &) const override { return false; }
++  bool isPICDefaultForced() const override { return true; }
++  UnwindLibType GetUnwindLibType(const llvm::opt::ArgList &) const override {
++    return UNW_None;
++  }
++
++protected:
++  Tool *buildLinker() const override;
++};
++
++} // namespace toolchains
++
++namespace tools {
++namespace dadao {
++
++class LLVM_LIBRARY_VISIBILITY Linker final : public Tool {
++public:
++  Linker(const ToolChain &TC) : Tool("DADAO::Linker", "ld.lld", TC) {}
++  bool hasIntegratedCPP() const override { return false; }
++  bool isLinkJob() const override { return true; }
++  void ConstructJob(Compilation &C, const JobAction &JA,
++                    const InputInfo &Output, const InputInfoList &Inputs,
++                    const llvm::opt::ArgList &TCArgs,
++                    const char *LinkingOutput) const override;
++};
++
++} // namespace dadao
++} // namespace tools
++} // namespace driver
++} // namespace clang
++#endif
+-- 
+2.43.0
+

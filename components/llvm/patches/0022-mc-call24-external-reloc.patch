@@ -1,0 +1,44 @@
+From 1c4cc6b46f4f98d723af2a90113263f8232ce821 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 12 Jul 2026 15:10:41 +0800
+Subject: [PATCH 22/22] MC: emit R_DADAO_CALL24 for undefined/cross-object call
+ targets (DL-064b)
+
+---
+ .../Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp   | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index 1caf0c7439e6..2418be122627 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -10,6 +10,8 @@
+ #include "llvm/MC/MCAsmBackend.h"
+ #include "llvm/MC/MCELFObjectWriter.h"
+ #include "llvm/MC/MCFixup.h"
++#include "llvm/MC/MCSymbol.h"
++#include "llvm/MC/MCValue.h"
+ #include "llvm/BinaryFormat/ELF.h"
+ #include "llvm/MC/MCObjectWriter.h"
+ #include "llvm/MC/MCSubtargetInfo.h"
+@@ -33,6 +35,17 @@ public:
+     unsigned Kind = Fixup.getKind();
+ 
+     if (Kind == DADAO::fixup_dadao_call24) {
++      const MCSymbol *Sym = Target.getAddSym();
++      if (Sym && Sym->isUndefined()) {
++        // Cross-object call: the target is undefined here (e.g. crt0.o's
++        // `call main` where main lives in another object). Emit an
++        // R_DADAO_CALL24 relocation for the linker instead of a bogus offset.
++        // A same-unit-defined target (even a global) is still resolved below so
++        // the flat-binary (no-linker) E2E path keeps working.
++        Value = 0;
++        maybeAddReloc(F, Fixup, Target, Value, IsResolved);
++        return;
++      }
+       int64_t Imm24 = (static_cast<int64_t>(Value) - 4) >> 2;
+       uint32_t Mask = 0xFFFFFF;
+       uint32_t Enc = (Imm24 & Mask) | (support::endian::read32be(Data) & ~Mask);
+-- 
+2.43.0
+

@@ -1,0 +1,10 @@
+// clang driver one-shot + cross-object call (DL-064b). crt0.o and the clang
+// object are SEPARATE objects; crt0's `call main` needs an R_DADAO_CALL24
+// relocation resolved by ld.lld. Proves the driver drives clang->ld.lld and
+// cross-object calls link correctly. Dual-backend exit 42.
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/clang_oneshot.c -o %t.elf
+// RUN: readelf -h %t.elf | grep -q '0xda0'
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 42'
