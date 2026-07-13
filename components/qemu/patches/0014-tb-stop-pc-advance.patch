@@ -1,0 +1,68 @@
+From 63b6843c4c7f5c4040da5d0dfbc87d36c6c9ffe6 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Mon, 13 Jul 2026 17:57:53 +0800
+Subject: [PATCH] target/dadao: advance env->pc for DISAS_TOO_MANY before TB
+ lookup (ML-003f)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Only branch-family instructions (br*/jump/call/ret) write env->pc via
+tcg_gen_st_i64; dadao_tr_tb_stop()'s DISAS_TOO_MANY case called
+tcg_gen_lookup_and_goto_ptr() (which resolves the next TB from
+env->pc via cpu_get_tb_cpu_state()) without ever advancing env->pc for
+a TB that ends without executing a branch.
+
+This is invisible for ordinary multi-instruction TBs (they almost
+always end on a real branch in practice), but cpu_io_recompile()
+constructs single-instruction "precise IO" TBs for whatever
+non-branch instruction triggered the mid-block MMIO/IO access — for
+those, DISAS_TOO_MANY fires after exactly one non-branch instruction,
+env->pc is never touched, and the next-TB lookup resolves back to the
+exact same stale PC: an infinite re-translate/re-execute loop of that
+one instruction (observed as unbounded `cpu_io_recompile: rewound
+execution of TB to <same pc>` — verified stuck for 60s+, not merely
+slow).
+
+Fix: write env->pc = ctx->base.pc_next before the goto-ptr lookup in
+the DISAS_TOO_MANY case, mirroring what every branch instruction
+already does explicitly.
+
+Verified: a previously-hanging picolibc printf link (indirect call
+through stdout's tinystdio put callback, a non-branch load instruction
+was the repeating PC) now completes instead of hanging past a 60s
+timeout. E2E 27/27, differential AGREE(4-way)=200/DIVERGE=0, no
+regression (ordinary TBs already ending on real branches are
+unaffected).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ target/dadao/translate.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 789dcaf..3e9ca95 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -1341,6 +1341,18 @@ static void dadao_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
+ 
+     switch (ctx->base.is_jmp) {
+     case DISAS_TOO_MANY:
++        /* Falling off the end of the TB (max_insns / page boundary / a
++         * single-instruction TB forced by cpu_io_recompile) — unlike every
++         * branch-family instruction, plain sequential insns never write
++         * env->pc themselves. tcg_gen_lookup_and_goto_ptr() finds the next
++         * TB via cpu_get_tb_cpu_state(), which reads env->pc directly, so
++         * it must be advanced to pc_next here or the lookup resolves back
++         * to this same (stale) PC — infinite re-translation/re-execution
++         * loop of the same instruction (only ever bites single-instruction
++         * non-branch TBs, e.g. the ones cpu_io_recompile constructs).
++         */
++        tcg_gen_st_i64(tcg_constant_i64(ctx->base.pc_next), tcg_env,
++                       offsetof(CPUDADAOState, pc));
+         tcg_gen_lookup_and_goto_ptr();
+         break;
+     case DISAS_NORETURN:
+-- 
+2.43.0
+

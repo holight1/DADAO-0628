@@ -114,3 +114,36 @@ python3 tools/run_differential.py 2>&1 | tail -3
 3. 若确认是 (b)：核对 `stdout_min.c` 与 tinystdio `libc/tinystdio/stdio_private.h` 的 `struct __file`/`FDEV_SETUP_STREAM` 宏定义逐字段比对。
 
 **已排除的方向**（别重复）：寄存器数量 rd0-31；栈指针未初始化；地址落入 MMIO 区；代码数据同页 SMC；"慢但会终止"（60秒验证过仍未完成）。
+
+---
+
+## 架构师第二轮：根因定位 + 修复（2026-07-13，查老仓库 + 知识图谱后）
+
+### 排查路径
+按用户指示先查 `~/toolchain/DADAO`（老 QEMU 仓库）里同类问题的历史处理——找到 `DL-060c-masked-async-deadlock-fix.md`：同款症状("guest TB 永远无法执行，PC 停在同一地址无限循环")，根因是"某状态被清除后又被另一路径立刻重新设置"的乒乓循环。以及 memory `feedback_qemu_escape_jmppc.md`：老仓库 ESCAPE 指令只更新 `env->REG_PC` 没同步更新 `env->jmp_pc`（tb_stop 用 jmp_pc 覆盖 cpu_pc），导致无限循环——**结构性教训**："目标架构若维护多处/多套 PC 表示，只要有一处该更新而没更新，就会在小众路径现身'PC 原地不动、无限重查同一 TB'"。
+
+**DADAO-0628 的 QEMU 是独立实现**（非老仓库 fork），没有 `jmp_pc` 分离机制，ESCAPE bug 的具体修法不直接适用，但**结构性心法可迁移**。
+
+### 真根因（已定位 + 修复 + 验证）
+`target/dadao/translate.c` 的 `dadao_tr_tb_stop()`：
+```c
+switch (ctx->base.is_jmp) {
+case DISAS_TOO_MANY:
+    tcg_gen_lookup_and_goto_ptr();   // ← 缺少写 env->pc！
+    break;
+...
+```
+全文核实：**只有分支族指令（br*/jump/call/ret）显式写 `env->pc`**（`tcg_gen_st_i64(pc_next+..., offsetof(pc))`，23 处全部来自这些指令）。`tcg_gen_lookup_and_goto_ptr()` 依赖 `cpu_get_tb_cpu_state()` 读 `env->pc` 找下一个 TB。**普通（非分支）指令结束的 TB（`DISAS_TOO_MANY`）从未写 `env->pc`**——正常大 TB 因几乎总以真分支结尾侥幸没暴露；`cpu_io_recompile` 为触发 IO 的非分支指令构造的单指令精确 TB **必然**如此结束（本例 `ldo rd16, rb8, 8`），`env->pc` 从未推进，`lookup_and_goto_ptr()` 查回同一陈旧 PC——无限重译/重执行同一条指令。
+
+**修复**（`.work/source/qemu` commit `63b6843`，patch `components/qemu/patches/0014-tb-stop-pc-advance.patch`）：`DISAS_TOO_MANY` 分支补上 `tcg_gen_st_i64(pc_next, ..., offsetof(pc))`，镜像分支指令已有的写法。
+
+**验证**：之前挂起的完整 printf 链接程序（60 秒超时都跑不完）现在**几秒内正常结束**（不再 timeout）；E2E 27/27、四方 AGREE(4-way)=200/DIVERGE=0 **无回归**（普通 TB 本就以真分支结尾，不受影响）。
+
+**知识图谱已抽取**：`compiler-backend/05-qemu-tcg-target-porting.md` 新增模式"非分支指令结束的 TB 必须显式写 PC"（commit `30822c0`）。
+
+### 遗留（新发现，范围外，非本任务阻塞）
+修复挂起后，同一测试跑出 **exit=130（0x82 ILLI）**——**非挂起**（trace 显示同一 PC 合法重复约 120 万次后正常终止于非法指令，无 `cpu_io_recompile` 反复），与本任务的"无限循环"是不同性质的问题，很可能是 `stdout_min.c`（ad-hoc 手写 tinystdio stdout 接线测试，非仓库文件）本身的结构体布局/逻辑问题，或 vfprintf 更深层的集成细节。**这是 ML-003b（picolibc goal① 收尾）范围的后续问题，非 QEMU TCG hang 本身**——留给 ML-003b 或新任务处理，别与本任务的 hang 混为一谈。
+
+### 判决
+**ML-003f 目标（QEMU printf 挂起）达成**：真根因定位、真修复、真验证（60s→秒级完成）、无回归、知识沉淀。
+
