@@ -1,0 +1,186 @@
+From b3bbe0418bee9f801b90ffb30eab68e62c1d7d99 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Mon, 13 Jul 2026 17:13:46 +0800
+Subject: [PATCH] MC/lld: fix cross-section same-object CALL24 + add
+ R_DADAO_ABS64 for data-section function pointers (ML-003e)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two MC/ELF-layer relocation gaps surfaced by picolibc (any real C build,
+not picolibc-specific):
+
+- G1: -ffunction-sections puts each function in its own section; a call
+  between two same-object functions in different sections was treated
+  as resolvable at assembly time (Sym->isUndefined() was false) and
+  encoded a bogus offset (verified: disassembled as `call -1`) with no
+  relocation emitted. Fixed by also forcing a relocation when the
+  fixup's section differs from the callee symbol's section, not only
+  when the symbol is truly undefined.
+- G2: `.quad symbol`-style 8-byte absolute data references (e.g. a
+  statically-initialized function-pointer global) fell through
+  DADAOAsmBackend::applyFixup unhandled (only the 4 custom
+  fixup_dadao_* kinds were handled) — the value silently stayed zero
+  with no relocation. Added R_DADAO_ABS64 (enum + AsmBackend FK_Data_8
+  handling + ELFObjectWriter case + lld ELF/Arch/DADAO.cpp relocate()).
+
+Ground-truth verified via real link (not just object-file inspection):
+`call -2` correctly resolves cross-section to the callee's address;
+a global function pointer's .data slot holds the real target address
+(big-endian) instead of zero. E2E 27/27, differential AGREE(4-way)=200/
+DIVERGE=0, no regression.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ lld/ELF/Arch/DADAO.cpp                        |  8 +++-
+ .../DADAO/MCTargetDesc/DADAOAsmBackend.cpp    | 48 ++++++++++++++++---
+ .../MCTargetDesc/DADAOELFObjectWriter.cpp     |  3 ++
+ .../DADAO/MCTargetDesc/DADAOMCTargetDesc.h    |  1 +
+ 4 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/lld/ELF/Arch/DADAO.cpp b/lld/ELF/Arch/DADAO.cpp
+index 1180466ce220..ae28c2ac1190 100644
+--- a/lld/ELF/Arch/DADAO.cpp
++++ b/lld/ELF/Arch/DADAO.cpp
+@@ -30,7 +30,8 @@ enum {
+   R_DADAO_BRANCH12 = 3,
+   R_DADAO_RELA_PAGE = 4,
+   R_DADAO_RELA_LO = 5,
+-  R_DADAO_NUM = 6,
++  R_DADAO_ABS64 = 6,
++  R_DADAO_NUM = 7,
+ };
+ 
+ class DADAO final : public TargetInfo {
+@@ -63,6 +64,7 @@ RelExpr DADAO::getRelExpr(RelType type, const Symbol &s,
+                           const uint8_t *loc) const {
+   switch (type) {
+   case R_DADAO_32:
++  case R_DADAO_ABS64:
+     return R_ABS;
+   case R_DADAO_CALL24:
+   case R_DADAO_BRANCH18:
+@@ -84,6 +86,10 @@ void DADAO::relocate(uint8_t *loc, const Relocation &rel,
+     write32be(loc, static_cast<uint32_t>(val));
+     return;
+ 
++  case R_DADAO_ABS64:
++    write64be(loc, val);
++    return;
++
+   case R_DADAO_CALL24: {
+     int64_t imm = (static_cast<int64_t>(val) - 4) >> 2;
+     checkInt(ctx, loc, imm, 24, rel);
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index 2418be122627..4488e6fda503 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -36,16 +36,17 @@ public:
+ 
+     if (Kind == DADAO::fixup_dadao_call24) {
+       const MCSymbol *Sym = Target.getAddSym();
+-      if (Sym && Sym->isUndefined()) {
+-        // Cross-object call: the target is undefined here (e.g. crt0.o's
+-        // `call main` where main lives in another object). Emit an
+-        // R_DADAO_CALL24 relocation for the linker instead of a bogus offset.
+-        // A same-unit-defined target (even a global) is still resolved below so
+-        // the flat-binary (no-linker) E2E path keeps working.
++      const MCSection *FixupSec = F.getParent();
++      const MCSection *SymSec =
++          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
++                                      : nullptr;
++      if ((Sym && Sym->isUndefined()) || (SymSec && SymSec != FixupSec)) {
++        // Undefined or cross-section: emit relocation for the linker
+         Value = 0;
+         maybeAddReloc(F, Fixup, Target, Value, IsResolved);
+         return;
+       }
++      // Same-section defined target: resolve directly
+       int64_t Imm24 = (static_cast<int64_t>(Value) - 4) >> 2;
+       uint32_t Mask = 0xFFFFFF;
+       uint32_t Enc = (Imm24 & Mask) | (support::endian::read32be(Data) & ~Mask);
+@@ -54,6 +55,16 @@ public:
+     }
+ 
+     if (Kind == DADAO::fixup_dadao_branch18) {
++      const MCSymbol *Sym = Target.getAddSym();
++      const MCSection *FixupSec = F.getParent();
++      const MCSection *SymSec =
++          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
++                                      : nullptr;
++      if ((Sym && Sym->isUndefined()) || (SymSec && SymSec != FixupSec)) {
++        Value = 0;
++        maybeAddReloc(F, Fixup, Target, Value, IsResolved);
++        return;
++      }
+       int64_t Imm18 = (static_cast<int64_t>(Value) - 4) >> 2;
+       uint32_t Mask = 0x3FFFF;
+       uint32_t Enc = (Imm18 & Mask) | (support::endian::read32be(Data) & ~Mask);
+@@ -62,6 +73,16 @@ public:
+     }
+ 
+     if (Kind == DADAO::fixup_dadao_branch12) {
++      const MCSymbol *Sym = Target.getAddSym();
++      const MCSection *FixupSec = F.getParent();
++      const MCSection *SymSec =
++          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
++                                      : nullptr;
++      if ((Sym && Sym->isUndefined()) || (SymSec && SymSec != FixupSec)) {
++        Value = 0;
++        maybeAddReloc(F, Fixup, Target, Value, IsResolved);
++        return;
++      }
+       int64_t Imm12 = (static_cast<int64_t>(Value) - 4) >> 2;
+       uint32_t Mask = 0xFFF;
+       uint32_t Enc = (Imm12 & Mask) | (support::endian::read32be(Data) & ~Mask);
+@@ -92,6 +113,21 @@ public:
+       return;
+     }
+ 
++    // Generic FK_Data_8: 64-bit absolute data (function pointers, etc.)
++    if (Kind == FK_Data_8) {
++      const MCSymbol *Sym = Target.getAddSym();
++      const MCSection *FixupSec = F.getParent();
++      const MCSection *SymSec =
++          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
++                                      : nullptr;
++      if ((Sym && Sym->isUndefined()) || (SymSec && SymSec != FixupSec)) {
++        maybeAddReloc(F, Fixup, Target, Value, IsResolved);
++        return;
++      }
++      support::endian::write64be(Data + Offset, Value);
++      return;
++    }
++
+     if (IsResolved)
+       support::endian::write32be(Data + Offset,
+                                   static_cast<uint32_t>(Value) & 0xFFFFFFFF);
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+index f11fa5524fa7..95617322565e 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOELFObjectWriter.cpp
+@@ -30,6 +30,9 @@ protected:
+     switch (unsigned(Fixup.getKind())) {
+     default:
+       llvm_unreachable("Unknown fixup kind");
++    case FK_Data_8:
++      return unsigned(DADAO::R_DADAO_ABS64);
++    case FK_Data_4:
+     case FK_SecRel_4:
+       return unsigned(DADAO::R_DADAO_32);
+     case DADAO::fixup_dadao_call24:
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+index 4f6aced18bed..56b7fc19979b 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCTargetDesc.h
+@@ -48,6 +48,7 @@ enum {
+   R_DADAO_BRANCH12 = 3,
+   R_DADAO_RELA_PAGE = 4,
+   R_DADAO_RELA_LO = 5,
++  R_DADAO_ABS64 = 6,
+   R_DADAO_NUM,
+ };
+ } // namespace DADAO
+-- 
+2.43.0
+

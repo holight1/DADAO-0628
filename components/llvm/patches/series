@@ -22,3 +22,4 @@
 0022-mc-call24-external-reloc.patch
 0023-dadao-trap-llvm-mc.patch
 0024-picolibc-backend-enablement.patch
+0025-mc-relocation-gaps.patch

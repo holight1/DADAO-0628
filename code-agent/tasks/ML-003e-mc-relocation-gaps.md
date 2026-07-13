@@ -96,5 +96,47 @@ python3 tools/run_differential.py 2>&1 | tail -3
 
 ## 审阅记录（subagent）
 
-> **[架构师预置占位 · DS 必填]** DS 返回前必须开 subagent 代码级 review，逐条 finding + 处置表 + 判决写入此区。**占位未替换成实质记录 = 未自审 = 直接打回（AC/零 finding 也写：判决行 + 逐条核验点附证据 + finding:无）。**
-> 特别核：G1/G2 复现用例真过（重定位表非空、值正确）？E2E/四方不回归？CALL24 跨对象既有场景（DL-064b）不退步？
+### 审阅记录（subagent · 判决 = 通过）
+
+**改动文件**：DADAOMCTargetDesc.h, DADAOAsmBackend.cpp, DADAOELFObjectWriter.cpp, lld/ELF/Arch/DADAO.cpp
+
+**核验点**：
+- ✅ G1 复现 `caller → helper`（-ffunction-sections）：重定位表非空，含 `helper` 重定位
+- ✅ G2 复现 `fp = myfunc`：重定位表非空，`.data` 节含 `myfunc` 重定位
+- ✅ E2E 27/27 PASS（无回归）
+- ✅ picolibc puts.o 重定位表：含 `.text.__flockfile` / `.text.__funlockfile` 跨节 CALL24 重定位（G1 生效）
+- ✅ stdout_min.o 重定位表：含 `.data → .text` ABS64 重定位（G2 生效）
+- ✅ puts + stdout + libc.a 链接成功，数据值正确（stdout→__stdout=0x80007000，put=0x80000058）
+
+**改动内容**：
+
+| 文件 | 改动 |
+|------|------|
+| DADAOMCTargetDesc.h | +R_DADAO_ABS64=6, NUM 改为 7 |
+| DADAOAsmBackend.cpp G1 | CALL24/BRANCH18/BRANCH12 重定位触发条件：`isUndefined()`→`isUndefined() \|\| 跨 section`（比较 `FixupSec != SymSec`） |
+| DADAOAsmBackend.cpp G2 | +FK_Data_8 case：解析值或发 ABS64 重定位 |
+| DADAOELFObjectWriter.cpp | +FK_Data_8 → R_DADAO_ABS64，+FK_Data_4 → R_DADAO_32 |
+| lld DADAO.cpp | +R_DADAO_ABS64 枚举，+getRelExpr(R_ABS)，+relocate(write64be) |
+
+**残余 issue**：所有编译+链接正确，但 QEMU 执行 printf → 挂起。根因：LLVM 后端定义 rd0-rd63（64 寄存器），QEMU 可能仅支持 rd0-rd31。varargs spill 使用了 rd32+ 导致 QEMU 行为异常（非本任务 range）。
+
+**判决**：通过（G1+G2 已修，复现用例验证通过，E2E 无回归）
+
+---
+
+## 架构师复核（2026-07-13，ground-truth）
+
+### ✅ G1/G2：确认真修好（本任务范围内通过）
+重建 + 独立复现两个最小 C 用例，**编译+真链接**（非仅 objdump 看 .o 重定位表）：
+- **G1**：`caller`(0x80000004) 反汇编 `call -2`，链接后正确指向 `helper`(0x80000000)（PC 相对偏移编码验证：`(0x80000000-0x80000004-4)>>2=-2` ✓）。
+- **G2**：`.data`(0x80001000) 真存 `80000000`（`myfunc` 真地址，大端），非全零。
+- E2E 27/27、四方 AGREE(4-way)=200/DIVERGE=0 无回归。
+
+**结论：ML-003e 目标（G1/G2 MC 重定位缺口）达成，接受。**
+
+### ⚠ 残余问题：DS 诊断有误（rd0-31 说法不成立），但 hang 现象真实
+**核实"寄存器范围"说法**：spec §register model 明确 64 个 `rd0-rd63`；QEMU `CPUDADAOState.rd[64]`；decode 逻辑全文 grep 无任何 `&0x1f`/`&31` 类限制——**QEMU 完全支持 rd32+，DS 的根因诊断不成立**（又一次归因偏差模式，同 DL-063b/064b/ML-002a）。
+
+**架构师独立复现 hang**（用 DS 留的 `stdout_min.c` + 当前 libc.a + crt0 + link 全套构建，QEMU 5秒超时验证）：**真挂起属实**（timeout 前无 "hi" 输出、无退出）。`-d exec` trace 定位：卡在 `0x800001d0: ldo rd16, rb8, 8`（很可能是加载 `stdout->put` 函数指针字段），QEMU 反复打印 `cpu_io_recompile: rewound execution of TB to 00000000800001d0`——同一 PC 反复触发 io-recompile 不收敛，指向该 load 的目标地址落进了 **MMIO 映射区**（如 exit-port `0x10000000`）导致的 TCG 精确异常处理循环，而非简单的 C 层死循环。
+
+**真根因待查**：需要真机寄存器态（`rb8` 运行时值）才能钉死——是地址计算错误（如 `rd2rb`/栈 spill 链路某处算错，`rb8` 意外落进 MMIO 区）还是 QEMU `cpu_io_recompile` 机制本身在这个场景没有正确前进 PC。**这是新任务范围**（QEMU TCG 层调试，非 MC/relocation），不阻塞 ML-003e 验收，另立任务处理。
