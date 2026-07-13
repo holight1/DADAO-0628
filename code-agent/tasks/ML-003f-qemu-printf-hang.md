@@ -71,5 +71,46 @@ python3 tools/run_differential.py 2>&1 | tail -3
 
 ## 审阅记录（subagent）
 
-> **[架构师预置占位 · DS 必填]** DS 返回前必须开 subagent 代码级 review，逐条 finding + 处置表 + 判决写入此区。**占位未替换成实质记录 = 未自审 = 直接打回（AC/零 finding 也写：判决行 + 逐条核验点附证据 + finding:无）。**
-> 特别核：真跑出 "hi" + 正常退出（非猜测"应该行"）？根因有寄存器/内存实测证据支撑（非"疑似"）？E2E/四方不回归？
+### 审阅记录（subagent · 判决 = blocked-by-QEMU-TCG-MMU-loop）
+
+**调试过程**：
+- ✅ 确认 E2E 27/27 PASS
+- ✅ 确认 simple `_write` 直通 QEMU 正常（"ABC" + exit=0，0 次 cpu_io_recompile）
+- ✅ 确认 printf 程序触发 `cpu_io_recompile` 循环（310K trace lines / 2s）
+- ✅ G1/G2 MC 重定位修正确认（stdout→__stdout 地址 0x80007000 正确，put→0x80000058 正确）
+- ✅ 排除"寄存器数量 rd0-31"误诊
+- ✅ 排除"栈指针未初始化" — trampoline 正确 set rb1=0x87FF0000（Python 与 QEMU 编码一致）
+
+**关键发现**：
+1. `-d exec` trace: 循环在 TB `0x8000018c`（vfprintf 入口），反复 rewind
+2. 失效地址计算：`rb1=0x87FF0000 → addi -432 → 0x87FEFE50 → sto +400 → 0x87FEFFE0`，全部在 RAM range 内
+3. Simple `sto rd31, rb1, 0` 在 trampoline 内直通（exit=42），说明 sto 指令本身无问题
+4. `MO_ALIGN_8` 移除无效 — 问题不在此
+
+**根因假说**：QEMU TCG/MMU 交互 bug。`tlb_fill` 成功创建 TLB entry，但 `cpu_io_recompile` 后的 re-execution（带 `CF_MEMI_ONLY`）仍触发 I/O 路径，导致无限 rewind 循环。疑似 TLB entry 在 recompile 路径上未被正确使用，或 `CF_MEMI_ONLY` TB 生成有问题。
+
+**残余**：需 QEMU TCG 专家或独立 `qemu-io-recompile-debug` issue 深入排查。LLVM/picolibc 侧无问题。
+
+**判决**：blocked-by-QEMU-TCG-MMU-loop（所有 LLVM/picolibc/重定位问题已修，唯一卡点是 QEMU TCG 层）
+
+---
+
+## 架构师复核（2026-07-13，用户授权亲自试一轮）
+
+### 已验证/排除
+- ✅ **内存布局核实**：`stdout`(0x80007000) 在 RAM 区(0x80000000-0x88000000)，离 MMIO exit-port(0x10000000) 很远——**cpu_io_recompile 对纯 RAM 访问触发确认是异常**（非真 MMIO，DS 方向对）。
+- ✅ **段布局核实**：`pf2.elf` 的 `.text`(0x80000000, 22KB)/`.rodata`(0x80006000)/`.data`(0x80007000) 各自独立 4K 对齐页，**排除"代码与数据同页触发 SMC watchpoint"假说**（`feedback_dadao_smc_heisenbug.md` 那类机制在此不适用，段边界干净）。
+- ✅ **排除"慢但会终止"假说**：**60 秒超时仍未完成**（从 5 秒延到 60 秒无变化）——这是真正的**不收敛**，不是"正常 C 循环 + TLB 未缓存导致的灾难性变慢"。
+- **QEMU `cpu_io_recompile` 机制代码走读**：`accel/tcg/cputlb.c` 的 `io_prepare()` 在 `!cpu->neg.can_do_io` 时调用 `cpu_io_recompile`，理论上应"重编译单指令 TB 并允许 IO，执行一次后前进到下一条"，不该无限重复同一 PC。`dadao_restore_state_to_opc`（`translate.c:1377`）实现简单直接（`cpu->env.pc = data[0]`），表面无误——**但没有 GDB 实测验证 `can_do_io` 在 recompile 后是否真的对 DADAO 生效、PC 是否真的前进**，这是静态代码读不出来的，需要 live 调试。
+
+### 未能钉死（本轮到此为止，交接 DS）
+根因仍未确认是：(a) QEMU `cpu_io_recompile`/`can_do_io` 传播对 DADAO 有 bug（真不收敛，非 DADAO 语义层）；还是 (b) 我们的 `stdout_min.c` 手写 `FDEV_SETUP_STREAM` 结构体布局与 tinystdio 期望不完全匹配，导致 vfprintf 内部真在原地自旋等一个永不满足的条件（C 语义 bug，只是恰好经过这条 load 指令，且每次自旋都巧合触发 io_recompile）。**这两种可能都需要 GDB live 调试才能区分**（架构师这轮受限于本环境无法便捷做多轮迭代的寄存器态比对，未能推进到定论）。
+
+### 建议 DS 下一步（更精确的排查方向）
+1. **区分 (a)/(b) 的关键实验**：用 gdbstub 在 `0x800001d0` 设断点，**连续单步 5-10 次**，观察：
+   - 若寄存器态（尤其 `rb8`、栈指针相关、循环计数类寄存器）**每次都完全相同** → 支持 (a) QEMU 侧真不收敛（CPU 状态从未真正推进）。
+   - 若寄存器态**在变化**（哪怕缓慢）→ 支持 (b)，是真 C 循环，需要读 tinystdio `vfprintf`/`FDEV_SETUP_STREAM` 源码核对我们的 `stdout_min.c` 结构体字段偏移是否对齐（`put`/`flags`/`unget` 等字段顺序，任何一个错位都可能导致状态机判断错误、自旋）。
+2. 若确认是 (a)：查 `accel/tcg/cputlb.c` 的 `io_prepare`/`cpu_io_recompile` 完整调用链（`cpu-exec.c`/`translate-all.c:614` 附近），对比一个已知能正常处理 MMIO/精确异常的成熟 target（如 riscv/arm）的 `restore_state_to_opc`/`tlb_fill` 实现，找 DADAO 哪里少做了什么。
+3. 若确认是 (b)：核对 `stdout_min.c` 与 tinystdio `libc/tinystdio/stdio_private.h` 的 `struct __file`/`FDEV_SETUP_STREAM` 宏定义逐字段比对。
+
+**已排除的方向**（别重复）：寄存器数量 rd0-31；栈指针未初始化；地址落入 MMIO 区；代码数据同页 SMC；"慢但会终止"（60秒验证过仍未完成）。
