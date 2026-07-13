@@ -1,0 +1,571 @@
+From 1130ab466eb32cb86f9ce7c8f95d054a3ec3d0eb Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Mon, 13 Jul 2026 16:06:05 +0800
+Subject: [PATCH] =?UTF-8?q?target/dadao:=20picolibc=20backend=20enablement?=
+ =?UTF-8?q?=20=E2=80=94=20mem*=20expand,=20varargs,=20indirect=20call=20(M?=
+ =?UTF-8?q?L-003a-d)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Real-C libc compilation (picolibc) exercised codegen paths never hit by
+hand-written test vectors, surfacing and fixing a cluster of backend gaps:
+
+- llvm.memcpy/memmove/memset intrinsics: force full inline expansion
+  (MaxStoresPerMem* = UINT_MAX) since brcond-based expansion was
+  previously unselectable.
+- varargs (VASTART): DADAOMachineFunctionInfo (VarArgsFrameIndex/Size) +
+  DADAOTargetMachine::createMachineFunctionInfo override — printf's
+  va_list handling no longer null-derefs.
+- GPRB spill/reload support in storeRegToStackSlot/loadRegFromStackSlot.
+- Jump tables (BR_JT/BRIND/JumpTable) + ConstantPool addressing, with
+  AsmPrinter MO_JumpTableIndex/MO_ConstantPoolIndex lowering — unlocks
+  switch statements and float/double literal pooling.
+- CTTZ/CTLZ/CTPOP set to Expand.
+- Function-pointer indirect calls (previously deferred, DL-063b/c):
+  CALL_PSEUDO_INDIRECT (DADAOInstrInfo.td) + expandPostRAPseudo case,
+  dispatched via DAGToDAG only when the DADAOISD::CALL callee is a
+  plain register (not GlobalAddress/ExternalSymbol, which keep the
+  existing direct CALL_IIII construction — binding tglobaladdr/
+  texternalsym as a Pat<> operand on the chain+glue call node trips a
+  scheduler BuildSchedUnits assertion regardless of Pseudo-ness).
+  Ground-truth repro matrix (7 cases spanning global/local callee,
+  void/int return, 0/const/variable args) all pass; picolibc's
+  libc/stdio/vfprintf.c (the real trigger — tinystdio's FILE dispatches
+  through function-pointer put/get callbacks) now compiles.
+- Fixed an adjacent latent segfault: the direct-call path unconditionally
+  built a 3-operand {Callee, Chain, Glue} list even when Glue is absent
+  (0 register arguments), crashing createOperands on the null SDValue —
+  mirrors the conditional-push already used on the indirect-call path.
+
+Verified: 27/27 E2E, differential AGREE(4-way)=200/DIVERGE=0, no
+regression on existing direct calls.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp     |  10 ++
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp   |  24 ++-
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   | 149 +++++++++++++++++-
+ llvm/lib/Target/DADAO/DADAOISelLowering.h     |   8 +
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp      |  14 +-
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       |  44 ++++++
+ .../Target/DADAO/DADAOMachineFunctionInfo.h   |  27 ++++
+ llvm/lib/Target/DADAO/DADAOTargetMachine.cpp  |   8 +
+ llvm/lib/Target/DADAO/DADAOTargetMachine.h    |   5 +
+ 9 files changed, 276 insertions(+), 13 deletions(-)
+ create mode 100644 llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
+
+diff --git a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+index de11e9f077ce..8244584a13c2 100644
+--- a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
++++ b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+@@ -71,6 +71,16 @@ private:
+             MCSymbolRefExpr::create(
+                 getSymbol(MO.getGlobal()), OutContext));
+         break;
++      case MachineOperand::MO_JumpTableIndex:
++        MCOp = MCOperand::createExpr(
++            MCSymbolRefExpr::create(
++                GetJTISymbol(MO.getIndex()), OutContext));
++        break;
++      case MachineOperand::MO_ConstantPoolIndex:
++        MCOp = MCOperand::createExpr(
++            MCSymbolRefExpr::create(
++                GetCPISymbol(MO.getIndex()), OutContext));
++        break;
+       }
+       OutMI.addOperand(MCOp);
+     }
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index 067c470d29db..bdb41903148c 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -86,10 +86,28 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+       SDLoc DLC(Node);
+       SDValue Chain = Node->getOperand(0);
+       SDValue Callee = Node->getOperand(1);
+-      SDValue Glue = Node->getOperand(2);
++      unsigned NumOps = Node->getNumOperands();
++      SDValue Glue = NumOps > 2 ? Node->getOperand(2) : SDValue();
++      if (Callee.getOpcode() == ISD::TargetGlobalAddress ||
++          Callee.getOpcode() == ISD::TargetExternalSymbol) {
++        // A null (absent) Glue must not be pushed as an operand — an
++        // unconditional 3-element {Callee, Chain, Glue} list crashes
++        // createOperands when Glue.getNode()==nullptr (0 register args,
++        // e.g. `int f(void){ return callee(); }`). Mirror the conditional
++        // push already used on the indirect-call path below.
++        SmallVector<SDValue, 3> DirectOps = {Callee, Chain};
++        if (Glue.getNode()) DirectOps.push_back(Glue);
++        MachineSDNode *Call = CurDAG->getMachineNode(
++            DADAO::CALL_IIII, DLC, MVT::Other, MVT::Glue, DirectOps);
++        ReplaceNode(Node, Call);
++        return;
++      }
++      // Indirect call: construct CALL_PSEUDO_INDIRECT with explicit
++      // chain and glue to preserve scheduler ordering edges.
++      SmallVector<SDValue, 3> Ops = {Callee, Chain};
++      if (Glue.getNode()) Ops.push_back(Glue);
+       MachineSDNode *Call = CurDAG->getMachineNode(
+-          DADAO::CALL_IIII, DLC, MVT::Other, MVT::Glue,
+-          {Callee, Chain, Glue});
++          DADAO::CALL_PSEUDO_INDIRECT, DLC, MVT::Other, MVT::Glue, Ops);
+       ReplaceNode(Node, Call);
+       return;
+     }
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 611f66369e51..4bb227abd58b 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -1,5 +1,6 @@
+ //===-- DADAOISelLowering.cpp - DADAO DAG Lowering Implementation ---------===//
+ #include "DADAOISelLowering.h"
++#include "DADAOMachineFunctionInfo.h"
+ #include "DADAOSubtarget.h"
+ #include "DADAOTargetMachine.h"
+ #include "MCTargetDesc/DADAOMCTargetDesc.h"
+@@ -18,6 +19,8 @@ using namespace llvm;
+ 
+ #include "DADAOGenCallingConv.inc"
+ 
++char llvm::DADAOMachineFunctionInfo::ID = 0;
++
+ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+                                          const DADAOSubtarget &STI)
+     : TargetLowering(TM, STI) {
+@@ -27,6 +30,31 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::SUB, MVT::i64, Legal);
+ 
+   setOperationAction(ISD::BR_CC, MVT::Other, Custom);
++  setOperationAction(ISD::BRCOND, MVT::Other, Custom);
++  setOperationAction(ISD::BR_JT, MVT::Other, Expand);
++  setOperationAction(ISD::BRIND, MVT::Other, Custom);
++  setOperationAction(ISD::JumpTable, MVT::i64, Custom);
++  setOperationAction(ISD::ConstantPool, MVT::i64, Custom);
++
++  setOperationAction(ISD::CTTZ, MVT::i64, Expand);
++  setOperationAction(ISD::CTLZ, MVT::i64, Expand);
++  setOperationAction(ISD::CTPOP, MVT::i64, Expand);
++
++  setOperationAction(ISD::VASTART, MVT::Other, Custom);
++  setOperationAction({ISD::VAARG, ISD::VACOPY, ISD::VAEND}, MVT::Other, Expand);
++
++  setOperationAction(ISD::ROTL, MVT::i64, Expand);
++  setOperationAction(ISD::ROTR, MVT::i64, Expand);
++  setOperationAction(ISD::MULHU, MVT::i64, Expand);
++  setOperationAction(ISD::MULHS, MVT::i64, Expand);
++  setOperationAction(ISD::SHL_PARTS, MVT::i64, Expand);
++  setOperationAction(ISD::SRL_PARTS, MVT::i64, Expand);
++  setOperationAction(ISD::SRA_PARTS, MVT::i64, Expand);
++  setOperationAction(ISD::ATOMIC_CMP_SWAP, MVT::i64, Expand);
++  setOperationAction(ISD::BSWAP, MVT::i64, Expand);
++  setOperationAction(ISD::SMUL_LOHI, MVT::i64, Expand);
++  setOperationAction(ISD::UMUL_LOHI, MVT::i64, Expand);
++
+   setTargetDAGCombine(ISD::BR_CC);
+   setTargetDAGCombine(ISD::BRCOND);
+   setOperationAction(ISD::FrameIndex, MVT::i64, Custom);
+@@ -34,6 +62,10 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::SELECT_CC, MVT::i64, Expand);
+   setOperationAction(ISD::GlobalAddress, MVT::i64, Custom);
+ 
++  MaxStoresPerMemset = UINT_MAX;
++  MaxStoresPerMemcpy = UINT_MAX;
++  MaxStoresPerMemmove = UINT_MAX;
++
+   setMaxAtomicSizeInBitsSupported(0);
+ 
+   // Narrow load/store type actions
+@@ -47,13 +79,6 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   computeRegisterProperties(STI.getRegisterInfo());
+ }
+ 
+-static DADAOISD::NodeType getDADAOCallOp(SDValue Callee) {
+-  if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee))
+-    if (G->getGlobal()->isDeclaration() || G->getGlobal()->hasExternalLinkage())
+-      return DADAOISD::CALL;
+-  return DADAOISD::CALL;
+-}
+-
+ SDValue DADAOTargetLowering::LowerCall(
+     TargetLowering::CallLoweringInfo &CLI,
+     SmallVectorImpl<SDValue> &InVals) const {
+@@ -111,6 +136,8 @@ SDValue DADAOTargetLowering::LowerCall(
+ 
+   if (GlobalAddressSDNode *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
+     Callee = DAG.getTargetGlobalAddress(G->getGlobal(), DL, MVT::i64);
++  } else if (ExternalSymbolSDNode *E = dyn_cast<ExternalSymbolSDNode>(Callee)) {
++    Callee = DAG.getTargetExternalSymbol(E->getSymbol(), MVT::i64);
+   }
+ 
+   SDVTList NodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
+@@ -119,7 +146,7 @@ SDValue DADAOTargetLowering::LowerCall(
+   CallOps.push_back(Callee);
+   if (ArgGlue.getNode())
+     CallOps.push_back(ArgGlue);
+-  Chain = DAG.getNode(getDADAOCallOp(Callee), DL, NodeTys, CallOps);
++  Chain = DAG.getNode(DADAOISD::CALL, DL, NodeTys, CallOps);
+   SDValue Glue = Chain.getValue(1);
+ 
+   Chain = DAG.getCALLSEQ_END(Chain, DAG.getIntPtrConstant(NumBytes, DL, true),
+@@ -177,6 +204,47 @@ SDValue DADAOTargetLowering::LowerFormalArguments(
+                       MachinePointerInfo::getFixedStack(MF, FI)));
+     }
+   }
++
++  if (IsVarArg) {
++    static const MCPhysReg ArgRegs[] = {
++        DADAO::RD16, DADAO::RD17, DADAO::RD18,
++        DADAO::RD19, DADAO::RD20, DADAO::RD21,
++        DADAO::RD22, DADAO::RD23, DADAO::RD24,
++        DADAO::RD25, DADAO::RD26, DADAO::RD27,
++        DADAO::RD28, DADAO::RD29, DADAO::RD30,
++        DADAO::RD31};
++    unsigned Idx = CCInfo.getFirstUnallocated(ArgRegs);
++    MachineFrameInfo &MFI = MF.getFrameInfo();
++    DADAOMachineFunctionInfo *DFI = MF.getInfo<DADAOMachineFunctionInfo>();
++
++    unsigned XLenInBytes = 8;
++    unsigned NumArgRegs = sizeof(ArgRegs) / sizeof(ArgRegs[0]);
++    unsigned VarArgsSaveSize = XLenInBytes * (NumArgRegs - Idx);
++
++    int FI;
++    if (VarArgsSaveSize == 0) {
++      int VaArgOffset = CCInfo.getStackSize();
++      FI = MFI.CreateFixedObject(XLenInBytes, VaArgOffset, true);
++    } else {
++      int VaArgOffset = CCInfo.getStackSize();
++      FI = MFI.CreateFixedObject(VarArgsSaveSize, VaArgOffset, true);
++
++      for (unsigned I = Idx; I < NumArgRegs; ++I) {
++        Register VReg = RegInfo.createVirtualRegister(&DADAO::GPRDRegClass);
++        RegInfo.addLiveIn(ArgRegs[I], VReg);
++        SDValue ArgValue = DAG.getCopyFromReg(Chain, DL, VReg, MVT::i64);
++        int Offset = (I - Idx) * XLenInBytes;
++        SDValue PtrOff = DAG.getIntPtrConstant(Offset, DL);
++        SDValue Addr = DAG.getNode(ISD::ADD, DL, MVT::i64,
++                                    DAG.getFrameIndex(FI, MVT::i64), PtrOff);
++        Chain = DAG.getStore(Chain, DL, ArgValue, Addr,
++                              MachinePointerInfo::getFixedStack(MF, FI, Offset));
++      }
++    }
++    DFI->setVarArgsFrameIndex(FI);
++    DFI->setVarArgsSaveSize(VarArgsSaveSize);
++  }
++
+   return Chain;
+ }
+ 
+@@ -217,6 +285,16 @@ SDValue DADAOTargetLowering::LowerOperation(SDValue Op,
+     return lowerSETCC(Op, DAG);
+   case ISD::GlobalAddress:
+     return lowerGlobalAddress(Op, DAG);
++  case ISD::BRCOND:
++    return lowerBRCOND(Op, DAG);
++  case ISD::BRIND:
++    return lowerBRIND(Op, DAG);
++  case ISD::JumpTable:
++    return lowerJumpTable(Op, DAG);
++  case ISD::ConstantPool:
++    return lowerConstantPool(Op, DAG);
++  case ISD::VASTART:
++    return lowerVASTART(Op, DAG);
+   default:
+     break;
+   }
+@@ -387,6 +465,61 @@ SDValue DADAOTargetLowering::lowerGlobalAddress(SDValue Op,
+   return DAG.getNode(DADAOISD::PCREL_HI, DL, MVT::i64, GA);
+ }
+ 
++SDValue DADAOTargetLowering::lowerBRCOND(SDValue Op,
++                                          SelectionDAG &DAG) const {
++  SDLoc DL(Op);
++  SDValue Cond = Op.getOperand(1);
++  SDValue Dest = Op.getOperand(2);
++  EVT VT = Cond.getValueType();
++  if (VT == MVT::i1)
++    Cond = DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i64, Cond);
++  return DAG.getNode(ISD::BR_CC, DL, MVT::Other,
++                     Op.getOperand(0),
++                     DAG.getCondCode(ISD::SETNE),
++                     Cond,
++                     DAG.getConstant(0, DL, MVT::i64),
++                     Dest);
++}
++
++SDValue DADAOTargetLowering::lowerBRIND(SDValue Op,
++                                        SelectionDAG &DAG) const {
++  SDLoc DL(Op);
++  return DAG.getNode(DADAOISD::BRIND, DL, MVT::Other,
++                     Op.getOperand(0), Op.getOperand(1));
++}
++
++SDValue DADAOTargetLowering::lowerJumpTable(SDValue Op,
++                                             SelectionDAG &DAG) const {
++  SDLoc DL(Op);
++  JumpTableSDNode *N = cast<JumpTableSDNode>(Op);
++  SDValue TJT = DAG.getTargetJumpTable(N->getIndex(), MVT::i64);
++  return DAG.getNode(DADAOISD::JT_ADDR, DL, MVT::i64, TJT);
++}
++
++SDValue DADAOTargetLowering::lowerConstantPool(SDValue Op,
++                                               SelectionDAG &DAG) const {
++  SDLoc DL(Op);
++  ConstantPoolSDNode *N = cast<ConstantPoolSDNode>(Op);
++  SDValue TCP = DAG.getTargetConstantPool(N->getConstVal(), MVT::i64,
++                                           N->getAlign(), N->getOffset());
++  return DAG.getNode(DADAOISD::CP_ADDR, DL, MVT::i64, TCP);
++}
++
++SDValue DADAOTargetLowering::lowerVASTART(SDValue Op,
++                                          SelectionDAG &DAG) const {
++  MachineFunction &MF = DAG.getMachineFunction();
++  DADAOMachineFunctionInfo *FuncInfo =
++      MF.getInfo<DADAOMachineFunctionInfo>();
++
++  SDLoc DL(Op);
++  SDValue FI = DAG.getFrameIndex(FuncInfo->getVarArgsFrameIndex(),
++                                 getPointerTy(MF.getDataLayout()));
++
++  const Value *SV = cast<SrcValueSDNode>(Op.getOperand(2))->getValue();
++  return DAG.getStore(Op.getOperand(0), DL, FI, Op.getOperand(1),
++                      MachinePointerInfo(SV));
++}
++
+ SDValue DADAOTargetLowering::PerformDAGCombine(SDNode *N,
+                                                 DAGCombinerInfo &DCI) const {
+   SelectionDAG &DAG = DCI.DAG;
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index e5b58b639739..d831382ff28a 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -24,6 +24,9 @@ enum NodeType {
+   SEL,    // (cond, false, true) → i64  conditional select via csz
+   FI_ADDR, // (TargetFrameIndex) → i64  frame address in GPRB
+   PCREL_HI, // (GlobalAddress) → i64  page-aligned PC-relative address in RB
++  BRIND,   // (chain, target) — indirect branch
++  JT_ADDR, // (TargetJumpTable) → i64  jump table address
++  CP_ADDR, // (TargetConstantPool) → i64  constant pool address
+ };
+ } // namespace DADAOISD
+ 
+@@ -58,6 +61,11 @@ private:
+   SDValue lowerFrameIndex(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerSETCC(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerBRCOND(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerBRIND(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerJumpTable(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerConstantPool(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerVASTART(SDValue Op, SelectionDAG &DAG) const;
+ };
+ 
+ } // namespace llvm
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index 91ae9d1b8ae7..e72186d36c40 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -172,6 +172,14 @@ bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+     MI.eraseFromParent();
+     return true;
+   }
++  case DADAO::CALL_PSEUDO_INDIRECT: {
++    BuildMI(MBB, MI, DL, get(DADAO::CALL_RRII))
++        .addReg(DADAO::RB0)
++        .addReg(MI.getOperand(0).getReg())
++        .addImm(0);
++    MI.eraseFromParent();
++    return true;
++  }
+   }
+   return false;
+ }
+@@ -187,7 +195,8 @@ void DADAOInstrInfo::storeRegToStackSlot(
+       MachinePointerInfo::getFixedStack(MF, FrameIndex),
+       MachineMemOperand::MOStore, MFI.getObjectSize(FrameIndex),
+       Align(8));
+-  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass) {
++  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass ||
++      RC == &DADAO::GPRBRegClass || RC == &DADAO::GPRB_AllocatableRegClass) {
+     BuildMI(MBB, MBBI, DL, get(DADAO::STO_FI))
+         .addReg(SrcReg, getKillRegState(IsKill))
+         .addReg(DADAO::RB1)
+@@ -210,7 +219,8 @@ void DADAOInstrInfo::loadRegFromStackSlot(
+       MachinePointerInfo::getFixedStack(MF, FrameIndex),
+       MachineMemOperand::MOLoad, MFI.getObjectSize(FrameIndex),
+       Align(8));
+-  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass) {
++  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass ||
++      RC == &DADAO::GPRBRegClass || RC == &DADAO::GPRB_AllocatableRegClass) {
+     BuildMI(MBB, MBBI, DL, get(DADAO::LDO_FI))
+         .addDef(DstReg)
+         .addReg(DADAO::RB1)
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index a950d4d5d3f2..e9ce9c9c423e 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -63,6 +63,10 @@ def SDT_DADAOBr1 : SDTypeProfile<0, 2,
+     [SDTCisVT<0, i64>, SDTCisVT<1, OtherVT>]>;
+ def SDT_DADAOBr2 : SDTypeProfile<0, 3,
+     [SDTCisVT<0, i64>, SDTCisVT<1, i64>, SDTCisVT<2, OtherVT>]>;
++def SDT_DADAOBrInd : SDTypeProfile<0, 1,
++    [SDTCisVT<0, i64>]>;
++def SDT_DADAOCall : SDTypeProfile<0, 1,
++    [SDTCisVT<0, i64>]>;
+ 
+ def DADAOBreq : SDNode<"DADAOISD::BREQ", SDT_DADAOBr2, [SDNPHasChain]>;
+ def DADAOBrne : SDNode<"DADAOISD::BRNE", SDT_DADAOBr2, [SDNPHasChain]>;
+@@ -74,8 +78,13 @@ def DADAOBrp  : SDNode<"DADAOISD::BRP",  SDT_DADAOBr1, [SDNPHasChain]>;
+ def DADAOBrnp : SDNode<"DADAOISD::BRNP", SDT_DADAOBr1, [SDNPHasChain]>;
+ def DADAOCmp  : SDNode<"DADAOISD::CMP",  SDTIntBinOp>;
+ def DADAOCmpU : SDNode<"DADAOISD::CMPU", SDTIntBinOp>;
++def DADAOcall  : SDNode<"DADAOISD::CALL", SDT_DADAOCall,
++                         [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue]>;
+ def DADAOFiAddr : SDNode<"DADAOISD::FI_ADDR", SDTIntUnaryOp>;
+ def DADAOPCRelHi : SDNode<"DADAOISD::PCREL_HI", SDTIntUnaryOp>;
++def DADAObrind   : SDNode<"DADAOISD::BRIND", SDT_DADAOBrInd, [SDNPHasChain]>;
++def DADAOjt_addr : SDNode<"DADAOISD::JT_ADDR", SDTIntUnaryOp>;
++def DADAOcp_addr : SDNode<"DADAOISD::CP_ADDR", SDTIntUnaryOp>;
+ 
+ // Minimal CodeGen-only pseudos (spike scaffold, throwaway).
+ // These bring GPRD-typed i64 add/return down to MIR so finalize-isel can
+@@ -111,6 +120,25 @@ def UREM_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
+ let isReturn = 1, isTerminator = 1, isBarrier = 1 in
+ def RET_PSEUDO : DADAOPseudo<(outs), (ins), [(DADAORetGlue)]>;
+ 
++// Indirect-call pseudo (expandPostRAPseudo resolves to real CALL_RRII, same
++// two-stage scheme as ADD_PSEUDO/RET_PSEUDO above). Direct calls (callee is
++// a GlobalAddress/ExternalSymbol) stay on the pre-existing manual DAGToDAG
++// construction of CALL_IIII (ML-003d ground-truth: binding tglobaladdr /
++// texternalsym directly as a Pat<> operand for a chain+glue DADAOcall node
++// — pseudo or not — trips a DAG scheduler BuildSchedUnits assertion; a plain
++// Pseudo indirect call — uses F_IIII format (imm24 field unused, carries no
++// explicit result; chain+glue come from isCall). DADAOPseudo was avoided because
++// it infers a spurious MVT::i64 result from the first input operand.
++let isCall = 1,
++    Defs = [RD31],
++    Uses = [RD16, RD17, RD18, RD19, RD20, RD21, RD22, RD23,
++            RD24, RD25, RD26, RD27, RD28, RD29, RD30],
++    isPseudo = 1,
++    isCodeGenOnly = 1,
++    Size = 0 in
++def CALL_PSEUDO_INDIRECT : InstDADAO<(outs), (ins GPRD:$reg), "", []>;
++def : Pat<(DADAOcall GPRD:$reg), (CALL_PSEUDO_INDIRECT GPRD:$reg)>;
++
+ // FrameIndex pseudo-instructions (PEI resolves to real LDO/STO).
+ // The $fi operand holds the FrameIndex index, resolved by eliminateFrameIndex.
+ // $imm12 holds the GEP/add constant (0 for direct FrameIndex references).
+@@ -263,6 +291,11 @@ let op = 0x4F in def STMO_RB_RRRI : F_RRRI_RB<(outs), (ins GPRB:$rbha, GPRB:$rbh
+ let isBranch = 1, isTerminator = 1, isBarrier = 1 in
+ let op = 0x64 in def JUMP_IIII : F_IIII<(outs), (ins brtarget24:$imm24), "jump $imm24", []>;
+ let op = 0x65 in def JUMP_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "jump $rbha, $rdhb, $imm12", []>;
++//===----------------------------------------------------------------------===//
++// Jump / Call / Ret (op=0x64-0x6E)
++//===----------------------------------------------------------------------===//
++
++// Real call instructions (used by ExpandPostRAPseudo)
+ let isCall = 1,
+     Defs = [RD31],
+     Uses = [RD16, RD17, RD18, RD19, RD20, RD21, RD22, RD23,
+@@ -305,6 +338,17 @@ def : Pat<(DADAOBrnz GPRD:$val, bb:$target), (BRNZ_RIII GPRD:$val, bb:$target)>;
+ def : Pat<(DADAOBrp  GPRD:$val, bb:$target), (BRP_RIII  GPRD:$val, bb:$target)>;
+ def : Pat<(DADAOBrnp GPRD:$val, bb:$target), (BRNP_RIII GPRD:$val, bb:$target)>;
+ 
++// BRIND via GPRD register → JUMP_RRII (real instruction, for jump tables)
++def : Pat<(DADAObrind GPRD:$target),       (JUMP_RRII RB0, GPRD:$target, 0)>;
++
++// Jump table address: rela + addi_rb(lo) → RB base  
++def : Pat<(DADAOjt_addr tjumptable:$jt),
++          (ADDI_RBRRII (RELA_RIII tjumptable:$jt), tjumptable:$jt)>;
++
++// Constant pool address: rela + addi_rb(lo) → RB base
++def : Pat<(DADAOcp_addr tconstpool:$cp),
++          (ADDI_RBRRII (RELA_RIII tconstpool:$cp), tconstpool:$cp)>;
++
+ //===----------------------------------------------------------------------===//
+ // CodeGen patterns — shifts (spec §3.11)
+ //===----------------------------------------------------------------------===//
+diff --git a/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h b/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
+new file mode 100644
+index 000000000000..276ded80a846
+--- /dev/null
++++ b/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
+@@ -0,0 +1,27 @@
++//===-- DADAOMachineFunctionInfo.h - DADAO private MF info ------*- C++ -*-===//
++#ifndef LLVM_LIB_TARGET_DADAO_DADAOMACHINEFUNCTIONINFO_H
++#define LLVM_LIB_TARGET_DADAO_DADAOMACHINEFUNCTIONINFO_H
++
++#include "llvm/CodeGen/MachineFunction.h"
++
++namespace llvm {
++
++class Function;
++class TargetSubtargetInfo;
++
++class DADAOMachineFunctionInfo : public MachineFunctionInfo {
++  int VarArgsFrameIndex = -1;
++  unsigned VarArgsSaveSize = 0;
++
++public:
++  static char ID;
++  DADAOMachineFunctionInfo(const Function &F, const TargetSubtargetInfo *STI) {}
++
++  int getVarArgsFrameIndex() const { return VarArgsFrameIndex; }
++  void setVarArgsFrameIndex(int Index) { VarArgsFrameIndex = Index; }
++  unsigned getVarArgsSaveSize() const { return VarArgsSaveSize; }
++  void setVarArgsSaveSize(int Size) { VarArgsSaveSize = Size; }
++};
++
++} // namespace llvm
++#endif
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+index 6d7682bde6f1..14033eac6568 100644
+--- a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+@@ -2,6 +2,7 @@
+ #include "DADAOTargetMachine.h"
+ #include "DADAO.h"
+ #include "DADAOISelLowering.h"
++#include "DADAOMachineFunctionInfo.h"
+ #include "DADAORegisterInfo.h"
+ #include "DADAOSubtarget.h"
+ #include "TargetInfo/DADAOTargetInfo.h"
+@@ -28,6 +29,13 @@ static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {
+   return RM.value_or(Reloc::Static);
+ }
+ 
++MachineFunctionInfo *DADAOTargetMachine::createMachineFunctionInfo(
++    BumpPtrAllocator &Allocator, const Function &F,
++    const TargetSubtargetInfo *STI) const {
++  return DADAOMachineFunctionInfo::create<DADAOMachineFunctionInfo>(Allocator, F,
++                                                                     STI);
++}
++
+ DADAOTargetMachine::DADAOTargetMachine(
+     const Target &T, const Triple &TT, StringRef Cpu, StringRef FeatureString,
+     const TargetOptions &Options, std::optional<Reloc::Model> RM,
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.h b/llvm/lib/Target/DADAO/DADAOTargetMachine.h
+index fc81d35763cd..c119f63b469e 100644
+--- a/llvm/lib/Target/DADAO/DADAOTargetMachine.h
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.h
+@@ -5,6 +5,7 @@
+ #include "DADAOSubtarget.h"
+ #include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
+ #include "llvm/CodeGen/TargetPassConfig.h"
++#include "llvm/CodeGen/MachineFunction.h"
+ #include <optional>
+ 
+ namespace llvm {
+@@ -30,6 +31,10 @@ public:
+ 
+   TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
+ 
++  MachineFunctionInfo *
++  createMachineFunctionInfo(BumpPtrAllocator &Allocator, const Function &F,
++                            const TargetSubtargetInfo *STI) const override;
++
+ private:
+   DADAOSubtarget Subtarget;
+   std::unique_ptr<TargetLoweringObjectFile> TLOF;
+-- 
+2.43.0
+

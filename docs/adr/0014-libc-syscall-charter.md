@@ -47,6 +47,23 @@ DL-064a/b 后 clang 一条龙 freestanding 通（`clang hello.c` → 双后端 h
 - **阶段 1（MVP：printf + malloc + llvm-test-suite SingleSource）= picolibc**：最小路径——3 stub（`_write`→SYS_write、`_exit`→SYS_exit、`_sbrk`→SYS_brk）+ tinystdio（printf 不依赖 malloc）。`clang -target dadao` 编 picolibc → `-lpicolibc` 链。crt 用现有 `crt0.s`（`_start`→`main`，picolibc 风格）。
 - **阶段 2（长期：真 kernel）= musl**：SEE/SBI handler 完善（mmap/brk/clone…）后切 musl（行业标准、真 OS 必选，arch 移植层 `arch/dadao/`）。**用户里程碑仍是 musl**；picolibc 是打通 printf/malloc 的过渡。
 
+#### D5.1：为什么 tinystdio（stdio 表面最小化）+ 实施发现（ML-003a de-risk，2026-07-13）
+
+**为什么 tinystdio 不用经典 newlib stdio**（也是"为什么 picolibc 先于 musl"的同一理由——**小 stdio 表面先行**）：
+
+| 维度 | tinystdio | newlib 经典 stdio / musl stdio |
+|------|-----------|------------------------------|
+| printf 依赖 | 直接格式化到 putc 钩子，**不需 malloc** | 完整 FILE* 缓冲，**需 malloc + `_reent`/`_impure_ptr` + `__sinit`** |
+| syscall stub | 基本只 `_write`（字符输出钩子） | 全套 POSIX：`_write/_read/_lseek/_fstat/_isatty/_close`+`_sbrk` |
+| 体积/init | KB 级、stdout 是 putc 指针薄壳 | 大一圈、stdout 走重入机制重 init |
+
+`printf("hi")` 在 tinystdio 只需 `_write` 一个 syscall——这正是阶段 1"3 stub 打通 printf"成立的前提。用 newlib/musl 的重 stdio 则拖进 malloc+reent+全套 POSIX stub，"最小路径"不成立。**picolibc = tinystdio**（本版 1.8.11 已删 `newlib-tinystdio` 开关，tinystdio 为唯一 stdio 引擎；`libc/tinystdio/`=格式化核心、`libc/stdio/`=公共 API 包装+POSIX 层，**非另一套 stdio**）。
+
+**实施发现（ML-003a，纠正）**：
+- picolibc 为 novel dadao target 用 clang 构建时，**卡的墙 80% 是 DADAO 后端 codegen 缺口**（mem* intrinsic 展开、VASTART/varargs、跳转表/常量池/多个 Expand、间接调用），**非 picolibc/libc 特有**——换 musl 一个不少且更多。**这验证了 D5「小 libc 先趟后端」的判断**：picolibc 廉价逮出并修了这批后端 bug，给 musl 交 de-risked 后端。
+- 链接 `undefined stdout/vfprintf` **是 picolibc 控制台配置缺口**（`stdout` 在 `posixiob_stdout.c`，受 `posix-console` 等选项门控），**非 libc 选型问题**——修法=给 tinystdio stdout 走最小输出（`FDEV_SETUP_STREAM` 绑 `_write`）或按需开 console 选项。
+- **musl 现在上是早的**：syscall 面不够（malloc 要 mmap、`__init_libc` 要 TLS/线程指针，现 SEE 只有 write/exit/brk）+ arch 移植大（`arch/dadao/` ~15-20 文件 vs picolibc 1 machine dir+3 stub）+ 后端墙相同还更多。musl 仍是终点，时机在"kernel + SEE syscall 面扩起来"之后。
+
 ### D6：验证 = dual-backend + 分层（接 ADR-0012）
 - syscall 层双后端一致：同一 `trap cfx_smon` 程序，QEMU 与 gem5 **console 输出一致 + 退出码一致**（syscall 层进入 T2 dual-backend gate）。
 - 分片：先 **syscall 机制**（手写 asm `trap`-write "hi"+`trap`-exit → 双后端）→ 再 **picolibc port**（真 `printf("hello")` + malloc）→ 再 **llvm-test-suite SingleSource**（ADR-0012 T3）。
