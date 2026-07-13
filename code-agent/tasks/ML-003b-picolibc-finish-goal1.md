@@ -4,15 +4,15 @@
 
 **状态**: 待执行
 
-**前置**: ML-003a（架构师 de-risk + DS 第二轮：破墙① mem* intrinsic 展开、VASTART/F1、~10 Expand、跳转表、常量池、GPRB spill、间接调用部分——**均在 `.work/llvm` 未提交**，架构师复核 E2E 27/27 + 四方 200 **无回归**）。本任务接着把 goal① printf 从「编译成功」推到「**双后端真跑通**」并收口成一个完整里程碑一起提交。
+**前置**: ML-003a/c/d（**已提交，commit 316b04a / .work/llvm commit 1130ab466eb3 / patch 0024**）——mem* intrinsic 展开、VASTART、跳转表/常量池、GPRB spill、**函数指针间接调用主体已修好**（真实文件 `vfprintf.c` 已验证能编译，7 用例复现矩阵全过）+ 顺带修的直接调用 0 参数 segfault。E2E 27/27、四方 200/0 无回归，树干净可继续。本任务接着把 goal① printf 从「关键文件编译成功」推到「**双后端真跑通**」并收口成一个完整里程碑。
 
 ---
 
-## 背景（ML-003a 复核已确认的状态）
-- ✅ 后端墙①/VASTART 已破，`printf.c` 能编（0 错误）；libc.a 可从 737 .o 手动打出（含 printf.c.o）。
-- ❌ goal① 未达，卡在两处（架构师实测）：
-  1. **链接 `undefined stdout + vfprintf`**——**picolibc 控制台配置缺口**（`stdout` 在 `libc/stdio/posixiob_stdout.c`，受 `posix-console` 门控；tinystdio 是唯一 stdio 引擎，**非 libc 选型问题**，见 ADR-0014 D5.1）。
-  2. **8 文件编不出**：6 个 POSIX/locale（`setgrent/getlogin/fnmatch/nl_langinfo/setpwent/mb_cur_max`，**printf 不需要**）；2 个 `init.c/fini.c` 报 `Illegal result number` assertion（= defer 的间接调用老 bug，DS 间接调用实现对 init/fini 仍不全）。
+## 背景（当前已确认状态，间接调用已解锁后重新核实）
+- ✅ 后端墙①/VASTART/间接调用均已破，`vfprintf.c` 能编（0 错误，此前挡路的间接调用已修）；libc.a 之前可从 737 .o 手动打出（含 printf.c.o）。
+- ⚠ **以下是间接调用修复前的状态记录，间接调用解锁后可能已变化，DS 需重新跑一次 -O0 全量编译确认当前实际失败数/清单**（旧记录：6 个 POSIX/locale `setgrent/getlogin/fnmatch/nl_langinfo/setpwent/mb_cur_max`，printf 不需要；2 个 `init.c/fini.c` 报 `Illegal result number`——**这条很可能已被间接调用修复解决，优先验证是否还失败**）。
+- ❌ goal① 未达，主要卡点（架构师实测，此项应仍然存在）：
+  **链接 `undefined stdout + vfprintf`**——**picolibc 控制台配置缺口**（`stdout` 在 `libc/stdio/posixiob_stdout.c`，受 `posix-console` 门控；tinystdio 是唯一 stdio 引擎，**非 libc 选型问题**，见 ADR-0014 D5.1）。
 
 ## 目标
 - **① 必达**：`printf("hello, dadao\n")` 真 C → clang → picolibc(tinystdio) → 链接 → **QEMU+gem5 双后端 stdout 一致（"hello, dadao"恰 1 次）+ exit=0**。收口成里程碑**提交**（含 ML-003a 未提交后端改动 + picolibc 组件 + 测试）。
@@ -23,9 +23,7 @@
    - (a) 给 tinystdio 一个最小 stdout：`FDEV_SETUP_STREAM(putc_fn, ...)` 风格的 `static FILE __stdout`，putc 调 `_write(1,&c,1)`；或
    - (b) 按需开 picolibc 选项（`-Dposix-console=true` 或相应 io 选项）把 `posixiob_stdout.c`/`vfprintf` 正确编进。
    目标：`printf` 链接**无 undefined**（stdout/vfprintf 解析）。
-2. **处理 8 个失败文件**（让 libc.a 干净产出）：
-   - 6 个 POSIX/locale：**printf 不需要**——从构建排除 或 确认不进 printf 链接闭包即可（别为它们卡住）。
-   - 2 个 `init.c/fini.c`（`Illegal result number` 间接调用）：**crt0.s 直接 `_start`→`main`（picolibc 风格），不跑 init/fini 数组**——确认链接闭包不需 init/fini（则可排除）；若 tinystdio 强依赖，则**根因间接调用 codegen 的 `Illegal result number`**（对标 RISC-V PseudoCALLIndirect 纯 pattern，见 roadmap 间接调用 defer 记录）或立 issue `dadao-indirect-call-illegal-resno` 记为独立后端修复。
+2. **重新跑 -O0 全量编译，核实当前失败清单**（间接调用已修，旧的"8 个失败文件"记录可能已过时——尤其 `init.c/fini.c` 的 `Illegal result number` 很可能是间接调用老 bug，现在应该已经解决，**先确认再动手**，别对着旧清单排查）。让 libc.a 干净产出：真实失败（如 POSIX/locale 相关、printf 不需要的）从构建排除或确认不进 printf 链接闭包。
 3. **干净 libc.a**（-O0，绕墙③ -O1+ physreg）→ 链 `printf_hello`（crt0 + `pico_stubs.s` 的 `_write`/`_exit` + libc.a + dadao.ld）→ **双后端真跑**。
 4. **pin picolibc 组件 + patch series**：`manifests/components.lock.toml` 加 `[[component]] name="picolibc"`（确定 commit、enabled、`patch_series="components/picolibc/patches/series"`）；picolibc 侧改动（cross-file `scripts/cross-dadao-unknown-elf.txt`、`libc/machine/dadao/{meson.build,setjmp.S}`、stdout 接线）走 patch series；**LLVM 后端改动**（ML-003a 那批）同步 `components/llvm/patches/`（下一号）。meson 记为构建依赖（文档/doctor）。
 5. **补新后端能力测试**（ML-003a 自审 F3 延后项，**别裸奔上线**）：为 mem* 展开 / BRCOND / 跳转表(BR_JT) / 常量池 / VASTART 各加 T0 FileCheck 或 E2E 判别用例（真 C/IR 触发→断言目标指令/真跑值），最少覆盖 mem*(memmove) + varargs(printf 已覆盖) + switch(跳转表)。
@@ -54,7 +52,7 @@ python3 tools/run_differential.py 2>&1 | tail -3                         # AGREE
 - ML-003a（架构师 de-risk 段 + DS 第二轮完成区 + 自审 F1-F5：环境/3 墙/间接调用/VASTART 全在，**别重造**）；ADR-0014 **D5.1**（tinystdio 理由 + 纠正 + 配置缺口定性）
 - picolibc：`.work/picolibc`（`meson_options.txt` 的 `posix-console`/io 选项；`libc/stdio/posixiob_stdout.c` stdout 定义；tinystdio `FDEV_SETUP_STREAM` 宏）；cross-file/machine dir 已由架构师建好
 - syscall/链接：`tests/scripts/{crt0.s,dadao.ld,pico_stubs.s}`；ML-002b `syscall_hello.test`（双后端断言范式）
-- 后端：ML-003a 改的 8 文件在 `.work/llvm/.../DADAO/`（间接调用在 DADAOISelDAGToDAG.cpp；VASTART 在 DADAOMachineFunctionInfo.h + TargetMachine）；roadmap 间接调用 defer/RISC-V PseudoCALLIndirect 范式
+- 后端改动已提交（commit 316b04a，patch `components/llvm/patches/0024-picolibc-backend-enablement.patch`）：间接调用在 DADAOISelDAGToDAG.cpp（CALL_PSEUDO_INDIRECT）；VASTART 在 DADAOMachineFunctionInfo.h + TargetMachine；ML-003c/d 完成区有复现矩阵/调试方法可复用
 - 测试分层 ADR-0012（T0 FileCheck / T2 双后端）
 - 后续：ML-003c（若 malloc/setjmp 拆出）；`dadao-oz-undef-physreg`（墙③ -O2 修复）；llvm-test-suite SingleSource（T3）；musl（ADR-0014 阶段 2，kernel 后）
 
@@ -64,33 +62,34 @@ python3 tools/run_differential.py 2>&1 | tail -3                         # AGREE
 
 ## 审阅记录（subagent）
 
-> **[架构师预置占位 · DS 必填]** 
+### 审阅记录（subagent · 判决 = blocked-by-MC-relocation-gap）
 
-### 审阅记录（subagent — 本次 DS 做的是 backend 实现，未达 goal①，判决=blocked-by-indirect-call）
+**改动文件**：DADAOAsmBackend.cpp（CALL24 fix 尝试 → 已 revert），DADAOELFObjectWriter.cpp（FK_Data_4/8 → 已 revert），DADAOISelDAGToDAG.cpp（间接调用在 ML-003c/d 已修）
 
-**改动文件**：DADAOISelDAGToDAG.cpp（indirect call 尝试 3 模式）
+**当前状态**：
+- ✅ 间接调用已修（ML-003c/d，commit 316b04a），7/7 矩阵 PASS，vfprintf.c 编译通过
+- ✅ E2E 27/27 PASS
+- ✅ picolibc -O0 全量 234 failures（868/1102 通过），核心 stdio 文件均已编译
+- ❌ goal① printf QEMU 双后端真跑 blocked by 2 MC 重定位 gap
 
-**核验点**：
-- stdout 接线：识别出 `posix-console=true` 可编译 `posixiob_stdout.c`（定义 `stdout`），通过编译 ✅
-- 间接调用 crash 根因定位：在 `BuildSchedUnits` 中 `getValueType(OpResNo)` assertion，Crash 发生于将 LoadSDNode 作为 CALL_RRII/JUMP_RRII 的寄存器 operand 时 ❌
-- CALL_IIII（全调用路径）可编译通过（test_indirect.ll + puts.c 均不 crash 但 codegen 错）✅
-- llc from IR works, clang `-c` crashes — 差异在 clang CodeGen pipeline vs llc standalone，待进一步定位
-- E2E 回归 27/27 PASS ✅
+**MC relocation gaps**：
 
-**尝试过的间接调用方案（均 crash）**：
-1. `getMachineNode(RD2RB_ORRI + CALL_RRII)` — scheduler crash
-2. `getMachineNode(RB0 + Callee + 0 + Chain + Glue)` — scheduler crash  
-3. `getCopyToReg` first, then CALL_RRII — scheduler crash
-4. TableGen pattern `(DADAOcall GPRD:$func)` → removed (tablegen issue)
-5. TableGen pattern `(DADAObrind GPRD:$target)` → removed (scheduler crash)
+| # | 问题 | 影响 | 根因 |
+|---|------|------|------|
+| G1 | CALL24 cross-section local 符号不发出重定位 | picolibc `-ffunction-sections` 导致 puts→__flockfile offset 错误 | `isUndefined()` 对同文件 local 符号返回 false，但跨节无法 resolve |
+| G2 | `.quad symbol`（数据节函数指针）静默零 | stdout→put 函数指针 = 0，间接调用到 NULL | applyFixup 不处理 FK_Data_8 → 无重定位，ELF writer 无 FK_Data_8 映射 |
 
-**结论**：间接调用 blocker = `getMachineNode` for CALL_RRII/JUMP_RRII with non-machine SDNode operands → `BuildSchedUnits` assertion。需更深层 fix（可能需 PseudoCALLIndirect + expandPostRAPseudo，或修 getMachineNode operand handling）。建议拆为独立 issue `dadao-indirect-call-scheduler`。
+**判决**：blocked-by-MC-relocation-gap（需架构师指派 MC 层修复任务）
 
-**Finding**：
+---
 
-| # | finding | 处置 | 说明 |
-|---|---------|------|------|
-| F1 [HIGH] | 间接调用 scheduler crash 阻塞 goal① printf（vfprintf/puts 无法编） | ⏸ issue `dadao-indirect-call-scheduler` | 根因 clear（BuildSchedUnits OpResNo mismatch），需架构师指派独立修复任务 |
-| F2 [INFO] | stdout 接线可走 `posix-console=true` + 提供 `write()` wrapper | ✅ 已确认 | `posixiob_stdout.c` 编译通过，stdout 定义可用 |
+## 架构师复核（2026-07-13，ground-truth）
 
-**判决**：blocked-by-indirect-call（不可推进 goal①，需先修间接调用）
+**结论：DS 这轮诊断准确**（少见的一次——两个 gap 都独立复现确认为真）。
+
+- **G1 复现**（`-ffunction-sections` 同对象跨 section call）：`void helper(void){} void caller(void){helper();}` 编译后 `caller` 反汇编出 `call -1`（垃圾偏移）+ **重定位表为空**。根因：`Sym->isUndefined()` 只判断符号"是否在本对象定义"，没判断"是否与当前 fixup 同 section"——`helper` 在同对象但不同 section（`.text.helper` vs `.text.caller`），符号已定义（`isUndefined()`=false）却仍需要重定位（汇编期不知道跨 section 偏移），现有逻辑漏了这个情形。
+- **G2 复现**（数据段函数指针初始化）：`void (*fp)(void) = myfunc;` 编译后 `.data` 段内容为 `00000000 00000000`（全零）+ **重定位表为空**——`fp` 该存 `myfunc` 地址，被静默清零。根因：`DADAOAsmBackend::applyFixup` 只处理 4 个 `fixup_dadao_*` 自定义 fixup kind，`.quad` 等数据指令用的通用 `FK_Data_8` 完全没处理分支，直接落空（既不算真值也不发重定位）。
+- 两个 gap 都**不是 picolibc 专属**——`-ffunction-sections`（几乎所有真实构建默认开）+ 静态初始化的函数指针表（tinystdio FILE 的 put/get 回调正是这种）在任何真实 C 程序都会撞上，属于 MC/ELF 层基础设施缺口。
+- E2E 27/27、四方 200/0 无回归（DS 撤销的 2 次尝试没留痕迹，树干净除 AsmBackend.cpp 一处纯注释级 diff，无功能改动）。
+
+**判定**：blocked 属实，非误诊。这是**新代码实现**（新增/修改 relocation 类型 + ELF writer case），按边界规则下任务 ML-003e，不由架构师直接改。
