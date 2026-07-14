@@ -14,3 +14,4 @@
 0013-dadao-trap-syscall.patch
 0014-tb-stop-pc-advance.patch
 0015-precise-exception-pc.patch
+0016-target-dadao-align-brk_base-default-with-dadao.ld-he.patch

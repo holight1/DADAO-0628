@@ -19,3 +19,10 @@ static int my_putc(char c, FILE *f) {
 
 static struct __file __my_stdout = FDEV_SETUP_STREAM(my_putc, NULL, NULL, __SWR);
 FILE *const stdout = &__my_stdout;
+
+/* memset — needed by picolibc nano-malloc */
+void *memset(void *s, int c, unsigned long n) {
+    unsigned char *p = s;
+    for (unsigned long i = 0; i < n; i++) p[i] = (unsigned char)c;
+    return s;
+}

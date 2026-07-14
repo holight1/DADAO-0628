@@ -1,0 +1,26 @@
+From a26e252428418ab629c4115ab1396075bcfcdbab Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 14:10:36 +0800
+Subject: [PATCH] target/dadao: align brk_base default with dadao.ld heap
+ region (ML-003m)
+
+---
+ target/dadao/cpu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index b9c029a..e8ec0ff 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -161,7 +161,7 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+                     SHUTDOWN_CAUSE_GUEST_SHUTDOWN, arg0 & 0xFF);
+                 exit(arg0 & 0xFF);
+             case 214: { /* SYS_brk: set program break */
+-                static uint64_t brk_base = 0x90000000;
++                static uint64_t brk_base = 0x87E00000;
+                 if (arg0 == 0)
+                     ret = brk_base;
+                 else {
+-- 
+2.43.0
+

@@ -27,7 +27,7 @@ _sbrk:
     addi rd18, rd31, 0     # cur = rd31
     addi rd16, rd0, 214    # sysno=brk
     addi rd17, rd18, 0     # rd17=cur
-    add rd0, rd17, rd17, rd20  # rd17=cur+incr
+    add rd0, rd17, rd17, rd20  # rdha=rd0(discard carry), rdhb=rd17=cur+incr
     trap 2, 0
     addi rd31, rd18, 0     # return old cur
     ret rd0, 0

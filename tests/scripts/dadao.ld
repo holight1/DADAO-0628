@@ -34,6 +34,13 @@ SECTIONS {
     *(COMMON)
   } :data
 
+  /* Static heap region consumed by picolibc's libos/fallback/sbrk.c
+   * (__fallback_sbrk / weak-referenced sbrk()) — required whenever that
+   * archive member is pulled into the link (ADR-0014 D3). */
+  . = ALIGN(4096);
+  __heap_start = .;
+  __heap_end = 0x87E00000;
+
   /DISCARD/ : {
     *(.note.GNU-stack)
   }
