@@ -21,12 +21,11 @@
 // RUN: %llvm-objcopy -O binary %t.elf %t.bin
 // RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 0'
 // RUN: grep -c "OK OK2" %t.out | xargs test 1 -eq
-// gem5 skipped — issue gem5-se-heap-not-covered-by-elf-segment is RESOLVED
-// (DG-007b: dadao.ld's .heap NOLOAD section now gives the heap real PT_LOAD
-// memsz coverage; gem5 SE no longer page-faults on the heap and runs the
-// malloc/memset/strcmp logic to completion). codegen-indirect-call-rb0-misuse
-// is also FIXED (DL-066a; see indirect_call.test for a dual-backend regression
-// probe). Still skipped because this test links a prebuilt
-// .work/picolibc/build-dadao/libc.a compiled before the fix — the my_putc
-// indirect-call site (same as printf_hello.test) is baked into old libc.a
-// object code. See issue picolibc-libc-rebuild-blocked.
+// gem5: issue gem5-se-heap-not-covered-by-elf-segment is RESOLVED (DG-007b:
+// dadao.ld's .heap NOLOAD section now gives the heap real PT_LOAD memsz
+// coverage; gem5 SE no longer page-faults on the heap). libc.a has been
+// rebuilt clean (ML-005a) with the DL-066a indirect-call fix baked in, so
+// the my_putc callback site is no longer miscompiled. Feed the real ld.lld
+// ELF directly to gem5 SE (same pattern as align_strfn.test).
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gem5.out 2>&1; test $? -eq 0'
+// RUN: grep -c "OK OK2" %t.gem5.out | xargs test 1 -eq

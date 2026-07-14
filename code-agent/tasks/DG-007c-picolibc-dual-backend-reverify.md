@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（lit 测试 + 双后端验证）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核）——★ picolibc goal①/② 双后端里程碑真正收官
 
 **前置**：本轮全部已完成并合入的修复——DG-007b（gem5 堆区 PT_LOAD 覆盖）、DL-066a（间接调用不再误用 rb0）、ML-005a（libc.a 解锁重建，DL-066a 修复已烘进）、DL-067b（string 函数 BR_CC 崩溃修复，picolibc 干净重建可用）。四个修复叠加后，`printf_hello.test`/`malloc_hello.test` 理论上首次具备在 gem5 SE 上真正跑通的全部前提条件。
 
@@ -42,3 +42,13 @@ python3 tools/run_differential.py 2>&1 | tail -3
 - `docs/issues.yaml` 的 `gem5-se-heap-not-covered-by-elf-segment`（closed）、`codegen-indirect-call-rb0-misuse`（closed）条目
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**如实报告，不确定能不能双后端通过就老实去试，试出来是什么结果就报告什么结果**。
+
+---
+
+## 架构师复核（2026-07-14，ground-truth）：通过 —— ★ 里程碑达成
+
+- diff 审阅：两个测试文件都是真实 `RUN` 行 + 真实 `grep -c` 精确断言，无 `|| true`、无弱化，注释准确反映本轮四个前置修复的贡献。
+- **独立从零重建 libc.a**（`rm -rf build-dadao && make build-picolibc`，非复用 subagent 的构建产物）：`llvm-lit -v printf_hello.test malloc_hello.test` 两个都 PASS（双后端）。
+- 全 E2E 30/31（同一个已知无关的 `syscall_hello.test` 失败）、四方差分 AGREE(3-way)=200/DIVERGE=0、Sail AGREE(4-way)=200，不回归。
+
+**判定**：通过，提交。**picolibc goal①（printf）/goal②（malloc）自 ADR-0014 立项以来首次真正双后端（QEMU+gem5）验证通过**——本轮 DG-007a→DG-007b→DL-066a→ML-005a→DL-067a→DL-067b→DG-007c 七个任务的连续修复链条在此收口。

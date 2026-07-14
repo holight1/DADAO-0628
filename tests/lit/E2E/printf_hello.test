@@ -23,10 +23,9 @@
 // RUN: %llvm-objcopy -O binary %t.elf %t.bin
 // RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 0'
 // RUN: grep -c "hello, dadao" %t.out | xargs test 1 -eq
-// gem5 skipped — codegen-indirect-call-rb0-misuse is FIXED (DL-066a; see
-// indirect_call.test for a dual-backend regression probe), but this test still
-// links a prebuilt .work/picolibc/build-dadao/libc.a that was compiled before
-// the fix — the my_putc indirect-call site lives inside libc.a's vfprintf and
-// is already baked into old object code. Rebuilding libc.a is blocked by
-// unrelated gaps (see issue picolibc-libc-rebuild-blocked); until then this
-// case doesn't actually exercise the fix on gem5.
+// gem5: libc.a has been rebuilt clean (ML-005a unblocked the rebuild) with
+// the DL-066a indirect-call fix baked in, so the my_putc callback site inside
+// vfprintf is no longer miscompiled. Feed the real ld.lld ELF directly to
+// gem5 SE (same pattern as align_strfn.test), no gen_min_elf needed.
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gem5.out 2>&1; test $? -eq 0'
+// RUN: grep -c "hello, dadao" %t.gem5.out | xargs test 1 -eq
