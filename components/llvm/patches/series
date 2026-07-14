@@ -23,3 +23,4 @@
 0023-dadao-trap-llvm-mc.patch
 0024-picolibc-backend-enablement.patch
 0025-mc-relocation-gaps.patch
+0026-varargs-frame-size-fix.patch
