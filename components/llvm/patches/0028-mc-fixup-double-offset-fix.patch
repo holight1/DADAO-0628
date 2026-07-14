@@ -1,0 +1,89 @@
+From 45d59391b3c3715e5f3046219e4bd8891e7a7898 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 11:56:29 +0800
+Subject: [PATCH 28/29] target/dadao: fix double-offset memory corruption in
+ applyFixup (ML-003i)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DS's gdb session (ML-003i) found real evidence of MC fragment memory
+corruption: MCFragment::Parent and STI overwritten with the identical
+garbage value 0x8802000000000000, crashing MCAssembler::layout() with
+a bare SIGSEGV (no assertion — a real buffer overrun, not a caught
+invariant violation).
+
+Root cause: DADAOAsmBackend::applyFixup's `Data` parameter already
+points at this fixup's location within the fragment (the caller
+pre-offsets it) — confirmed against RISC-V's RISCVAsmBackend::
+applyFixup, which indexes `Data[Idx]` directly and asserts
+`Fixup.getOffset() + NumBytes <= F.getSize()` rather than adding the
+offset again. DADAO's FK_Data_8 case (added in ML-003e) and the
+generic fallback case wrote to `Data + Offset` — double-applying the
+offset — writing past the intended bytes into whatever memory follows,
+which is exactly how an adjacent MCFragment's own struct fields
+(Parent/STI) got clobbered.
+
+This was invisible in every prior test: earlier tests only ever had a
+single fixup per (small) fragment, where Offset happened to be 0 in
+practice. A jump table is the first case with *multiple* FK_Data_8
+fixups packed into one larger shared fragment at different non-zero
+offsets — the double-offset bug finally had daylight to write out of
+bounds.
+
+(An earlier attempt in this same debugging session went the opposite,
+wrong direction — added `+ Offset` to the call24/branch18/branch12/
+rela_page cases, which were *already correct* without it; this
+regressed clang_oneshot.test with an ArrayRef::slice out-of-bounds
+assertion and was reverted.)
+
+Verified: the crash is gone (vfprintf.c with real -ffunction-sections
+flags now fails cleanly with "Undefined temporary symbol" instead of
+SIGSEGV — a separate, still-open, non-crashing issue, likely needing
+ELFObjectWriter::useSectionSymbol / needsRelocateWithSymbol to route
+local/temporary jump-table-index labels through section-relative
+relocations). E2E 27/27, differential AGREE(4-way)=200/DIVERGE=0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .../Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp   | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index 4488e6fda503..095324492fa6 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -31,7 +31,14 @@ public:
+   void applyFixup(const MCFragment &F, const MCFixup &Fixup,
+                   const MCValue &Target, uint8_t *Data, uint64_t Value,
+                   bool IsResolved) override {
+-    unsigned Offset = Fixup.getOffset();
++    // NOTE: Data already points at this fixup's location within the
++    // fragment (the caller pre-offsets it) — don't add Fixup.getOffset()
++    // again when indexing into Data. Adding it a second time (as a prior
++    // version of this file did for FK_Data_8 / the generic fallback) wrote
++    // past the intended bytes and corrupted adjacent MC fragment data —
++    // only surfaced once a single fragment held multiple fixups at
++    // different offsets (e.g. a multi-entry jump table), never in earlier
++    // one-fixup-per-fragment tests (ML-003i).
+     unsigned Kind = Fixup.getKind();
+ 
+     if (Kind == DADAO::fixup_dadao_call24) {
+@@ -124,12 +131,12 @@ public:
+         maybeAddReloc(F, Fixup, Target, Value, IsResolved);
+         return;
+       }
+-      support::endian::write64be(Data + Offset, Value);
++      support::endian::write64be(Data, Value);
+       return;
+     }
+ 
+     if (IsResolved)
+-      support::endian::write32be(Data + Offset,
++      support::endian::write32be(Data,
+                                   static_cast<uint32_t>(Value) & 0xFFFFFFFF);
+   }
+ 
+-- 
+2.43.0
+

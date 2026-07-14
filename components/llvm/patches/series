@@ -25,3 +25,5 @@
 0025-mc-relocation-gaps.patch
 0026-varargs-frame-size-fix.patch
 0027-jumptable-section-fix.patch
+0028-mc-fixup-double-offset-fix.patch
+0029-jumptable-standard-section-routing.patch

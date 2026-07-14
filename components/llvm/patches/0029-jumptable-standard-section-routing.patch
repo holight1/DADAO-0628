@@ -1,0 +1,139 @@
+From 4f2967eac9ec202941f820fd5b46fbd5319f1c16 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 11:57:51 +0800
+Subject: [PATCH 29/29] target/dadao: route jump tables via
+ shouldPutJumpTableInFunctionSection, drop hand-rolled emitJumpTableInfo
+ (ML-003i)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DS's first attempt at keeping jump tables in-section (ML-003h,
+rejected) hand-rolled an emitJumpTableInfo() override that switched to
+OutContext.getObjectFileInfo()->getTextSection() — the *generic*
+.text section, a different ELF section from the function's own
+.text.<fname> under -ffunction-sections, reproducing the exact
+cross-section bug it was meant to fix.
+
+LLVM already has a standard hook for this: TargetLoweringObjectFile::
+shouldPutJumpTableInFunctionSection() (defaults to false for ELF).
+Added a small DADAOTargetObjectFile : TargetLoweringObjectFileELF
+override returning true, and removed the custom emitJumpTableInfo()
+entirely — the stock AsmPrinter::emitJumpTableImpl() now handles
+emission (correct alignment, data-region markers, endian handling)
+using the function's actual current section, no override needed.
+
+Verified via picolibc's vfprintf.c: .LJTI0_0 and its jump-table
+entries land in .text.vfprintf alongside the function (checked via
+disassembly). E2E 27/27, differential AGREE(4-way)=200/DIVERGE=0, no
+regression.
+
+(This alone did not fully resolve ML-003h/i — see the following commit
+for the actual MC fragment corruption bug this uncovered, and
+ML-003i's task file for the remaining non-crashing "Undefined
+temporary symbol" issue.)
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp    | 37 +-------------------
+ llvm/lib/Target/DADAO/DADAOTargetMachine.cpp | 22 +++++++++++-
+ 2 files changed, 22 insertions(+), 37 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+index f13555020fd9..c67df53ebad9 100644
+--- a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
++++ b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+@@ -7,6 +7,7 @@
+ #include "llvm/CodeGen/MachineFunction.h"
+ #include "llvm/CodeGen/MachineInstr.h"
+ #include "llvm/CodeGen/MachineJumpTableInfo.h"
++#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
+ #include "llvm/IR/DataLayout.h"
+ #include "llvm/MC/MCContext.h"
+ #include "llvm/MC/MCExpr.h"
+@@ -42,42 +43,6 @@ public:
+     EmitToStreamer(*OutStreamer, TmpInst);
+   }
+ 
+-  // Override to emit jump tables inline in the function's own section
+-  // instead of the default .rodata. DADAO accesses the jump table with
+-  // PC-relative rela+addi; the base emitter switches to .rodata, and under
+-  // -ffunction-sections the function body lives in .text.<fname> — a
+-  // *different* section from .rodata, so the rela+addi becomes a
+-  // cross-section reference to a temporary (non-symtab-worthy) jump-table
+-  // label. That is what produced "Undefined temporary symbol" at the ELF
+-  // writer (ML-003h).
+-  //
+-  // Fix: don't switch sections at all. emitJumpTableInfo() runs right after
+-  // the function body, while OutStreamer is still positioned in that
+-  // function's own section (.text.<fname> under -ffunction-sections, plain
+-  // .text otherwise) — emitting in place keeps the jump table and its
+-  // referencing branch in the same section, matching the PC-relative
+-  // rela+addi access pattern. (A prior attempt explicitly switched to
+-  // OutContext.getObjectFileInfo()->getTextSection() — the *generic*
+-  // .text section, which is itself a distinct section from .text.<fname>
+-  // under -ffunction-sections and reproduced the exact same bug.)
+-  void emitJumpTableInfo() override {
+-    const MachineJumpTableInfo *MJTI = MF->getJumpTableInfo();
+-    if (!MJTI || MJTI->getJumpTables().empty())
+-      return;
+-
+-    const std::vector<MachineJumpTableEntry> &JT = MJTI->getJumpTables();
+-    unsigned PtrSize = MF->getDataLayout().getPointerSize();
+-
+-    OutStreamer->emitValueToAlignment(Align(PtrSize));
+-    for (unsigned i = 0, e = JT.size(); i != e; ++i) {
+-      const std::vector<MachineBasicBlock *> &MBBs = JT[i].MBBs;
+-      OutStreamer->emitLabel(GetJTISymbol(i));
+-      for (MachineBasicBlock *MBB : MBBs)
+-        OutStreamer->emitValue(
+-            MCSymbolRefExpr::create(MBB->getSymbol(), OutContext), PtrSize);
+-    }
+-  }
+-
+ private:
+   void lowerToMCInst(const MachineInstr *MI, MCInst &OutMI) {
+     OutMI.setOpcode(MI->getOpcode());
+diff --git a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+index 14033eac6568..5ca7e6ea83f6 100644
+--- a/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
++++ b/llvm/lib/Target/DADAO/DADAOTargetMachine.cpp
+@@ -29,6 +29,26 @@ static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {
+   return RM.value_or(Reloc::Static);
+ }
+ 
++namespace {
++// DADAO accesses jump tables via a PC-relative rela+addi sequence, which
++// requires the table to live in the *same* section as the branch
++// referencing it. The generic ELF TLOF default
++// (shouldPutJumpTableInFunctionSection() == false) puts jump tables in a
++// separate section, which becomes a genuine cross-section reference under
++// -ffunction-sections (ML-003h/i). Route jump tables into the function's
++// own section instead, and let the stock AsmPrinter::emitJumpTableImpl()
++// emit them (a hand-rolled emitJumpTableInfo() override that emits inline
++// without switching sections was tried and triggered a real MC fragment
++// corruption — see ML-003i).
++class DADAOTargetObjectFile : public TargetLoweringObjectFileELF {
++public:
++  bool shouldPutJumpTableInFunctionSection(bool UsesLabelDifference,
++                                           const Function &F) const override {
++    return true;
++  }
++};
++} // end anonymous namespace
++
+ MachineFunctionInfo *DADAOTargetMachine::createMachineFunctionInfo(
+     BumpPtrAllocator &Allocator, const Function &F,
+     const TargetSubtargetInfo *STI) const {
+@@ -47,7 +67,7 @@ DADAOTargetMachine::DADAOTargetMachine(
+                                getEffectiveCodeModel(CodeModel, CodeModel::Small),
+                                OptLevel),
+       Subtarget(TT, Cpu, FeatureString, *this),
+-      TLOF(std::make_unique<TargetLoweringObjectFileELF>()) {
++      TLOF(std::make_unique<DADAOTargetObjectFile>()) {
+   initAsmInfo();
+ }
+ 
+-- 
+2.43.0
+

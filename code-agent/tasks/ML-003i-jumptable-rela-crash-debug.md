@@ -82,5 +82,48 @@ python3 tools/run_differential.py 2>&1 | tail -3
 
 ## 审阅记录（subagent）
 
-> **[架构师预置占位 · DS 必填]** DS 返回前必须开 subagent 代码级 review，逐条 finding + 处置表 + 判决写入此区。**占位未替换成实质记录 = 未自审 = 直接打回（AC/零 finding 也写：判决行 + 逐条核验点附证据 + finding:无）。**
-> 特别核：是否真用 gdb 定位了崩溃点（有 bt 证据）？修法是否是"直接解析路径真正修好"而非"强制走重定位/禁用跳转表"这类绕过？vfprintf.c 真编译通过 0 崩溃？完整 printf 测试真跑出正确输出+exit=0？E2E/四方不回归？
+### 审阅记录（subagent · 判决 = needs-fix，根因已精确定位）
+
+**gdb 调试证据**：
+
+```
+#0  llvm::MCFragment::getFixups() at MCSection.h:655
+    return MutableArrayRef(getParent()->FixupStorage) ← getParent()=0x8802000000000000 → SIGSEGV
+#1  llvm::MCAssembler::layout() at MCAssembler.cpp:706
+    for (MCFixup &Fixup : F.getFixups())
+
+F = { Kind = FT_Data, FixedSize = 24, FixupStart = 0, FixupEnd = 0,
+      Parent = 0x8802000000000000,    ← CORRUPTED
+      STI = 0x8802000000000000,       ← SAME corrupted value!
+      VarContentStart = 604110848 }    ← also garbage
+```
+
+**根因**：`MCAssembler::layout()` 遍历 MCSection 的 fragment 链表时，某个 DataFragment 的 `Parent` 指针被覆写为垃圾值 `0x8802000000000000`。`Parent` 和 `STI` 同时被覆写为相同值，且 `VarContentStart` 也被破坏——说明该 fragment 的内存被外部 write 越界踩踏。
+
+**触发条件**：覆写 `emitJumpTableInfo`（不 switch section，在原地发射跳转表 `.8byte .LBB` 数据）后产生。怀疑 `emitValue` → `emitBytes` → DataFragment 创建/追加过程中，某处 buffer 扩容与相邻 fragment struct 内存重叠。
+
+**E2E**：27/27 PASS
+
+**判决**：needs-fix（MC 层 DataFragment 内存越界踩踏，需 MC/Streamer 专家复查 fragment 布局与固定值写入边界）
+
+---
+
+## 架构师复核（2026-07-14，亲自修一轮）：**真崩溃已修好，剩余问题已收窄，转 ML-003j**
+
+DS 这轮是真调试（gdb + 真实证据），诊断方向对，判"needs-fix"诚实。按新规则架构师先亲自尝试修复。
+
+### ✅ 修复 1：跳转表 section 路由改用 LLVM 标准机制（已提交 `4f2967eac9ec`/patch 0029）
+DS/架构师此前的手搓 `emitJumpTableInfo()` 覆写（无论是切"通用 `.text`"还是"不切换直接发射"）都是**绕开标准机制**造出来的脆弱代码。LLVM 本有标准 hook：`TargetLoweringObjectFile::shouldPutJumpTableInFunctionSection()`（ELF 默认 `false`）。新增 `DADAOTargetObjectFile` 子类覆写为 `true`，**删除全部手搓 `emitJumpTableInfo`**，让官方 `AsmPrinter::emitJumpTableImpl()` 接管（正确处理对齐/data-region标记/大端序）。验证：`.LJTI0_0` 等标签正确落进 `.text.vfprintf`。
+
+### ✅ 修复 2：真正的内存踩踏根因（已提交 `45d59391b3c3`/patch 0028）
+DS gdb 抓到的 `Parent`/`STI` 被覆写成同一垃圾值——根因是 `DADAOAsmBackend::applyFixup` 的 `Data` 参数**本身已经是调用方定位好的地址**（对照 RISC-V `RISCVAsmBackend::applyFixup`：直接 `Data[Idx]`，断言检查 `Fixup.getOffset()+NumBytes<=F.getSize()` 而非再加偏移）。**`FK_Data_8`（架构师 ML-003e 自己加的）和通用兜底分支都多加了一次 `+ Offset`**——双重偏移，写出预期字节范围外，正是覆盖相邻 fragment 结构体字段（`Parent`/`STI`）的真凶。单指令测试从没暴露（fragment 里只有一个 fixup，offset 恰好是 0）；跳转表是第一个"一个大 fragment 里塞进多个不同 offset 的 `FK_Data_8` fixup"的场景，才让这个 bug 见光。
+
+**修复过程有个真实的自我纠正**：架构师最初误诊，给 `call24`/`branch18`/`branch12`/`rela_page` 也加了 `+Offset`（这四处**本来就是对的**，不该加）——这个错误方向立刻被 `clang_oneshot.test` 回归测试逮到（`ArrayRef::slice` 越界断言），及时撤销，改对了真正需要修的 `FK_Data_8`/兜底分支。
+
+**验证**：`vfprintf.c` 真实 flags 编译**不再崩溃**（SIGSEGV 消失），E2E 27/27、四方 200/0 无回归。
+
+### ⚠ 剩余问题（已收窄，转 ML-003j）
+修好崩溃后，`vfprintf.c` 编译回到一个**干净、不崩溃**的编译错误："Undefined temporary symbol"（原始现象）。追了一层：ELF writer 的 `useSectionSymbol` 机制（把"对局部临时符号的重定位"转换成"对 section 符号+偏移的重定位"，避免临时符号进符号表）要求 `SymA->getBinding()==STB_LOCAL && !SymA->isUndefined()`——**`.LJTI0_0` 在 `recordRelocation` 求值时被判定为"未定义"**，尽管它确实在同一 section（`.text.vfprintf`）里定义，只是**物理位置在引用点(`rela`/`addi`)之后**（跳转表标签在函数尾部发射，指令在函数体中部引用它，是前向引用）。`fixup_dadao_rela_page` 的 `!IsResolved` 判断直接送去 `maybeAddReloc`，没有走"同 section 直接解析"的快速路径（不同于 `call24`/`branch18` 等已有 same-section 直接解析分支）——这可能是本任务真正剩下的缺口：`rela_page`/`rela_lo` 对**同 section 前向引用的本地标签**处理不完整。
+
+### 判定
+**真崩溃已根治，转 ML-003j 收尾"Undefined temporary symbol"**（现在是干净、可调试的编译错误，非内存踩踏）。
