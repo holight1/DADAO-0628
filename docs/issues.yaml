@@ -420,7 +420,34 @@
   # 无关，未修复，留待后续任务定位 `lowerGlobalAddress`/`ADDI_RBRRII` 低
   # 12 位 fixup 生成逻辑。
 
-- id: wiki-9f378f4-sbi-see-deferred-delta
+- id: dadao-oz-undef-physreg
+  title: "-O1+ 建 picolibc：`call` 的 implicit-use 寄存器列表覆盖 rd17-rd30 全范围而非仅实际参数寄存器，MachineVerifier 报 'Using an undefined physical register'"
+  status: open
+  scope: [CodeGen]
+  blocks: [llvm-test-suite-t3-above-o0]
+  resolved_by: null
+  # 首次记录于 ML-003a（2026-07-13）："-O1/-O2/-Oz 编带函数调用的 libc
+  # （argz_insert 等）报 63× Bad machine code: Using an undefined physical
+  # register（rd17-rd30 implicit killed/used）——像 call 指令隐式操作数/
+  # regmask 设置 bug"，此前只在多个任务文件里提及，从未真正登记进
+  # issues.yaml 或附具体复现证据。
+  #
+  # 架构师复核 M2.6 阶段顺手复现（2026-07-14）：
+  # `clang --target=dadao -O1 -c libc/argz/argz_insert.c` 的 `-print-after-all`
+  # MIR dump 显示：
+  # ```
+  # CALL_IIII @argz_add, <regmask ...>, implicit-def $rd31, implicit $rd16,
+  #   implicit killed $rd17, implicit killed $rd18, implicit killed $rd19,
+  #   implicit killed $rd20, implicit killed $rd21, ..., implicit killed $rd30
+  # ```
+  # 该函数只有 4 个真实参数（`Function Live Ins: $rd16/$rd17/$rd18/$rd19`），
+  # 但 `CALL_IIII` 的 implicit-use 列表把 rd20-rd30 也标记为"隐式使用/杀死"
+  # ——这些寄存器在本函数内从未被定义过。`-O0` 大概率因为没跑
+  # MachineVerifier（或 liveness 计算方式不同）而未触发。疑似 `LowerCall`
+  # （`DADAOISelLowering.cpp:84`）构造 outgoing-argument 的隐式寄存器列表时
+  # 用了固定的"全部参数寄存器范围"而非按实际传参数量截断。待专门任务
+  # 根因定位 + 修复，是 llvm-test-suite（ADR-0012 T3）能否在高于 -O0
+  # 的优化级别跑起来的前置。
   title: "wiki 13a414d→9f378f4（8 commits）B 桶 delta 记入 deferred 域未来基线（ADR-0013 Phase 2·B 桶策略，该域启动时吸收）。A 桶(M1 核心 SimRISC-01/02)空——SimRISC-01/02/03 零 diff、差分 AGREE(4-way)=200/DIVERGE=0 不回归、pin 已推进至 9f378f4。**SBI 域**(DADAO-22)：PTBR/PTHI/PAHI 走 rb→rd 中转+跳转表(10929f7)、SBI_PHYMEM_ALLOC_PAGE 失败返回值 0→-1(b1a5f7f)、popcnt 实现改 TODO(popcnt 不在 SimRISC ISA)——是未来 musl 系统调用落地(ML-001a recon)的上游依赖。**异常/SEE 域**(DADAO-12)：excp_num 拆 sync_num+async_num/escape_num→rc5(b3d6c82)、CFXMEM 增内部储存块非法访问触发(ea10f5e)、异常进出伪代码统一+cfxld/cfxst 路由简化(6079ecd)、§5 重构+FE→FPEXCP+中断模型前移(defdd96)——异常域启动时须回放吸收。**FP 域**(SimRISC-00 MISC-RF)：浮点指令补 -orrr/-orri 后缀(bc39c7c/b1a5f7f)。C 桶(装饰)已随 pin 吸收无需跟踪：add 示例补 rd0 4 操作数、CSR 名去重、phymem→pmem 全局重命名。"
   status: open
   scope: [SEE, SBI, FP]
