@@ -1,0 +1,13 @@
+// DL-066a: indirect call through a function pointer (no malloc/heap) — locks
+// down the fix for codegen-indirect-call-rb0-misuse. CALL_PSEUDO_INDIRECT used
+// to expand to `CALL_RRII RB0, <target>, 0`, but rb0 as call base means "PC+4"
+// (spec §1.3), not zero, so the computed target was PC+4+absolute_address.
+// QEMU happened to run this "correctly" only because of the separate,
+// unrelated QEMU-rb0-not-maintained defect (rb0 always reads 0 there); gem5
+// correctly maintains rb0 and used to land at a garbage address before the fix.
+// Dual-backend exit 42.
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/indirect_call.c -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 42'

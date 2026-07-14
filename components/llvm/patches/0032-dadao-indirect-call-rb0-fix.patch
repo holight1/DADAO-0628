@@ -1,0 +1,51 @@
+From 64a43474e870913253745f8c2390fca361d1584d Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 15:14:18 +0800
+Subject: [PATCH] target/dadao: fix CALL_PSEUDO_INDIRECT rb0 misuse as call
+ base (DL-066a)
+
+expandPostRAPseudo's CALL_PSEUDO_INDIRECT expanded to CALL_RRII with rb0
+as the base register, but rb0 architecturally means PC+4 (spec section 1.3),
+not zero -- absolute indirect calls through a function pointer computed
+PC+4+target instead of target. QEMU happened to run this correctly only
+because of the separate QEMU-rb0-not-maintained defect (rb0 always reads 0
+there); gem5 correctly maintains rb0 and exposed the real miscompilation.
+
+Materialize the absolute target address into a fixed scratch RB register
+(rb5: reserved, unallocated, no ABI role) via the existing rd2rb cross-bank
+copyPhysReg bridge (DL-051a), then emit CALL_RRII rb5, rd0, 0 (base=address,
+offset=rd0=0).
+---
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index e72186d36c40..db2103e53c81 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -173,9 +173,20 @@ bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+     return true;
+   }
+   case DADAO::CALL_PSEUDO_INDIRECT: {
+-    BuildMI(MBB, MI, DL, get(DADAO::CALL_RRII))
+-        .addReg(DADAO::RB0)
++    // The callee address lives in an RD-bank register (MI.getOperand(0)),
++    // but `call rrii`'s base (rbha) is an RB-bank operand and rb0 means
++    // "PC+4" (spec §1.3), not "zero" — using rb0 as rbha here would compute
++    // PC+4+target instead of target (see DG-007a). Materialize the absolute
++    // address into a fixed scratch RB register (rb5: reserved, unallocated,
++    // no ABI role — see contracts/abi/spec.md, unlike rb3/rb4=gp/tp) via the
++    // same rd2rb cross-bank bridge used by copyPhysReg (DL-051a), then use
++    // that as the base with rd0 (hardwired zero) as the offset.
++    BuildMI(MBB, MI, DL, get(DADAO::RD2RB_ORRI), DADAO::RB5)
+         .addReg(MI.getOperand(0).getReg())
++        .addImm(1);
++    BuildMI(MBB, MI, DL, get(DADAO::CALL_RRII))
++        .addReg(DADAO::RB5)
++        .addReg(DADAO::RD0)
+         .addImm(0);
+     MI.eraseFromParent();
+     return true;
+-- 
+2.43.0
+

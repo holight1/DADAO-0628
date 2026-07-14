@@ -29,3 +29,4 @@
 0029-jumptable-standard-section-routing.patch
 0030-rela-same-section-fastpath.patch
 0031-jumptable-label-must-be-emitted.patch
+0032-dadao-indirect-call-rb0-fix.patch

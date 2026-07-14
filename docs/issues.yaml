@@ -223,10 +223,10 @@
 
 - id: gem5-se-heap-not-covered-by-elf-segment
   title: "dadao.ld 的 __heap_start/__heap_end 无输出 section/无 PHDR 覆盖，gem5 SE 按 PT_LOAD memsz 建页表故堆访问缺页；QEMU 走裸 flat binary 不受影响"
-  status: open
+  status: closed
   scope: [gem5, picolibc, linker-script]
-  blocks: [picolibc-goal2-dual-backend]
-  resolved_by: null
+  blocks: []
+  resolved_by: DG-007b（dadao.ld 加 `.heap (NOLOAD)` 输出 section 落进 `:data` PHDR，__heap_start/__heap_end 符号名不变；重链 malloc_hello 后第二个 PT_LOAD memsz=0x7df8000 覆盖 0x80008000..0x87e00000；gem5 SE 上原故障地址 0x80009000 不再缺页，程序推进到 tick=3222000（原 187000）执行完 malloc/memset/strcmp 逻辑，撞上独立的 codegen-indirect-call-rb0-misuse；E2E 29/29、四方 AGREE 200/DIVERGE=0 不回归）
   # DG-007a 根因（subagent，architect 复核）：malloc_hello.elf 在 gem5 SE 下
   # 于 tick=187000 崩溃 `Page table fault @ 0x80009000`——gdb 确认故障 PC 在
   # picolibc malloc 内部（_set_size，首次 malloc(32) 的 bookkeeping），故障
@@ -245,10 +245,18 @@
 
 - id: codegen-indirect-call-rb0-misuse
   title: "CALL_PSEUDO_INDIRECT 的 expandPostRAPseudo 用 rb0 作 call 的 base，但 rb0 语义=PC+4（非零）——绝对地址间接调用被算成 PC+4+绝对地址；QEMU 因已知 QEMU-rb0-not-maintained 缺陷（rb0 恒读 0）而巧合跑对"
-  status: open
+  status: closed
   scope: [CodeGen, gem5]
-  blocks: [picolibc-goal1-dual-backend]
-  resolved_by: null
+  blocks: []
+  resolved_by: DL-066a（DADAOInstrInfo.cpp expandPostRAPseudo 的 CALL_PSEUDO_INDIRECT 改用 rd2rb 桥把绝对地址物化进固定 scratch rb5（reserved/unallocated/无 ABI 角色，别于 rb3/rb4=gp/tp），再 `CALL_RRII rb5, RD0, 0`（base=绝对地址，offset=rd0=0）；反汇编确认新指令序列 `rd2rb rb5, rdX, 1` + `call rb5, rd0, 0` 不再用 rb0；独立最小探针 tests/lit/E2E/indirect_call.test（无 malloc/heap 的函数指针互调）新增并双后端 exit=42 通过——修复前用同一探针在 gem5 上 ground-truth 复现崩溃 `Page table fault @ 0x100000054`，PC=0x80000048/PC+4=0x8000004c/&add2=0x80000008，0x8000004c+0x80000008=0x100000054 精确对应根因公式；QEMU 侧不受影响（QEMU-rb0-not-maintained 仍 open，之前的巧合抵消对本探针同样成立）。E2E 29/30（新增 indirect_call.test 后计数；1 个既有失败 syscall_hello.test 为无关环境问题，与本改动无关，fix 前后均失败一致复现）、四方差分 AGREE(3-way)=200/DIVERGE=0/Sail AGREE(4-way)=200 不回归。**picolibc-goal1/2-dual-backend 仍未完全解锁**：printf_hello.test/malloc_hello.test 链接的 `.work/picolibc/build-dadao/libc.a` 是用修复前的旧编译器预建的，my_putc 间接调用点（vfprintf 内部 `f->put()`）已固化进旧目标码，需要重建 libc.a 才能让这两个既有 E2E 用例真正吃到本次修复；见新 issue `picolibc-libc-rebuild-blocked`。
+  # DG-007b（2026-07-14）：确认 malloc_hello 也踩这个 bug，不止 printf_hello——
+  # malloc_hello.c 调用 printf，经 stdout_min.c 的 FDEV_SETUP_STREAM 走同一
+  # my_putc 函数指针间接调用点。heap 缺页问题（见
+  # gem5-se-heap-not-covered-by-elf-segment，已 resolved）修复后，
+  # malloc_check.elf 在 gem5 SE 上推进到 tick=3222000（原 heap 缺页在
+  # tick=187000）执行完 malloc/memset/strcmp，随后在同一条 `call rb0, rd31, 0`
+  # 指令（PC=0x80002464）撞上本 issue：故障地址 0x100002554 =
+  # (PC+4=0x80002468) + (&my_putc=0x800000ec)，与 printf_hello 根因一致。
   # DG-007a 根因（subagent，architect 复核）：printf_hello.elf 在 gem5 SE
   # 下于 tick=120000 崩溃 `Page table fault @ 0x100000464`（与
   # gem5-se-heap-not-covered-by-elf-segment 是两个不同故障地址/不同根因，
@@ -267,6 +275,47 @@
   # 会在 QEMU 上同时暴露。修复方向：不用 rb0 做 base，改用 rd2rb 桥
   # （已有的跨 bank copy 机制，DL-051a）把目标地址物化进一个 scratch RB
   # 寄存器，再 `CALL_RRII <scratch_rb>, RD0, 0`（base=绝对地址，offset=0）。
+
+- id: picolibc-libc-rebuild-blocked
+  title: "tests/lit/E2E 的 printf_hello.test/malloc_hello.test 链接的 .work/picolibc/build-dadao/libc.a 是旧（DL-066a 修复前）编译器预建的产物；`ninja libc.a` 全量重建当前会在无关模块上失败，暂无法验证 DL-066a 修复在这两个既有用例上的端到端效果"
+  status: open
+  scope: [picolibc, clang, CodeGen]
+  blocks: [picolibc-goal1-dual-backend, picolibc-goal2-dual-backend]
+  resolved_by: null
+  # DL-066a（2026-07-14）验证阶段发现：尝试 `ninja libc.a` 全量重建触发两类
+  # 与本次 CALL_PSEUDO_INDIRECT 修复无关的既有缺口——
+  # (a) libc/signal/sigjmp_{setsigs,getsigs}.c：`../libc/include/setjmp.h` 里
+  #     `jmp_buf` 类型未定义（缺 dadao 的 machine/setjmp.h 或类似头），编译报
+  #     "unknown type name 'jmp_buf'"；
+  # (b) libc/stdio/atold_engine.c（long double engine）：DADAO backend 在
+  #     SelectionDAG legalize 阶段 "fatal error: unsupported library call
+  #     operation"（`__atold_engine` 里某个 libcall 未在 DADAOISelLowering 里
+  #     实现）。
+  # 因此 DL-066a 未重建 libc.a（范围外、且会引入两个新的独立问题）。printf_hello/
+  # malloc_hello 的 my_putc 间接调用点位于 libc.a 内部（vfprintf → FILE.put），
+  # 该目标码是用修复前的旧编译器生成、已固化，故这两个用例目前的 PASS 不能
+  # 证明 DL-066a 对它们生效——用独立无 libc 依赖的 tests/lit/E2E/indirect_call.test
+  # 补齐了判别性验证。后续重建 libc.a 需先处理 (a)(b) 两个缺口。
+
+- id: syscall-hello-write-output-missing
+  title: "syscall_hello.test：exit=42 正确但 SYS_write 的 hi\\n 输出完全缺失（连垃圾字节都没有），QEMU stdout 只有 monitor 启动 banner"
+  status: open
+  scope: [QEMU]
+  blocks: null
+  resolved_by: null
+  # 架构师在 DG-007b/DL-066a 复核阶段发现（2026-07-14）：全 E2E 从 29/29 变成
+  # 29/30（新增 indirect_call.test 之后），syscall_hello.test 是这次唯一失败
+  # 项。已用 `git stash` 确认在两个修复之前的干净提交树上独立复现同样失败——
+  # 与 DG-007b/DL-066a 均无关，是更早就存在的缺陷（两个子任务的"pre-existing/
+  # 无关"判断均属实）。现象：手动裸跑 `qemu-system-dadao -M dadao-m1
+  # -nographic -bios trampoline.bin -kernel sh.bin`，退出码=42（SYS_exit 正确
+  # 执行），但捕获的 stdout 只有 66 字节，全部是 QEMU 自身的 monitor 启动
+  # banner（"QEMU 10.0.0 monitor..."），一个字节的 "hi" 或垃圾数据都没有——
+  # 说明 SYS_write（trap sysno=64）在这个独立单文件小程序里没有把任何字节
+  # 写进 stdout（而同一 write 机制在 printf_hello.test 里通过 picolibc 正常
+  # 工作，故不是 write handler 整体坏了）。未深入排查具体原因（怀疑
+  # `rela rb8,msg_data` + `addi rb8,rb8,msg_data` 计算 msg_data 地址是否正确，
+  # 或 monitor/serial 共享 stdio 导致的缓冲/时序问题），留待后续任务专门排查。
 
 - id: wiki-9f378f4-sbi-see-deferred-delta
   title: "wiki 13a414d→9f378f4（8 commits）B 桶 delta 记入 deferred 域未来基线（ADR-0013 Phase 2·B 桶策略，该域启动时吸收）。A 桶(M1 核心 SimRISC-01/02)空——SimRISC-01/02/03 零 diff、差分 AGREE(4-way)=200/DIVERGE=0 不回归、pin 已推进至 9f378f4。**SBI 域**(DADAO-22)：PTBR/PTHI/PAHI 走 rb→rd 中转+跳转表(10929f7)、SBI_PHYMEM_ALLOC_PAGE 失败返回值 0→-1(b1a5f7f)、popcnt 实现改 TODO(popcnt 不在 SimRISC ISA)——是未来 musl 系统调用落地(ML-001a recon)的上游依赖。**异常/SEE 域**(DADAO-12)：excp_num 拆 sync_num+async_num/escape_num→rc5(b3d6c82)、CFXMEM 增内部储存块非法访问触发(ea10f5e)、异常进出伪代码统一+cfxld/cfxst 路由简化(6079ecd)、§5 重构+FE→FPEXCP+中断模型前移(defdd96)——异常域启动时须回放吸收。**FP 域**(SimRISC-00 MISC-RF)：浮点指令补 -orrr/-orri 后缀(bc39c7c/b1a5f7f)。C 桶(装饰)已随 pin 吸收无需跟踪：add 示例补 rd0 4 操作数、CSR 名去重、phymem→pmem 全局重命名。"
