@@ -109,26 +109,43 @@ they are two independent bugs):
 **Neither picolibc goal is dual-backend verified yet** — both are QEMU-only
 until their respective blocker is fixed.
 
+**Status (2026-07-14, updated)**: DG-007a/b and DL-066a are done — both bugs
+above are fixed and verified (E2E 29/30, one pre-existing unrelated failure
+`syscall_hello.test`, see issue `syscall-hello-write-output-missing`;
+differential AGREE(3-way)=200, Sail AGREE(4-way)=200). A new blocker surfaced
+during DL-066a's verification: `printf_hello.test`/`malloc_hello.test` link a
+prebuilt `libc.a` compiled with the pre-fix compiler, so they don't actually
+exercise the rb0 fix yet — tracked as issue `picolibc-libc-rebuild-blocked`
+(rebuilding `libc.a` hits two further, unrelated pre-existing gaps: a missing
+`jmp_buf` type and an unsupported-libcall legalization failure in
+`atold_engine.c`). ML-005a (in progress) unblocks the rebuild before the
+dual-backend re-verify step below can actually mean anything.
+
 ## M2.6: dual-backend unblock + llvm-test-suite on-ramp (2026-07-14 architect roadmap)
 
 Architect-proposed sequence, executed via subagent (not DS — the first thread
 is gem5-internal work, which per `feedback_ds_gem5_semantic_unreliable` goes to
 a subagent that owns the gem5 component, not DS):
 
-1. **DG-007 / DL-066 (dual-backend blockers)** — highest priority: blocks
-   dual-backend verification of work already claimed done (picolibc
-   goal①/②). DG-007a's root-cause pass found two independent bugs, not one:
+1. **DG-007 / DL-066 / ML-005 (dual-backend blockers)** — highest priority:
+   blocks dual-backend verification of work already claimed done (picolibc
+   goal①/②). DG-007a's root-cause pass found two independent bugs, not one,
+   and fixing them surfaced a third blocker:
    - DG-007a: root-cause (done, subagent) — see "Open blockers" above.
-   - DG-007b (gem5 side): fix `gem5-se-heap-not-covered-by-elf-segment` —
-     give the linker-script heap region a `SHT_NOBITS` output section inside
-     a `PT_LOAD` segment (or a dedicated third segment) so gem5's page table
-     covers it; zero-cost on the QEMU flat-binary path.
-   - DL-066a (CodeGen side): fix `codegen-indirect-call-rb0-misuse` — stop
-     using `rb0` as the call base; materialize the absolute target into a
-     scratch RB register via the existing rd2rb bridge (DL-051a) and emit
-     `CALL_RRII <scratch_rb>, RD0, 0` instead.
+   - DG-007b (done): fixed `gem5-se-heap-not-covered-by-elf-segment` — gave
+     the linker-script heap region a `NOLOAD` output section inside the
+     `:data` `PT_LOAD` segment so gem5's page table covers it; zero-cost on
+     the QEMU flat-binary path.
+   - DL-066a (done): fixed `codegen-indirect-call-rb0-misuse` — stopped using
+     `rb0` as the call base; materializes the absolute target into reserved
+     scratch register `rb5` via the existing rd2rb bridge (DL-051a) and emits
+     `CALL_RRII rb5, RD0, 0` instead. New regression test `indirect_call.test`
+     locks this down on both backends.
+   - ML-005a (in progress): unblock `picolibc-libc-rebuild-blocked` so
+     `libc.a` can actually be rebuilt with the fixed compiler.
    - DG-007c / DL-066b: dual-backend re-verify `printf_hello.test` +
-     `malloc_hello.test` on gem5, full E2E + differential regression.
+     `malloc_hello.test` on gem5 with a freshly-rebuilt `libc.a`, full E2E +
+     differential regression.
 2. **DL-065 (`dadao-oz-undef-physreg`, -O1+ codegen gap)** — needed before
    llvm-test-suite can run above -O0.
    - DL-065a: root-cause the "undefined physical register" at -O1+.
