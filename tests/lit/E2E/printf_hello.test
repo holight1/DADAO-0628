@@ -23,5 +23,7 @@
 // RUN: %llvm-objcopy -O binary %t.elf %t.bin
 // RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 0'
 // RUN: grep -c "hello, dadao" %t.out | xargs test 1 -eq
-// gem5 skipped — issue gem5-se-lld-elf-load-crash (real lld-linked
-// multi-segment ELF crashes on gem5 SE at load time, before main() runs)
+// gem5 skipped — issue codegen-indirect-call-rb0-misuse (CALL_PSEUDO_INDIRECT
+// wrongly uses rb0, meaning PC+4, as the base for an absolute-address call;
+// the stdout put-function-pointer callback hits this; QEMU is unaffected only
+// because of the separate open QEMU-rb0-not-maintained defect)

@@ -221,25 +221,52 @@
 
 # ── Found by wiki 升级审计 (WU-001a, ADR-0013 首次执行) ────────────────────────
 
-- id: gem5-se-lld-elf-load-crash
-  title: "gem5 SE 无法加载真实 ld.lld 产出的多段 ELF（picolibc 全链路），在 main() 运行前即崩溃"
+- id: gem5-se-heap-not-covered-by-elf-segment
+  title: "dadao.ld 的 __heap_start/__heap_end 无输出 section/无 PHDR 覆盖，gem5 SE 按 PT_LOAD memsz 建页表故堆访问缺页；QEMU 走裸 flat binary 不受影响"
   status: open
-  scope: [gem5, picolibc]
-  blocks: [picolibc-goal1-dual-backend, picolibc-goal2-dual-backend]
+  scope: [gem5, picolibc, linker-script]
+  blocks: [picolibc-goal2-dual-backend]
   resolved_by: null
-  # 架构师 ML-003m review 期间发现（2026-07-14）：printf_hello.elf（无 malloc）
-  # 和 malloc_hello.elf 均在 gem5 SE 下于 tick=187000（极早）崩溃：
-  # `panic: Page table fault when accessing virtual address 0x80009000`。
-  # 两个 ELF 均崩在同一模式，证明与 malloc/heap 无关（printf_hello 完全不碰
-  # 堆）。程序头 dump 显示 PT_LOAD seg0 vaddr=0x7ffff000（比 .text 的
-  # sh_addr=0x80000000 低一页，ld.lld 的 FILEHDR/PHDRS 头部保留页布局），
-  # seg1（.data）vaddr=0x80007000 filesz=memsz=0x20；故障地址 0x80009000
-  # 落在两个 PT_LOAD 段之外，是程序自身触发的额外访问（非 .bss 缺口——本例
-  # .bss 大小为 0）。既有 gem5 双后端 E2E 测试（div_rem/nested_call 等）全部
-  # 走 `gen_min_elf` 从裸 .text 二进制合成单段最小 ELF，从未加载过 ld.lld
-  # 产出的真实多段 ELF，故此前从未暴露。goal①（printf_hello.test）此前只
-  # 验证过 QEMU，从未真正双后端验证——之前"goal① 完整收尾"的说法需要修正为
-  # "goal① QEMU 端完整收尾，gem5 端存在本 issue，未验证"。
+  # DG-007a 根因（subagent，architect 复核）：malloc_hello.elf 在 gem5 SE 下
+  # 于 tick=187000 崩溃 `Page table fault @ 0x80009000`——gdb 确认故障 PC 在
+  # picolibc malloc 内部（_set_size，首次 malloc(32) 的 bookkeeping），故障
+  # 地址 0x80009000 = roundUp(.bss 结束地址 0x80008045, 4096)，正是"最后一个
+  # 被映射页之后一字节"。根因：dadao.ld 的 `__heap_start = .; __heap_end =
+  # 0x87E00000;` 是裸 location-counter 符号，未落进任何 PHDRS 分配的输出
+  # section，第二个 PT_LOAD 段（:data）的 memsz 止于 .bss，不覆盖堆区。
+  # picolibc libos/fallback/sbrk.c 的 __fallback_sbrk 纯指针递增
+  # (__heap_start..__heap_end)，不经过任何 syscall，全靠链接脚本保证内存
+  # 真实存在。QEMU 端用 `llvm-objcopy -O binary` 产出的裸 flat binary
+  # 而非 ELF（`-kernel %t.bin`），QEMU 不解析 PT_LOAD/memsz，是一整块
+  # 已映射 DRAM 窗口，故不受影响——gem5 SE 按 ELF 段严格建页表是正确行为，
+  # 有缺陷的是 dadao.ld 本身。修复方向：给堆区加一个 SHT_NOBITS 的 `.heap`
+  # 输出 section 落进 `:data` PHDR（或单独第三个 PT_LOAD），扩大 memsz 覆盖
+  # 堆区（NOBITS 不占文件字节，QEMU 侧 flat binary 零开销）。
+
+- id: codegen-indirect-call-rb0-misuse
+  title: "CALL_PSEUDO_INDIRECT 的 expandPostRAPseudo 用 rb0 作 call 的 base，但 rb0 语义=PC+4（非零）——绝对地址间接调用被算成 PC+4+绝对地址；QEMU 因已知 QEMU-rb0-not-maintained 缺陷（rb0 恒读 0）而巧合跑对"
+  status: open
+  scope: [CodeGen, gem5]
+  blocks: [picolibc-goal1-dual-backend]
+  resolved_by: null
+  # DG-007a 根因（subagent，architect 复核）：printf_hello.elf 在 gem5 SE
+  # 下于 tick=120000 崩溃 `Page table fault @ 0x100000464`（与
+  # gem5-se-heap-not-covered-by-elf-segment 是两个不同故障地址/不同根因，
+  # 此前 ML-003m 误判两者"同一崩溃"，已更正）。gdb 确认故障 PC 在
+  # stdout_min.c 的 my_putc 间接调用点，目标寄存器（rd31）持有真实绝对地址
+  # 0x800000ec（&my_putc）。DADAOInstrInfo.cpp:175-176
+  # `CALL_PSEUDO_INDIRECT` 展开为 `CALL_RRII RB0, <target reg>, 0`——按 spec
+  # §5.4 + gem5 decoder.cc §1.3 通用语义，rbha=rb0 恒表示"base=PC+4"（不是
+  # "无 base/base=0"），故实际目标 = PC+4 + 绝对地址，垃圾值。QEMU 端"能
+  # 跑"是因为已知 open issue `QEMU-rb0-not-maintained`（QEMU 从不维护
+  # env->rb[0]=PC+4，恒读 0）让这个误用巧合抵消——同一"两个缺陷互相掩盖"
+  # 模式（另见 ML-003m 的 sbrk/gem5 brk_base 一节）。gem5 正确维护 rb0=PC+4
+  # 故按 spec 语义暴露了这个真实 miscompilation。此 bug 影响任何走
+  # CALL_PSEUDO_INDIRECT 的间接调用（不限 picolibc），当前只是恰好被
+  # QEMU-rb0-not-maintained 掩盖，QEMU-rb0-not-maintained 一旦修复此 bug
+  # 会在 QEMU 上同时暴露。修复方向：不用 rb0 做 base，改用 rd2rb 桥
+  # （已有的跨 bank copy 机制，DL-051a）把目标地址物化进一个 scratch RB
+  # 寄存器，再 `CALL_RRII <scratch_rb>, RD0, 0`（base=绝对地址，offset=0）。
 
 - id: wiki-9f378f4-sbi-see-deferred-delta
   title: "wiki 13a414d→9f378f4（8 commits）B 桶 delta 记入 deferred 域未来基线（ADR-0013 Phase 2·B 桶策略，该域启动时吸收）。A 桶(M1 核心 SimRISC-01/02)空——SimRISC-01/02/03 零 diff、差分 AGREE(4-way)=200/DIVERGE=0 不回归、pin 已推进至 9f378f4。**SBI 域**(DADAO-22)：PTBR/PTHI/PAHI 走 rb→rd 中转+跳转表(10929f7)、SBI_PHYMEM_ALLOC_PAGE 失败返回值 0→-1(b1a5f7f)、popcnt 实现改 TODO(popcnt 不在 SimRISC ISA)——是未来 musl 系统调用落地(ML-001a recon)的上游依赖。**异常/SEE 域**(DADAO-12)：excp_num 拆 sync_num+async_num/escape_num→rc5(b3d6c82)、CFXMEM 增内部储存块非法访问触发(ea10f5e)、异常进出伪代码统一+cfxld/cfxst 路由简化(6079ecd)、§5 重构+FE→FPEXCP+中断模型前移(defdd96)——异常域启动时须回放吸收。**FP 域**(SimRISC-00 MISC-RF)：浮点指令补 -orrr/-orri 后缀(bc39c7c/b1a5f7f)。C 桶(装饰)已随 pin 吸收无需跟踪：add 示例补 rd0 4 操作数、CSR 名去重、phymem→pmem 全局重命名。"

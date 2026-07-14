@@ -21,6 +21,7 @@
 // RUN: %llvm-objcopy -O binary %t.elf %t.bin
 // RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 0'
 // RUN: grep -c "OK OK2" %t.out | xargs test 1 -eq
-// gem5 skipped — issue gem5-se-lld-elf-load-crash (real lld-linked multi-segment
-// ELF crashes on gem5 SE at load time, unrelated to malloc; also affects
-// printf_hello.test, which has never actually been gem5-verified either)
+// gem5 skipped — issue gem5-se-heap-not-covered-by-elf-segment (dadao.ld's
+// __heap_start/__heap_end aren't inside any PT_LOAD segment's memsz, so gem5
+// SE's page table faults on the first heap access; QEMU is unaffected because
+// it loads a flat binary with no ELF segment parsing at all)

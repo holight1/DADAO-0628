@@ -90,13 +90,24 @@ size omitting `VarArgsSaveSize` (stack overflow into caller frame), LLVM MC
 memory corruption), and LLVM AsmPrinter skipping jump-table target labels
 when a target block coincidentally looks like a fallthrough at `-O0`.
 
-**Open blocker**: issue `gem5-se-lld-elf-load-crash` — gem5 SE cannot load a
-real `ld.lld`-produced multi-segment ELF; it panics (page-table fault) before
-`main()` runs, independent of malloc/heap. All existing gem5 dual-backend
-tests instead go through `gen_min_elf` (a synthesized single-segment ELF from
-a raw `.text` binary), so this path was never exercised until the picolibc
-E2E tests tried to run on gem5. **Neither picolibc goal is dual-backend
-verified yet** — both are QEMU-only until this is fixed.
+**Open blockers** (corrected 2026-07-14 by DG-007a — an earlier note claimed
+both goals hit "the same" gem5 crash; that was a truncated-output misread,
+they are two independent bugs):
+- `gem5-se-heap-not-covered-by-elf-segment` (blocks goal②): `dadao.ld`'s
+  `__heap_start`/`__heap_end` aren't inside any `PT_LOAD` segment's `memsz`,
+  so gem5 SE's page table (built strictly from ELF segments) faults on the
+  first heap access. QEMU is unaffected because it loads a flat binary with
+  no ELF segment parsing at all.
+- `codegen-indirect-call-rb0-misuse` (blocks goal①): `CALL_PSEUDO_INDIRECT`'s
+  expansion uses `rb0` (architecturally PC+4, not zero) as the base for an
+  absolute-address indirect call — the stdout put-function-pointer callback
+  hits this. QEMU "works" only because of the separate, already-tracked
+  `QEMU-rb0-not-maintained` defect (QEMU never updates rb0, reads 0), which
+  coincidentally cancels the miscompilation; gem5 correctly maintains rb0 and
+  so exposes the real bug. This is a genuine miscompilation, not gem5-specific.
+
+**Neither picolibc goal is dual-backend verified yet** — both are QEMU-only
+until their respective blocker is fixed.
 
 ## M2.6: dual-backend unblock + llvm-test-suite on-ramp (2026-07-14 architect roadmap)
 
@@ -104,14 +115,20 @@ Architect-proposed sequence, executed via subagent (not DS — the first thread
 is gem5-internal work, which per `feedback_ds_gem5_semantic_unreliable` goes to
 a subagent that owns the gem5 component, not DS):
 
-1. **DG-007 (gem5 ELF load crash)** — highest priority: blocks dual-backend
-   verification of work already claimed done (picolibc goal①/②).
-   - DG-007a: root-cause `gem5-se-lld-elf-load-crash` (subagent, read/diagnose
-     only — gem5 generic ELF loader vs. DADAO-specific loader hook vs.
-     memory-layout collision with `argsInit`).
-   - DG-007b: fix based on root cause.
-   - DG-007c: dual-backend re-verify `printf_hello.test` + `malloc_hello.test`
-     on gem5, full E2E + differential regression.
+1. **DG-007 / DL-066 (dual-backend blockers)** — highest priority: blocks
+   dual-backend verification of work already claimed done (picolibc
+   goal①/②). DG-007a's root-cause pass found two independent bugs, not one:
+   - DG-007a: root-cause (done, subagent) — see "Open blockers" above.
+   - DG-007b (gem5 side): fix `gem5-se-heap-not-covered-by-elf-segment` —
+     give the linker-script heap region a `SHT_NOBITS` output section inside
+     a `PT_LOAD` segment (or a dedicated third segment) so gem5's page table
+     covers it; zero-cost on the QEMU flat-binary path.
+   - DL-066a (CodeGen side): fix `codegen-indirect-call-rb0-misuse` — stop
+     using `rb0` as the call base; materialize the absolute target into a
+     scratch RB register via the existing rd2rb bridge (DL-051a) and emit
+     `CALL_RRII <scratch_rb>, RD0, 0` instead.
+   - DG-007c / DL-066b: dual-backend re-verify `printf_hello.test` +
+     `malloc_hello.test` on gem5, full E2E + differential regression.
 2. **DL-065 (`dadao-oz-undef-physreg`, -O1+ codegen gap)** — needed before
    llvm-test-suite can run above -O0.
    - DL-065a: root-cause the "undefined physical register" at -O1+.

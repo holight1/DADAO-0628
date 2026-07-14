@@ -104,8 +104,14 @@ git status --short   # 确认无二进制产物被追踪
 
 `pico_stubs.s` 的 trap 版 `_sbrk`/ADR-0014 D1-D2 的 cfx_smon syscall 机制目前对 malloc 路径是**死代码**，仅为 musl 阶段（真正需要 syscall 级 brk）预留；QEMU `brk_base` 默认值改动（`0x90000000`→`0x87E00000`，与 `dadao.ld` 的 `__heap_end` 对齐）当前不影响任何测试路径,但架构师已提交为 patch 0016（`components/qemu/patches/`）保持可复现,供 musl 阶段启用该路径时使用。
 
-### gem5 跳过：诊断错误，已定位真实原因
-DS 测试注释原文"gem5 skipped — heap page mapping known issue"——**诊断不成立**。架构师独立复现：`printf_hello.elf`（完全不涉及 malloc/heap）在 gem5 SE 下同样崩溃（`panic: Page table fault when accessing virtual address 0x80009000`，tick=187000，main() 运行前），证明与堆无关，是 **ld.lld 产出的真实多段 ELF 在 gem5 SE 加载阶段崩溃**的通用问题（已有的 gem5 双后端 E2E 测试全部走 `gen_min_elf` 从裸 `.text` 二进制合成单段 ELF，从未加载过 `ld.lld` 产出的真实多段 ELF）。已登记 issue `gem5-se-lld-elf-load-crash`（`docs/issues.yaml`，blocks: picolibc-goal1/goal2-dual-backend），两个测试文件的注释已改为引用此 issue（而非 DS 的错误诊断）。**goal①（printf_hello.test）此前从未真正双后端验证过**——之前"goal① 完整收尾"的表述需要修正为"QEMU 端完整收尾，gem5 端因此 issue 未验证"。
+### gem5 跳过：诊断错误，已定位真实原因（**2026-07-14 二次更正**）
+DS 测试注释原文"gem5 skipped — heap page mapping known issue"——**诊断不成立**。架构师最初复现 `printf_hello.elf` 在 gem5 SE 下也崩溃于同一地址 `0x80009000`，据此判断"两个 goal 撞的是同一个 ELF 加载缺口"并登记了单一 issue `gem5-se-lld-elf-load-crash`——**这个判断本身也是错的**：DG-007a（subagent 根因定位）用 `tail` 截断前的完整输出重新确认，`printf_hello.elf` 实际崩溃地址是 `0x100000464`（tick=120000），与 `malloc_hello.elf` 的 `0x80009000`（tick=187000）是**两个不同故障、两个独立根因**，纯属架构师当时只看了 `tail -15` 截断输出、没实际核对故障地址就归并成了"同一崩溃"。
+
+已拆分为两个独立 issue（`docs/issues.yaml`）：
+- `gem5-se-heap-not-covered-by-elf-segment`（blocks goal②）：`dadao.ld` 的 `__heap_start`/`__heap_end` 未落进任何 PHDR 输出 section，第二个 PT_LOAD 的 memsz 不覆盖堆区，gem5 SE 按 ELF 段建页表故缺页；QEMU 走裸 flat binary 不解析 PT_LOAD 故不受影响。
+- `codegen-indirect-call-rb0-misuse`（blocks goal①）：`CALL_PSEUDO_INDIRECT` 的 `expandPostRAPseudo` 用 `rb0`（语义=PC+4，非零）做绝对间接调用的 base，`stdout_min.c` 的 `my_putc` 函数指针回调正是这个真实调用点；QEMU 端"能跑"是巧合——已知 open issue `QEMU-rb0-not-maintained`（QEMU 从不维护 `rb[0]=PC+4`，恒读 0）碰巧抵消了这个 miscompilation，gem5 正确维护 rb0 故按 spec 语义暴露了真实 bug。
+
+两个测试文件的 gem5-skip 注释已分别改为引用各自正确的 issue。**goal①（printf_hello.test）此前从未真正双后端验证过**——之前"goal① 完整收尾"的表述需要修正为"QEMU 端完整收尾，gem5 端因 `codegen-indirect-call-rb0-misuse` 未验证"；**goal②** 因 `gem5-se-heap-not-covered-by-elf-segment` 未验证。见 `feedback_dadao_add_semantics_and_grep_trap.md`（本次是同一会话里第二次"下判断前没交叉验证"的教训，已追加记录）。
 
 ### 已完成的清理
 - `stdout_min.c` 的 `memset`：确认必要（`libc.a` 只有 `memset_chk`/`wmemset`,缺 plain `memset`,nano-malloc 依赖它），保留。
