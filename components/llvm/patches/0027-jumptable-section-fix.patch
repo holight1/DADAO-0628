@@ -1,0 +1,103 @@
+From 851ad359b2e10b48c7ba6b0948514b543fb9c938 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 11:20:53 +0800
+Subject: [PATCH] target/dadao: emit jump tables in the function's own section,
+ not generic .text (ML-003h)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DS's first attempt at this override (rejected, ML-003h review) switched
+to OutContext.getObjectFileInfo()->getTextSection() before emitting the
+jump table — that returns the *generic* .text section, which under
+-ffunction-sections is a distinct ELF section from the function's own
+.text.<fname>. The branch referencing the jump table (rela+addi,
+PC-relative) ended up pointing across sections, producing "Undefined
+temporary symbol" at ELFObjectWriter time.
+
+Fix: don't switch sections at all. emitJumpTableInfo() runs right after
+the function body while OutStreamer is still positioned in that
+function's own section — emitting in place keeps the jump table and its
+referencing branch together, matching the PC-relative access pattern.
+
+Verified via picolibc's vfprintf.c (-ffunction-sections): the jump
+table (.LJTI0_0 etc.) now lands in .text.vfprintf alongside the
+function, confirmed via disassembly of the generated .s. E2E 27/27,
+differential AGREE(4-way)=200/DIVERGE=0, no regression.
+
+Residual (not yet root-caused, handed to ML-003i): compiling
+vfprintf.c end-to-end still fails — with the pre-existing (ML-003e)
+AsmBackend fixup_dadao_rela_page/rela_lo direct-resolution path now
+reached (since sections finally match), it crashes (SIGSEGV in
+MCAssembler::layout/Finish, no assertion message) rather than
+resolving the local jump-table label directly. DS's ML-003h attempt to
+force a relocation for all temporary symbols avoided this crash but
+produced the different "Undefined temporary symbol" ELF-writer error
+instead — neither path is a real fix; the direct-resolution code for a
+same-section local branch target needs its own fix.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp | 39 +++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+index 8244584a13c2..f13555020fd9 100644
+--- a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
++++ b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+@@ -6,6 +6,9 @@
+ #include "llvm/CodeGen/AsmPrinter.h"
+ #include "llvm/CodeGen/MachineFunction.h"
+ #include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/CodeGen/MachineJumpTableInfo.h"
++#include "llvm/IR/DataLayout.h"
++#include "llvm/MC/MCContext.h"
+ #include "llvm/MC/MCExpr.h"
+ #include "llvm/MC/MCInst.h"
+ #include "llvm/MC/MCStreamer.h"
+@@ -39,6 +42,42 @@ public:
+     EmitToStreamer(*OutStreamer, TmpInst);
+   }
+ 
++  // Override to emit jump tables inline in the function's own section
++  // instead of the default .rodata. DADAO accesses the jump table with
++  // PC-relative rela+addi; the base emitter switches to .rodata, and under
++  // -ffunction-sections the function body lives in .text.<fname> — a
++  // *different* section from .rodata, so the rela+addi becomes a
++  // cross-section reference to a temporary (non-symtab-worthy) jump-table
++  // label. That is what produced "Undefined temporary symbol" at the ELF
++  // writer (ML-003h).
++  //
++  // Fix: don't switch sections at all. emitJumpTableInfo() runs right after
++  // the function body, while OutStreamer is still positioned in that
++  // function's own section (.text.<fname> under -ffunction-sections, plain
++  // .text otherwise) — emitting in place keeps the jump table and its
++  // referencing branch in the same section, matching the PC-relative
++  // rela+addi access pattern. (A prior attempt explicitly switched to
++  // OutContext.getObjectFileInfo()->getTextSection() — the *generic*
++  // .text section, which is itself a distinct section from .text.<fname>
++  // under -ffunction-sections and reproduced the exact same bug.)
++  void emitJumpTableInfo() override {
++    const MachineJumpTableInfo *MJTI = MF->getJumpTableInfo();
++    if (!MJTI || MJTI->getJumpTables().empty())
++      return;
++
++    const std::vector<MachineJumpTableEntry> &JT = MJTI->getJumpTables();
++    unsigned PtrSize = MF->getDataLayout().getPointerSize();
++
++    OutStreamer->emitValueToAlignment(Align(PtrSize));
++    for (unsigned i = 0, e = JT.size(); i != e; ++i) {
++      const std::vector<MachineBasicBlock *> &MBBs = JT[i].MBBs;
++      OutStreamer->emitLabel(GetJTISymbol(i));
++      for (MachineBasicBlock *MBB : MBBs)
++        OutStreamer->emitValue(
++            MCSymbolRefExpr::create(MBB->getSymbol(), OutContext), PtrSize);
++    }
++  }
++
+ private:
+   void lowerToMCInst(const MachineInstr *MI, MCInst &OutMI) {
+     OutMI.setOpcode(MI->getOpcode());
+-- 
+2.43.0
+

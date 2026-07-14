@@ -24,3 +24,4 @@
 0024-picolibc-backend-enablement.patch
 0025-mc-relocation-gaps.patch
 0026-varargs-frame-size-fix.patch
+0027-jumptable-section-fix.patch
