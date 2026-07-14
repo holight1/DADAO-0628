@@ -1,0 +1,150 @@
+From 840d71cc67f181be7cc58cee799b7f83adfbd189 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 16:58:31 +0800
+Subject: [PATCH] target/dadao: fix call implicit-use physreg range overflow at
+ -O1+ (DL-065a)
+
+CALL_IIII/CALL_RRII/CALL_PSEUDO_INDIRECT declared a static tablegen
+Uses=[RD16..RD30] list, unconditionally attaching all 15 potential
+argument registers as implicit-use MachineOperands to every call
+instance, regardless of how many arguments that call site actually
+passes. At -O0 this goes unnoticed (RegAllocFast never runs
+LiveIntervals analysis for physical registers). At -O1+, LiveIntervals
+(feeding RegAllocGreedy) walks backward from each implicit physreg use
+looking for a reaching definition; for calls with fewer than 15 real
+arguments the extra registers have none, and MachineVerifier aborts
+with 'Bad machine code: Using an undefined physical register' (63
+occurrences in argz_insert.c alone).
+
+Fix: LowerCall now pushes an explicit DAG.getRegister() SDValue operand
+for each entry in RegsToPass onto the DADAOISD::CALL node (the standard
+LLVM pattern, e.g. RISCVISelLowering::LowerCall), and
+DADAOISelDAGToDAG.cpp's Select() carries those operands through into
+the selected CALL_IIII/CALL_PSEUDO_INDIRECT MachineSDNode (ahead of the
+trailing Chain/Glue, per InstrEmitter's operand-ordering invariant).
+InstrEmitter then marks exactly the real per-call-site argument
+registers implicit-use, so the static Uses=[...] list is removed
+(Defs=[RD31] for the return-value clobber is unaffected and kept).
+---
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp | 31 ++++++++++++++++++---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp |  8 ++++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td     | 19 +++++++++----
+ 3 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index bdb41903148c..3d6b6023f7b8 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -87,15 +87,36 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+       SDValue Chain = Node->getOperand(0);
+       SDValue Callee = Node->getOperand(1);
+       unsigned NumOps = Node->getNumOperands();
+-      SDValue Glue = NumOps > 2 ? Node->getOperand(2) : SDValue();
++      // Operands beyond Chain/Callee are: zero or more RegisterSDNode
++      // operands (one per actual call argument register, added by
++      // LowerCall — DL-065a) followed optionally by a trailing Glue. Carry
++      // all of them through unchanged so InstrEmitter marks exactly the
++      // real per-call-site argument registers implicit-use on the emitted
++      // CALL machine instr, instead of relying on a static/maximal Uses=[...]
++      // list in tablegen (which over-claims registers with no reaching
++      // definition and trips the MachineVerifier at -O1+).
++      bool HasGlue = NumOps > 2 &&
++                     Node->getOperand(NumOps - 1).getValueType() == MVT::Glue;
++      unsigned NumExtra = NumOps - 2 - (HasGlue ? 1 : 0);
++      SmallVector<SDValue, 8> ExtraOps;
++      for (unsigned i = 0; i < NumExtra; ++i)
++        ExtraOps.push_back(Node->getOperand(2 + i));
++      SDValue Glue = HasGlue ? Node->getOperand(NumOps - 1) : SDValue();
++
++      // SelectionDAG requires chain/glue-typed operands to trail the operand
++      // list (InstrEmitter::AddOperand asserts on this), so the register
++      // operands must go *before* Chain, not after it: {Callee, RegOps...,
++      // Chain, [Glue]}.
+       if (Callee.getOpcode() == ISD::TargetGlobalAddress ||
+           Callee.getOpcode() == ISD::TargetExternalSymbol) {
+         // A null (absent) Glue must not be pushed as an operand — an
+-        // unconditional 3-element {Callee, Chain, Glue} list crashes
++        // unconditional {Callee, ..., Chain, Glue} list crashes
+         // createOperands when Glue.getNode()==nullptr (0 register args,
+         // e.g. `int f(void){ return callee(); }`). Mirror the conditional
+         // push already used on the indirect-call path below.
+-        SmallVector<SDValue, 3> DirectOps = {Callee, Chain};
++        SmallVector<SDValue, 8> DirectOps = {Callee};
++        DirectOps.append(ExtraOps.begin(), ExtraOps.end());
++        DirectOps.push_back(Chain);
+         if (Glue.getNode()) DirectOps.push_back(Glue);
+         MachineSDNode *Call = CurDAG->getMachineNode(
+             DADAO::CALL_IIII, DLC, MVT::Other, MVT::Glue, DirectOps);
+@@ -104,7 +125,9 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+       }
+       // Indirect call: construct CALL_PSEUDO_INDIRECT with explicit
+       // chain and glue to preserve scheduler ordering edges.
+-      SmallVector<SDValue, 3> Ops = {Callee, Chain};
++      SmallVector<SDValue, 8> Ops = {Callee};
++      Ops.append(ExtraOps.begin(), ExtraOps.end());
++      Ops.push_back(Chain);
+       if (Glue.getNode()) Ops.push_back(Glue);
+       MachineSDNode *Call = CurDAG->getMachineNode(
+           DADAO::CALL_PSEUDO_INDIRECT, DLC, MVT::Other, MVT::Glue, Ops);
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 48303c5369fc..148607afaa53 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -146,6 +146,14 @@ SDValue DADAOTargetLowering::LowerCall(
+   SmallVector<SDValue, 4> CallOps;
+   CallOps.push_back(Chain);
+   CallOps.push_back(Callee);
++  // Add the argument registers actually used by *this* call site as explicit
++  // RegisterSDNode operands, so InstrEmitter marks exactly those registers
++  // implicit-use on the resulting CALL machine instr (DL-065a) — not a
++  // static/maximal Uses=[...] list in tablegen, which would over-claim
++  // registers with no reaching definition and trip the MachineVerifier at
++  // -O1+ (see DADAOInstrInfo.td CALL_IIII/CALL_RRII/CALL_PSEUDO_INDIRECT).
++  for (auto &Reg : RegsToPass)
++    CallOps.push_back(DAG.getRegister(Reg.first, Reg.second.getValueType()));
+   if (ArgGlue.getNode())
+     CallOps.push_back(ArgGlue);
+   Chain = DAG.getNode(DADAOISD::CALL, DL, NodeTys, CallOps);
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index e9ce9c9c423e..5d3b18ecadab 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -129,10 +129,18 @@ def RET_PSEUDO : DADAOPseudo<(outs), (ins), [(DADAORetGlue)]>;
+ // Pseudo indirect call — uses F_IIII format (imm24 field unused, carries no
+ // explicit result; chain+glue come from isCall). DADAOPseudo was avoided because
+ // it infers a spurious MVT::i64 result from the first input operand.
++// NOTE: no static Uses=[...] list here (DL-065a). The real per-call argument
++// registers are already modeled precisely by LowerCall's glued CopyToReg
++// chain (DADAOISelLowering.cpp), which InstrEmitter turns into implicit-use
++// operands scoped to the actual number of arguments at this call site. A
++// blanket Uses=[RD16..RD30] here would add all 15 argument-range registers
++// as implicit uses on *every* call regardless of real arg count, including
++// ones with no reaching definition — MachineVerifier flags those as "Using
++// an undefined physical register" once register-liveness tracking is
++// active (post-RA, i.e. -O1+; -O0 uses RegAllocFast and never turns
++// tracksLiveness() on, so the bogus uses go unchecked there).
+ let isCall = 1,
+     Defs = [RD31],
+-    Uses = [RD16, RD17, RD18, RD19, RD20, RD21, RD22, RD23,
+-            RD24, RD25, RD26, RD27, RD28, RD29, RD30],
+     isPseudo = 1,
+     isCodeGenOnly = 1,
+     Size = 0 in
+@@ -296,10 +304,11 @@ let op = 0x65 in def JUMP_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb
+ //===----------------------------------------------------------------------===//
+ 
+ // Real call instructions (used by ExpandPostRAPseudo)
++// NOTE: no static Uses=[...] list (DL-065a) — see the identical rationale on
++// CALL_PSEUDO_INDIRECT above; LowerCall's glued CopyToReg chain already
++// contributes the correct per-call-site implicit-use set.
+ let isCall = 1,
+-    Defs = [RD31],
+-    Uses = [RD16, RD17, RD18, RD19, RD20, RD21, RD22, RD23,
+-            RD24, RD25, RD26, RD27, RD28, RD29, RD30] in
++    Defs = [RD31] in
+ let op = 0x6C in def CALL_IIII : F_IIII<(outs), (ins imms24:$imm24), "call $imm24", []>;
+ let op = 0x6D in def CALL_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "call $rbha, $rdhb, $imm12", []>;
+ let op = 0x6E in def RET_RIII  : F_RIII_RD<(outs GPRD:$rdha), (ins imms18:$imm18), "ret $rdha, $imm18", []>;
+-- 
+2.43.0
+

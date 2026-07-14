@@ -10,9 +10,34 @@ REQUIRED = {"id", "title", "status", "scope", "blocks", "resolved_by"}
 VALID_STATUSES = {"open", "closed"}
 
 
+class DuplicateKeyLoader(yaml.SafeLoader):
+    """A missing '- id:' line lets a mapping's fields silently absorb the
+    next entry's fields as duplicate keys (last one wins) instead of
+    raising a parse error — plain SafeLoader doesn't flag this. Override
+    construct_mapping to make duplicate keys within one node fatal."""
+
+    def construct_mapping(self, node, deep=False):
+        mapping = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate key {key!r} in mapping (a preceding "
+                    f"'- id:' line may be missing, merging two entries)",
+                    key_node.start_mark,
+                )
+            mapping.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def main():
     with open(PATH) as f:
-        data = yaml.safe_load(f)
+        try:
+            data = yaml.load(f, Loader=DuplicateKeyLoader)
+        except yaml.YAMLError as e:
+            print(f"ERROR: {PATH}: {e}")
+            print("ISSUE REGISTRY: FAIL (1 error(s))")
+            sys.exit(1)
 
     if not isinstance(data, list):
         print(f"ERROR: {PATH}: expected a list, got {type(data).__name__}")

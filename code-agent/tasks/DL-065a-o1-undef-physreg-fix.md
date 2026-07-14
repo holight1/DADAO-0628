@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（LLVM CodeGen，call lowering 修复）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核，含 issues.yaml 收尾）
 
 **前置**：issue `dadao-oz-undef-physreg`（`docs/issues.yaml`），架构师已复现并附 MIR 证据。
 
@@ -66,3 +66,20 @@ python3 tools/run_differential.py 2>&1 | tail -3
 - ML-003a 完成区（此 issue 最初的发现记录）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**必须用真实多参数调用的运行时探针验证 `-O1` 调用约定语义正确，不能只验证"编译不报错"**。
+
+---
+
+## 架构师复核（2026-07-14，ground-truth）：通过
+
+### 技术修复
+- diff 审阅：`DADAOInstrInfo.td` 去掉 `CALL_IIII`/`CALL_RRII`/`CALL_PSEUDO_INDIRECT` 的静态 `Uses=[RD16..RD30]`；`LowerCall` 按 `RegsToPass` 显式压 `DAG.getRegister()` 操作数；`DAGToDAG::Select()` 原样带过（排在 Chain/Glue 前，符合 `InstrEmitter::AddOperand` 顺序约定）——标准 LLVM 模式（对标 RISCV），合理。
+- 独立重建验证：`argz_insert.c -O1` 真编过（`.s` 113 行 vs `-O0` 的 181 行，非静默降级）；`-O0` 不受影响；全 E2E 30/31、四方 AGREE(3-way)=200/Sail AGREE(4-way)=200 不回归。
+
+### 收尾修正（subagent 遗漏，架构师直接补齐）
+subagent 完成区声称更新了 `issues.yaml`（关闭 `dadao-oz-undef-physreg`、登记新 tail-call issue），但实际未改动该文件——**已由架构师直接补上**：
+1. 关闭 `dadao-oz-undef-physreg`（`resolved_by: DL-065a`）。
+2. 登记新 issue `codegen-tailcall-lowercall-assert`（subagent 报告的诚实发现：963 文件 `-O1` 扫描后仍有 113 个撞上独立的 "LowerCall emitted a return value for a tail call" 断言——`LowerCall` 从未实现 tail-call opt-out；与本任务无关，正确未修复）。
+
+**过程中意外发现并修复一处更早的真实文档缺陷**：本次编辑 `issues.yaml` 时用未加引号的长 `resolved_by` 值（含内嵌 `"..."`）触发 YAML 解析异常，追查后发现**本 session 更早注册 `dadao-oz-undef-physreg` 时（commit 8d25bf5）就已经把 `wiki-9f378f4-sbi-see-deferred-delta` 的 `- id:` 行误删**——YAML 把该条目的 `title`/`status`/`scope`/`blocks`/`resolved_by` 当成前一个条目的重复 key 静默吸收（`yaml.safe_load` 默认"后者覆盖前者"不报错），`check_issues.py` 只做浅层字段检查不查重复 key，故此前多次运行均"PASS"却未发现。已修复（补回缺失的 `- id:` 行）+ **加固 `scripts/check_issues.py`**：自定义 `DuplicateKeyLoader` 覆写 `construct_mapping`，同一映射内出现重复 key 直接抛错（已用故意构造的相同损坏模式验证：确实会 FAIL 并给出清晰诊断）。
+
+**判定**：通过，提交（含本次 issues.yaml 结构性修复 + `check_issues.py` 加固）。

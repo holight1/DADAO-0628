@@ -422,10 +422,10 @@
 
 - id: dadao-oz-undef-physreg
   title: "-O1+ 建 picolibc：`call` 的 implicit-use 寄存器列表覆盖 rd17-rd30 全范围而非仅实际参数寄存器，MachineVerifier 报 'Using an undefined physical register'"
-  status: open
+  status: closed
   scope: [CodeGen]
-  blocks: [llvm-test-suite-t3-above-o0]
-  resolved_by: null
+  blocks: []
+  resolved_by: DL-065a（DADAOInstrInfo.td 去掉 CALL 三条指令的静态 Uses 列表；LowerCall 改为按 RegsToPass 显式挂 DAG.getRegister() 操作数，DAGToDAG Select 原样带过；InstrEmitter 据此只标真正传参寄存器为 implicit-use）
   # 首次记录于 ML-003a（2026-07-13）："-O1/-O2/-Oz 编带函数调用的 libc
   # （argz_insert 等）报 63× Bad machine code: Using an undefined physical
   # register（rd17-rd30 implicit killed/used）——像 call 指令隐式操作数/
@@ -448,8 +448,26 @@
   # 用了固定的"全部参数寄存器范围"而非按实际传参数量截断。待专门任务
   # 根因定位 + 修复，是 llvm-test-suite（ADR-0012 T3）能否在高于 -O0
   # 的优化级别跑起来的前置。
+
+- id: wiki-9f378f4-sbi-see-deferred-delta
   title: "wiki 13a414d→9f378f4（8 commits）B 桶 delta 记入 deferred 域未来基线（ADR-0013 Phase 2·B 桶策略，该域启动时吸收）。A 桶(M1 核心 SimRISC-01/02)空——SimRISC-01/02/03 零 diff、差分 AGREE(4-way)=200/DIVERGE=0 不回归、pin 已推进至 9f378f4。**SBI 域**(DADAO-22)：PTBR/PTHI/PAHI 走 rb→rd 中转+跳转表(10929f7)、SBI_PHYMEM_ALLOC_PAGE 失败返回值 0→-1(b1a5f7f)、popcnt 实现改 TODO(popcnt 不在 SimRISC ISA)——是未来 musl 系统调用落地(ML-001a recon)的上游依赖。**异常/SEE 域**(DADAO-12)：excp_num 拆 sync_num+async_num/escape_num→rc5(b3d6c82)、CFXMEM 增内部储存块非法访问触发(ea10f5e)、异常进出伪代码统一+cfxld/cfxst 路由简化(6079ecd)、§5 重构+FE→FPEXCP+中断模型前移(defdd96)——异常域启动时须回放吸收。**FP 域**(SimRISC-00 MISC-RF)：浮点指令补 -orrr/-orri 后缀(bc39c7c/b1a5f7f)。C 桶(装饰)已随 pin 吸收无需跟踪：add 示例补 rd0 4 操作数、CSR 名去重、phymem→pmem 全局重命名。"
   status: open
   scope: [SEE, SBI, FP]
   blocks: null
   resolved_by: null  # 各 deferred 域启动时回放吸收；见 docs/reviews/wiki-upgrade-9f378f4.md
+
+- id: codegen-tailcall-lowercall-assert
+  title: "DADAO LowerCall 从未实现 tail-call opt-out，-O1+ 对 return foo(...) 形态尝试 sibling-call 下降，撞 LowerCall emitted a return value for a tail call 断言"
+  status: open
+  scope: [CodeGen]
+  blocks: [llvm-test-suite-t3-above-o0]
+  resolved_by: null
+  # DL-065a 验证阶段发现（2026-07-14，subagent）：修完 call 隐式寄存器范围
+  # 溢出后，对全部 963 个 picolibc .c 文件做 -O1 扫描，仍有 113 个文件在
+  # 一个不同、独立的断言上崩溃：LowerCall emitted a return value for a
+  # tail call!——DADAO 的 LowerCall 从未加 isEligibleForTailCallOptimization
+  # 之类的覆写去关闭尾调用优化，故 -O1+ 遇到 `return foo(...);` 形态的
+  # 代码会尝试 sibling-call 下降并崩溃。与 DL-065a 的隐式寄存器问题是两个
+  # 独立缺口，未修复（本任务范围之外）。是 llvm-test-suite（ADR-0012 T3）
+  # 在高于 -O0 跑起来前的另一个必修项，与 dadao-oz-undef-physreg 一起构成
+  # -O1+ 支持的两大缺口。
