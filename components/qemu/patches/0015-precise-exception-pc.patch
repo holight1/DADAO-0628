@@ -1,0 +1,70 @@
+From e3b4e2116c4bf4408555cb288d960a11be89b390 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 09:47:25 +0800
+Subject: [PATCH] target/dadao: restore precise env->pc before raising an
+ exception (ML-003b)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+dadao_raise_exception() only set exception_index and called
+cpu_loop_exit() — env->pc still held whatever a prior branch/TB-boundary
+write last set it to (only branch-family instructions and, since
+ML-003f, DISAS_TOO_MANY write env->pc; a mid-TB helper-raised exception
+like gen_exception_illegal's checks never did). do_interrupt() then
+reported the wrong faulting address: the TB's entry PC, not the actual
+instruction that failed a spec constraint check.
+
+Fix: call cpu_restore_state(cs, pc) with the helper's return address
+(GETPC()) before setting exception_index, mirroring what
+dadao_cpu_do_unaligned_access already does for unaligned accesses.
+helper_raise_exception now passes GETPC() through instead of 0.
+
+Found while debugging an ILLI fault during picolibc printf (ML-003b):
+the previously-reported PC pointed at vfprintf's entry (a harmless
+`addi`), which was misleading; with this fix the debug build correctly
+reported the actual faulting instruction. This is a general debugging
+correctness fix independent of that specific investigation — any future
+DADAO exception (ILLI/MALIGN) now reports where it really happened.
+
+Verified: E2E 27/27, differential AGREE(4-way)=200/DIVERGE=0, no
+regression.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ target/dadao/helper.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 3e2aa39..5afc31d 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -10,13 +10,24 @@ G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
+                                       uintptr_t pc)
+ {
+     CPUState *cs = env_cpu(env);
++    /* Reconstruct the precise env->pc of the instruction that raised the
++     * exception (mid-TB helper call) — without this, env->pc still holds
++     * whatever a prior branch/TB-boundary write last set it to, and
++     * do_interrupt() reports the wrong faulting address (a debugging
++     * pitfall found via ML-003b: reported PC was the TB's *entry*, not
++     * the actual instruction, since gen_exception_illegal-style checks
++     * fire mid-block).
++     */
++    if (pc) {
++        cpu_restore_state(cs, pc);
++    }
+     cs->exception_index = exception;
+     cpu_loop_exit(cs);
+ }
+ 
+ void helper_raise_exception(CPUDADAOState *env, uint32_t exception)
+ {
+-    dadao_raise_exception(env, exception, 0);
++    dadao_raise_exception(env, exception, GETPC());
+ }
+ 
+ void helper_exit(CPUDADAOState *env, uint64_t code)
+-- 
+2.43.0
+
