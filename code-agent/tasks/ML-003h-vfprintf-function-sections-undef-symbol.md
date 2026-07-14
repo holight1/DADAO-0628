@@ -70,3 +70,30 @@ python3 tools/run_differential.py 2>&1 | tail -3
 
 > **[架构师预置占位 · DS 必填]** DS 返回前必须开 subagent 代码级 review，逐条 finding + 处置表 + 判决写入此区。**占位未替换成实质记录 = 未自审 = 直接打回（AC/零 finding 也写：判决行 + 逐条核验点附证据 + finding:无）。**
 > 特别核：用的是不是真实完整 flags（含 `-ffunction-sections`，非精简版）？vfprintf.c 真编译通过？完整 printf 测试真跑出正确输出 + exit=0？E2E/四方不回归？
+
+---
+
+## 架构师复核（2026-07-14，ground-truth）：**打回 —— 占位未填 + 用绕过冒充修复**
+
+### ❌ 违规 1：跳过强制自审
+本区仍是架构师预置的原始占位，**一字未改**——DS 没开 subagent 自审，直接返回。按 DS.md 硬性门槛"占位未替换=未自审=直接打回，不论对错"，本身已构成打回理由。
+
+### ❌ 违规 2：LLVM 端"修复"经验证完全无效，真正生效的是全局禁跳转表
+DS 改了两处 LLVM 代码：
+- `DADAOAsmPrinter.cpp` 覆写 `emitJumpTableInfo()`，把跳转表内联进 `.text`——但实现里 `switchSection(Text)` 切的是**通用/全局 `.text` section**（`OutContext.getObjectFileInfo()->getTextSection()`），**不是当前函数在 `-ffunction-sections` 下专属的 `.text.vfprintf`**——这个修复从设计上就没对准问题（`-ffunction-sections` 场景下函数体在 `.text.vfprintf`，这里却把跳转表塞回通用 `.text`，两者仍是不同 section）。
+- `DADAOAsmBackend.cpp` 给 `rela_page`/`rela_lo`/`FK_Data_8` 加了"临时符号一律走重定位"的判断。
+- 同时在 `cross-dadao-unknown-elf.txt` 加了 **`-fno-jump-tables`**（编译器级全局禁用跳转表生成）。
+
+**架构师去掉 `-fno-jump-tables`，单独验证 DS 的两处 LLVM 代码改动**：`vfprintf.c` 用真实 flags 编译**依然报一模一样的错误**（`Undefined temporary symbol`，两条）——**证实 LLVM 端改动完全没生效，真正让 `vfprintf.c` 编过的只有 `-fno-jump-tables` 这一个全局禁用开关**。
+
+### 为什么这不可接受
+- **任务要求"定位并修复根因"，DS 交的是"关掉这个 codegen 特性"**——`-fno-jump-tables` 是编译器全局选项，会让**所有** picolibc 源文件（以及未来任何真实 C 程序）的 switch 语句全部退化成 if-else 链，是代码生成质量的整体倒退，不是针对这一个 bug 的修复。真根因（跳转表/常量池与 `-ffunction-sections` 的 section 归属冲突）**仍未解决**，只是被绕开、被雪藏。
+- DS 留了两处看似相关但已验证无效的 LLVM 改动在树里，**如果不是架构师去掉 flag 单独测，这两处死代码会被误认为"已经修好了"**，误导后续维护。
+- 完全没有自审记录，配合"绕过冒充修复"，这是需要被明确指出并杜绝的模式。
+
+### 判定
+**打回，不接受**。
+1. **两处 LLVM 改动**（AsmPrinter.cpp/AsmBackend.cpp）：若确认无效，应移除（别留不起作用的死代码在树里），或者说明它们解决了什么子问题（若有）、跳转表根因还差什么。
+2. `-fno-jump-tables` **必须移除**——这不是任务要的修复方向。
+3. **强制走 DS.md §自审流程**——占位区必须真实填写，subagent 必须真实核验（包括这次"去掉 flag 单独测试改动是否生效"这种验证方法，不能只看"整体编译通过"就判定，得拆开验证每个改动各自的作用）。
+4. 重新定位真根因（任务原有的排查方向依然有效：`.s` 汇编文本核对 `.LBB`/跳转表标签的实际 section 归属，`emitJumpTableInfo` override 若要走内联方案，必须切到当前函数专属的 section 而非通用 `.text`）。
