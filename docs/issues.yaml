@@ -277,25 +277,39 @@
   # 寄存器，再 `CALL_RRII <scratch_rb>, RD0, 0`（base=绝对地址，offset=0）。
 
 - id: picolibc-libc-rebuild-blocked
-  title: "tests/lit/E2E 的 printf_hello.test/malloc_hello.test 链接的 .work/picolibc/build-dadao/libc.a 是旧（DL-066a 修复前）编译器预建的产物；`ninja libc.a` 全量重建当前会在无关模块上失败，暂无法验证 DL-066a 修复在这两个既有用例上的端到端效果"
-  status: open
+  title: "tests/lit/E2E 的 printf_hello.test/malloc_hello.test 链接的 libc.a 曾是旧编译器预建产物；ML-005a 已解锁真实重建，DL-066a 修复现已确认烘进 libc.a"
+  status: closed
   scope: [picolibc, clang, CodeGen]
-  blocks: [picolibc-goal1-dual-backend, picolibc-goal2-dual-backend]
-  resolved_by: null
-  # DL-066a（2026-07-14）验证阶段发现：尝试 `ninja libc.a` 全量重建触发两类
-  # 与本次 CALL_PSEUDO_INDIRECT 修复无关的既有缺口——
-  # (a) libc/signal/sigjmp_{setsigs,getsigs}.c：`../libc/include/setjmp.h` 里
-  #     `jmp_buf` 类型未定义（缺 dadao 的 machine/setjmp.h 或类似头），编译报
-  #     "unknown type name 'jmp_buf'"；
-  # (b) libc/stdio/atold_engine.c（long double engine）：DADAO backend 在
-  #     SelectionDAG legalize 阶段 "fatal error: unsupported library call
-  #     operation"（`__atold_engine` 里某个 libcall 未在 DADAOISelLowering 里
-  #     实现）。
-  # 因此 DL-066a 未重建 libc.a（范围外、且会引入两个新的独立问题）。printf_hello/
-  # malloc_hello 的 my_putc 间接调用点位于 libc.a 内部（vfprintf → FILE.put），
-  # 该目标码是用修复前的旧编译器生成、已固化，故这两个用例目前的 PASS 不能
-  # 证明 DL-066a 对它们生效——用独立无 libc 依赖的 tests/lit/E2E/indirect_call.test
-  # 补齐了判别性验证。后续重建 libc.a 需先处理 (a)(b) 两个缺口。
+  blocks: []
+  resolved_by: ML-005a
+  # DL-066a（2026-07-14）验证阶段发现两个卡点，均由 ML-005a 处理：
+  # (a) jmp_buf 类型未定义——**已修**：picolibc 把各架构 jmp_buf 大小定义
+  #     集中在 `libc/include/machine/setjmp.h` 一个 `#ifdef __arch__` 级联
+  #     文件里（非每架构独立头），加 `#ifdef __dadao__` 分支（_JBTYPE=long
+  #     long, _JBLEN=16，按 callee-saved rd8-rd15 8 个 GPR 估算+余量）。只解
+  #     决类型编译，`libc/machine/dadao/setjmp.S` 仍是已知 stub（不真正保存/
+  #     恢复），不影响本 issue 范围。
+  # (b) atold_engine.c 的 "unsupported library call operation"——**确认非
+  #     配置问题**：`meson_options.txt` 的 `io-long-double`（默认已 false）
+  #     只控制 printf/scanf 是否*调用*这个引擎，不控制这个编译单元本身是否
+  #     被编译（`libc/stdio/meson.build` 无条件把 atold_engine.c 列进
+  #     srcs_stdio）。真正排除需要改 picolibc meson.build 结构或实现浮点
+  #     libcall lowering（后者超出范围，未做）。当前仍无法单独编译这个文件，
+  #     但 `make build-picolibc`（ML-003l 起就用 `ninja -k 0 || true`）容错
+  #     跳过它不影响打包，不阻塞本 issue 的关闭。
+  #
+  # ML-005a 顺带发现**范围大得多的背景**：非容错的 `ninja libc.a` 实际有
+  # 228 个编译单元失败（不止最初撞到的 2 个），多数是 libm/complex（M1 排除
+  # RF 浮点，预期内），但**基础 string.h 函数（strlen/memset/memchr/strcat/
+  # strchr/strstr）也在其中，与浮点无关**——已拆分登记为独立 issue
+  # `codegen-string-fn-promote-crash`（架构师已复现确认，见该条目）。
+  #
+  # 干净重建验证：`rm -rf build-dadao && make build-picolibc` 产出 1.6M/813
+  # 成员的 libc.a；反汇编 `libc_stdio_vfprintf.c.o` 确认 `f->put()` 间接调用
+  # 点现为 `call rb5, rd0, 0`（DL-066a 修复的寄存器），不再是 `rb0`——
+  # printf_hello.test/malloc_hello.test 首次真正吃到 DL-066a 的修复。
+  # E2E 29/30（syscall_hello.test 无关既有失败）、四方 AGREE(3-way)=200、
+  # Sail AGREE(4-way)=200，不回归。
 
 - id: syscall-hello-write-output-missing
   title: "syscall_hello.test：exit=42 正确但 SYS_write 的 hi\\n 输出完全缺失（连垃圾字节都没有），QEMU stdout 只有 monitor 启动 banner"
@@ -316,6 +330,36 @@
   # 工作，故不是 write handler 整体坏了）。未深入排查具体原因（怀疑
   # `rela rb8,msg_data` + `addi rb8,rb8,msg_data` 计算 msg_data 地址是否正确，
   # 或 monitor/serial 共享 stdio 导致的缓冲/时序问题），留待后续任务专门排查。
+
+- id: codegen-string-fn-promote-crash
+  title: "DADAO backend 在 DAG->DAG ISel 阶段对 strlen/memset/memchr/strcat/strchr/strstr 等基础 libc/string 函数崩溃：fatal error: Do not know how to promote this operator's operand"
+  status: open
+  scope: [CodeGen]
+  blocks: [llvm-test-suite-t3]
+  resolved_by: null
+  # ML-005a（subagent）尝试全新 `ninja libc.a`（非 -k 0 容错模式）发现：
+  # picolibc -O0 全量重建实际有 228 个编译单元失败，不止 issue
+  # picolibc-libc-rebuild-blocked 记录的 2 个（那 2 个只是 fail-fast 模式下
+  # 最先撞到的）。多数失败是 libm/complex（M1 排除 RF 浮点扩展，属预期范围
+  # 不算 bug），但**基础 libc/string 函数（strlen/memset/memchr/strcat/
+  # strchr/strstr 等，与浮点完全无关）也在其中**。Makefile 的
+  # `build-picolibc` target（ML-003l）本身用 `ninja -k 0 || true` 容错跑，
+  # 静默吞掉这批失败继续打包 libc.a，此前从未被察觉。
+  #
+  # 架构师独立复现（2026-07-14）：
+  # `clang --target=dadao -O0 -c libc/string/strlen.c` 崩溃，报错：
+  # ```
+  # PromoteIntegerOperand Op #1: t27: ch = <<Unknown Target Node #524>> t0, t22, BasicBlock:ch<while.end>
+  # fatal error: error in backend: Do not know how to promote this operator's operand!
+  # ```
+  # 崩在 "DADAO DAG->DAG Pattern Instruction Selection" pass 处理 `@strlen`
+  # 时——某个 DADAO 自定义 SDNode（很可能是 strlen 内部 while 循环出口的
+  # BR_CC/SETCC 类节点，用了窄位宽如 i1/i8 条件）在类型合法化的
+  # "PromoteIntegerOperand" 分支里没有对应 case，触发 llvm_unreachable 类
+  # fatal error。这是**真实、与浮点无关的 CodeGen 缺口**，会阻断任何用到
+  # 基础 string.h 函数的真实 C 程序，直接影响 llvm-test-suite（ADR-0012 T3，
+  # 几乎所有非 trivial 测试都会调用 strlen/memcpy/memset 类函数）能否跑起来。
+  # 待专门任务根因定位 + 修复。
 
 - id: wiki-9f378f4-sbi-see-deferred-delta
   title: "wiki 13a414d→9f378f4（8 commits）B 桶 delta 记入 deferred 域未来基线（ADR-0013 Phase 2·B 桶策略，该域启动时吸收）。A 桶(M1 核心 SimRISC-01/02)空——SimRISC-01/02/03 零 diff、差分 AGREE(4-way)=200/DIVERGE=0 不回归、pin 已推进至 9f378f4。**SBI 域**(DADAO-22)：PTBR/PTHI/PAHI 走 rb→rd 中转+跳转表(10929f7)、SBI_PHYMEM_ALLOC_PAGE 失败返回值 0→-1(b1a5f7f)、popcnt 实现改 TODO(popcnt 不在 SimRISC ISA)——是未来 musl 系统调用落地(ML-001a recon)的上游依赖。**异常/SEE 域**(DADAO-12)：excp_num 拆 sync_num+async_num/escape_num→rc5(b3d6c82)、CFXMEM 增内部储存块非法访问触发(ea10f5e)、异常进出伪代码统一+cfxld/cfxst 路由简化(6079ecd)、§5 重构+FE→FPEXCP+中断模型前移(defdd96)——异常域启动时须回放吸收。**FP 域**(SimRISC-00 MISC-RF)：浮点指令补 -orrr/-orri 后缀(bc39c7c/b1a5f7f)。C 桶(装饰)已随 pin 吸收无需跟踪：add 示例补 rd0 4 操作数、CSR 名去重、phymem→pmem 全局重命名。"

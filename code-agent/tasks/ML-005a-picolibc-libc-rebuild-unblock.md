@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（picolibc 配置 + LLVM backend 排查）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核，(a)已修/(b)确认非配置问题正确未做+发现更大范围问题）
 
 **前置**：issue `picolibc-libc-rebuild-blocked`（`docs/issues.yaml`）；DG-007b/DL-066a 完成区（gem5 双后端两个真实 bug 已修，但 `printf_hello.test`/`malloc_hello.test` 链接的 `.work/picolibc/build-dadao/libc.a` 是旧编译器预建产物，`my_putc` 间接调用点已固化进旧目标码，需要重建 libc.a 才能让这两个 E2E 用例真正吃到 DL-066a 的修复）。
 
@@ -48,3 +48,14 @@ python3 tools/run_differential.py 2>&1 | tail -3
 - `contracts/isa/spec.md`（M1 排除 RF 浮点扩展的范围声明，判断 atold_engine 是否本就不该编译进 M1 目标）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**必须真跑 `make build-picolibc` 从干净状态重建，不能只改配置没验证真的编出来**。
+
+---
+
+## 架构师复核（2026-07-14，ground-truth）：通过
+
+- (a) jmp_buf：`libc/include/machine/setjmp.h` 加 `__dadao__` 分支，picolibc 集中式头文件写法确认正确（非按架构分目录）。
+- (b) atold_engine：独立核对 `meson_options.txt`/`libc/stdio/meson.build`，确认 `io-long-double` 只控制调用方是否使用引擎、不控制该文件是否被编译——subagent"非配置问题"的判断成立，正确没有强行绕过或勉强实现浮点 libcall。
+- **独立复现更大范围发现**：手动编译 `libc/string/strlen.c`（补全 include 路径），复现完全相同的崩溃：`PromoteIntegerOperand Op #1: ... <<Unknown Target Node #524>> ... fatal error: Do not know how to promote this operator's operand!`，崩在 `DADAO DAG->DAG Pattern Instruction Selection` 处理 `@strlen`。这是与浮点无关的真实 CodeGen 缺口，已拆分登记独立 issue `codegen-string-fn-promote-crash`（原 `picolibc-libc-rebuild-blocked` 只记 2 个缺口，现更正为准确反映 228 个失败单元中"libm/complex 预期内排除 + string 函数是真 bug"的区分，closed by ML-005a）。
+- 独立重跑：`rm -rf build-dadao && make build-picolibc` 干净重建，反汇编 `libc_stdio_vfprintf.c.o` 确认间接调用点为 `call rb5, rd0, 0`（DL-066a 修复已烘进）；E2E 29/30、四方 AGREE(3-way)=200/Sail AGREE(4-way)=200 不回归。
+
+**判定**：通过，提交。**下一步**：`codegen-string-fn-promote-crash` 根因定位（string 函数是任何真实 C 程序的基本依赖，比原计划的 -O1 physreg 缺口更优先，直接影响 llvm-test-suite 能否起步）。
