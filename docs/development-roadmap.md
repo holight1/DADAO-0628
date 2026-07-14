@@ -98,6 +98,43 @@ a raw `.text` binary), so this path was never exercised until the picolibc
 E2E tests tried to run on gem5. **Neither picolibc goal is dual-backend
 verified yet** — both are QEMU-only until this is fixed.
 
+## M2.6: dual-backend unblock + llvm-test-suite on-ramp (2026-07-14 architect roadmap)
+
+Architect-proposed sequence, executed via subagent (not DS — the first thread
+is gem5-internal work, which per `feedback_ds_gem5_semantic_unreliable` goes to
+a subagent that owns the gem5 component, not DS):
+
+1. **DG-007 (gem5 ELF load crash)** — highest priority: blocks dual-backend
+   verification of work already claimed done (picolibc goal①/②).
+   - DG-007a: root-cause `gem5-se-lld-elf-load-crash` (subagent, read/diagnose
+     only — gem5 generic ELF loader vs. DADAO-specific loader hook vs.
+     memory-layout collision with `argsInit`).
+   - DG-007b: fix based on root cause.
+   - DG-007c: dual-backend re-verify `printf_hello.test` + `malloc_hello.test`
+     on gem5, full E2E + differential regression.
+2. **DL-065 (`dadao-oz-undef-physreg`, -O1+ codegen gap)** — needed before
+   llvm-test-suite can run above -O0.
+   - DL-065a: root-cause the "undefined physical register" at -O1+.
+   - DL-065b: fix.
+   - DL-065c: verify -O1 E2E + regression (does not need to reach -O2 yet).
+3. **ML-004 (llvm-test-suite SingleSource wiring, ADR-0012 T3)** — first real
+   large-scale regression surface once 1-2 are unblocked.
+   - ML-004a: wire the build/run infrastructure (cross-compile via clang,
+     execute via QEMU, collect pass/fail) for a small SingleSource subset.
+   - ML-004b: run the subset, triage failures (real backend bugs vs. missing
+     libc surface vs. test-suite assumptions that don't hold for a freestanding
+     target).
+   - ML-004c: fix whatever is cheaply fixable from the triage.
+   - ML-004d: lock in as a `make check-suite`-style gate (not part of `make
+     check`, same pattern as `check-golden`/`check-legality`) and record what's
+     still open for a later round.
+
+This list is a plan, not a contract — findings at any step may re-scope later
+steps (e.g. DL-065's root cause may turn out to be multiple independent bugs,
+or ML-004a's wiring may surface gaps that reorder the triage). Progress and any
+re-scoping is tracked in the task files (`code-agent/tasks/DG-007*`,
+`DL-065*`, `ML-004*`) and folded back into this section as it lands.
+
 ## Deferred Milestones
 
 - Fix `gem5-se-lld-elf-load-crash` (unblocks dual-backend verification for
