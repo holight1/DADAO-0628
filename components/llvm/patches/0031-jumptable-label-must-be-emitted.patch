@@ -1,0 +1,98 @@
+From 4b4af3758863ba52ea7dcd71ddd73cf2636a7ecc Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 13:24:45 +0800
+Subject: [PATCH] target/dadao: mark jump-table destinations
+ setLabelMustBeEmitted (ML-003k)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root-caused via a minimal repro (dense-range switch, 6 cases, -O0) and
+llc -print-after-all: the destination MachineBasicBlock for a jump
+table entry (.LBB0_1 in the repro; .LBB0_19/.LBB3_13 in the real
+vfprintf.c failure) survives every single MI pass all the way through
+postrapseudos — it is never removed, merged, or altered structurally.
+The bug is not a codegen/pass-pipeline problem at all; it is purely in
+label *emission*.
+
+AsmPrinter::shouldEmitLabelForBasicBlock() skips printing a label for
+any block with exactly one predecessor that is also its immediate
+layout predecessor (isBlockOnlyReachableByFallthrough) — the ordinary,
+correct behavior for a true fallthrough target, which needs no symbol.
+A jump-table entry reaches its destination via an *indirect* jump
+(rela+addi+BRIND), not a fallthrough, but nothing about the MI-level
+CFG (a plain predecessor edge) distinguishes the two cases. At -O0,
+with no block-placement pass reordering anything, DADAO's jump-table
+dispatch block ends up laid out immediately before one of its own
+targets often enough to hit this by coincidence — and that target's
+label is silently dropped, leaving a `.quad` jump-table entry
+referencing a symbol that was never printed ("Undefined temporary
+symbol" at the ELF writer once MC layer bugs from ML-003e/i were
+independently fixed).
+
+The escape hatch already exists: MachineBasicBlock::
+setLabelMustBeEmitted() forces the label regardless of the
+fallthrough heuristic. It's normally invoked by callbr/inline-asm-goto
+lowering (SelectionDAGBuilder.cpp) but ordinary switch-to-jump-table
+lowering never calls it — most targets' block-placement passes at
+higher opt levels keep jump-table dispatch blocks away from their own
+targets, so the coincidence this needs essentially never arises there.
+
+Fix: override AsmPrinter::emitFunctionBodyStart() to mark every
+MachineBasicBlock referenced by any MachineJumpTableInfo entry before
+per-block emission begins.
+
+Verified: minimal repro (6-case dense switch) — the previously-missing
+label now has exactly 1 definition, matching every other case block.
+picolibc's vfprintf.c, compiled with the *exact* real build flags
+(-ffunction-sections, no -fno-jump-tables, no other workaround),
+compiles with 0 errors. Full end-to-end: crt0 + stdout_min.c (tinystdio
+FDEV_SETUP_STREAM bridge) + printf_hello.c + a cleanly-rebuilt libc.a,
+linked and run on QEMU — real output "hello, dadao" (exactly once) +
+exit=0. E2E 27/27 (pre-existing suite unaffected), differential
+AGREE(4-way)=200/DIVERGE=0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp | 25 +++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+index c67df53ebad9..0fa2be971d83 100644
+--- a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
++++ b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+@@ -35,6 +35,31 @@ public:
+     return false;
+   }
+ 
++  // A jump-table destination block that (per the ordinary CFG predecessor
++  // analysis) has exactly one predecessor and happens to be laid out
++  // immediately after it looks, to AsmPrinter::shouldEmitLabelForBasicBlock,
++  // indistinguishable from an ordinary fallthrough target — which by design
++  // gets no label (nothing needs to name a block execution just falls into).
++  // But a jump-table entry reaches that block via an *indirect* jump
++  // (rela+addi+BRIND), not the fallthrough at all; the `.quad` entry in the
++  // table still needs a real symbol to reference. The generic mechanism for
++  // this (MachineBasicBlock::setLabelMustBeEmitted(), which forces a label
++  // regardless of the fallthrough heuristic) is normally invoked by
++  // callbr/inline-asm-goto lowering, not by ordinary switch-to-jump-table
++  // lowering — the latter has never needed it on most targets, since
++  // higher-opt-level block placement rarely lays a jump-table dispatch block
++  // directly adjacent to one of its own targets. At -O0, with no block
++  // placement pass reordering anything, DADAO hits that coincidence, and the
++  // target's label silently never gets printed — a real, verified dangling
++  // jump-table entry (`.quad .LBB0_19` with no `.LBB0_19:` anywhere in the
++  // file), confirmed via a minimal repro before this fix and gone after it.
++  void emitFunctionBodyStart() override {
++    if (const MachineJumpTableInfo *MJTI = MF->getJumpTableInfo())
++      for (const MachineJumpTableEntry &Entry : MJTI->getJumpTables())
++        for (MachineBasicBlock *MBB : Entry.MBBs)
++          MBB->setLabelMustBeEmitted();
++  }
++
+   void emitInstruction(const MachineInstr *MI) override {
+     if (MI->isCFIInstruction())
+       return;
+-- 
+2.43.0
+
