@@ -157,11 +157,20 @@ a subagent that owns the gem5 component, not DS):
      wrong-legalize-VT bug; new regression test `align_strfn.test`.
    - DG-007c/DL-066b: dual-backend re-verify — `printf_hello.test` and
      `malloc_hello.test` now genuinely pass on both QEMU and gem5.
-2. **DL-065 (`dadao-oz-undef-physreg`, -O1+ codegen gap)** — needed before
-   llvm-test-suite can run above -O0.
-   - DL-065a: root-cause the "undefined physical register" at -O1+.
-   - DL-065b: fix.
-   - DL-065c: verify -O1 E2E + regression (does not need to reach -O2 yet).
+2. **DL-065 (`dadao-oz-undef-physreg`, -O1+ codegen gap) — ✅ done.**
+   Root-caused and fixed in one pass: `CALL_IIII`/`CALL_RRII`/
+   `CALL_PSEUDO_INDIRECT` had a static tablegen `Uses=[RD16..RD30]` list
+   unconditionally attached to every call regardless of real argument count;
+   `-O1+`'s `LiveIntervals` (never run at `-O0`) flagged the ones with no
+   reaching definition. Fixed via the standard LLVM pattern (per-call-site
+   explicit register operands from `LowerCall`, RISC-V style). A sweep of all
+   963 picolibc `.c` files at `-O1` now shows zero remaining "undefined
+   physical register" failures (down from ~63 in `argz_insert.c` alone). A
+   separate, deeper gap was found and correctly left alone: 113 files still
+   crash on `LowerCall emitted a return value for a tail call!` — DADAO's
+   `LowerCall` never implemented tail-call opt-out — tracked as new issue
+   `codegen-tailcall-lowercall-assert` (needed before `-O1+` picolibc builds
+   end-to-end, not before this narrower fix).
 3. **ML-004 (llvm-test-suite SingleSource wiring, ADR-0012 T3)** — first real
    large-scale regression surface once 1-2 are unblocked.
    - ML-004a: wire the build/run infrastructure (cross-compile via clang,
