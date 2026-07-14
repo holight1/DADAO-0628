@@ -2,7 +2,22 @@
 
 **执行环境**: 本地 DS · DADAO-0628（构建基础设施 + lit 测试调整）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核，含一处修复）
+
+## 复核结果
+
+- `make build-picolibc`（全新环境，`rm -rf .work/picolibc/build-dadao` 后重跑）：PASS，产出 `libc.a`，含 `printf.c.o`/`vfprintf.c.o`。
+- `printf_hello.test`：PASS。
+- 全 E2E：28/28。四方差分：AGREE(4-way)=200/DIVERGE=0。
+- `git status`：无二进制文件被追踪（`.work/` 已整体 gitignore）。
+
+## 发现并修复的问题
+
+`Makefile` 的 `build-picolibc` target 用 `-Dc_args="['-O0','-g0','-Wno-error']"` 传给 `meson setup`，meson 对同一 built-in option 的命令行参数会**覆盖**（非合并）cross-file 里的值，导致 cross-file 的 `c_args = ['-nostdlib','-ffreestanding','-DNEWLIB_NANO_MALLOC']` 被替换丢失（`-ffreestanding`/`-DNEWLIB_NANO_MALLOC` 消失）。测试当时仍能通过，但偏离了预期配置。
+
+修复：删除 `-Dc_args=...` 覆盖（`--buildtype=plain` 已提供 `-O0`/`-g`，不需要重复指定）。复核后重跑确认 `-ffreestanding`/`-DNEWLIB_NANO_MALLOC` 恢复，`printf.c.o`/`vfprintf.c.o` 仍正常编出，全部验收命令重新跑过均 PASS。
+
+已提交。
 
 **前置**：ML-003k（架构师亲自修复跳转表悬空条目真根因，`.work/llvm` commit `4b4af3758863`/patch 0031，goal① 已在无 workaround 情况下真实验证通过：`vfprintf.c` 真编译 + 完整链路真跑出 "hello, dadao"+exit=0，E2E 28/28、四方 200/0）。**本任务只是把这个已验证工作的手动流程正规化进构建系统**，不涉及任何新的 codegen/MC 修复。
 

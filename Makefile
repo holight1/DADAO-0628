@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi check-golden check-legality
+.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc build-picolibc check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi check-golden check-legality
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -15,6 +15,7 @@ help:
 	@echo "  make prepare         Fetch and apply enabled components"
 	@echo "  make build-qemu      Configure and compile QEMU (Phase 3)"
 	@echo "  make build-mc        Build LLVM MC components for DADAO (Phase 2)"
+	@echo "  make build-picolibc  Build picolibc for DADAO (meson + ninja, Phase 5)"
 	@echo "  make check           Run repository-level structural checks"
 	@echo "  make docker-image    Build the reproducible development image"
 	@echo "  make clean-work      Remove generated .work content only"
@@ -62,6 +63,28 @@ build-mc: manifest-check
 	  -DLLVM_ENABLE_ASSERTIONS=ON
 	ninja -C $(LLVM_BUILD) llvm-mc llvm-objdump
 	@echo "build-mc: PASS"
+
+PICOLIBC_SRC   ?= .work/picolibc
+PICOLIBC_BUILD ?= .work/picolibc/build-dadao
+MESON          ?= $(PWD)/.work/source/qemu/build/pyvenv/bin/meson
+
+build-picolibc: manifest-check
+	@if [ ! -x "$(MESON)" ]; then \
+		echo "ERROR: meson not found at $(MESON). Install with: pip install meson ninja"; \
+		exit 1; \
+	fi
+	@echo "=== Configuring picolibc for DADAO ==="
+	cd $(PICOLIBC_SRC) && "$(MESON)" setup build-dadao \
+	  --cross-file scripts/cross-dadao-unknown-elf.txt \
+	  -Dmultilib=false -Dtests=false -Dsemihost=false -Dpicocrt=false \
+	  --buildtype=plain \
+	  --wipe
+	@echo "=== Building picolibc ==="
+	ninja -C $(PICOLIBC_BUILD) -j$$(nproc) -k 0 || true
+	@echo "=== Packaging libc.a ==="
+	.work/build/llvm/bin/llvm-ar rcs $(PICOLIBC_BUILD)/libc.a \
+	  $$(find $(PICOLIBC_BUILD)/libc.a.p -name '*.o')
+	@echo "build-picolibc: PASS (libc.a at $(PICOLIBC_BUILD)/libc.a)"
 
 check-wiki-drift:
 	@$(PYTHON) scripts/check_wiki_drift.py

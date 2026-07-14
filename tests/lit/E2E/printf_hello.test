@@ -1,0 +1,25 @@
+// goal① printf test: real C → clang → picolibc(tinystdio) → link → QEMU
+//
+// Verifies that printf("hello, dadao\n") outputs the correct string and
+// exits with code 0, using a pre-built picolibc libc.a and a tiny stdout
+// bridge (stdout_min.c) that routes FILE.put → _write via trap syscall.
+//
+//
+// RUN: %llvm-mc -triple=dadao -filetype=obj %S/../../scripts/crt0.s -o %t.crt0.o
+// RUN: %llvm-mc -triple=dadao -filetype=obj %S/../../scripts/pico_stubs.s -o %t.stubs.o
+// RUN: %clang --target=dadao -nostdlib -nostdinc -ffreestanding -O0 -c \
+// RUN:   -I%pico_include -I%pico_stdio -I%pico_locale -I%pico_root \
+// RUN:   -I%pico_build -I%{clanginc} \
+// RUN:   -D_LIBC -DNEWLIB_NANO_MALLOC \
+// RUN:   %S/../../scripts/stdout_min.c -o %t.stdout.o
+// RUN: %clang --target=dadao -nostdlib -nostdinc -ffreestanding -O0 -c \
+// RUN:   -I%pico_include -I%pico_stdio -I%pico_locale -I%pico_root \
+// RUN:   -I%pico_build -I%{clanginc} \
+// RUN:   -D_LIBC -DNEWLIB_NANO_MALLOC \
+// RUN:   %S/Inputs/printf_hello.c -o %t.hello.o
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld -nostdlib \
+// RUN:   %t.crt0.o %t.stubs.o %t.stdout.o %t.hello.o \
+// RUN:   %S/../../../.work/picolibc/build-dadao/libc.a -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 0'
+// RUN: grep -c "hello, dadao" %t.out | xargs test 1 -eq
