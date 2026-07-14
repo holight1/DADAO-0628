@@ -63,12 +63,53 @@ decision C we pivot to clang first and revisit indirect call later. WIP is
 in the DL-063c task. Committed patch series stops at 0019 (clean, no broken
 0020); lit 24/24.
 
+## M2.5: clang frontend + libc MVP (2026-07-12 ~ 07-14)
+
+clang integration landed (DL-064a/b): `clang hello.c -o hello` freestanding
+one-shot (driver → assembler → `ld.lld`) produces a real DADAO ELF, no host
+fallback. Fixed an MC cross-object `call` relocation gap surfaced by driver
+separate-compilation linking (patch llvm/0022).
+
+**ADR-0014 libc/syscall charter** (2026-07-12): syscall = SEE `trap cfx_smon`
+(spec-first, not a semihosting/MMIO hack); software ABI defined (rd16=sysno,
+rd17-22=args, rd31=ret, Linux asm-generic numbering); libc staged
+picolibc (phase 1: printf+malloc+llvm-test-suite) → musl (phase 2: after a
+real kernel). ML-002a/b/c implemented `trap`→CFXTRAP + cfx_smon responder
+(write/exit/brk) on both backends.
+
+**picolibc goal① (printf) and goal② (malloc) done on QEMU** (ML-003a-m,
+2026-07-13/14): real C `printf("hello, dadao\n")` and `malloc`/`free` via
+picolibc's own static-heap `sbrk` fallback (`dadao.ld` `__heap_start`/
+`__heap_end`, matching ADR-0014 D3) both run correctly on QEMU with no
+workarounds and no prebuilt binaries checked in. Five real backend bugs were
+found and fixed along the way: QEMU TB-stop not advancing PC for non-branch
+single-instruction TBs (infinite `cpu_io_recompile` loop), QEMU exceptions
+never calling `cpu_restore_state` (imprecise fault PC), LLVM varargs frame
+size omitting `VarArgsSaveSize` (stack overflow into caller frame), LLVM MC
+`applyFixup` double-offsetting `FK_Data_8`/generic-fallback fixups (fragment
+memory corruption), and LLVM AsmPrinter skipping jump-table target labels
+when a target block coincidentally looks like a fallthrough at `-O0`.
+
+**Open blocker**: issue `gem5-se-lld-elf-load-crash` — gem5 SE cannot load a
+real `ld.lld`-produced multi-segment ELF; it panics (page-table fault) before
+`main()` runs, independent of malloc/heap. All existing gem5 dual-backend
+tests instead go through `gen_min_elf` (a synthesized single-segment ELF from
+a raw `.text` binary), so this path was never exercised until the picolibc
+E2E tests tried to run on gem5. **Neither picolibc goal is dual-backend
+verified yet** — both are QEMU-only until this is fixed.
+
 ## Deferred Milestones
 
-- clang DADAO frontend (triple/TargetInfo/ABI/driver) — next milestone.
-- Complete ABI and runtime.
-- System QEMU, exception model, and MMU.
-- Static userspace and libc (musl port; provides memcpy/memset/... symbols).
-- llvm-test-suite (gated on clang + musl; ADR-0012 T3).
+- Fix `gem5-se-lld-elf-load-crash` (unblocks dual-backend verification for
+  the whole picolibc/clang pipeline).
+- Function-pointer indirect call (deferred 2026-07-12, decision C).
+- Complete ABI and runtime; aggregate/struct-by-value, struct return,
+  `llvm.mem*` intrinsic inline-expansion (all gated on clang, now available —
+  not yet started).
+- `dadao-oz-undef-physreg` (-O1+ codegen gap, needed before llvm-test-suite
+  at -O2).
+- musl (phase 2 libc; provides the large/variable-size `memcpy`/`memset`
+  libcall symbols; gated on a real kernel).
+- llvm-test-suite SingleSource (ADR-0012 T3).
 - Kernel bring-up.
 - Dynamic linking, TLS, signals, atomics, and SMP.
