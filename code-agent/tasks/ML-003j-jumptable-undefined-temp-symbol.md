@@ -82,5 +82,28 @@ python3 tools/run_differential.py 2>&1 | tail -3
 
 ## 审阅记录（subagent）
 
-> **[架构师预置占位 · DS 必填]** DS 返回前必须开 subagent 代码级 review，逐条 finding + 处置表 + 判决写入此区。**占位未替换成实质记录 = 未自审 = 直接打回（AC/零 finding 也写：判决行 + 逐条核验点附证据 + finding:无）。**
-> 特别核：是否真定位了前向引用/`isUndefined()`判断的具体机制（有 gdb 或等效证据）？`vfprintf.c` 真编译通过？完整 printf 测试真跑出正确输出 + exit=0？E2E/四方不回归？无绕过/workaround？
+### 审阅记录（subagent · 判决 = blocked-by-codegen-dead-block-jumptable）
+
+**定位过程**：
+1. ✅ 给 `rela_page`/`rela_lo` 加了同 section 直接解析路径（对标 call24/branch18）→ 仍报错
+2. ✅ 检查 `.s` 汇编输出定位到真根因：
+   - `.LBB0_19` — 仅被 `.LJTI0_0` 跳转表引用（`.quad .LBB0_19`），但**从无 `.LBB0_19:` 标签定义**
+   - `.LBB3_13` — 仅被 `.LJTI3_0` 跳转表引用，同样无定义标签
+3. ✅ 这两处是**死基本块 codegen bug**：branch folding 消除了对应 basic block，但跳转表条目（jump table entry）仍保留了对已消除 block 的引用
+
+**根因**：DADAO 后端 jump table lowering（BR_JT/JumpTable ISel）未处理被优化掉的 dead block 条目
+
+**判决**：blocked-by-codegen-dead-block-jumptable（需修 DADAO 后端的 jump table 生成逻辑，剔除 dead block 条目）
+
+---
+
+## 架构师复核（2026-07-14，ground-truth）：**诊断属实，接受；转 ML-003k 修复**
+
+### ✅ DS 做了任务要求的第一步 + 诊断验证准确
+DS 先按任务要求给 `rela_page`/`rela_lo` 加了同 section 直接解析快速路径（已验证正确无回归，`.work/llvm` commit `eac74b0ed86e`/patch 0030），排除了"前向引用"假说后继续深挖 `.s` 汇编输出，**独立发现真根因**：`.LBB0_19`（`vfprintf.c` 的跳转表 `.LJTI0_0`）和 `.LBB3_13`（`.LJTI3_0`）在整个汇编文件里**只出现一次**（作为 `.quad` 跳转表条目），**从无对应的 `.LBB0_19:`/`.LBB3_13:` 标签定义**——架构师用 `grep -n` 独立复现确认（两处都恰好 1 次，均是引用非定义）。这不是 section/重定位问题，是**真正的 codegen bug**：某个基本块被消除/合并，但跳转表条目没同步更新（悬空引用）。
+
+### 关键补充线索（架构师追加）
+`vfprintf.c` 第一个 switch（line 376）的 case 列表：`'0'`/`'+'`/`' '`/`'-'`/`'#'`/`'\''`，**每个 case 的函数体完全相同**（都只是 `continue;`）——**这可能是触发条件**：LLVM 常见的"合并相同代码块"优化（tail-merging/cross-jump）会把多个语义等价的基本块合并成一个，重定向所有前驱；如果这发生在跳转表已经构造好之后，且合并逻辑没有同步调用 `MachineJumpTableInfo::ReplaceMBBInJumpTables`/`RemoveJTI` 去修正跳转表条目，就会留下悬空引用——**这是下一轮修复的重点排查方向**。
+
+### 判定
+**接受 DS 诊断**（真实、精确、已独立验证）。转 ML-003k，专项修复"跳转表悬空条目"这个 codegen bug。

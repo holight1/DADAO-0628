@@ -27,3 +27,4 @@
 0027-jumptable-section-fix.patch
 0028-mc-fixup-double-offset-fix.patch
 0029-jumptable-standard-section-routing.patch
+0030-rela-same-section-fastpath.patch

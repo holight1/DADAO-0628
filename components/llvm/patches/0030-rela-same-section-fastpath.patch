@@ -1,0 +1,90 @@
+From eac74b0ed86e608d18001b4c2a4478ead4acc21b Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 12:56:27 +0800
+Subject: [PATCH] target/dadao: add same-section fast path for
+ rela_page/rela_lo fixups (ML-003j)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mirrors the existing call24/branch18/branch12 pattern: when the target
+symbol is defined in the same section as the fixup, resolve the
+page-aligned PC-relative offset directly instead of always deferring
+to the linker. Previously rela_page/rela_lo unconditionally emitted a
+relocation whenever `!IsResolved`, with no same-section short-circuit.
+
+Verified: E2E 27/27, differential AGREE(4-way)=200/DIVERGE=0, no
+regression. Does not by itself fix ML-003j's remaining "Undefined
+temporary symbol" — that turned out to be a separate, deeper codegen
+bug (see task md): two jump-table entries (.LBB0_19, .LBB3_13 in
+vfprintf.c) reference basic blocks that were never emitted at all —
+a dangling jump-table entry from block merging/elimination that
+didn't patch MachineJumpTableInfo, not a section/relocation issue.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .../DADAO/MCTargetDesc/DADAOAsmBackend.cpp    | 36 +++++++++++++++----
+ 1 file changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index 095324492fa6..e8bbbd38b42d 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -98,25 +98,47 @@ public:
+     }
+ 
+     if (Kind == DADAO::fixup_dadao_rela_page) {
+-      if (!IsResolved) {
++      const MCSymbol *Sym = Target.getAddSym();
++      const MCSection *FixupSec = F.getParent();
++      const MCSection *SymSec =
++          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
++                                      : nullptr;
++      if (!IsResolved &&
++          (!SymSec || SymSec != FixupSec || (Sym && Sym->isUndefined()))) {
+         Value = 0;
+         maybeAddReloc(F, Fixup, Target, Value, IsResolved);
+         return;
+       }
+-      int64_t Target = static_cast<int64_t>(Value) + Fixup.getOffset() + 4;
+-      int64_t Aligned = Target & ~0xFFFULL;
++      // Either resolved, or same-section (relative offset is fixed):
++      // compute the page-aligned PC-relative offset and encode directly.
++      int64_t TargetAddr = static_cast<int64_t>(Value) + Fixup.getOffset() + 4;
++      int64_t Aligned = TargetAddr & ~0xFFFULL;
+       int64_t Imm = static_cast<int64_t>(Aligned) - static_cast<int64_t>(Fixup.getOffset() + 4);
+       int64_t Imm18 = Imm >> 12;
+-      uint32_t Mask = 0x3FFFF;
++      uint32_t Mask = 0x3FFFF; 
+       uint32_t Enc = (Imm18 & Mask) | (support::endian::read32be(Data) & ~Mask);
+       support::endian::write32be(Data, Enc);
+       return;
+     }
+ 
+     if (Kind == DADAO::fixup_dadao_rela_lo) {
+-      // Always defer to linker — section-relative Value != absolute address
+-      Value = 0;
+-      maybeAddReloc(F, Fixup, Target, Value, IsResolved);
++      const MCSymbol *Sym = Target.getAddSym();
++      const MCSection *FixupSec = F.getParent();
++      const MCSection *SymSec =
++          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
++                                      : nullptr;
++      if (!IsResolved &&
++          (!SymSec || SymSec != FixupSec || (Sym && Sym->isUndefined()))) {
++        Value = 0;
++        maybeAddReloc(F, Fixup, Target, Value, IsResolved);
++        return;
++      }
++      // Same-section or resolved: compute low 12 bits of PC-relative offset
++      int64_t Imm12 = static_cast<int64_t>(Value) + Fixup.getOffset() + 4;
++      Imm12 = Imm12 & 0xFFF;
++      uint32_t Mask = 0xFFF;
++      uint32_t Enc = (Imm12 & Mask) | (support::endian::read32be(Data) & ~Mask);
++      support::endian::write32be(Data, Enc);
+       return;
+     }
+ 
+-- 
+2.43.0
+
