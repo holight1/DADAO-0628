@@ -333,10 +333,10 @@
 
 - id: codegen-string-fn-promote-crash
   title: "DADAO backend 在 DAG->DAG ISel 阶段对 strlen/memset/memchr/strcat/strchr/strstr 等基础 libc/string 函数崩溃：fatal error: Do not know how to promote this operator's operand"
-  status: open
+  status: closed
   scope: [CodeGen]
   blocks: [llvm-test-suite-t3]
-  resolved_by: null
+  resolved_by: DL-067b
   # ML-005a（subagent）尝试全新 `ninja libc.a`（非 -k 0 容错模式）发现：
   # picolibc -O0 全量重建实际有 228 个编译单元失败，不止 issue
   # picolibc-libc-rebuild-blocked 记录的 2 个（那 2 个只是 fail-fast 模式下
@@ -360,6 +360,65 @@
   # 基础 string.h 函数的真实 C 程序，直接影响 llvm-test-suite（ADR-0012 T3，
   # 几乎所有非 trivial 测试都会调用 strlen/memcpy/memset 类函数）能否跑起来。
   # 待专门任务根因定位 + 修复。
+  #
+  # 根因（DL-067a subagent + 架构师复核）：`DADAOISelLowering.cpp` 对
+  # `ISD::BR_CC` 注册了两条并行路径——`LowerOperation`（经
+  # `setOperationAction(BR_CC, MVT::Other, Custom)`）和
+  # `PerformDAGCombine`（经 `setTargetDAGCombine(BR_CC)`，同样调用
+  # `LowerBR_CC`）。后者在 pre-legalize 的 Combine1 阶段就提前把
+  # `br_cc` 转成不透明的 `DADAOISD::BRZ` 等自定义节点——早于
+  # `SelectionDAG::LegalizeTypes()`。当某次 combine（`ReduceLoadWidth`
+  # 把对齐检查场景的 load 窄化成 i8）产出非法类型的 `br_cc` 操作数时，
+  # 类型合法化跑到这个已经是自定义节点的 `BRZ` 就无从下手（18 个
+  # `DADAOISD::` 节点均无 `PromoteIntegerOperand`/`ReplaceNodeResults`
+  # 覆写）——fatal error。
+  #
+  # 修复（DL-067b，架构师直修）：去掉 `PerformDAGCombine` 里冗余的
+  # `case ISD::BR_CC` 分支 + `setTargetDAGCombine(ISD::BR_CC)`。**副作用
+  # 发现**：单纯去掉该分支后，全部使用比较的现有 E2E 测试
+  # （loop_sum/cond_abs 等）反而以 `Cannot select: br_cc` 崩溃——原来
+  # `setOperationAction(BR_CC, MVT::Other, Custom)` 的注册类型从来没被
+  # `LegalizeDAG` 真正查询过（其 BR_CC 分支按被比较操作数的类型
+  # `Node->getOperand(2)`即 LHS/i64查找 action，不是链类型 `Other`）；
+  # 冗余的 pre-legalize combine 从 backend 建立以来就一直在悄悄代劳真正
+  # 的转换工作。同步修正为 `setOperationAction(BR_CC, MVT::i64, Custom)`
+  # 后，`LowerOperation` 的 Custom 路径才在正确的（类型合法化后）阶段
+  # 真正生效。
+  #
+  # 验证：DL-067a 最小复现（对齐检查+提前 NUL 循环）不再崩溃；4 组
+  # 双后端运行时判别探针（8 字节对齐指针跳过循环体/未对齐指针走满整个
+  # 检查范围/未对齐指针在 0 次与 2 次迭代后遇 NUL）QEMU=gem5 全部正确
+  # （不只是"编译不崩"）；`tests/lit/E2E/align_strfn.test` 固化为回归；
+  # picolibc 干净重建（`rm -rf build-dadao && make build-picolibc`）确认
+  # strlen.c/memset.c/memchr.c/strcat.c/strchr.c/strstr.c 均编译产出
+  # `.o`，不再崩溃（剩余约 205 个失败编译单元全部是 libm/complex 浮点，
+  # M1 排除范围内，与本 issue 无关）；E2E 30/31（新增 align_strfn.test，
+  # 同一个既有 syscall_hello.test 无关失败）；差分 AGREE(3-way)=200/
+  # DIVERGE=0、Sail AGREE(4-way)=200，不回归。落 patch
+  # `components/llvm/patches/0033-br-cc-premature-combine-fix.patch`。
+  #
+  # **附带发现、记为新 issue** `codegen-global-addr-const-offset-dropped`：
+  # 探针设计过程中发现一个无关的既有 miscompile——`@global + 编译期常量`
+  # （如 `buf+3`，GlobalAddress 带非零 `getOffset()`）在物化独立全局地址
+  # 时，低 12 位 `addi_rb`（`R_DADAO_RELA_LO`）没有把这个常量偏移量
+  # 编码进去（`*(buf+3)` 取到了 `buf[0]`）。与 BR_CC 无关，不在本任务
+  # 范围内，未修复。
+
+- id: codegen-global-addr-const-offset-dropped
+  title: "GlobalAddress 带非零编译期常量偏移（如 `@buf + 3`）物化为独立地址值时，RELA_LO addi 的低 12 位偏移量被丢弃——`*(buf+3)` 实际读到 buf[0]"
+  status: open
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: null
+  # DL-067b 构造 BR_CC 运行时判别探针时意外发现（2026-07-14）：
+  # `static char buf[8]={1..8}; int main(){return *(buf+3);}` 在 QEMU 上
+  # 返回 1（buf[0]）而非期望的 4（buf[3]）。反汇编显示
+  # `rela rb8,1 / addi rb8,rb8,0`——低 12 位立即数是 0，没有把 GEP 常量
+  # 偏移 3 编码进 `RELA_LO` fixup。garr_index.test 类场景（数组变量索引，
+  # 运行时索引经 ADD 叠加）不撞这个坑；只有"编译期常量偏移直接折叠进
+  # GlobalAddress 的 offset 字段"这条路径受影响。与 DL-067b 的 BR_CC 修复
+  # 无关，未修复，留待后续任务定位 `lowerGlobalAddress`/`ADDI_RBRRII` 低
+  # 12 位 fixup 生成逻辑。
 
 - id: wiki-9f378f4-sbi-see-deferred-delta
   title: "wiki 13a414d→9f378f4（8 commits）B 桶 delta 记入 deferred 域未来基线（ADR-0013 Phase 2·B 桶策略，该域启动时吸收）。A 桶(M1 核心 SimRISC-01/02)空——SimRISC-01/02/03 零 diff、差分 AGREE(4-way)=200/DIVERGE=0 不回归、pin 已推进至 9f378f4。**SBI 域**(DADAO-22)：PTBR/PTHI/PAHI 走 rb→rd 中转+跳转表(10929f7)、SBI_PHYMEM_ALLOC_PAGE 失败返回值 0→-1(b1a5f7f)、popcnt 实现改 TODO(popcnt 不在 SimRISC ISA)——是未来 musl 系统调用落地(ML-001a recon)的上游依赖。**异常/SEE 域**(DADAO-12)：excp_num 拆 sync_num+async_num/escape_num→rc5(b3d6c82)、CFXMEM 增内部储存块非法访问触发(ea10f5e)、异常进出伪代码统一+cfxld/cfxst 路由简化(6079ecd)、§5 重构+FE→FPEXCP+中断模型前移(defdd96)——异常域启动时须回放吸收。**FP 域**(SimRISC-00 MISC-RF)：浮点指令补 -orrr/-orri 后缀(bc39c7c/b1a5f7f)。C 桶(装饰)已随 pin 吸收无需跟踪：add 示例补 rd0 4 操作数、CSR 名去重、phymem→pmem 全局重命名。"

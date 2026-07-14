@@ -1,0 +1,84 @@
+From 2fa77e88d959f7e197d62966542bd358d775c9d8 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 14 Jul 2026 16:09:40 +0800
+Subject: [PATCH] target/dadao: fix BR_CC premature pre-legalize combine +
+ wrong legalize VT (DL-067b)
+
+PerformDAGCombine registered a redundant ISD::BR_CC case that called the
+same LowerBR_CC as LowerOperation's Custom path, but fired during the
+pre-legalize Combine1 pass -- before SelectionDAG::LegalizeTypes() could
+promote illegal-typed (e.g. i8, from ReduceLoadWidth narrowing an
+alignment-check load) br_cc operands. Since none of DADAO's custom
+DADAOISD:: nodes have PromoteIntegerOperand/ReplaceNodeResults overrides,
+type legalization then crashed on the resulting opaque custom node
+("Do not know how to promote this operator's operand!"), blocking
+strlen/memset/memchr/strcat/strchr/strstr and other libc string functions
+that alignment-check pointers via `(unsigned long)p & 7`.
+
+Removing the redundant combine alone regressed all E2E tests using
+comparisons (loop_sum, cond_abs, etc.) with 'Cannot select: br_cc' --
+the legacy setOperationAction(ISD::BR_CC, MVT::Other, Custom) had never
+actually been consulted by LegalizeDAG, which looks up BR_CC's action
+using the compared operand's type (Node->getOperand(2), i.e. LHS: i64),
+not the chain type (Other) BR_CC itself produces. The premature combine
+had been silently doing the real work for the entire lifetime of the
+backend. Fixed the registration to MVT::i64 so the Custom path now
+actually fires at the correct (post type-legalization) stage.
+
+Verified: DL-067a's minimal repro (align-check + early-NUL loop) compiles
+without crashing; a 4-case dual-backend runtime probe (aligned-skip,
+full-walk, early-NUL at two trip counts) confirms branch semantics are
+correct on both QEMU and gem5, not just non-crashing; picolibc rebuild
+shows strlen.c/memset.c/memchr.c/strcat.c/strchr.c/strstr.c now compile
+(remaining ~205 failures are all libm/complex float, out of M1 scope); E2E 30/31 (new align_strfn.test added, same 1 pre-existing unrelated
+syscall_hello.test failure), differential AGREE(3-way)=200/DIVERGE=0,
+Sail AGREE(4-way)=200 -- zero regression.
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp | 10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 4bb227abd58b..48303c5369fc 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -29,7 +29,10 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::ADD, MVT::i64, Legal);
+   setOperationAction(ISD::SUB, MVT::i64, Legal);
+ 
+-  setOperationAction(ISD::BR_CC, MVT::Other, Custom);
++  // Legalize looks up BR_CC's action using the compared operand's type
++  // (Node->getOperand(2), i.e. LHS), not the chain type (MVT::Other) that
++  // BR_CC itself produces. i64 is DADAO's only legal integer type.
++  setOperationAction(ISD::BR_CC, MVT::i64, Custom);
+   setOperationAction(ISD::BRCOND, MVT::Other, Custom);
+   setOperationAction(ISD::BR_JT, MVT::Other, Expand);
+   setOperationAction(ISD::BRIND, MVT::Other, Custom);
+@@ -55,7 +58,6 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::SMUL_LOHI, MVT::i64, Expand);
+   setOperationAction(ISD::UMUL_LOHI, MVT::i64, Expand);
+ 
+-  setTargetDAGCombine(ISD::BR_CC);
+   setTargetDAGCombine(ISD::BRCOND);
+   setOperationAction(ISD::FrameIndex, MVT::i64, Custom);
+   setOperationAction(ISD::SETCC, MVT::i64, Custom);
+@@ -522,8 +524,6 @@ SDValue DADAOTargetLowering::lowerVASTART(SDValue Op,
+ 
+ SDValue DADAOTargetLowering::PerformDAGCombine(SDNode *N,
+                                                 DAGCombinerInfo &DCI) const {
+-  SelectionDAG &DAG = DCI.DAG;
+-  SDLoc DL(N);
+   switch (N->getOpcode()) {
+   case ISD::BRCOND: {
+     SDValue Cond = N->getOperand(1);
+@@ -535,8 +535,6 @@ SDValue DADAOTargetLowering::PerformDAGCombine(SDNode *N,
+     }
+     break;
+   }
+-  case ISD::BR_CC:
+-    return LowerBR_CC(SDValue(N, 0), DAG);
+   default:
+     break;
+   }
+-- 
+2.43.0
+
