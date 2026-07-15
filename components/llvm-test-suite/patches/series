@@ -1,0 +1,5 @@
+# One repository-relative patch path per line, in application order.
+# llvm-test-suite is fetched as a source-only reference (SingleSource pure-
+# compute .c files) — we do not build its own CMake/lit harness, so no
+# patches are expected. Keep empty unless a specific test source needs a
+# minimal fix to compile with our freestanding target.

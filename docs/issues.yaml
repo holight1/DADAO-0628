@@ -471,3 +471,43 @@
   # 独立缺口，未修复（本任务范围之外）。是 llvm-test-suite（ADR-0012 T3）
   # 在高于 -O0 跑起来前的另一个必修项，与 dadao-oz-undef-physreg 一起构成
   # -O1+ 支持的两大缺口。
+
+- id: codegen-global-byte-mask-load-wrong-endian-offset
+  title: "-O0：对全局/静态 int 做窄化位运算（如 `x & 0xFF`）时，narrow-load combine 选取的字节偏移按小端假设（offset+0），但 DADAO 是大端——取到最高字节而非最低字节，值整体错误"
+  status: open
+  scope: [CodeGen]
+  blocks: [llvm-test-suite-loop-call-accumulator]
+  resolved_by: null
+  # ML-004a（llvm-test-suite SingleSource 布线，2026-07-15）先发现症状：5/8
+  # 挑选的纯计算测试（crc8.le/crc16.be/popcount-clz-ctz/divrem loop/divtest）
+  # 在 QEMU 上把「callee 写全局累加器 + 调用点对该全局做 `& 0xFF` 再
+  # return」这一模式全部得到 0；subagent 二分排除若干"调用相关"假设后
+  # 判断触发条件是"return 表达式对刚被调用写过的全局做位运算"。
+  #
+  # 架构师复核（ground-truth）：**与函数调用完全无关**，是更通用的大端
+  # narrow-load 偏移错误。零调用最小复现：
+  # ```c
+  # static int acc = 5;
+  # int main(void) { return acc & 0xFF; }   // host=5  dadao=0  FAIL（无任何 call）
+  # ```
+  # 反汇编（`--triple=dadao`）：
+  # ```
+  # rela rb8, 0        ; rb8 = page(acc)
+  # addi rb8, rb8, 0   ; rb8 += offset(acc)
+  # ldbu rd31, rb8, 0  ; 从 rb8+0 读 1 字节 unsigned
+  # ```
+  # `ldbu ...,0` 从地址偏移 **0** 读单字节——对 DADAO 的大端 4 字节 int
+  # （`5` 存为 `00 00 00 05`），偏移 0 是最高字节（=0x00），真正的低字节
+  # （0x05）在偏移 **3**。这是标准 `ReduceLoadWidth`/narrow-load DAG combine
+  # 把 `(load i32) & 0xFF` 优化成"直接读最低有效字节"时选错了字节偏移
+  # （按小端惯例默认取 offset+0，未按大端目标调整为 offset+(width-1)）——
+  # 与 DL-067b 修的 BR_CC 大端 narrow-load bug 是**同一大类"大端 narrow-load
+  # 处理缺陷"的另一个独立触发点**（那次是分支条件、这次是直接返回值），
+  # 但触发的具体 combine/代码路径待确认是否相同。
+  #
+  # 阻塞：ML-004a 里 crc8_le/crc16_be/popcount/divrem_loop/divtest 五个改写
+  # 自 llvm-test-suite 的测试无法端到端跑通（已跳过，未提交为 lit fixture，
+  # 避免把已知 bug 的错误值固化为"预期"）。下一步：专门任务定位具体是
+  # 哪个 DAG combine 产出了这个 narrow byte load，比照 DL-067b 的排查方法
+  # （`-debug-only=dagcombine` 逐步追踪），确认 DADAO target 的
+  # `isBigEndian()`/相关 hook 在这条 combine 路径上是否被正确查询。

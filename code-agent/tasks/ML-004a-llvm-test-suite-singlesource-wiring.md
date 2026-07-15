@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（组件锁定 + 构建/运行基础设施）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核，含根因更正）
 
 **前置**：ADR-0012 D4 已定策略（"先跑 SingleSource 纯计算子集，无 libc I/O，只算+返回值，能上 QEMU/gem5 退出码 harness"）；clang 集成（DL-064a/b）+ picolibc 双后端里程碑（本轮 DG-007/DL-066/ML-005/DL-067 全链）均已完成，工具链具备跑真实 C 的能力。
 
@@ -47,3 +47,22 @@ python3 tools/run_differential.py 2>&1 | tail -3
 - `tests/scripts/{crt0.s,dadao.ld}`（现有 freestanding 启动/链接脚本，新测试大概率能直接复用）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**如实报告能跑通几个、卡住几个，不要挑软柿子凑数字**。
+
+---
+
+## 架构师复核（2026-07-15，ground-truth）：通过，含根因更正
+
+### 布线本身
+- `manifests/components.lock.toml` 加 `llvm-test-suite` 组件、pin 具体 commit（非 branch）；`.work/source/llvm-test-suite`/`gem5` 均确认 clean checkout 在正确 commit（`git status --short` 零输出）。
+- 独立重跑：`llvm-lit tests/lit/E2E/llvm-test-suite/` 3/3 PASS（`bitops`/`minint`/`arrayresolution`）；全 E2E 33/34（同一个已知无关的 `syscall_hello.test` 失败）；四方 AGREE(3-way)=200/Sail AGREE(4-way)=200，不回归；`manifest_check.py` PASS。
+- 未采用 llvm-test-suite 自带 CMake/lit 基础设施，遵照薄封装范式；未为让测试过而改 CodeGen/libc；5 个跑不通的用例未固化错误值为"预期"、未提交为 lit fixture——遵守约束。
+
+### 根因更正（架构师独立验证）
+subagent 把新发现的 miscompile 描述为"函数调用写全局后，调用点对该全局做位运算读到调用前旧值"，并列出多轮排除"调用相关"假设的过程。**架构师用零调用最小复现证明这个定性不成立**：
+```c
+static int acc = 5;
+int main(void) { return acc & 0xFF; }   // host=5  dadao=0（无任何 call）
+```
+反汇编显示 `ldbu rd31, rb8, 0`——从大端 4 字节 `acc` 的偏移 **0**（最高字节）读单字节，而非低字节所在的偏移 **3**。这是 narrow-load DAG combine 把 `(load i32) & 0xFF` 优化成"直接读最低字节"时，字节偏移选取按小端惯例默认 offset+0、未针对 DADAO 大端调整——与 DL-067b 修复的 BR_CC 大端 narrow-load bug是**同一大类缺陷的另一个独立触发点**，但与"是否发生过函数调用"无关。已更正 `issues.yaml` 的 id/标题/正文（`codegen-global-mask-after-call-miscompile`→`codegen-global-byte-mask-load-wrong-endian-offset`），保留 subagent 的原始发现路径记录（避免抹去有效的调查线索），补充架构师验证的真实根因 + 与 DL-067b 的关联指针，供后续任务参照排查方法直接复用。
+
+**判定**：通过，提交（含 issues.yaml 根因更正）。
