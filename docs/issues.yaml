@@ -753,3 +753,70 @@
   # 调用，返回值在调用后被大量后续运算使用）与 ML-004c 修的 CALL RegMask
   # 缺陷典型触发形态吻合，5 个独立输入值均验证双后端与 host 一致、无分
   # 歧。新增 lit 测试 `tests/lit/E2E/llvm-test-suite/sign_conversions.test`。
+
+- id: codegen-atomic-ops-unimplemented
+  title: "DADAO 后端从未实现原子操作 codegen（ATOMIC_FENCE/LOAD/STORE/LOAD_ADD/SWAP 均 Cannot select，ATOMIC_CMP_SWAP 降级到未实现的 libcall 路径）"
+  status: open
+  scope: [CodeGen]
+  blocks: [musl-pthread-phase-c]
+  resolved_by: null
+  # ML-010a（2026-07-17，subagent）给 musl 写 atomic_arch.h 前按任务要求
+  # 先探测：__sync_synchronize/__sync_fetch_and_add/__sync_lock_test_and_set/
+  # __sync_lock_release/__atomic_load_n 均在 SelectionDAG 阶段
+  # "Cannot select"，__sync_val_compare_and_swap 走到 "unsupported library
+  # call operation"（与 soft-float libcall 缺口同类）。架构师复核独立复现
+  # 三个探针（fetch_and_add/synchronize/CAS）报错逐字一致。范围广（5 类
+  # ATOMIC_* SDNode 全无 TargetLowering action/pattern），非一两个 pattern
+  # 能补，未修复。当前用非原子 load-modify-store 实现 atomic_arch.h 绕过
+  # （仅静态单线程阶段安全，ADR-0014 D5.2），真正解决必须在 pthread_create
+  # 多线程阶段（阶段C）前补齐，届时要么实现真 codegen，要么走 LL/SC 风格
+  # 内联汇编。
+
+- id: musl-inline-asm-empty-clobber-reg-alloc
+  title: "含 `asm volatile(\"\" ::: \"memory\")` 之类的纯 clobber（无输入/输出操作数）内联汇编在 DADAO 后端触发寄存器分配失败（couldn't allocate reg for constraint 'r'）"
+  status: open
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: null
+  # ML-009a/ML-010a（2026-07-17）编译 musl 全树时发现，两个独立触发点：
+  # `src/string/explicit_bzero.c`（ML-009a 先发现）、
+  # `src/env/__libc_start_main.c`（ML-010a 因 atomic_arch.h 补齐后才编译到
+  # 这一步，新曝光）。两处都是 musl 自带的"空 asm 内存屏障"惯用法（无真实
+  # 输入/输出寄存器约束，只有 clobber list），在其它成熟 target 上是无操作
+  # 编译期屏障，DADAO 后端的寄存器分配器却在没有真实操作数需要分配的情况
+  # 下报"couldn't allocate reg for constraint 'r'"——提示内联汇编操作数处理
+  # 路径本身有缺口，非 musl 代码问题。未修复，未根因定位。
+
+- id: musl-backend-assert-illegal-result-number
+  title: "musl `intscan.c`/`mallocng/donate.c` 编译时撞 SDNode::getValueType 断言 'ResNo < NumValues && \"Illegal result number!\"'"
+  status: open
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: null
+  # ML-010a（2026-07-17）atomic_arch.h 落地后这两个文件首次真正编译到这
+  # 一步（此前被 atomic_arch.h 缺失挡住）才曝光。未做根因定位，只记录触
+  # 发文件和断言文本，留给独立后端任务排查。
+
+- id: musl-backend-assert-node-already-inserted
+  title: "musl `setrlimit.c`/`res_query.c`/`vfwprintf.c` 编译时撞 ScheduleDAGSDNodes::BuildSchedUnits 断言 'N->getNodeId() == -1 && \"Node already inserted!\"'"
+  status: open
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: null
+  # ML-010a（2026-07-17）同上，atomic_arch.h 解锁后新曝光，未做根因定位。
+
+- id: musl-backend-assert-unanalyzable-fallthrough
+  title: "musl `regex/glob.c`/`regex/regcomp.c` 编译时撞 MachineBlockPlacement::buildCFGChains 断言 'Unexpected block with un-analyzable fallthrough!'"
+  status: open
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: null
+  # ML-010a（2026-07-17）同上，atomic_arch.h 解锁后新曝光，未做根因定位。
+
+- id: musl-backend-assert-instrinfo-unreachable
+  title: "musl `legacy/daemon.c` 编译时撞 UNREACHABLE executed at TargetInstrInfo.h:786"
+  status: open
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: null
+  # ML-010a（2026-07-17）同上，atomic_arch.h 解锁后新曝光，未做根因定位。
