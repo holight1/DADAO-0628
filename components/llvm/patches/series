@@ -32,3 +32,4 @@
 0032-dadao-indirect-call-rb0-fix.patch
 0033-br-cc-premature-combine-fix.patch
 0034-call-implicit-use-physreg-fix.patch
+0035-global-address-offset-asmprinter-fix.patch

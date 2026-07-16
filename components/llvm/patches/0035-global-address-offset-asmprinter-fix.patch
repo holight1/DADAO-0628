@@ -1,0 +1,71 @@
+From 778e62ed55f060a3b1843e9591feb6ca1d972776 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 16 Jul 2026 16:44:12 +0800
+Subject: [PATCH] target/dadao: fix MO_GlobalAddress offset dropped in
+ AsmPrinter (DL-068b)
+
+DADAOAsmPrinter::lowerToMCInst's MO_GlobalAddress case built a bare
+MCSymbolRefExpr from MO.getGlobal(), discarding MO.getOffset() entirely.
+Any MachineOperand carrying a nonzero global-address offset silently
+lowered to relocation addend 0.
+
+This surfaced as a real miscompile: `static int acc = 5; int main(void)
+{ return acc & 0xFF; }` returned 0 instead of 5 on DADAO (big-endian).
+The generic narrow-load DAG combine correctly narrows `(load i32) & 0xFF`
+to a single-byte load and correctly computes the big-endian byte address
+as `@acc + 3` (verified via -debug-only=dagcombine and -stop-after=
+finalize-isel MIR dump, both showing `@acc + 3` on the RELA_RIII/
+ADDI_RBRRII operands) -- the DAG combine and DataLayout::isBigEndian()
+query were never at fault. The +3 addend was carried correctly as
+GlobalAddressSDNode/MachineOperand offset all the way through instruction
+selection, then silently dropped in the final MC lowering step, so the
+emitted `rela`/`addi` pair resolved to address+0 (the high byte of the
+4-byte big-endian int) instead of address+3 (the low byte) -- landing on
+`ldbu rd31, rb8, 0` reading 0x00 instead of 0x05.
+
+Fix: emit MCBinaryExpr::createAdd(symbol, offset) when MO.getOffset() is
+nonzero, mirroring the standard pattern used by other backends' operand
+lowering.
+
+Verified: disassembly relocation addend now `.data+0x3`; minimal repro
+returns 5 on both QEMU and gem5. Additional discriminating probes (16-bit
+mask, high-byte-nonzero values, stack vars) all correct on both backends.
+align_strfn.test (DL-067b regression) still passes. Full E2E 33/34
+(known-unrelated syscall_hello.test failure), differential AGREE(3-way)
+=200/DIVERGE=0, Sail AGREE(4-way)=200 -- zero regression.
+---
+ llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+index 0fa2be971d83..af9d4557bc09 100644
+--- a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
++++ b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+@@ -95,11 +95,20 @@ private:
+       case MachineOperand::MO_Immediate:
+         MCOp = MCOperand::createImm(MO.getImm());
+         break;
+-      case MachineOperand::MO_GlobalAddress:
+-        MCOp = MCOperand::createExpr(
+-            MCSymbolRefExpr::create(
+-                getSymbol(MO.getGlobal()), OutContext));
++      case MachineOperand::MO_GlobalAddress: {
++        // MO.getOffset() carries byte-offset addends attached to the
++        // GlobalAddressSDNode (e.g. a big-endian narrow-load combine
++        // selecting a sub-word load at `@acc + 3` for `x & 0xFF` on a
++        // 4-byte int). Dropping it here silently truncated the addend to 0,
++        // making RELA_RIII/ADDI_RBRRII/LDBU_RRII resolve to the wrong byte.
++        const MCExpr *Expr =
++            MCSymbolRefExpr::create(getSymbol(MO.getGlobal()), OutContext);
++        if (int64_t Offset = MO.getOffset())
++          Expr = MCBinaryExpr::createAdd(
++              Expr, MCConstantExpr::create(Offset, OutContext), OutContext);
++        MCOp = MCOperand::createExpr(Expr);
+         break;
++      }
+       case MachineOperand::MO_JumpTableIndex:
+         MCOp = MCOperand::createExpr(
+             MCSymbolRefExpr::create(
+-- 
+2.43.0
+

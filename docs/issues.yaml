@@ -406,19 +406,17 @@
 
 - id: codegen-global-addr-const-offset-dropped
   title: "GlobalAddress 带非零编译期常量偏移（如 `@buf + 3`）物化为独立地址值时，RELA_LO addi 的低 12 位偏移量被丢弃——`*(buf+3)` 实际读到 buf[0]"
-  status: open
+  status: closed
   scope: [CodeGen]
-  blocks: null
-  resolved_by: null
+  blocks: []
+  resolved_by: DL-068b（与 codegen-global-byte-mask-load-wrong-endian-offset 是同一根因——DADAOAsmPrinter::lowerToMCInst 的 MO_GlobalAddress 分支丢弃 MO.getOffset()；架构师用本 issue 原始复现 `*(buf+3)` 独立验证 DL-068b 的修复后返回正确值 4，一并关闭）
   # DL-067b 构造 BR_CC 运行时判别探针时意外发现（2026-07-14）：
   # `static char buf[8]={1..8}; int main(){return *(buf+3);}` 在 QEMU 上
   # 返回 1（buf[0]）而非期望的 4（buf[3]）。反汇编显示
   # `rela rb8,1 / addi rb8,rb8,0`——低 12 位立即数是 0，没有把 GEP 常量
   # 偏移 3 编码进 `RELA_LO` fixup。garr_index.test 类场景（数组变量索引，
   # 运行时索引经 ADD 叠加）不撞这个坑；只有"编译期常量偏移直接折叠进
-  # GlobalAddress 的 offset 字段"这条路径受影响。与 DL-067b 的 BR_CC 修复
-  # 无关，未修复，留待后续任务定位 `lowerGlobalAddress`/`ADDI_RBRRII` 低
-  # 12 位 fixup 生成逻辑。
+  # GlobalAddress 的 offset 字段"这条路径受影响。
 
 - id: dadao-oz-undef-physreg
   title: "-O1+ 建 picolibc：`call` 的 implicit-use 寄存器列表覆盖 rd17-rd30 全范围而非仅实际参数寄存器，MachineVerifier 报 'Using an undefined physical register'"
@@ -474,10 +472,10 @@
 
 - id: codegen-global-byte-mask-load-wrong-endian-offset
   title: "-O0：对全局/静态 int 做窄化位运算（如 `x & 0xFF`）时，narrow-load combine 选取的字节偏移按小端假设（offset+0），但 DADAO 是大端——取到最高字节而非最低字节，值整体错误"
-  status: open
+  status: closed
   scope: [CodeGen]
   blocks: [llvm-test-suite-loop-call-accumulator]
-  resolved_by: null
+  resolved_by: DL-068b
   # ML-004a（llvm-test-suite SingleSource 布线，2026-07-15）先发现症状：5/8
   # 挑选的纯计算测试（crc8.le/crc16.be/popcount-clz-ctz/divrem loop/divtest）
   # 在 QEMU 上把「callee 写全局累加器 + 调用点对该全局做 `& 0xFF` 再
@@ -511,3 +509,24 @@
   # 哪个 DAG combine 产出了这个 narrow byte load，比照 DL-067b 的排查方法
   # （`-debug-only=dagcombine` 逐步追踪），确认 DADAO target 的
   # `isBigEndian()`/相关 hook 在这条 combine 路径上是否被正确查询。
+  #
+  # DL-068b（2026-07-16，subagent + 架构师复核，patch 0035）：**根因更正**
+  # ——不是 DAG combine 的问题。`-debug-only=dagcombine` + `-stop-after=
+  # finalize-isel` MIR 双重验证：narrow-load combine 和 DADAO 的
+  # `isBigEndian()` 查询都是**对的**，正确生成 `@acc + 3`（4 字节大端 int
+  # 的低字节偏移），并且这个 +3 一路正确携带到 RELA_RIII/ADDI_RBRRII 的
+  # MachineOperand（MIR 里能看到 `@acc + 3`）。真正丢失点在
+  # `DADAOAsmPrinter::lowerToMCInst` 的 `MO_GlobalAddress` 分支——只用
+  # `MO.getGlobal()` 建 `MCSymbolRefExpr`，完全没读 `MO.getOffset()`，把
+  # +3 静默丢成 0，导致 `rela`/`addi` 重定位 addend 恒为 0。修复：offset
+  # 非零时用 `MCBinaryExpr::createAdd` 把 offset 加进符号表达式。验证：
+  # 最小复现 exit=5（QEMU/gem5 一致）；补充判别性探针（`& 0xFFFF`、高位非零
+  # 值、栈变量、`short` 窄化）全部双后端正确；`align_strfn.test`
+  # （DL-067b 回归）不受影响；全 E2E 33/34（同一已知 syscall_hello.test
+  # 失败）、差分 AGREE(3-way)=200/DIVERGE=0、Sail AGREE(4-way)=200，零回归。
+  # 重跑 ML-004a 跳过的 5 个用例：**divrem_loop 现在端到端跑通**（QEMU=
+  # gem5=期望值，此前受本 bug 阻塞）；其余 4 个（crc8_le/crc16_be/
+  # popcount-clz-ctz/divtest）仍不过，但故障形态已变化——3 个稳定触发
+  # MALIGN（exit 0x81，QEMU/gem5 一致）、1 个（divtest）产出双后端一致但
+  # 数值错误的结果，均与本 bug 无关，是独立的、尚未定位的 CodeGen 缺口
+  # （未展开排查，超出本任务范围，未新开 issue——留给后续任务视需要立项）。
