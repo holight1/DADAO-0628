@@ -24,9 +24,25 @@ def main() -> int:
     source_root.mkdir(parents=True, exist_ok=True)
     for component in enabled:
         target = source_root / component["name"]
-        if not target.exists():
+        freshly_cloned = not target.exists()
+        if freshly_cloned:
             run("git", "clone", "--filter=blob:none", "--no-checkout",
                 component["repository"], str(target))
+            # A `--no-checkout` clone's HEAD points at the remote's default
+            # branch tip, not the pinned commit -- and that tip is almost
+            # always a *descendant* of the pin, so the "already patched"
+            # ancestor check below would false-positive and skip the
+            # checkout entirely, leaving the working tree empty and HEAD on
+            # the wrong commit (found while enabling musl in ML-009a: a
+            # fresh clone's dirty-check used to fire first and mask this).
+            # There cannot be any patch commits applied yet in a clone this
+            # same call just created, so go straight to the pinned commit.
+            run("git", "fetch", "--no-tags", "origin", component["commit"],
+                cwd=target)
+            run("git", "checkout", "--detach", component["commit"], cwd=target)
+            print(f"fetch: {component['name']} -> {component['commit']}")
+            continue
+
         dirty = subprocess.check_output(
             ["git", "-C", str(target), "status", "--porcelain=v1"], text=True
         )
