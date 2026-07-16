@@ -236,11 +236,24 @@ a subagent that owns the gem5 component, not DS):
      `gem5-sign-conversions-backend-divergence`) turned out to already be
      fixed incidentally by ML-004c, re-verified with multiple independent
      inputs to rule out coincidence.
-   - ML-004e (next): lock the `llvm-test-suite/` directory in as a
-     `make check-suite`-style gate (not part of `make check`, same pattern as
-     `check-golden`/`check-legality`), then keep expanding the SingleSource
-     pure-compute slice as a cheap, no-libc-needed way to keep surfacing
-     CodeGen gaps ahead of the musl-gated full gcc-c-torture run.
+   - **ML-004e (2026-07-16) — done. Confirmed already covered, no new gate
+     built.** Checked whether a separate `make check-suite`-style target was
+     actually needed (as this list originally speculated) before building
+     one. Finding: `tests/lit/E2E/llvm-test-suite/` is a plain subdirectory
+     of `tests/lit/E2E/`, `tests/lit/E2E/lit.cfg` has no `config.excludes` or
+     path-restricting glob, and lit recurses into subdirectories by default
+     — so `llvm-lit tests/lit/E2E/` (the existing, only E2E entry point;
+     there is no CI script or workflow file in this repo that separately
+     globs `.test` files) already discovers and runs all 23
+     `llvm-test-suite/*.test` cases as part of the same 54/54 run. Building
+     a parallel `check-suite` target would have just re-run the identical
+     command under a new name. Per the task's explicit instruction not to
+     manufacture redundant machinery, no Makefile change was made; this
+     entry (plus ADR-0012 D4) is the documentation lock-in instead —
+     `llvm-test-suite/` is regular T2 E2E regression, not experimental/
+     optional content. `make check` itself is unaffected (E2E has always
+     run via the independent `llvm-lit` command, never through `make
+     check`). Continue expanding the SingleSource pure-compute slice per D4.
 
 This list is a plan, not a contract — findings at any step may re-scope later
 steps. Progress and any re-scoping is tracked in the task files

@@ -57,6 +57,8 @@ ADR-0007 定了**向量怎么设计**（独立预期值、五类向量、两条 
 
 **时序**：核心 CodeGen 补完（select→函数指针→memcpy→struct 返回）→ clang 集成 → 最小 musl+syscall → 先跑 **SingleSource 纯计算子集**（无 libc I/O，只算+返回值，能上 QEMU/gem5 退出码 harness，双后端一致性）→ 最后全量带 libc（QEMU 主、gem5 抽检）。**不用 llvm-test-suite 当近期门槛**。
 
+**`llvm-test-suite/` 子目录 = 常规 T2 E2E 回归的一部分，不是实验性内容**（ML-004e，2026-07-16 确认）：`tests/lit/E2E/llvm-test-suite/` 就是 `tests/lit/E2E/` 下的普通子目录，`tests/lit/E2E/lit.cfg` 没有 `config.excludes` 或限定路径的 glob，lit 默认递归子目录——所以现有唯一 E2E 入口 `llvm-lit tests/lit/E2E/` 已经把它跟其余用例一起跑（当前 54/54，含 `llvm-test-suite/` 下 23/23）。本仓库没有另外的 CI workflow/脚本会用不递归的 glob 单独跑 E2E。确认后未新增 `make check-suite` 之类的并行 target（会是对同一条命令的重复封装）；`make check` 本身不含 E2E（结构性检查，E2E 走独立的 `llvm-lit` 命令），不受影响。
+
 ### D5：终极目标 = gcc-c-torture 全量通过，失败必有明确理由（2026-07-16 用户定，参照旧 toolchain 先例）
 
 **用户目标**：C 的全量测试通过；不通过的必须有明确且合理的理由。

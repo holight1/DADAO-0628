@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（构建脚本/门禁基础设施）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核，确认现状已覆盖，未新增冗余门禁）
 
 **前置**：ML-004a-d 已完成，`tests/lit/E2E/llvm-test-suite/` 目录 23/23、全 E2E 54/54 全部真通过（零已知失败）。
 
@@ -40,3 +40,11 @@ make check 2>&1 | tail -5             # 确认 make check 本身不受影响（l
 - `Makefile`（现有 `check`/其它 target 的定义，判断是否需要小改动）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**如实报告现状是否已覆盖，不要为了有产出而制造不必要的新脚本**。
+
+---
+
+## 架构师复核（2026-07-16，ground-truth）：通过
+
+调查结论正确：`tests/lit/E2E/llvm-test-suite/` 是 `tests/lit/E2E/` 的普通子目录，lit 默认递归，唯一 E2E 入口 `llvm-lit tests/lit/E2E/` 已经覆盖（独立验证 54/54）；仓库内无其它用不递归 glob 单独跑 E2E 的 CI 脚本；`make check` 本身不含 E2E（结构性检查），不受影响。正确判断"无需新增机制"，只补充了 ADR-0012 D4 + development-roadmap.md 的说明性文字，没有制造冗余脚本——符合任务对"轻量确认性质"的要求。
+
+**判定**：通过，提交。
