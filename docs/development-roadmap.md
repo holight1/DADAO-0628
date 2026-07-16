@@ -200,17 +200,25 @@ a subagent that owns the gem5 component, not DS):
      plus full differential+E2E re-verification). The other 2 failures are 3
      independently-tracked, not-yet-investigated issues (a switch-dispatch
      MALIGN, a no-call wrong-value bug, and a QEMU/gem5 backend divergence).
-   - **First-round pass report**: 12 pass / 10 fail, all failures now
-     attributed to 4 tracked issues (not a pass-rate number to chase blindly
-     — the point of this milestone is surfacing real gaps, per ADR-0012 D4).
-   - **ML-004c (in progress, dispatched 2026-07-16)**: fix
-     `codegen-call-clobbers-gprb-not-declared` (highest leverage — closes
-     8/10 current failures) with full regression re-verification (this one
-     touches register allocation for every call site, so the task requires
-     a full differential + E2E run, not a sampled subset).
-   - ML-004d: once the known gaps are triaged down, lock in as a
-     `make check-suite`-style gate (not part of `make check`, same pattern as
-     `check-golden`/`check-legality`).
+   - **ML-004c (2026-07-16) — done. ★ 20/20 in `tests/lit/E2E/llvm-test-suite/`.**
+     Fixed `codegen-call-clobbers-gprb-not-declared`: `LowerCall` now attaches
+     a `RegMask` from `getCallPreservedMask()` to the CALL SDNode (standard
+     LLVM pattern), closing 8 of the 10 outstanding failures at once. Found
+     and fixed a second latent bug in the process: `storeRegToStackSlot`/
+     `loadRegFromStackSlot` routed GPRB (address-bank) spills through the
+     RD-bank encoding (silently corrupting the register index) — never
+     triggered before because nothing had ever forced the allocator to
+     spill a live-across-call GPRB value until this fix made that happen for
+     the first time. Full differential + E2E re-verified (broad change,
+     touches every call site) — zero regression.
+   - The other 2 of the original 10 failures are still open, independently
+     tracked, not yet investigated: `codegen-switch-dispatch-malign-in-callee`,
+     `codegen-misha-sum-wrong-value-no-call`, `gem5-sign-conversions-backend-divergence`
+     (3 issues, since one ML-004b test hit 2 at once isn't the case — see
+     issues.yaml for exact mapping).
+   - ML-004d (next): triage the remaining 3 issues; once clear, lock the
+     `llvm-test-suite/` directory in as a `make check-suite`-style gate (not
+     part of `make check`, same pattern as `check-golden`/`check-legality`).
 
 This list is a plan, not a contract — findings at any step may re-scope later
 steps. Progress and any re-scoping is tracked in the task files
@@ -251,7 +259,6 @@ sequencing, per ADR-0012 D5:
 
 ## Deferred Milestones
 
-- `codegen-call-clobbers-gprb-not-declared` (ML-004c in progress — see above).
 - `codegen-switch-dispatch-malign-in-callee`, `codegen-misha-sum-wrong-value-no-call`,
   `gem5-sign-conversions-backend-divergence` (3 more real gaps found expanding
   the llvm-test-suite slice in ML-004b, not yet investigated).
