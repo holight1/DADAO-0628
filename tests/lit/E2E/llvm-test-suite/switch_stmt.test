@@ -1,0 +1,14 @@
+// llvm-test-suite SingleSource slice (ADR-0012 D4, ML-004d). See
+// Inputs/switch_stmt.c header for upstream provenance + full root-cause
+// writeup. Previously failed with a MALIGN fault (0x81) inside the switch-
+// dispatch callee on both backends (codegen-switch-dispatch-malign-in-
+// callee, ML-004b); root-caused and fixed by ML-004d (two same-section MC/
+// AsmBackend fixup bugs — FK_Data_8 ignoring IsResolved, rela_page/rela_lo's
+// same-section fast path using an unsound formula — plus a BRIND rb0-misuse
+// bug in JUMP_RRII lowering, same family as codegen-indirect-call-rb0-
+// misuse/DL-066a but for jump tables instead of indirect calls).
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -nostdlib -Wl,-T,%S/../../../scripts/dadao.ld %t.crt0.o %S/Inputs/switch_stmt.c -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 119'
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 119'

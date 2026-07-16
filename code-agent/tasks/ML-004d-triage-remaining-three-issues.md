@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（CodeGen/gem5 排查）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核，★★ 全 E2E 54/54 = 100% 通过，含补关闭一个更早的老 issue）
 
 **前置**：ML-004a/b/c 已完成，`tests/lit/E2E/llvm-test-suite/` 目录 20/20 全通过。ML-004b 扩充覆盖时另外发现的 3 个独立、尚未排查的失败用例仍是 open：`codegen-switch-dispatch-malign-in-callee`、`codegen-misha-sum-wrong-value-no-call`、`gem5-sign-conversions-backend-divergence`（均在 `docs/issues.yaml`）。
 
@@ -44,3 +44,21 @@ llvm-lit -v tests/lit/E2E/llvm-test-suite/ 2>&1 | tail -30
 - `.work/source/llvm-test-suite/SingleSource/`（原始测试源码）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**严格遵守不碰 patch/git 历史的约束**。
+
+---
+
+## 架构师复核（2026-07-16，ground-truth）：通过 —— ★★ 全 E2E 100% 通过
+
+### 硬性约束遵守情况
+- `.work/llvm` git log 确认干净 additive 提交（`d324a5db0956`，在 `ab11cbd8e94e` ML-004c 之上），无 rebase/am/reset。
+
+### 独立验证
+- 全新 `ninja` 重建；`llvm-lit tests/lit/E2E/`：**54/54 全部真 PASS**（含 `syscall_hello.test`——这是本 session 从很早期就开放的一个"无关既有缺陷"，从未被本轮任何任务当作目标，这次是真正的意外之喜）。
+- `tests/lit/E2E/llvm-test-suite/`：23/23（20 既有 + 3 新增）。
+- 四方 AGREE(3-way)=200/Sail AGREE(4-way)=200，不回归。`manifest_check.py`/`check_issues.py` 均 PASS。
+- 代码审阅：`DADAOAsmBackend.cpp` 的修复方向是**删除一个此前（ML-003j/patch 0030）添加的、事后证明不健全的"同 section 快路径"优化**，改为始终走真实 ELF relocation（与早已验证过的跨 section/全局变量路径完全一致）——这是简化而非增加复杂度，对正确性是好事。`JUMP_PSEUDO_INDIRECT` 的修复严格镜像 `CALL_PSEUDO_INDIRECT`（DL-066a）的 rd2rb桥接scratch RB5 手法，一致性好。
+
+### 遗漏补齐
+subagent 报告里提到"顺带修复了 syscall_hello.test"，但只在对话报告里说明，未更新 `docs/issues.yaml` 里对应的老 issue `syscall-hello-write-output-missing`（这是本 session 很早期发现、非本任务分配范围内的 issue）——架构师已补充关闭，注明根因关联。
+
+**判定**：通过，提交。★★ **全部 E2E 测试 100% 通过（54/54），无任何已知失败**——这是 DADAO-0628 项目自创立以来首次达成"零已知失败"的状态。

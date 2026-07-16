@@ -313,10 +313,10 @@
 
 - id: syscall-hello-write-output-missing
   title: "syscall_hello.test：exit=42 正确但 SYS_write 的 hi\\n 输出完全缺失（连垃圾字节都没有），QEMU stdout 只有 monitor 启动 banner"
-  status: open
+  status: closed
   scope: [QEMU]
-  blocks: null
-  resolved_by: null
+  blocks: []
+  resolved_by: ML-004d（架构师复核确认为"副作用修复"：ML-004d 修的三个 MC/CodeGen 同 section fixup bug 之一——`FK_Data_8`/`rela_page`/`rela_lo` 的同 section 快速路径丢弃必要重定位——`syscall_hello.test` 恰好是单文件内 `rela rb8,msg_data` 引用同 section 符号，撞上同一根因。修复后独立验证 PASS，`msg_data` 地址正确、"hi" 输出正确出现。全 E2E 51/51→54/54(随后 ML-004d 又新增3个测试)真正达成 100% 通过。
   # 架构师在 DG-007b/DL-066a 复核阶段发现（2026-07-14）：全 E2E 从 29/29 变成
   # 29/30（新增 indirect_call.test 之后），syscall_hello.test 是这次唯一失败
   # 项。已用 `git stash` 确认在两个修复之前的干净提交树上独立复现同样失败——
@@ -662,31 +662,94 @@
 
 - id: codegen-switch-dispatch-malign-in-callee
   title: "ML-004b 扩充测试 switch_stmt：故障（MALIGN 0x81，双后端一致）发生在 switch-dispatch 的被调用函数内部，疑似独立于 codegen-call-clobbers-gprb-not-declared 的跳转表相关缺陷"
-  status: open
+  status: closed
   scope: [CodeGen]
   blocks: null
-  resolved_by: null
+  resolved_by: ML-004d
   # ML-004b（2026-07-16，subagent）扩充覆盖时发现，未展开根因排查（任务
   # 范围内标注为"likely a distinct, uninvestigated jump-table issue"）。
   # 与 codegen-call-clobbers-gprb-not-declared 的区别：那批故障都在
   # "调用返回之后"，这次故障在被调用函数内部本身。留待后续任务定位。
+  #
+  # ML-004d（2026-07-16）根因：**三个**独立缺陷叠加，jump table 是仓库里
+  # 第一个"同 .text section 内引用同 section 符号"的构造（此前 rela/
+  # addi_rb 全部用于访问 .data 段全局变量，跨 section，从未走到下列同
+  # section 短路分支）：
+  # (1) DADAOAsmBackend::applyFixup 的 FK_Data_8（`.quad LBBn` 跳转表条目）
+  #     分支：符号"已定义 + 同 section"时无条件直接写 Value（未经检查
+  #     IsResolved），但对非 PC-relative fixup，MCAssembler::evaluateFixup
+  #     算出的 IsResolved=Target.isAbsolute()——只要涉及符号就是 false，
+  #     Value 只是符号在本 section 内的预链接偏移（不是最终绝对地址）。
+  #     结果：跳转表 `.quad` 条目被写成 (目标块偏移-函数偏移) 而非真绝对
+  #     地址（真实复现：本该是 0x80000054 却写成 0x4c）。修复：只有真正
+  #     IsResolved（无符号纯常量）才直接写，否则一律走 maybeAddReloc，让
+  #     链接器用 R_DADAO_ABS64 计算真实地址（和跨 section 全局变量场景
+  #     一致的路径，早已验证正确）。
+  # (2) fixup_dadao_rela_page/rela_lo 的"同 section 快速路径"（ML-003j
+  #     引入，patch 0030，动机是排查另一个 vfprintf.c 问题、最终未采用其
+  #     诊断路径而是 ML-003k 修的 dead-block 问题——这条快速路径本身从未
+  #     被真正验证过端到端正确性）：用于计算跳转表**自身基址**（`rela
+  #     rb8,.LJTI0_0`/`addi rb8,rb8,.LJTI0_0`，测试函数引用嵌在自己内部
+  #     的跳转表数据）。该公式对 PC-relative 页对齐（&~0xFFF 掩码）和低
+  #     12 位在跨多个目标文件链接（如 crt0.o 贡献的若干字节）时不是
+  #     line-invariant 的（不同于 call24/branch18/branch12 的纯差值计算，
+  #     掩码操作对外部固定位移不封闭）；且原公式本身代数有误（"+4"错误
+  #     叠加）。真实复现：imm18 算成 -1（应为 0）。修复：同样一律走
+  #     maybeAddReloc，交给已验证正确的链接器 R_DADAO_RELA_PAGE/RELA_LO
+  #     handler（lld/ELF/Arch/DADAO.cpp）用真实最终地址计算。
+  # (3) BRIND（switch 跳转表分派本身的间接跳转）复用了与
+  #     codegen-indirect-call-rb0-misuse（DL-066a）同一家族的 rb0 误用：
+  #     `jump rbha,rdhb,imm12` 对 rbha=rb0 特殊定义为"相对跳转"（非"零基
+  #     址"），旧 Pat 直接 `(JUMP_RRII RB0, GPRD:$target, 0)` 把跳转表读出
+  #     的绝对地址当成相对偏移叠加到 PC+4 上。修复：仿 DL-066a 引入
+  #     JUMP_PSEUDO_INDIRECT 伪指令，expandPostRAPseudo 里用 rd2rb 桥先把
+  #     绝对地址物化进 scratch RB5，再 `jump rb5, rd0, 0`（base=绝对地址，
+  #     offset=rd0=硬连线零）。
+  #
+  # 三处均在 `.work/llvm`：DADAOAsmBackend.cpp（FK_Data_8 + rela_page/
+  # rela_lo）、DADAOInstrInfo.td/.cpp（JUMP_PSEUDO_INDIRECT）。验证：
+  # `switch_stmt.c`（真实 upstream 源码改编，8-case switch + jump table）
+  # 双后端 exit=119=host；反汇编确认跳转表条目为真绝对地址、`rela rb8,0`/
+  # `addi rb8,rb8,376` 正确算出表基址 0x80000178。**意外连带修复**：长期
+  # 已知无关失败 `syscall_hello.test`（同样是同 section rela 引用，仅
+  # 单目标文件、无 crt0.o 前缀）现在也真正通过——E2E 50/51→51/51。全量
+  # 回归：四方 AGREE(3-way)=200/DIVERGE=0、Sail AGREE(4-way)=200 不变。
+  # 新增 lit 测试 `tests/lit/E2E/llvm-test-suite/switch_stmt.test`。
 
 - id: codegen-misha-sum-wrong-value-no-call
   title: "ML-004b 扩充测试 misha_sum：热循环内无函数调用，host=1/dadao=2，与 codegen-call-clobbers-gprb-not-declared 无关的独立数值错误"
-  status: open
+  status: closed
   scope: [CodeGen]
   blocks: null
-  resolved_by: null
+  resolved_by: ML-004c
   # ML-004b（2026-07-16，subagent）扩充覆盖时发现，未展开根因排查（明确
   # 排除了"函数调用后 GPRB 陈旧值"这条已知根因，因为热循环内根本没有调用）。
+  #
+  # ML-004d（2026-07-16）重跑确认：现行工具链（ML-004c 之后）双后端与
+  # host 一致（用原始 NUM=2 复现 host=QEMU=gem5=1；另用 NUM=5 换填充模式
+  # 复现 host=QEMU=gem5=35，排除巧合）。**已被 ML-004c 顺带修好**——原始
+  # triage 的"热循环内无调用"观察本身准确，但没有排除"整个复现用例"里
+  # main()→sum() 的调用本身（携带 GPRB 指针参数、返回后继续用）正是
+  # ML-004c 修的 CALL RegMask 缺陷的典型触发形态；循环体自己没有 call 不
+  # 代表整个函数调用边界没有踩中同一根因。新增 lit 测试
+  # `tests/lit/E2E/llvm-test-suite/misha_sum.test`。
 
 - id: gem5-sign-conversions-backend-divergence
   title: "ML-004b 扩充测试 sign_conversions：QEMU PASS，gem5 SIGABRT（page fault @ addr 0）——双后端分歧，未定位"
-  status: open
+  status: closed
   scope: [gem5, CodeGen]
   blocks: null
-  resolved_by: null
+  resolved_by: ML-004c
   # ML-004b（2026-07-16，subagent）扩充覆盖时发现，未展开根因排查。按
   # ADR-0012 方法论，双后端分歧本身就是 bug 信号（QEMU/gem5 只要有一个不
   # 一致，说明其中至少一个有真实缺陷，需要专门任务用 gem5
   # --debug-flags=Exec 或 gdbstub 定位故障 PC/寄存器态）。
+  #
+  # ML-004d（2026-07-16）重跑确认：现行工具链（ML-004c 之后）双后端一致
+  # 且与 host 匹配（用 upstream 原始 0x80 输入复现 host=QEMU=gem5=55；另
+  # 用 0x01/0xFF/0x7F/0x55 四个独立输入值排除巧合，全部三方一致）。**已被
+  # ML-004c 顺带修好**——未独立复现原始 SIGABRT（原报告没留下可复现的具
+  # 体崩溃现场之外的信息），但复现用例的结构（getSC()/getUC() 两次函数
+  # 调用，返回值在调用后被大量后续运算使用）与 ML-004c 修的 CALL RegMask
+  # 缺陷典型触发形态吻合，5 个独立输入值均验证双后端与 host 一致、无分
+  # 歧。新增 lit 测试 `tests/lit/E2E/llvm-test-suite/sign_conversions.test`。

@@ -1,0 +1,239 @@
+From d324a5db09565d8cb46fc69463c91c6648d45215 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 16 Jul 2026 21:56:40 +0800
+Subject: [PATCH] target/dadao: fix jump-table dispatch MALIGN (same-section MC
+ fixup + BRIND rb0 misuse) (ML-004d)
+
+Three independent bugs, all first exposed by switch-statement jump-table
+dispatch (the first construct to reference same-.text-section symbols from
+same-.text-section code; all prior rela/addi_rb usage was cross-section,
+for .data globals):
+
+1. DADAOAsmBackend::applyFixup's FK_Data_8 (.quad label) case ignored
+   IsResolved and unconditionally wrote the raw pre-link section-relative
+   Value whenever the symbol was 'defined and same-section', silently
+   dropping the relocation needed for the linker to add the section's
+   final base address. Fixed by honoring IsResolved like every other
+   fixup kind here.
+
+2. fixup_dadao_rela_page/rela_lo's same-section fast path (added in
+   ML-003j/patch 0030 while chasing an unrelated vfprintf.c bug that
+   turned out to be fixed differently by ML-003k) used an unsound formula:
+   page-masking and low-12-bits extraction are not invariant under a
+   constant shift contributed by other object files sharing the final
+   section (unlike the pure-delta call24/branch18/branch12 fast paths,
+   which are), and the arithmetic itself double-counted a '+4' offset.
+   Fixed by always deferring to a real relocation, exactly as the
+   long-verified cross-section (global variable) path already does.
+
+3. BRIND (jump-table indirect branch) lowering used JUMP_RRII with RB0
+   directly as the base register, hitting the same rb0-misuse hazard as
+   codegen-indirect-call-rb0-misuse (DL-066a) for CALL_PSEUDO_INDIRECT:
+   rbha=rb0 means 'PC+4-relative', not 'zero base' (spec Sec5.3). Fixed
+   with a JUMP_PSEUDO_INDIRECT pseudo mirroring CALL_PSEUDO_INDIRECT's
+   rd2rb-bridge-into-scratch-RB5 fix.
+
+Verified with a real upstream llvm-test-suite switch statement
+(SingleSource/UnitTests/Integer/switch.c) compiled through clang -> llc ->
+lld, matching host gcc -O0 on both QEMU and gem5 (exit 119). Incidentally
+also fixes the previously-broken syscall_hello.test (same same-section
+rela bug, single object file). E2E 51/51 (up from 50/51), differential
+AGREE(3-way)=200/DIVERGE=0, Sail AGREE(4-way)=200 -- no regression.
+---
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp      | 18 ++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       | 25 +++++-
+ .../DADAO/MCTargetDesc/DADAOAsmBackend.cpp    | 83 ++++++++++++-------
+ 3 files changed, 92 insertions(+), 34 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index 610da12f966c..72791aff740c 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -191,6 +191,24 @@ bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+     MI.eraseFromParent();
+     return true;
+   }
++  case DADAO::JUMP_PSEUDO_INDIRECT: {
++    // Same rb0-misuse hazard as CALL_PSEUDO_INDIRECT above, for BRIND
++    // (jump-table dispatch): the jump-table entry in MI.getOperand(0) is
++    // an absolute block address, but `jump rbha, rdhb, imm12` special-
++    // cases rbha=rb0 as "relative" (target = rbha+rdhb+imm12, spec §5.3),
++    // not "zero base" — using rb0 directly would compute PC+4+target.
++    // Bridge the absolute address into scratch RB5 via rd2rb, then jump
++    // with base=RB5 (absolute address), offset=rd0 (hardwired zero).
++    BuildMI(MBB, MI, DL, get(DADAO::RD2RB_ORRI), DADAO::RB5)
++        .addReg(MI.getOperand(0).getReg())
++        .addImm(1);
++    BuildMI(MBB, MI, DL, get(DADAO::JUMP_RRII))
++        .addReg(DADAO::RB5)
++        .addReg(DADAO::RD0)
++        .addImm(0);
++    MI.eraseFromParent();
++    return true;
++  }
+   }
+   return false;
+ }
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 436289b17fe3..fc58ecb82205 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -147,6 +147,26 @@ let isCall = 1,
+ def CALL_PSEUDO_INDIRECT : InstDADAO<(outs), (ins GPRD:$reg), "", []>;
+ def : Pat<(DADAOcall GPRD:$reg), (CALL_PSEUDO_INDIRECT GPRD:$reg)>;
+ 
++// Indirect-jump pseudo (BRIND, i.e. jump-table dispatch): same rb0-misuse
++// hazard as CALL_PSEUDO_INDIRECT above (see ML-004d / codegen-switch-
++// dispatch-malign-in-callee) — `jump rbha, rdhb, imm12` special-cases
++// rbha=rb0 as "relative jump" (spec §5.3: target = rbha[47:0] + rdhb[47:0]
++// + imm12), but the jump-table entry loaded into $reg is already an
++// absolute block address, not an offset from PC+4. Using RB0 directly as
++// rbha (as the old plain-JUMP_RRII Pat did) computed PC+4+target instead
++// of target. Same fix as CALL_PSEUDO_INDIRECT: expandPostRAPseudo bridges
++// the absolute address into scratch RB5 via rd2rb, then emits a real
++// `jump rb5, rd0, 0` (base=absolute address, offset=rd0=hardwired zero).
++let isBranch = 1,
++    isIndirectBranch = 1,
++    isTerminator = 1,
++    isBarrier = 1,
++    isPseudo = 1,
++    isCodeGenOnly = 1,
++    Size = 0 in
++def JUMP_PSEUDO_INDIRECT : InstDADAO<(outs), (ins GPRD:$reg), "", []>;
++def : Pat<(DADAObrind GPRD:$target), (JUMP_PSEUDO_INDIRECT GPRD:$target)>;
++
+ // FrameIndex pseudo-instructions (PEI resolves to real LDO/STO).
+ // The $fi operand holds the FrameIndex index, resolved by eliminateFrameIndex.
+ // $imm12 holds the GEP/add constant (0 for direct FrameIndex references).
+@@ -363,10 +383,9 @@ def : Pat<(DADAOBrnz GPRD:$val, bb:$target), (BRNZ_RIII GPRD:$val, bb:$target)>;
+ def : Pat<(DADAOBrp  GPRD:$val, bb:$target), (BRP_RIII  GPRD:$val, bb:$target)>;
+ def : Pat<(DADAOBrnp GPRD:$val, bb:$target), (BRNP_RIII GPRD:$val, bb:$target)>;
+ 
+-// BRIND via GPRD register → JUMP_RRII (real instruction, for jump tables)
+-def : Pat<(DADAObrind GPRD:$target),       (JUMP_RRII RB0, GPRD:$target, 0)>;
++// BRIND lowering (JUMP_PSEUDO_INDIRECT) defined above near CALL_PSEUDO_INDIRECT.
+ 
+-// Jump table address: rela + addi_rb(lo) → RB base  
++// Jump table address: rela + addi_rb(lo) → RB base
+ def : Pat<(DADAOjt_addr tjumptable:$jt),
+           (ADDI_RBRRII (RELA_RIII tjumptable:$jt), tjumptable:$jt)>;
+ 
+diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+index e8bbbd38b42d..a3f330130ce6 100644
+--- a/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
++++ b/llvm/lib/Target/DADAO/MCTargetDesc/DADAOAsmBackend.cpp
+@@ -97,59 +97,80 @@ public:
+       return;
+     }
+ 
++    // rela_page/rela_lo: unlike call24/branch18/branch12 above (pure
++    // PC-relative deltas — invariant under any constant shift contributed
++    // by *other* object files placed in the same final section, since a
++    // subtraction cancels a uniform shift exactly), rela_page needs a
++    // *masked* (page-aligned) absolute address and rela_lo needs the raw
++    // absolute low-12-bits — neither is invariant under an external shift
++    // from other objects (e.g. crt0.o contributing a few bytes ahead of
++    // this object's own .text), because masking/low-bits are not linear
++    // in the same way subtraction is. A same-object "same section" fast
++    // path computed purely from this translation unit's own local layout
++    // is therefore unsound in general whenever the final section is
++    // assembled from multiple object files — confirmed via jump-table
++    // dispatch (test() computing rb8 = &.LJTI0_0, both living in the same
++    // .text section as the reference, but in a *different* object than
++    // crt0.o which precedes it in the link): the previous same-section
++    // fast path baked in imm18=-1 instead of 0 for rela_page and a wrong
++    // low-12 immediate for rela_lo, corrupting the runtime jump-table-base
++    // computation (ML-004d / codegen-switch-dispatch-malign-in-callee).
++    // Always defer to a real ELF relocation instead — the linker's own
++    // R_DADAO_RELA_PAGE/R_DADAO_RELA_LO handlers (lld/ELF/Arch/DADAO.cpp)
++    // already compute this correctly from true final addresses, exactly
++    // as they do for the long-verified cross-section (global variable)
++    // case; this fixup kind is inherently symbolic in practice (a
++    // jump-table/global/constant-pool address), so the `IsResolved`
++    // (pure-constant, no-symbol) branch below is a defensive fallback
++    // that is not expected to be hit by real DADAO codegen.
+     if (Kind == DADAO::fixup_dadao_rela_page) {
+-      const MCSymbol *Sym = Target.getAddSym();
+-      const MCSection *FixupSec = F.getParent();
+-      const MCSection *SymSec =
+-          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
+-                                      : nullptr;
+-      if (!IsResolved &&
+-          (!SymSec || SymSec != FixupSec || (Sym && Sym->isUndefined()))) {
++      if (!IsResolved) {
+         Value = 0;
+         maybeAddReloc(F, Fixup, Target, Value, IsResolved);
+         return;
+       }
+-      // Either resolved, or same-section (relative offset is fixed):
+-      // compute the page-aligned PC-relative offset and encode directly.
+-      int64_t TargetAddr = static_cast<int64_t>(Value) + Fixup.getOffset() + 4;
+-      int64_t Aligned = TargetAddr & ~0xFFFULL;
+-      int64_t Imm = static_cast<int64_t>(Aligned) - static_cast<int64_t>(Fixup.getOffset() + 4);
+-      int64_t Imm18 = Imm >> 12;
+-      uint32_t Mask = 0x3FFFF; 
++      int64_t Aligned = static_cast<int64_t>(Value) & ~0xFFFLL;
++      int64_t Imm18 = Aligned >> 12;
++      uint32_t Mask = 0x3FFFF;
+       uint32_t Enc = (Imm18 & Mask) | (support::endian::read32be(Data) & ~Mask);
+       support::endian::write32be(Data, Enc);
+       return;
+     }
+ 
+     if (Kind == DADAO::fixup_dadao_rela_lo) {
+-      const MCSymbol *Sym = Target.getAddSym();
+-      const MCSection *FixupSec = F.getParent();
+-      const MCSection *SymSec =
+-          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
+-                                      : nullptr;
+-      if (!IsResolved &&
+-          (!SymSec || SymSec != FixupSec || (Sym && Sym->isUndefined()))) {
++      if (!IsResolved) {
+         Value = 0;
+         maybeAddReloc(F, Fixup, Target, Value, IsResolved);
+         return;
+       }
+-      // Same-section or resolved: compute low 12 bits of PC-relative offset
+-      int64_t Imm12 = static_cast<int64_t>(Value) + Fixup.getOffset() + 4;
+-      Imm12 = Imm12 & 0xFFF;
++      int64_t Imm12 = static_cast<int64_t>(Value) & 0xFFF;
+       uint32_t Mask = 0xFFF;
+       uint32_t Enc = (Imm12 & Mask) | (support::endian::read32be(Data) & ~Mask);
+       support::endian::write32be(Data, Enc);
+       return;
+     }
+ 
+-    // Generic FK_Data_8: 64-bit absolute data (function pointers, etc.)
++    // Generic FK_Data_8: 64-bit absolute data (function pointers, jump-table
++    // entries, etc.). Unlike the PC-relative fixups above (call24/branch*/
++    // rela_page/rela_lo), an absolute pointer's final value depends on the
++    // link-time base address of the section it lives in — that is NOT
++    // known during this translation unit's assembly, even when the
++    // referenced symbol happens to live in the very same section as the
++    // fixup itself (a same-section *difference* is layout-invariant; a
++    // same-section *absolute value* is not, since the whole section still
++    // gets relocated as a block by the linker). The generic MC layer
++    // already computes this correctly via `IsResolved` (false whenever a
++    // symbol is involved, per MCAssembler::evaluateFixup's non-PC-relative
++    // path: `IsResolved = Target.isAbsolute()`); the previous same-section
++    // shortcut here ignored that signal and wrote the raw section-relative
++    // `Value` directly, silently dropping the relocation. Confirmed via
++    // switch-dispatch jump tables (`.quad .LBBn` entries live in the same
++    // `.text` section as their targets): entries were baked with
++    // (target-offset - enclosing-function-offset) instead of the true
++    // post-link absolute address, corrupting every indirect jump-table
++    // dispatch (ML-004d / codegen-switch-dispatch-malign-in-callee).
+     if (Kind == FK_Data_8) {
+-      const MCSymbol *Sym = Target.getAddSym();
+-      const MCSection *FixupSec = F.getParent();
+-      const MCSection *SymSec =
+-          (Sym && Sym->getFragment()) ? Sym->getFragment()->getParent()
+-                                      : nullptr;
+-      if ((Sym && Sym->isUndefined()) || (SymSec && SymSec != FixupSec)) {
++      if (!IsResolved) {
+         maybeAddReloc(F, Fixup, Target, Value, IsResolved);
+         return;
+       }
+-- 
+2.43.0
+
