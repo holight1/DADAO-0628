@@ -171,31 +171,44 @@ a subagent that owns the gem5 component, not DS):
    `LowerCall` never implemented tail-call opt-out — tracked as new issue
    `codegen-tailcall-lowercall-assert` (needed before `-O1+` picolibc builds
    end-to-end, not before this narrower fix).
-3. **ML-004 (llvm-test-suite SingleSource wiring, ADR-0012 T3)** — first real
-   large-scale regression surface once 1-2 are unblocked.
-   - ML-004a: wire the build/run infrastructure (cross-compile via clang,
-     execute via QEMU, collect pass/fail) for a small SingleSource subset —
-     **done** (2026-07-15). 3/8 chosen tests pass end-to-end
-     (`bitops`/`minint`/`arrayresolution`); 5/8 hit a genuine, newly-found
-     silent miscompile: narrow-load byte selection for `x & 0xFF`-style
-     masking assumes little-endian (`offset+0`) regardless of target
-     endianness, so on this big-endian target it reads the wrong byte.
-     Tracked as `codegen-global-byte-mask-load-wrong-endian-offset`.
-   - **DL-068 (fix the endian narrow-load bug) — in progress**, blocking
-     the rest of ML-004a's picked tests. A first attempt (DL-068a) went off
-     scope mid-task (attempted an unauthorized rebuild of the entire LLVM
-     patch-series git history via `git am`, lost real work in the process,
-     then hit the account's weekly usage limit) — the architect caught it
-     before a background build could bake the regression into the installed
-     compiler, and reset `.work/llvm` back to the last verified-good commit.
-     Redispatching with an explicit constraint against touching patch
-     history (see `feedback_subagent_scope_drift_git_history` memory).
-   - ML-004b: once DL-068 lands, retry the 5 blocked tests, expand the
-     SingleSource subset, and produce a first-round pass/fail report.
-   - ML-004c: fix whatever is cheaply fixable from the triage.
-   - ML-004d: lock in as a `make check-suite`-style gate (not part of `make
-     check`, same pattern as `check-golden`/`check-legality`) and record what's
-     still open for a later round.
+3. **ML-004 (llvm-test-suite SingleSource wiring, ADR-0012 T3) — first round done.**
+   - ML-004a (2026-07-15): wired the build/run infrastructure for a small
+     SingleSource subset. 3/8 passed; 5/8 hit a real silent miscompile
+     (`x & 0xFF` on a big-endian value reading the wrong byte).
+   - DL-068a/b: first attempt (DL-068a) went off scope — an agent attempted
+     an unauthorized rebuild of the LLVM patch-series git history, lost real
+     work, then hit the account's weekly usage limit; the architect caught
+     it before a background build could bake the regression into the
+     installed compiler, and restored `.work/llvm` to the last verified-good
+     commit (see `feedback_subagent_scope_drift_git_history` memory).
+     Redispatched (DL-068b, 2026-07-16) with an explicit ban on touching git
+     history — root cause turned out to be a global-address constant offset
+     silently dropped in `DADAOAsmPrinter`, not the DAG-combine byte-offset
+     logic originally suspected; fixed cleanly, and the fix also closed a
+     second, previously separate open issue with the identical root cause.
+   - **ML-004b (2026-07-16) — done.** 9 more tests wired and passing
+     dual-backend (12/22 total now in `tests/lit/E2E/llvm-test-suite/`).
+     The remaining 10 failures collapse into 4 distinct root causes, the
+     biggest being a genuinely systemic register-allocation bug: `CALL_IIII`/
+     `CALL_PSEUDO_INDIRECT` (the only two CALL instructions the register
+     allocator sees) never attach a `RegMask` from `getCallPreservedMask()`,
+     so it doesn't know GPRB (address-bank) registers above rb7 are
+     caller-saved and lets stale addresses survive across calls that clobber
+     them — affects 8 of the 10 failures. Tracked as
+     `codegen-call-clobbers-gprb-not-declared` (root-caused with a verified
+     minimal repro, not yet fixed — needs a `RegMask` operand on `LowerCall`
+     plus full differential+E2E re-verification). The other 2 failures are 3
+     independently-tracked, not-yet-investigated issues (a switch-dispatch
+     MALIGN, a no-call wrong-value bug, and a QEMU/gem5 backend divergence).
+   - **First-round pass report**: 12 pass / 10 fail, all failures now
+     attributed to 4 tracked issues (not a pass-rate number to chase blindly
+     — the point of this milestone is surfacing real gaps, per ADR-0012 D4).
+   - ML-004c (next): fix `codegen-call-clobbers-gprb-not-declared` (highest
+     leverage — closes 8/10 current failures) with full regression
+     re-verification.
+   - ML-004d: once the known gaps are triaged down, lock in as a
+     `make check-suite`-style gate (not part of `make check`, same pattern as
+     `check-golden`/`check-legality`).
 
 This list is a plan, not a contract — findings at any step may re-scope later
 steps. Progress and any re-scoping is tracked in the task files
