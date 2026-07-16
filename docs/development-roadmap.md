@@ -323,6 +323,19 @@ Pure research, no code written. Key findings:
   not hardware LL/SC, per an old-toolchain lesson) → musl configure
   integration → two E2E milestones (bare `exit(N)`, then `malloc`+`printf`).
 
+### Phase A complete (ML-007a, 2026-07-17): `cfx_smon` mmap/munmap/mprotect handlers
+
+All three P0/P1 syscall handlers musl's mallocng allocator needs are now
+implemented identically in QEMU and gem5, in a single task (not the 2-3 task
+estimate above): `mmap` (bump allocator over a fixed `0x100000000` arena,
+page-aligned), `munmap`/`mprotect` (both no-op, return 0 — no real reclaim or
+protection tracking needed for the static single-thread milestone). Verified
+with a hand-written discriminating probe (`tests/lit/E2E/mmap_probe.test`) that
+asserts exact address deltas via register subtraction, not just "doesn't
+crash" — E2E 55/55, differential AGREE(3-way)=200/Sail(4-way)=200 unchanged.
+**Phase A is done.** Next up is Phase B: musl crt0 auxv synthesis, then the
+`arch/dadao/` skeleton, per the task list above.
+
 ### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
 
 While spot-checking the recon report's QEMU source citations, found
@@ -359,7 +372,8 @@ retrospective.
 - `syscall-hello-write-output-missing` (pre-existing, unrelated to any
   recent work; `syscall_hello.test`'s SYS_write produces no output on QEMU
   despite a correct exit code).
-- musl (phase 2 libc; provides the large/variable-size `memcpy`/`memset`
-  libcall symbols; gated on a real kernel).
 - Kernel bring-up.
-- Dynamic linking, TLS, signals, atomics, and SMP.
+- Dynamic linking, signals, atomics, SMP, and user `__thread` TLS relocations
+  (musl's own static-single-thread subset does NOT wait on these — see
+  ADR-0014 D5.2 / ML-006a; only genuinely thread/kernel-dependent features
+  are deferred here).
