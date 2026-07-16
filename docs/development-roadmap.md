@@ -211,14 +211,36 @@ a subagent that owns the gem5 component, not DS):
      spill a live-across-call GPRB value until this fix made that happen for
      the first time. Full differential + E2E re-verified (broad change,
      touches every call site) — zero regression.
-   - The other 2 of the original 10 failures are still open, independently
-     tracked, not yet investigated: `codegen-switch-dispatch-malign-in-callee`,
-     `codegen-misha-sum-wrong-value-no-call`, `gem5-sign-conversions-backend-divergence`
-     (3 issues, since one ML-004b test hit 2 at once isn't the case — see
-     issues.yaml for exact mapping).
-   - ML-004d (next): triage the remaining 3 issues; once clear, lock the
-     `llvm-test-suite/` directory in as a `make check-suite`-style gate (not
-     part of `make check`, same pattern as `check-golden`/`check-legality`).
+   - **ML-004d (2026-07-16) — done. ★★ `tests/lit/E2E/` 54/54 — 100% pass,
+     zero known failures, project-wide, for the first time ever.**
+     Triaged the remaining 3 issues: `codegen-switch-dispatch-malign-in-callee`
+     was a genuinely new root cause — three independent bugs stacked, all
+     first exposed by jump-table dispatch (the first construct to reference
+     same-`.text`-section symbols from same-section code; all prior
+     `rela`/`addi_rb` use had been cross-section, for `.data` globals): (1)
+     `DADAOAsmBackend::applyFixup`'s `FK_Data_8` case ignored `IsResolved`
+     and wrote a raw pre-link value for "same-section" symbols, dropping a
+     needed relocation; (2) `rela_page`/`rela_lo`'s same-section fast path
+     (added in ML-003j chasing an unrelated bug, never fully validated) used
+     an unsound formula — page-masking/low-12-bits aren't invariant under a
+     constant shift from other object files, unlike the `call24`/`branch*`
+     fast paths; (3) `BRIND` (jump-table dispatch) used `JUMP_RRII` with
+     `RB0` directly as base — the same `rb0`-means-`PC+4` hazard DL-066a
+     fixed for indirect calls, just for jump tables. All three fixed (the
+     AsmBackend fix *removed* the unsound fast path entirely, deferring to
+     the long-verified real-relocation path — simplification, not added
+     complexity). **Side effect: this also fixed the long-standing,
+     unrelated `syscall-hello-write-output-missing` bug** (same root cause,
+     single object file) — closed too. The other two issues
+     (`codegen-misha-sum-wrong-value-no-call`,
+     `gem5-sign-conversions-backend-divergence`) turned out to already be
+     fixed incidentally by ML-004c, re-verified with multiple independent
+     inputs to rule out coincidence.
+   - ML-004e (next): lock the `llvm-test-suite/` directory in as a
+     `make check-suite`-style gate (not part of `make check`, same pattern as
+     `check-golden`/`check-legality`), then keep expanding the SingleSource
+     pure-compute slice as a cheap, no-libc-needed way to keep surfacing
+     CodeGen gaps ahead of the musl-gated full gcc-c-torture run.
 
 This list is a plan, not a contract — findings at any step may re-scope later
 steps. Progress and any re-scoping is tracked in the task files
@@ -259,9 +281,6 @@ sequencing, per ADR-0012 D5:
 
 ## Deferred Milestones
 
-- `codegen-switch-dispatch-malign-in-callee`, `codegen-misha-sum-wrong-value-no-call`,
-  `gem5-sign-conversions-backend-divergence` (3 more real gaps found expanding
-  the llvm-test-suite slice in ML-004b, not yet investigated).
 - `codegen-tailcall-lowercall-assert` (`LowerCall` never implemented
   tail-call opt-out; 113/963 picolibc files still crash on it at `-O1+`,
   found during DL-065a's verification sweep).
