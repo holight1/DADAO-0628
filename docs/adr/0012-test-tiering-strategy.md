@@ -57,6 +57,23 @@ ADR-0007 定了**向量怎么设计**（独立预期值、五类向量、两条 
 
 **时序**：核心 CodeGen 补完（select→函数指针→memcpy→struct 返回）→ clang 集成 → 最小 musl+syscall → 先跑 **SingleSource 纯计算子集**（无 libc I/O，只算+返回值，能上 QEMU/gem5 退出码 harness，双后端一致性）→ 最后全量带 libc（QEMU 主、gem5 抽检）。**不用 llvm-test-suite 当近期门槛**。
 
+### D5：终极目标 = gcc-c-torture 全量通过，失败必有明确理由（2026-07-16 用户定，参照旧 toolchain 先例）
+
+**用户目标**：C 的全量测试通过；不通过的必须有明确且合理的理由。
+
+**已有先例（`~/toolchain/llvm-unicore`，已归档但结论可继承——只继承结论/分类方法，不 cherry-pick 代码）**：旧工具链用 CMake 集成方式（`TEST_SUITE_USER_MODE_EMULATION`直接跑 llvm-test-suite 自己的构建系统，非本仓库 D4 定的"薄 lit 封装"路线）+ 真 musl libc，跑 `SingleSource/Regression/C/gcc-c-torture`（GCC 官方 C 语言torture 测试集，llvm-test-suite 自带），达到 **1617/1708 通过（94.7%），且 DL-028a 深挖分析证实剩余 91 个失败中 DADAO ISel/backend bug = 0**：
+- 51 个 FAIL_COMPILE：100% 是 clang 前端不支持的 GCC 扩展（嵌套函数 29、VLA-in-struct 8、未知 GCC builtin 8、asm 约束/十进制浮点 2、其它前端严格性 4）——**换任何 clang target 都会同样失败，与 DADAO 后端无关**。
+- 32 个 FAIL_LINK：100% 是测试集自身无 `main()` 的 companion library 文件，不是真正的链接缺陷。
+- 8 个 TIMEOUT：QEMU 模拟速度导致，非正确性问题。
+- **零 compiler-rt 符号缺失、零 FAIL_LLC、零 FAIL_RUN**（凡是编译链接过的程序，运行结果全对）。
+
+这证明"C 全量测试通过（不通过项有明确理由）"这个目标在 DADAO 这类目标架构上是**已经被验证过可行的**——DADAO-0628 的 greenfield 重建应该把 gcc-c-torture 的这份**失败分类方法论**（而非旧代码本身）当作最终验收基准：任何失败要么落进旧结果里已识别的"clang 前端不支持的 GCC 扩展/companion 文件/模拟器超时"这几类里，要么是需要記 issue 修的真 DADAO 缺陷。
+
+**对当前路线的含义**：
+1. gcc-c-torture 里大量用例依赖较完整的 hosted libc（`printf`/`malloc`/`string.h` 全套/`setjmp` 等）——当前 picolibc（ADR-0014 阶段1）大概率不足以覆盖，达到旧工具链同等通过率很可能需要先完成 **musl 移植（ADR-0014 阶段2）**。这不改变 D4"picolibc 先行"的阶段顺序，但明确了"全量通过"这个终极里程碑的真实前置是 musl，不是 picolibc。
+2. llvm-test-suite 的封装方式（本仓库 D4 定的"薄 lit 封装"vs 旧工具链的"CMake 直接集成"）暂不改变——ML-004a/b 已验证薄封装路线可行且更符合本仓库 freestanding/QEMU-exit-code 的测试哲学；若未来薄封装规模上不去（用例数量大到手写 lit 封装不现实），再考虑评估 CMake 集成路线，需要专门 ADR 决策，不是现在的默认选项。
+3. 当前 ML-004 系列（SingleSource 纯计算子集）是通往 gcc-c-torture 全量目标的第一步（不依赖 libc I/O），后续随 musl 完成再扩大到 gcc-c-torture 全集。
+
 ## 后果
 
 **正面**：反馈分层（秒→分钟→慢），T0 补上"选错指令"的快回归网；gem5 成本用在刀刃（新/风险/验收）不浪费在每次重跑；llvm-test-suite 有清晰前置路线，不被当近期阻塞。

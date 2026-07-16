@@ -203,9 +203,11 @@ a subagent that owns the gem5 component, not DS):
    - **First-round pass report**: 12 pass / 10 fail, all failures now
      attributed to 4 tracked issues (not a pass-rate number to chase blindly
      — the point of this milestone is surfacing real gaps, per ADR-0012 D4).
-   - ML-004c (next): fix `codegen-call-clobbers-gprb-not-declared` (highest
-     leverage — closes 8/10 current failures) with full regression
-     re-verification.
+   - **ML-004c (in progress, dispatched 2026-07-16)**: fix
+     `codegen-call-clobbers-gprb-not-declared` (highest leverage — closes
+     8/10 current failures) with full regression re-verification (this one
+     touches register allocation for every call site, so the task requires
+     a full differential + E2E run, not a sampled subset).
    - ML-004d: once the known gaps are triaged down, lock in as a
      `make check-suite`-style gate (not part of `make check`, same pattern as
      `check-golden`/`check-legality`).
@@ -215,14 +217,47 @@ steps. Progress and any re-scoping is tracked in the task files
 (`code-agent/tasks/DG-007*`, `DL-065*`, `DL-068*`, `ML-004*`) and folded back
 into this section as it lands.
 
+## Ultimate CodeGen/libc target: full gcc-c-torture pass (ADR-0012 D5, 2026-07-16)
+
+The user's stated end goal is the full C test suite passing, with every
+non-passing case having a clear, defensible reason. `~/toolchain/llvm-unicore`
+(the archived predecessor project) already proved this is achievable on this
+architecture: running `SingleSource/Regression/C/gcc-c-torture` (llvm-test-suite's
+bundled GCC C torture suite) via a CMake-integrated build against a real musl
+libc, it reached **1617/1708 passing (94.7%)**, and a dedicated deep-dive
+(`DL-028a-torture-failure-deep-dive.md`) confirmed **zero DADAO ISel/backend
+bugs** among the remaining 91 failures — 51 are clang frontend limitations on
+GCC extensions (nested functions, VLA-in-struct, unknown GCC builtins, `asm`
+constraints, decimal float — would fail on any clang target, not DADAO-specific),
+32 are test-suite companion files with no `main()` (not real link failures),
+and 8 are QEMU emulation timeouts. Zero missing compiler-rt symbols, zero
+runtime miscompiles among anything that compiled and linked.
+
+DADAO-0628 should treat this failure taxonomy (not the old code) as the
+acceptance template for "done" on gcc-c-torture. Two implications for
+sequencing, per ADR-0012 D5:
+- Reaching comparable coverage will very likely require **musl** (ADR-0014
+  phase 2), not just picolibc — a large fraction of gcc-c-torture exercises a
+  fairly complete hosted libc surface (`printf`, `malloc`, `string.h`,
+  `setjmp`, ...) that picolibc's current phase-1 scope doesn't aim to cover.
+  This doesn't change picolibc-first sequencing, it just names the real
+  prerequisite for the *full* torture-suite milestone.
+- The current ML-004 SingleSource pure-compute slice (no libc I/O) is the
+  first rung of the ladder toward this — it exercises CodeGen correctness
+  without needing musl first, and every real bug it surfaces (like
+  `codegen-call-clobbers-gprb-not-declared`) is exactly the kind of gap that
+  would otherwise resurface later, at much higher cost to diagnose, inside a
+  full gcc-c-torture run.
+
 ## Deferred Milestones
 
+- `codegen-call-clobbers-gprb-not-declared` (ML-004c in progress — see above).
+- `codegen-switch-dispatch-malign-in-callee`, `codegen-misha-sum-wrong-value-no-call`,
+  `gem5-sign-conversions-backend-divergence` (3 more real gaps found expanding
+  the llvm-test-suite slice in ML-004b, not yet investigated).
 - `codegen-tailcall-lowercall-assert` (`LowerCall` never implemented
   tail-call opt-out; 113/963 picolibc files still crash on it at `-O1+`,
   found during DL-065a's verification sweep).
-- `codegen-global-addr-const-offset-dropped` (global address + compile-time
-  constant offset loses the offset when materialized standalone; found
-  during DL-067b's probe design).
 - Function-pointer indirect call (deferred 2026-07-12, decision C — the
   general `CALL_INDIRECT_PSEUDO`/scheduler case, distinct from the simpler
   mechanism DL-066a fixed).
