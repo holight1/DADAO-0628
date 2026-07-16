@@ -1,0 +1,204 @@
+// ML-008a: crt0 auxv synthesis probe. tests/scripts/crt0_auxv.s builds the
+// argc/argv/envp/auxv stack layout musl's crt1.c / `_start_c(long *p)`
+// protocol expects (see that file's header comment for the exact cell
+// layout), then calls `_start_c(p)`. This probe *is* `_start_c`: it
+// performs real discriminating checks (register/memory comparisons, not
+// "doesn't crash") on every field p is required to expose:
+//   1. argc == 1
+//   2. argv[0] dereferences to the bytes "prog\0" (checked against literal
+//      ASCII immediates, not by re-reading the same memory back at itself)
+//   3. argv[1] == NULL
+//   4. envp[0] == NULL
+//   5. auxv is scanned (as a real consumer would: walk pairs until
+//      AT_NULL, dispatch on type) until AT_NULL, and every required key is
+//      found with the expected value: AT_PAGESZ=4096, AT_UID/EUID/GID/EGID
+//      /SECURE=0; AT_RANDOM must be a non-NULL pointer from which 16 bytes
+//      can be read without faulting. A counter incremented once per
+//      correctly-verified key must read exactly 7 once AT_NULL is reached
+//      (catches both missing keys and a wrong value on a present key).
+// Exit 42 = every check passed. Any other code identifies which check
+// failed (1..13, see labels below) for local debugging.
+//
+// RUN: %llvm-mc -triple=dadao -filetype=obj %S/../../scripts/crt0_auxv.s -o %t.crt0.o
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.check.o %s
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld %t.crt0.o %t.check.o -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+
+.text
+.globl _start_c
+_start_c:
+    # rb16 = p (pointer to the argc/argv/envp/auxv table built by crt0_auxv.s)
+
+    # --- check 1: argc == 1 ---
+    ldo rd8, rb16, 0
+    addi rd9, rd0, 1
+    breq rd8, rd9, chk_argv0
+    addi rd30, rd0, 1
+    jump fail
+
+chk_argv0:
+    # --- check 2: argv[0] content == "prog\0" (literal ASCII compares) ---
+    ldo rb17, rb16, 8
+    ldbu rd8, rb17, 0
+    addi rd9, rd0, 112              # 'p'
+    breq rd8, rd9, chk_argv0_r
+    addi rd30, rd0, 2
+    jump fail
+chk_argv0_r:
+    ldbu rd8, rb17, 1
+    addi rd9, rd0, 114              # 'r'
+    breq rd8, rd9, chk_argv0_o
+    addi rd30, rd0, 2
+    jump fail
+chk_argv0_o:
+    ldbu rd8, rb17, 2
+    addi rd9, rd0, 111              # 'o'
+    breq rd8, rd9, chk_argv0_g
+    addi rd30, rd0, 2
+    jump fail
+chk_argv0_g:
+    ldbu rd8, rb17, 3
+    addi rd9, rd0, 103              # 'g'
+    breq rd8, rd9, chk_argv0_nul
+    addi rd30, rd0, 2
+    jump fail
+chk_argv0_nul:
+    ldbu rd8, rb17, 4
+    brnz rd8, fail_argv0
+    jump chk_argv1
+fail_argv0:
+    addi rd30, rd0, 2
+    jump fail
+
+chk_argv1:
+    # --- check 3: argv[1] == NULL ---
+    ldo rb18, rb16, 16
+    rb2rd rd8, rb18, 1
+    brz rd8, chk_envp
+    addi rd30, rd0, 3
+    jump fail
+
+chk_envp:
+    # --- check 4: envp[0] == NULL ---
+    ldo rb19, rb16, 24
+    rb2rd rd8, rb19, 1
+    brz rd8, chk_auxv_init
+    addi rd30, rd0, 4
+    jump fail
+
+chk_auxv_init:
+    # auxv cursor = p + 32; matched-key counter = 0
+    addi rb20, rb16, 32
+    addi rd11, rd0, 0
+
+aux_loop:
+    ldo rd12, rb20, 0               # type
+    brz rd12, aux_done               # AT_NULL -> stop scanning
+
+    addi rd9, rd0, 6                 # AT_PAGESZ
+    breq rd12, rd9, aux_pagesz
+    addi rd9, rd0, 11                # AT_UID
+    breq rd12, rd9, aux_uid
+    addi rd9, rd0, 12                # AT_EUID
+    breq rd12, rd9, aux_euid
+    addi rd9, rd0, 13                # AT_GID
+    breq rd12, rd9, aux_gid
+    addi rd9, rd0, 14                # AT_EGID
+    breq rd12, rd9, aux_egid
+    addi rd9, rd0, 23                # AT_SECURE
+    breq rd12, rd9, aux_secure
+    addi rd9, rd0, 25                # AT_RANDOM
+    breq rd12, rd9, aux_random
+    jump aux_advance                 # unrecognized key: ignore, keep scanning
+
+aux_pagesz:
+    ldo rd13, rb20, 8
+    addi rd9, rd0, 4096
+    breq rd13, rd9, aux_pagesz_ok
+    addi rd30, rd0, 6
+    jump fail
+aux_pagesz_ok:
+    addi rd11, rd11, 1
+    jump aux_advance
+
+aux_uid:
+    ldo rd13, rb20, 8
+    brz rd13, aux_uid_ok
+    addi rd30, rd0, 7
+    jump fail
+aux_uid_ok:
+    addi rd11, rd11, 1
+    jump aux_advance
+
+aux_euid:
+    ldo rd13, rb20, 8
+    brz rd13, aux_euid_ok
+    addi rd30, rd0, 8
+    jump fail
+aux_euid_ok:
+    addi rd11, rd11, 1
+    jump aux_advance
+
+aux_gid:
+    ldo rd13, rb20, 8
+    brz rd13, aux_gid_ok
+    addi rd30, rd0, 9
+    jump fail
+aux_gid_ok:
+    addi rd11, rd11, 1
+    jump aux_advance
+
+aux_egid:
+    ldo rd13, rb20, 8
+    brz rd13, aux_egid_ok
+    addi rd30, rd0, 10
+    jump fail
+aux_egid_ok:
+    addi rd11, rd11, 1
+    jump aux_advance
+
+aux_secure:
+    ldo rd13, rb20, 8
+    brz rd13, aux_secure_ok
+    addi rd30, rd0, 11
+    jump fail
+aux_secure_ok:
+    addi rd11, rd11, 1
+    jump aux_advance
+
+aux_random:
+    # value must be a non-NULL pointer; then prove it is genuinely
+    # dereferenceable by reading 16 bytes through it (two 8-byte loads;
+    # an invalid pointer here would MALIGN/fault rather than silently
+    # pass).
+    ldo rb21, rb20, 8
+    rb2rd rd13, rb21, 1
+    brz rd13, fail_random_null
+    ldo rd14, rb21, 0
+    ldo rd15, rb21, 8
+    addi rd11, rd11, 1
+    jump aux_advance
+fail_random_null:
+    addi rd30, rd0, 12
+    jump fail
+
+aux_advance:
+    addi rb20, rb20, 16
+    jump aux_loop
+
+aux_done:
+    # all 7 required keys must have been matched with the correct value
+    addi rd9, rd0, 7
+    breq rd11, rd9, pass
+    addi rd30, rd0, 13
+    jump fail
+
+pass:
+    addi rd31, rd0, 42
+    halt rd31
+
+fail:
+    halt rd30
+    .size _start_c, . - _start_c
