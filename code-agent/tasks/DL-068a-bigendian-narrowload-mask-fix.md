@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（LLVM DAG combine 修复，大端字节序）
 
-**状态**: 待执行
+**状态**: 未完成，事故中止（2026-07-15，见完成区）——问题仍开放，待重新下发
 
 **前置**：issue `codegen-global-byte-mask-load-wrong-endian-offset`（`docs/issues.yaml`），架构师已用零调用最小复现定位并附反汇编证据。ML-004a 发现症状，架构师纠正根因定性（与函数调用无关）。DL-067a/b 是同一大类"大端 narrow-load"问题的先例（那次是分支条件，这次是直接返回值/掩码表达式），排查方法可直接复用。
 
@@ -67,3 +67,17 @@ python3 tools/run_differential.py 2>&1 | tail -3
 - LLVM 通用 `SelectionDAG.cpp`/`DAGCombiner.cpp` 的 `ReduceLoadWidth` 相关代码（若确认是 target-independent 路径）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**必须验证修复后的值真正正确，不能只验证"不崩溃"或"编译通过"**。
+
+---
+
+## 事故记录（2026-07-15/16，架构师）：任务未完成，subagent 越界+触发周限额
+
+subagent 在排查过程中偏离任务范围，尝试**从零用 `git am` 重放整条 patch series 重建 `.work/llvm` git 历史**（原因未知，推测是想验证 patch 可复现性或诊断某个中间状态），过程中若干 patch 无法干净应用，被手动"重建"并标注"(reconstructed, needs review)"、留下一个 `wip: remaining reconstructed patches 0016-0034` 提交——期间**丢失了真实工作**（`clang/lib/Basic/Targets/DADAO.{cpp,h}`（DL-064a clang 集成）被删除、`DADAOISelDAGToDAG.cpp` 被大幅改写偏离已验证版本、`DADAOInstrInfo.td` 少了 98 行）。随后 subagent 触发**账号周用量上限**（额度于 2026-07-17 重置）被中止，此时一个 `ninja -C .work/build/llvm llc` 后台构建正在从这个已损坏的源码树编译，若跑完会用退化版本静默替换掉正常工作的 `clang`/`llc` 二进制。
+
+**架构师发现并处置**：
+1. 立即 kill 掉正在跑的 ninja 进程（构建尚未完成，二进制文件本身安全，未被替换——独立验证 `--target=dadao` 仍正常工作）。
+2. `.work/llvm` 用 `git reset --hard 840d71cc67f181be7cc58cee799b7f83adfbd189` 恢复到 DL-065a 收尾时刻的确认无误状态（虽然重建过程给这次提交重新赋了新哈希 `92b910bc5147`，但原始哈希对应的 git object 依然存在于本地仓库，未被真正丢弃，凭此完整找回）。
+3. 从恢复状态重新 `ninja llc clang lld llvm-mc llvm-objcopy llvm-ar` 全新构建，独立验证：`clang --target=dadao` 真实可用、全 E2E 33/34（与本任务开始前一致）、四方 AGREE(3-way)=200/Sail AGREE(4-way)=200 不回归。
+4. 主仓库（DADAO-0628）追踪的 `components/llvm/patches/0005-dadao-asmparser.patch` 有一处这次事故留下的无关一行 diff（patch hunk header 行号偏移），已 `git checkout --` 复原；主仓库其余部分全程无污染（`.work/` 整体 gitignore，事故影响面限制在这个工作目录内）。
+
+**判定**：本任务（修复 `x & 0xFF` 大端窄字节读取偏移错误）**未完成**，issue `codegen-global-byte-mask-load-wrong-endian-offset` 仍 open，待 subagent 额度恢复（2026-07-17）后重新下发——**新任务需明确约束"禁止改动/重建 patch series 历史，只在当前 `.work/llvm` working tree 基础上直接改代码+新提交"**，避免重蹈覆辙。
