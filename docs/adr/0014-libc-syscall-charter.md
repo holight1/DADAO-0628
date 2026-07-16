@@ -64,6 +64,15 @@ DL-064a/b 后 clang 一条龙 freestanding 通（`clang hello.c` → 双后端 h
 - 链接 `undefined stdout/vfprintf` **是 picolibc 控制台配置缺口**（`stdout` 在 `posixiob_stdout.c`，受 `posix-console` 等选项门控），**非 libc 选型问题**——修法=给 tinystdio stdout 走最小输出（`FDEV_SETUP_STREAM` 绑 `_write`）或按需开 console 选项。
 - **musl 现在上是早的**：syscall 面不够（malloc 要 mmap、`__init_libc` 要 TLS/线程指针，现 SEE 只有 write/exit/brk）+ arch 移植大（`arch/dadao/` ~15-20 文件 vs picolibc 1 machine dir+3 stub）+ 后端墙相同还更多。musl 仍是终点，时机在"kernel + SEE syscall 面扩起来"之后。
 
+#### D5.2：musl 阶段2 时机更正（ML-006a 调研，2026-07-16）——不必等真 kernel
+
+D5.1 当时判断"musl 时机在 kernel 之后"，是因为设想 TLS/syscall 面缺口很大。**ML-006a 深化调研（`docs/reviews/musl-recon-2026-07-16.md`）推翻了这个悲观预期**：
+
+- **TLS 不卡**：`contracts/abi/spec.md` §1.2 已定义 `rb4=rbtp`，LLVM 后端已 reserve RB4；musl 源码本体零处使用编译器 `__thread` 关键字（全靠 `__pthread_self()` 从 TP 寄存器算出），意味着"跑通 musl 本体"完全不需要 TLS 重定位类型或真 kernel 提供的线程/信号机制，只需要给用户态写 rb4 补 2-3 个汇编 stub。
+- **syscall 面缺口比预想小**：静态单线程程序只缺 `mmap`/`munmap`（P0，mallocng 硬依赖）+ `mprotect`（P1）三个 handler，不需要 `clone`/`futex`/`set_tid_address` 等线程/信号类 syscall——这些在 ADR-0012 D5 终极目标（gcc-c-torture 里绝大多数用例单线程不 fork）驱动下可以继续延后。
+- **推论：musl 阶段2 的"静态单线程"子集不需要等真 kernel**，触发条件改为"驱动力=ADR-0012 D5 全量测试目标"而非"kernel 完成后自然轮到"。多线程/信号/`__thread`/动态链接（真正需要 kernel 级机制的部分）仍按原计划延后。
+- 已有具体分阶段任务清单（§ML-006a 报告 §5-7）：阶段A（syscall handler 补齐，2-3 任务，低风险）→阶段B（musl arch 骨架+E2E，5-7 任务，中风险，crt0 auxv 合成是唯一真正的新工作）→阶段C（多线程/信号/`__thread`/动态链接，明确延后）。
+
 ### D6：验证 = dual-backend + 分层（接 ADR-0012）
 - syscall 层双后端一致：同一 `trap cfx_smon` 程序，QEMU 与 gem5 **console 输出一致 + 退出码一致**（syscall 层进入 T2 dual-backend gate）。
 - 分片：先 **syscall 机制**（手写 asm `trap`-write "hi"+`trap`-exit → 双后端）→ 再 **picolibc port**（真 `printf("hello")` + malloc）→ 再 **llvm-test-suite SingleSource**（ADR-0012 T3）。
