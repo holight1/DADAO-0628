@@ -1,0 +1,51 @@
+# ML-004b: llvm-test-suite 失败用例排查 + 扩大覆盖 + 第一轮通过报告
+
+**执行环境**: 本地 subagent（CodeGen 排查 + lit 测试扩充）
+
+**状态**: 待执行
+
+**前置**：ML-004a（首批 8 个 SingleSource 用例布线，3/8 通过）、DL-068b（修复全局地址偏移丢失的 miscompile，让 1/5 此前失败的用例转为通过，另 4 个转为新的独立故障模式）。用户明确要求"第一轮的 llvm-test-suite 测试通过报告"。
+
+## ⚠️ 硬性约束（与 DL-068b 相同，必读）
+
+**禁止对 `.work/llvm`（或任何 `.work/<component>`）做 `git rebase`/`git am` 重放整条历史/`git reset` 之类改写既有 git 历史的操作**。只允许在当前 HEAD 基础上做普通的、追加式的新提交 + `git format-patch` 生成新 patch 加入 series（参照 DL-065a/DL-066a/DL-067b/DL-068b 的模式）。若排查中怀疑 patch series 有问题，如实报告，不要自己动手"验证"或"重建"。
+
+## 背景
+
+当前 `tests/lit/E2E/llvm-test-suite/` 下有 3 个通过的用例（`bitops`/`minint`/`arrayresolution`）+ DL-068b 新验证通过的 `divrem`（原 ML-004a 挑选的 8 个里的一个，此前因 DL-068b 修的 bug 失败，现在应该已经能过，但尚未正式写成 lit `.test` 提交）。还有 4 个用例（`crc8.le`/`crc16.be`/`popcount-clz-ctz`/`divtest`）撞上了 DL-068b 完成区记录的**新的、独立**故障模式：3 个撞 MALIGN（退出码 0x81，双后端一致）、1 个双后端一致但返回值错误。
+
+## 做什么
+
+1. **补上 `divrem` 的 lit 测试**：DL-068b 已验证 `2006-02-04-DivRem.c` 双后端通过，正式写成 `tests/lit/E2E/llvm-test-suite/divrem.test`（仿照现有 3 个的范式）。
+2. **排查 4 个失败用例**：
+   - **MALIGN 的 3 个（crc8.le/crc16.be/popcount-clz-ctz）**：先确认是不是**合法的 spec 行为**——DADAO spec §3.1 要求 8 字节对齐访问，若这些测试里有非对齐的 load/store（比如对 `char[]`/`uint8_t` 数组做非 8 字节对齐的多字节读写，或者结构体打包访问），MALIGN 可能是**正确、预期**的行为，不是 bug，只是这些 llvm-test-suite 用例假设了 x86/宿主那种任意对齐访问的自由度，不适配 DADAO 的对齐约束。若确认是"用例本身对 DADAO 不适用"（不是 bug），如实记录为"该测试在 DADAO 上不适用"，不必勉强让它过。
+   - **值错的 1 个（divtest）**：这个更像真 bug（双后端一致但算错，不是异常/故障）——用类似 DL-068b 的方法（缩小复现范围、debug trace）定位根因，如果能确认根因并且是小范围修复，可以修；如果发现是更大范围的问题，如实报告、记 issue，不强行在本任务内解决。
+3. **扩大覆盖**：从 `.work/source/llvm-test-suite` 的 `SingleSource/UnitTests/`（或 `Benchmarks/`）再挑 **10-15 个**新的纯计算测试（不同类型：递归、数组、字符串处理不含 libc I/O、简单数学），布线运行，如实报告结果。
+4. **产出"第一轮通过报告"**：汇总当前 `tests/lit/E2E/llvm-test-suite/` 目录下所有测试用例的通过/失败情况，做成一份清晰的表格（测试名/通过或失败/若失败注明原因分类：真 CodeGen bug / 合法 spec 行为不适用 / 其它），写入完成区。
+
+## 约束
+
+- 不为了让某个用例过而修改 CodeGen（除非确认是小范围、有把握的修复——若修了，要有反汇编/运行时判别性验证，不是"看起来编过了"就算）。
+- MALIGN 若确认是合法行为，不要绕过（不要给测试加特殊对齐指令让它凑合过——如实标注"不适用于 DADAO 对齐模型"）。
+- 不回归：E2E 全绿（含 `syscall_hello.test` 已知无关失败）、四方 AGREE(3-way)=200/DIVERGE=0、Sail AGREE(4-way)=200。
+
+## 验收（架构师亲跑）
+
+```bash
+cd ~/DADAO-0628
+llvm-lit -v tests/lit/E2E/llvm-test-suite/ 2>&1 | tail -30
+llvm-lit tests/lit/E2E/ 2>&1 | tail
+python3 tools/run_differential.py 2>&1 | tail -3
+```
+
+**判别强调**：完成区必须有一份清晰的"当前 llvm-test-suite 通过情况"表格（测试名/结果/失败原因分类），这是用户明确要的交付物；MALIGN 类的"不适用"判断需要有 spec 依据（引用 §号），不能凭感觉断定。
+
+## 参考指针
+
+- ML-004a 完成区（首批 8 个用例的选择理由 + 3/8 通过详情）
+- DL-068b 完成区（全局地址偏移丢失修复 + 4 个剩余失败用例的故障模式初步分类）
+- `contracts/isa/spec.md` §3.1（对齐访问要求，MALIGN 语义）
+- `tests/lit/E2E/llvm-test-suite/*.test`（现有 3 个测试的封装范式）
+- `.work/source/llvm-test-suite/SingleSource/`（测试源码所在）
+
+—— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**必须产出清晰的通过情况表格**；**严格遵守不碰 patch/git 历史的约束**。
