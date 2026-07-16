@@ -383,6 +383,32 @@ now goes straight to `checkout --detach <pin>`, skipping both the dirty
 check and the ancestor check (neither applies to a clone this same call
 just created).
 
+### Phase B, step 3 complete (ML-010a, 2026-07-17): musl atomic_arch.h
+
+Probed `__sync_*`/`__atomic_*` builtins against the DADAO backend first
+(as the task required, before assuming the old toolchain's approach would
+just work) and confirmed a broad, genuine codegen gap: `ATOMIC_FENCE`/
+`ATOMIC_LOAD`/`ATOMIC_STORE`/`ATOMIC_LOAD_ADD`/`ATOMIC_SWAP` all hit
+"Cannot select", and `ATOMIC_CMP_SWAP` falls through to the same
+unimplemented-libcall path already known from soft-float. Not a
+one/two-pattern fix, so per the task's hard constraint, no backend code
+was touched — tracked as `codegen-atomic-ops-unimplemented`. Since the
+current milestone (ADR-0014 D5.2) is explicitly static single-threaded
+(no `pthread_create` yet, so nothing can race), `atomic_arch.h` implements
+`a_cas`/`a_swap`/`a_fetch_add`/etc. as plain non-atomic load-modify-store
+C, loudly documented as not thread-safe and must be replaced before
+multithreading is enabled. Compiled file count 766 → 778;
+`atomic_arch.h`-related errors 198 → 0. This unblocked enough of the tree
+to newly expose the next blocker (`pthread_arch.h` missing, 183 files) and
+8 previously-hidden backend internal assertion crashes across 4 distinct
+sites — all registered as new tracked issues, none diagnosed further
+(that's follow-up work, not this task). E2E 56/56, differential
+unchanged. Note: this subagent's session hit the account's weekly usage
+limit mid-task (after the probe and the file write, before verification/
+commit) — recovered cleanly by resuming the same agent via its transcript
+rather than starting over, after confirming the repo was in a clean,
+undamaged state first.
+
 ### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
 
 While spot-checking the recon report's QEMU source citations, found
