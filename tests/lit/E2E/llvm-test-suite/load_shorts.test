@@ -1,0 +1,9 @@
+// llvm-test-suite SingleSource slice (ADR-0012 D4, ML-004b). Adapted from
+// SingleSource/UnitTests/2003-07-09-LoadShorts.c @ 68d03c39d (printf ->
+// exit-code accumulator, malloc -> stack struct, see Inputs/load_shorts.c
+// header). Dual-backend verified.
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -nostdlib -Wl,-T,%S/../../../scripts/dadao.ld %t.crt0.o %S/Inputs/load_shorts.c -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 48'
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 48'

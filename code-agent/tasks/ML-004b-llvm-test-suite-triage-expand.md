@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（CodeGen 排查 + lit 测试扩充）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核，含补登记 3 个遗漏 issue）
 
 **前置**：ML-004a（首批 8 个 SingleSource 用例布线，3/8 通过）、DL-068b（修复全局地址偏移丢失的 miscompile，让 1/5 此前失败的用例转为通过，另 4 个转为新的独立故障模式）。用户明确要求"第一轮的 llvm-test-suite 测试通过报告"。
 
@@ -49,3 +49,34 @@ python3 tools/run_differential.py 2>&1 | tail -3
 - `.work/source/llvm-test-suite/SingleSource/`（测试源码所在）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**必须产出清晰的通过情况表格**；**严格遵守不碰 patch/git 历史的约束**。
+
+---
+
+## 架构师复核（2026-07-16，ground-truth）：通过
+
+### 硬性约束遵守情况
+- `.work/llvm` git log 确认仍停在 `778e62ed55f0`（DL-068b），无任何新提交/历史改动——严格遵守。
+
+### 独立验证
+- `llvm-lit -v tests/lit/E2E/llvm-test-suite/`：12/12 全部真 PASS（含 subagent 报告的所有新增用例）。
+- 全 E2E 42/43（同一已知无关的 `syscall_hello.test` 失败）、四方 AGREE(3-way)=200/Sail AGREE(4-way)=200，不回归。
+- **独立复现 `codegen-call-clobbers-gprb-not-declared` 的核心发现**：用 issue 里给出的 `rbreuse.c` 最小复现，host=36，DADAO(QEMU)=21——完全吻合报告。这是一个真实、系统性的寄存器分配正确性 bug（CALL 类指令未声明 RegMask/GPRB caller-saved 信息），影响面是"调用前算好一个地址值、调用后继续用"这一常见模式，值得后续专门任务修复。
+- subagent 自己的 review 阶段纠正了初稿的一处不精确描述（`CALL_IIII`/`CALL_RRII` 都声明 `Defs=[RD31]`的说法有误，用 `llvm-tblgen -gen-instr-info` 生成物核实后订正为 `CALL_RRII` 根本不在寄存器分配阶段出现、真正的第二个受影响指令是 `CALL_PSEUDO_INDIRECT`）——这个自我纠错的严谨度值得肯定。
+
+### 遗漏补登记
+完成区报告里提到的扩充覆盖新发现的 3 个失败用例（`switch_stmt`/`misha_sum`/`sign_conversions`）在报告文字里说明了"不同于已知根因、未展开排查"，但没有写进 `issues.yaml`——已由架构师补登记为三个独立 open issue（`codegen-switch-dispatch-malign-in-callee`/`codegen-misha-sum-wrong-value-no-call`/`gem5-sign-conversions-backend-divergence`），确保这些发现不会只停留在对话记录里、后续任务能查到。
+
+### 第一轮 llvm-test-suite 通过报告（用户要的交付物，汇总）
+
+| 测试 | 结果 |
+|------|------|
+| bitops / minint / arrayresolution | PASS（ML-004a，QEMU-only） |
+| divrem / bitwise_not / cast_bool / bad_load / sdiv_two / compare64_const / shorts_mask / load_shorts / fold_bug | PASS（双后端，ML-004b 新增） |
+| crc8.le / crc16.be / popcount-clz-ctz / divtest / long_shifts / loopbug / loopbug2 / int_overflow | FAIL——同一根因 `codegen-call-clobbers-gprb-not-declared`（CALL 指令未声明 GPRB caller-saved RegMask，调用后复用陈旧地址值） |
+| switch_stmt | FAIL——独立问题，疑似跳转表相关，`codegen-switch-dispatch-malign-in-callee` |
+| misha_sum | FAIL——独立问题，无调用参与，`codegen-misha-sum-wrong-value-no-call` |
+| sign_conversions | FAIL（gem5 独有）——双后端分歧，`gem5-sign-conversions-backend-divergence` |
+
+**当前：12 通过 / 10 失败（收敛到 4 个独立 issue，其中 1 个已定位精确根因待修，3 个待排查）**。
+
+**判定**：通过，提交。
