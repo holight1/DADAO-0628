@@ -1,0 +1,244 @@
+From ab11cbd8e94efc9b21d7cab40ed21a203b0370a0 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 16 Jul 2026 21:03:31 +0800
+Subject: [PATCH] target/dadao: attach CALL RegMask + fix GPRB spill/reload
+ bank (ML-004c)
+
+DADAOISelLowering::LowerCall never attached a RegisterMask operand for
+the call-clobbered set, so the register allocator had no way to know
+GPRB (address-bank) registers rb8+ are caller-saved (only rb0-7 are
+reserved/special) -- it let GPRB address values computed before a call
+survive across it even though the callee is free to clobber them
+(codegen-call-clobbers-gprb-not-declared, ML-004b). Fix: attach
+DAG.getRegisterMask(TRI->getCallPreservedMask(MF, CallConv)) to the
+DADAOISD::CALL SDNode, following the same pattern used by essentially
+every other LLVM target (e.g. RISCVISelLowering::LowerCall). It threads
+through DADAOISelDAGToDAG.cpp's Select() into both CALL_IIII and
+CALL_PSEUDO_INDIRECT MachineInstrs for free: the DL-065a operand-
+forwarding loop there already carries every SDValue between Callee and
+the trailing Chain/Glue through unchanged, and InstrEmitter's
+AddOperand already knows how to lower a RegisterMaskSDNode.
+
+This surfaced a second, previously-latent bug: once the allocator
+started actually spilling live-across-call GPRB values for the first
+time, DADAOInstrInfo::storeRegToStackSlot/loadRegFromStackSlot turned
+out to spill *every* register class (GPRD and GPRB alike) through
+STO_FI/LDO_FI, which are backed by the RD-target STO_RRII/LDO_RRII
+encoding (spec RD load/store) -- not the RB-target STO_RBRRII/
+LDO_RBRRII encoding (spec S4.1 "RB Single Load/Store") that already
+existed in DADAOInstrInfo.td but was never wired up for spilling. That
+silently re-encoded a spilled GPRB register's index as an RD register
+number, spilling/reloading the wrong physical register. Fixed by adding
+LDO_RB_FI/STO_RB_FI pseudo instructions (mirroring LDO_FI/STO_FI) that
+eliminateFrameIndex resolves to LDO_RBRRII/STO_RBRRII, and routing GPRB
+register-class spills/reloads through them.
+
+Verified: minimal repro from the issue (host=36) now returns 36 on both
+QEMU and gem5 (was QEMU=21 wrong, gem5=134 SIGABRT); disassembly
+confirms the RB-target opcodes (0x43/0x4B) are now used instead of the
+RD-target ones (0x33/0x3B). Discriminating probes (snapshot_bug2 GPRB
+value read before+after a call, nested calls with a GPRB value live
+across both, pointer-typed call arguments) all match host on both
+backends. All 8 llvm-test-suite cases previously blocked by this issue
+(crc8.le, crc16.be, popcount-clz-ctz, divtest, long_shifts, loopbug,
+loopbug2, int_overflow) now pass both backends, wired as new lit
+fixtures. Full E2E lit suite: 50/51 (same pre-existing unrelated
+syscall_hello.test failure). Full differential harness: AGREE(3-way)
+=200/DIVERGE=0, Sail AGREE(4-way)=200 -- no regression.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp | 24 ++++++++++++------
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp | 14 +++++++++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp    | 28 ++++++++++++++++++---
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td     | 16 ++++++++++++
+ llvm/lib/Target/DADAO/DADAORegisterInfo.cpp | 28 +++++++++++++++++++++
+ 5 files changed, 98 insertions(+), 12 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index 3d6b6023f7b8..b15fba75a345 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -87,14 +87,22 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+       SDValue Chain = Node->getOperand(0);
+       SDValue Callee = Node->getOperand(1);
+       unsigned NumOps = Node->getNumOperands();
+-      // Operands beyond Chain/Callee are: zero or more RegisterSDNode
+-      // operands (one per actual call argument register, added by
+-      // LowerCall — DL-065a) followed optionally by a trailing Glue. Carry
+-      // all of them through unchanged so InstrEmitter marks exactly the
+-      // real per-call-site argument registers implicit-use on the emitted
+-      // CALL machine instr, instead of relying on a static/maximal Uses=[...]
+-      // list in tablegen (which over-claims registers with no reaching
+-      // definition and trips the MachineVerifier at -O1+).
++      // Operands beyond Chain/Callee are, in order: zero or more
++      // RegisterSDNode operands (one per actual call argument register,
++      // added by LowerCall — DL-065a), then a single RegisterMaskSDNode
++      // operand marking every register the call clobbers (added by
++      // LowerCall — ML-004c), followed optionally by a trailing Glue. This
++      // loop doesn't need to distinguish the operand kinds — it just carries
++      // all of them through unchanged (InstrEmitter's AddOperand already
++      // knows how to lower a RegisterSDNode to an implicit-use MachineOperand
++      // and a RegisterMaskSDNode to a regmask MachineOperand) so the emitted
++      // CALL machine instr ends up with exactly the real per-call-site
++      // argument registers implicit-use plus the correct clobber mask,
++      // instead of relying on a static/maximal Uses=[...] list in tablegen
++      // (which over-claims registers with no reaching definition and trips
++      // the MachineVerifier at -O1+) or no clobber information at all (which
++      // let the register allocator keep stale GPRB values live across calls,
++      // ML-004b/c).
+       bool HasGlue = NumOps > 2 &&
+                      Node->getOperand(NumOps - 1).getValueType() == MVT::Glue;
+       unsigned NumExtra = NumOps - 2 - (HasGlue ? 1 : 0);
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 148607afaa53..08b296be1e8c 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -154,6 +154,20 @@ SDValue DADAOTargetLowering::LowerCall(
+   // -O1+ (see DADAOInstrInfo.td CALL_IIII/CALL_RRII/CALL_PSEUDO_INDIRECT).
+   for (auto &Reg : RegsToPass)
+     CallOps.push_back(DAG.getRegister(Reg.first, Reg.second.getValueType()));
++
++  // Attach a RegisterMask operand marking every register *not* preserved
++  // across this call as clobbered (standard LLVM pattern, e.g.
++  // RISCVISelLowering::LowerCall). Without this, the register allocator has
++  // no way to know GPRB (address-register bank) has no callee-saved
++  // registers — only rb0-7 are reserved/special (see
++  // DADAORegisterInfo::getReservedRegs) — so it silently lets GPRB values
++  // computed before a call "survive" across it even though the callee is
++  // free to clobber rb8+ (codegen-call-clobbers-gprb-not-declared, ML-004b/c).
++  const DADAORegisterInfo *TRI = MF.getSubtarget<DADAOSubtarget>().getRegisterInfo();
++  const uint32_t *Mask = TRI->getCallPreservedMask(MF, CallConv);
++  assert(Mask && "Missing call preserved mask for calling convention");
++  CallOps.push_back(DAG.getRegisterMask(Mask));
++
+   if (ArgGlue.getNode())
+     CallOps.push_back(ArgGlue);
+   Chain = DAG.getNode(DADAOISD::CALL, DL, NodeTys, CallOps);
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index db2103e53c81..610da12f966c 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -206,14 +206,25 @@ void DADAOInstrInfo::storeRegToStackSlot(
+       MachinePointerInfo::getFixedStack(MF, FrameIndex),
+       MachineMemOperand::MOStore, MFI.getObjectSize(FrameIndex),
+       Align(8));
+-  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass ||
+-      RC == &DADAO::GPRBRegClass || RC == &DADAO::GPRB_AllocatableRegClass) {
++  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass) {
+     BuildMI(MBB, MBBI, DL, get(DADAO::STO_FI))
+         .addReg(SrcReg, getKillRegState(IsKill))
+         .addReg(DADAO::RB1)
+         .addImm(0)
+         .addFrameIndex(FrameIndex)
+         .addMemOperand(MMO);
++  } else if (RC == &DADAO::GPRBRegClass ||
++             RC == &DADAO::GPRB_AllocatableRegClass) {
++    // GPRB (address-bank) spill must use the RB-target sto encoding
++    // (STO_RBRRII, spec §4.1) — the RD-target STO_FI/STO_RRII above stores a
++    // GPRD register's value and would silently re-encode SrcReg's RB index
++    // as an RD register number (ML-004c).
++    BuildMI(MBB, MBBI, DL, get(DADAO::STO_RB_FI))
++        .addReg(SrcReg, getKillRegState(IsKill))
++        .addReg(DADAO::RB1)
++        .addImm(0)
++        .addFrameIndex(FrameIndex)
++        .addMemOperand(MMO);
+   } else {
+     llvm_unreachable("storeRegToStackSlot: unsupported register class");
+   }
+@@ -230,14 +241,23 @@ void DADAOInstrInfo::loadRegFromStackSlot(
+       MachinePointerInfo::getFixedStack(MF, FrameIndex),
+       MachineMemOperand::MOLoad, MFI.getObjectSize(FrameIndex),
+       Align(8));
+-  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass ||
+-      RC == &DADAO::GPRBRegClass || RC == &DADAO::GPRB_AllocatableRegClass) {
++  if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass) {
+     BuildMI(MBB, MBBI, DL, get(DADAO::LDO_FI))
+         .addDef(DstReg)
+         .addReg(DADAO::RB1)
+         .addImm(0)
+         .addFrameIndex(FrameIndex)
+         .addMemOperand(MMO);
++  } else if (RC == &DADAO::GPRBRegClass ||
++             RC == &DADAO::GPRB_AllocatableRegClass) {
++    // GPRB (address-bank) reload must use the RB-target ldo encoding
++    // (LDO_RBRRII, spec §4.1) — see storeRegToStackSlot above (ML-004c).
++    BuildMI(MBB, MBBI, DL, get(DADAO::LDO_RB_FI))
++        .addDef(DstReg)
++        .addReg(DADAO::RB1)
++        .addImm(0)
++        .addFrameIndex(FrameIndex)
++        .addMemOperand(MMO);
+   } else {
+     llvm_unreachable("loadRegFromStackSlot: unsupported register class");
+   }
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 5d3b18ecadab..436289b17fe3 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -155,6 +155,22 @@ def LDO_FI : DADAOPseudo<(outs GPRD:$rdha), (ins GPRB:$rbhb, imms12:$imm12, i64i
+ let mayStore = 1 in
+ def STO_FI : DADAOPseudo<(outs), (ins GPRD:$rdha, GPRB:$rbhb, imms12:$imm12, i64imm:$fi), []>;
+ 
++// RB-bank counterparts (ML-004c): frame-slot spill/reload of a GPRB
++// (address-bank) register itself must go through the RB-target ldo/sto
++// encoding (LDO_RBRRII/STO_RBRRII, spec §4.1 "RB Single Load/Store"), not
++// the RD-target LDO_FI/STO_FI above — those are backed by LDO_RRII/STO_RRII
++// (spec §3.x RD load/store), a *different* opcode/encoding that stores a
++// GPRD register's value, not a GPRB register's. Reusing the RD-bank pseudo
++// for a GPRB register silently re-encodes the RB register's index as if it
++// were an RD register number, spilling/reloading the wrong physical
++// register (surfaced by ML-004c once the CALL RegMask fix made the
++// allocator actually spill live-across-call GPRB values for the first
++// time — codegen-call-clobbers-gprb-not-declared).
++let mayLoad = 1 in
++def LDO_RB_FI : DADAOPseudo<(outs GPRB:$rbha), (ins GPRB:$rbhb, imms12:$imm12, i64imm:$fi), []>;
++let mayStore = 1 in
++def STO_RB_FI : DADAOPseudo<(outs), (ins GPRB:$rbha, GPRB:$rbhb, imms12:$imm12, i64imm:$fi), []>;
++
+ // FrameIndex→GPRB materialization pseudo (eliminateFrameIndex resolves)
+ def ADDI_RB_FI : DADAOPseudo<(outs GPRB:$rbha), (ins GPRB:$rbhb, i64imm:$fi), []>;
+ 
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+index aa27d5747a39..cd7a15cab55a 100644
+--- a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+@@ -141,6 +141,34 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     MI.eraseFromParent();
+     return true;
+   }
++  case DADAO::LDO_RB_FI: {
++    // GPRB spill/reload (ML-004c) — RB-target ldo (LDO_RBRRII, spec §4.1),
++    // not the RD-target LDO_RRII used by plain LDO_FI above.
++    int64_t GEPOff = MI.getOperand(2).getImm();
++    int64_t Total = FrameOff + GEPOff;
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RBRRII))
++            .add(MI.getOperand(0))
++            .add(MI.getOperand(1))
++            .addImm(Total);
++    MIB.setMemRefs(MI.memoperands());
++    MI.eraseFromParent();
++    return true;
++  }
++  case DADAO::STO_RB_FI: {
++    // GPRB spill/reload (ML-004c) — RB-target sto (STO_RBRRII, spec §4.1),
++    // not the RD-target STO_RRII used by plain STO_FI above.
++    int64_t GEPOff = MI.getOperand(2).getImm();
++    int64_t Total = FrameOff + GEPOff;
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, II, DL, TII->get(DADAO::STO_RBRRII))
++            .add(MI.getOperand(0))
++            .add(MI.getOperand(1))
++            .addImm(Total);
++    MIB.setMemRefs(MI.memoperands());
++    MI.eraseFromParent();
++    return true;
++  }
+   }
+ }
+ 
+-- 
+2.43.0
+

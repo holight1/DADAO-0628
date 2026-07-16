@@ -33,3 +33,4 @@
 0033-br-cc-premature-combine-fix.patch
 0034-call-implicit-use-physreg-fix.patch
 0035-global-address-offset-asmprinter-fix.patch
+0036-call-regmask-gprb-spill-fix.patch

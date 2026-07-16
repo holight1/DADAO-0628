@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（LLVM CodeGen 修复，寄存器分配正确性）
 
-**状态**: 待执行
+**状态**: 通过（架构师复核，★ llvm-test-suite 目录 20/20 全通过）
 
 **前置**：issue `codegen-call-clobbers-gprb-not-declared`（`docs/issues.yaml`），根因已由 ML-004b 精确定位并附最小复现，架构师已独立验证。这是当前 llvm-test-suite 10 个失败用例里 8 个的共同根因，杠杆最大。
 
@@ -62,3 +62,21 @@ llvm-lit -v tests/lit/E2E/llvm-test-suite/ 2>&1 | tail -30
 - `.work/llvm/llvm/lib/Target/DADAO/DADAOISelLowering.cpp`（`LowerCall`）、`DADAOISelDAGToDAG.cpp`（`Select` 里 CALL 相关分支）、`DADAORegisterInfo.cpp`（`getCallPreservedMask`/`getCalleeSavedRegs`/`getReservedRegs`）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**必须做全量差分+E2E 回归**（不是抽样跑受影响的几个测试）；**严格遵守不碰 patch/git 历史的约束**。
+
+---
+
+## 架构师复核（2026-07-16，ground-truth）：通过
+
+### 硬性约束遵守情况
+- `.work/llvm` git log 确认干净的 additive 提交（`ab11cbd8e94e`，在 `778e62ed55f0` DL-068b 之上），无 rebase/am/reset 痕迹。
+
+### 独立验证
+- 全新 `ninja` 重建；`rbreuse.c` 最小复现独立跑：host=36/QEMU=36/gem5=36（此前 QEMU=21/gem5=SIGABRT）。
+- `llvm-lit -v tests/lit/E2E/llvm-test-suite/`：**20/20 全部真 PASS**（含此前受阻的全部 8 个）。
+- 全 E2E 50/51（同一已知无关的 `syscall_hello.test` 失败，51=43+8 新增，与报告吻合）、四方 AGREE(3-way)=200/Sail AGREE(4-way)=200，不回归。
+- `issues.yaml`/`manifest_check.py` 均 PASS。
+
+### 意外发现的第二个真实 bug（本任务修复过程中的连带修正，非范围膨胀）
+`DADAOInstrInfo::storeRegToStackSlot`/`loadRegFromStackSlot` 此前把 GPRB（地址 bank）和 GPRD 寄存器都路由到同一套 RD-bank 的 `STO_FI`/`LDO_FI` pseudo——本次 RegMask 修复让寄存器分配器**史上第一次**真的去溢出一个跨调用存活的 GPRB 值时，才暴露这个潜伏的编码错误（GPRB 寄存器序号被当成 RD 寄存器序号错误编码）。新增 `LDO_RB_FI`/`STO_RB_FI`（对应 spec §4.1 RB-bank load/store），正确路由。这是必要的连带修复，不是范围膨胀——没有它 RegMask 修复本身反而会引入新的溢出正确性问题。
+
+**判定**：通过，提交。★ **ML-004 系列（llvm-test-suite 首轮）完整收官：20/20 全通过，10 个失败全部归零**。

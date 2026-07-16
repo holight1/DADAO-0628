@@ -537,10 +537,10 @@
 
 - id: codegen-call-clobbers-gprb-not-declared
   title: "CALL 指令（CALL_IIII 直接调用 / CALL_PSEUDO_INDIRECT 间接调用，寄存器分配阶段实际能看到的两条）只声明 `Defs = [RD31]`，LowerCall 从未附加 RegMask 操作数——寄存器分配器不知道 GPRB（地址寄存器）bank 除 rb0-7（Reserved）外全部是 caller-saved，导致跨调用存活的 GPRB 地址值被静默覆盖"
-  status: open
+  status: closed
   scope: [CodeGen]
   blocks: [llvm-test-suite-call-in-loop-address-survival]
-  resolved_by: null
+  resolved_by: ML-004c
   # ML-004b（2026-07-16，subagent）排查 DL-068b 遗留的 4 个 llvm-test-suite
   # 失败用例（crc8.le/crc16.be/popcount-clz-ctz/divtest）。逐个重新在当前
   # 工具链上跑（发现 ML-004a/DL-068b 的 gem5 侧此前用了错误的封装方式
@@ -628,6 +628,37 @@
   #
   # 被这个根因阻塞、未固化为 lit fixture 的用例：crc8.le/crc16.be/
   # popcount-clz-ctz（MALIGN 0x81）、divtest（数值错但双后端一致）。
+  #
+  # **ML-004c（2026-07-16）已修**：`DADAOISelLowering::LowerCall` 附加
+  # `DAG.getRegisterMask(TRI->getCallPreservedMask(MF, CallConv))` 到
+  # `DADAOISD::CALL` SDNode（标准 LLVM 模式，参照 RISCVISelLowering）；
+  # `DADAOISelDAGToDAG.cpp` `Select()` 里 DL-065a 已有的操作数转发循环
+  # 不加修改就把这个新操作数原样带进 `CALL_IIII`/`CALL_PSEUDO_INDIRECT`
+  # 的 MachineInstr（`InstrEmitter::AddOperand` 本身认识
+  # `RegisterMaskSDNode`）。**修复过程中发现并连带修了第二个、此前从未
+  # 触发过的潜伏 bug**：`DADAOInstrInfo::storeRegToStackSlot`/
+  # `loadRegFromStackSlot` 对 GPRD 和 GPRB 两个寄存器类都统一走
+  # `STO_FI`/`LDO_FI`，但这两个伪指令背后是 RD-bank 的
+  # `STO_RRII`/`LDO_RRII` 编码（RD load/store），不是 spec §4.1 "RB
+  # Single Load/Store" 描述的 RB-bank `STO_RBRRII`/`LDO_RBRRII`
+  # 编码（`DADAOInstrInfo.td` 里其实早已存在，只是从未接到溢出路径
+  # 上）——用 RD-bank 编码溢出一个 GPRB 寄存器，会把该寄存器的编号原样
+  # 套进 RD 寄存器编号位置，静默溢出/重载了错误的物理寄存器。这个 bug
+  # 此前从未暴露，因为在本 issue 修复之前寄存器分配器从不知道要在调用前后
+  # 溢出/重载 GPRB 值——RegMask 一接上、分配器第一次真正尝试溢出 GPRB
+  # 寄存器就踩了它。新增 `LDO_RB_FI`/`STO_RB_FI` 伪指令（`eliminateFrameIndex`
+  # 解析到 `LDO_RBRRII`/`STO_RBRRII`），GPRB 类走这条路径。
+  #
+  # **验证**：issue 最小复现（host=36）双后端由 QEMU=21(错)/gem5=134(SIGABRT)
+  # → QEMU=gem5=36；反汇编确认改用 RB-bank opcode 0x43/0x4B（此前
+  # 0x33/0x3B）。判别性探针（`snapshot_bug2.c` 调用前后读同一 GPRB 值、
+  # 嵌套调用、指针类型调用参数）双后端全部与 host 吻合。此前受阻的全部
+  # 8 个 llvm-test-suite 用例（crc8.le/crc16.be/popcount-clz-ctz/divtest/
+  # long_shifts/loopbug/loopbug2/int_overflow）双后端全部转为通过，已固化
+  # 为新 lit fixture（`tests/lit/E2E/llvm-test-suite/{crc8_le,crc16_be,
+  # popcount_clz_ctz,divtest,long_shifts,loopbug,loopbug2,int_overflow}.test`）。
+  # 全 E2E 50/51（同一已知无关的 `syscall_hello.test` 失败）、四方
+  # AGREE(3-way)=200/DIVERGE=0、Sail AGREE(4-way)=200，不回归。
 
 - id: codegen-switch-dispatch-malign-in-callee
   title: "ML-004b 扩充测试 switch_stmt：故障（MALIGN 0x81，双后端一致）发生在 switch-dispatch 的被调用函数内部，疑似独立于 codegen-call-clobbers-gprb-not-declared 的跳转表相关缺陷"
