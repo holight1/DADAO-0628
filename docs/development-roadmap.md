@@ -292,6 +292,59 @@ sequencing, per ADR-0012 D5:
   would otherwise resurface later, at much higher cost to diagnose, inside a
   full gcc-c-torture run.
 
+### musl integration recon (ML-006a, 2026-07-16) — `docs/reviews/musl-recon-2026-07-16.md`
+
+Pure research, no code written. Key findings:
+- **TLS is not a blocker** (better news than ADR-0014 D5.1 originally worried):
+  `contracts/abi/spec.md` §1.2 already defines `rb4 = rbtp`, and the LLVM
+  backend already reserves RB4. Writing it needs no new instruction (an
+  ordinary RB-bank register copy). musl's own source has **zero** uses of the
+  compiler `__thread` keyword — its internal per-thread state is entirely
+  derived from the TP register — so getting musl itself running needs no ELF
+  TLS relocation types at all; those are only needed for *user* `__thread`
+  variables, which can be deferred.
+- **Current syscall surface gap**: only `write`/`exit`/`exit_group`/`brk` are
+  implemented in the `cfx_smon` responder (QEMU + gem5). musl's mallocng
+  allocator hard-requires real `mmap` (no brk fallback) — `mmap`/`munmap` are
+  P0, `mprotect` is P1. Thread/signal syscalls can be deferred entirely for a
+  static single-threaded first milestone.
+- **ADR-0014 D2's syscall ABI does not need to change** — ADR-0014-D2's
+  register convention was already chosen for zero-friction musl adoption; only
+  the responder's `switch(sysno)` case tables need incremental additions.
+- Rough estimate: **8-12 tasks** across phase A (syscall handlers, low risk)
+  and phase B (musl arch skeleton + first E2E, medium risk — crt0 auxv
+  synthesis is the one genuinely new piece of work, everything else has a
+  "conclusion-level" precedent from the archived toolchain's port). Phase C
+  (threading, signals, `__thread`, dynamic linking) explicitly deferred.
+- **Concrete next tasks** (see report §7 for the full list): `cfx_smon`
+  mmap/munmap handler → mprotect handler → musl crt0 auxv synthesis → musl
+  `arch/dadao/` skeleton (syscall_arch.h/reloc.h/bits) → TLS stubs
+  (`get_tp.s`/`__set_thread_area.s`) → `atomic_arch.h` (`__sync_*` builtins,
+  not hardware LL/SC, per an old-toolchain lesson) → musl configure
+  integration → two E2E milestones (bare `exit(N)`, then `malloc`+`printf`).
+
+### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
+
+While spot-checking the recon report's QEMU source citations, found
+`.work/source/qemu`'s `target/dadao/` directory entirely missing — `git log`
+showed HEAD reset to bare upstream, `git reflog` confirmed `fetch.py`'s
+`git checkout --detach <pinned commit>` had silently discarded all 16 applied
+QEMU patch commits (likely triggered when ML-004a re-ran `make fetch` to pull
+in the new `llvm-test-suite` component — the loop touches *every* enabled
+component, not just the new one). This is almost certainly the same root cause
+behind the earlier DL-068a incident (`.work/llvm`'s history getting mangled) —
+that agent likely encountered `.work/llvm` already silently reset by this same
+bug and misdiagnosed it as needing a full patch-series rebuild. Recovered
+`.work/source/qemu` via `git reset --hard` to the last-known-good commit found
+in reflog (matching patch 0016 exactly), and fixed `fetch.py`'s root cause: it
+now checks `git merge-base --is-ancestor <pinned-commit> HEAD` before doing
+anything, and skips the checkout entirely if the pinned commit is already an
+ancestor of HEAD (i.e. patches are already applied on top) — verified against
+the real repo state (`llvm`/`qemu` correctly detected as "already patched,
+leaving alone"). `make fetch` is now safe to re-run at any time. See
+`feedback_subagent_scope_drift_git_history` memory for the full incident
+retrospective.
+
 ## Deferred Milestones
 
 - `codegen-tailcall-lowercall-assert` (`LowerCall` never implemented
