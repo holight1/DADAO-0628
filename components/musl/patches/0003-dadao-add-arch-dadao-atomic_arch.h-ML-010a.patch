@@ -1,0 +1,155 @@
+From 5adeeac42c977a78404f3507b398813cac8aa5b2 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 17 Jul 2026 06:04:58 +0800
+Subject: [PATCH] dadao: add arch/dadao/atomic_arch.h (ML-010a)
+
+Route B: a probe compiling __sync_val_compare_and_swap/__sync_fetch_and_add/
+__sync_lock_test_and_set/__sync_synchronize/__sync_lock_release/
+__atomic_load_n individually with clang --target=dadao -O0 -c shows every
+one of them hits an unimplemented SelectionDAG lowering path in the current
+DADAO LLVM backend (AtomicFence/AtomicLoad/AtomicStore/AtomicLoadAdd/
+AtomicSwap all 'Cannot select', __sync_val_compare_and_swap hits the same
+'unsupported library call operation' libcall-lowering gap already known
+from soft-float). This is a broad backend codegen gap, not a one/two-pattern
+fix, and out of this task's scope (no backend changes here).
+
+Per ADR-0014 D5.2 the current libc porting milestone is a static
+single-threaded subset (pthread_create deferred), so no other execution
+flow can race with these primitives in this phase. atomic_arch.h therefore
+implements a_cas/a_cas_p/a_swap/a_fetch_add/a_barrier/a_store/a_and/a_or/
+a_inc/a_dec as plain non-atomic load-modify-store sequences -- functionally
+correct for the current single-threaded scope, explicitly NOT thread-safe,
+and must be replaced with real atomics (fixed backend + __sync_*, or an
+LL/SC-style inline-asm sequence) before pthread_create()-based
+multithreading is enabled.
+---
+ arch/dadao/atomic_arch.h | 117 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 117 insertions(+)
+ create mode 100644 arch/dadao/atomic_arch.h
+
+diff --git a/arch/dadao/atomic_arch.h b/arch/dadao/atomic_arch.h
+new file mode 100644
+index 00000000..bcaba069
+--- /dev/null
++++ b/arch/dadao/atomic_arch.h
+@@ -0,0 +1,117 @@
++/* ML-010a: dadao atomic_arch.h -- STATIC SINGLE-THREAD ONLY, NOT REAL ATOMICS.
++ *
++ * Background (see code-agent/tasks/ML-010a-musl-atomic-arch.md for full
++ * rationale): the obvious approach -- mirroring the old (archived) toolchain's
++ * arch/dadao/atomic_arch.h, which built these primitives on top of GCC/clang
++ * `__sync_*` builtins -- was tried first and does NOT work on the current
++ * DADAO LLVM backend. A standalone probe compiling `__sync_val_compare_and_swap`,
++ * `__sync_fetch_and_add`, `__sync_lock_test_and_set`, `__sync_synchronize`,
++ * `__sync_lock_release`, and `__atomic_load_n` individually with
++ * `clang --target=dadao -O0 -c` shows every one of them hits an unimplemented
++ * SelectionDAG lowering path in the backend:
++ *
++ *   __sync_synchronize()            -> "Cannot select: ... AtomicFence ..."
++ *   __sync_fetch_and_add (i32)      -> "Cannot select: ... AtomicLoadAdd ..."
++ *   __sync_lock_test_and_set (i32)  -> "Cannot select: ... AtomicSwap ..."
++ *   __sync_lock_release (i32)       -> "Cannot select: ... AtomicStore ..."
++ *   __atomic_load_n (i32, SEQ_CST)  -> "Cannot select: ... AtomicLoad ..."
++ *   __sync_val_compare_and_swap     -> "error in backend: unsupported library
++ *                                       call operation" (expands to a libcall;
++ *                                       same libcall-lowering gap already
++ *                                       known from soft-float, see ML-009a)
++ *
++ * i.e. this is a genuine, broad DADAO backend codegen gap (ATOMIC_FENCE,
++ * ATOMIC_LOAD, ATOMIC_STORE, ATOMIC_LOAD_ADD, ATOMIC_SWAP all lack
++ * TargetLowering actions/patterns, and ATOMIC_CMP_SWAP falls through to an
++ * unimplemented libcall path) -- not a one- or two-pattern fix, and not
++ * something this task is scoped to touch (task hard constraint: do not modify
++ * LLVM backend code; report and stop). See the task file's "探测结果" section
++ * for the full probe transcript.
++ *
++ * Per ADR-0014 D5.2, the current libc porting milestone is explicitly a
++ * STATIC SINGLE-THREADED subset (pthread_create and friends are deferred to
++ * a later phase). There is, by construction, no other execution flow that
++ * can race with any of the operations below in this phase. So instead of
++ * real atomic read-modify-write sequences, every primitive here is a plain,
++ * non-atomic load-modify-store. This is functionally correct for the current
++ * single-threaded scope and definitely NOT thread-safe or interrupt-safe.
++ *
++ * MUST be revisited (real atomics, or a fixed backend + `__sync_*`/inline-asm
++ * LL/SC-style sequence) before pthread_create()-based multithreading is
++ * enabled. Do not reuse this file's implementations past that point.
++ *
++ * a_barrier() below is a plain compiler (not hardware) memory-ordering fence
++ * (empty asm with a "memory" clobber) -- it only prevents the compiler from
++ * reordering accesses across it; it does not (and in single-thread scope
++ * does not need to) emit any hardware fence instruction.
++ */
++
++#define a_cas a_cas
++static inline int a_cas(volatile int *p, int t, int s)
++{
++	int old = *p;
++	if (old == t) *p = s;
++	return old;
++}
++
++#define a_cas_p a_cas_p
++static inline void *a_cas_p(volatile void *p, void *t, void *s)
++{
++	void *old = *(void *volatile *)p;
++	if (old == t) *(void *volatile *)p = s;
++	return old;
++}
++
++#define a_swap a_swap
++static inline int a_swap(volatile int *p, int v)
++{
++	int old = *p;
++	*p = v;
++	return old;
++}
++
++#define a_fetch_add a_fetch_add
++static inline int a_fetch_add(volatile int *p, int v)
++{
++	int old = *p;
++	*p = (int)((unsigned)old + (unsigned)v);
++	return old;
++}
++
++#define a_barrier a_barrier
++static inline void a_barrier(void)
++{
++	__asm__ __volatile__ ("" : : : "memory");
++}
++
++#define a_store a_store
++static inline void a_store(volatile int *p, int v)
++{
++	a_barrier();
++	*p = v;
++	a_barrier();
++}
++
++#define a_and a_and
++static inline void a_and(volatile int *p, int v)
++{
++	*p = *p & v;
++}
++
++#define a_or a_or
++static inline void a_or(volatile int *p, int v)
++{
++	*p = *p | v;
++}
++
++#define a_inc a_inc
++static inline void a_inc(volatile int *p)
++{
++	a_fetch_add(p, 1);
++}
++
++#define a_dec a_dec
++static inline void a_dec(volatile int *p)
++{
++	a_fetch_add(p, -1);
++}
+-- 
+2.43.0
+

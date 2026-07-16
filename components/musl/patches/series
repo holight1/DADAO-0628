@@ -1,2 +1,3 @@
 0001-dadao-add-arch-dadao-compile-time-skeleton-ML-009a.patch
 0002-dadao-fix-CRTJMP-in-reloc.h-subagent-review-finding-.patch
+0003-dadao-add-arch-dadao-atomic_arch.h-ML-010a.patch
