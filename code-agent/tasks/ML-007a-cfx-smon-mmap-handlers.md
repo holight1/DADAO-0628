@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent（QEMU + gem5 双后端，syscall responder 扩展）
 
-**状态**: 待执行
+**状态**: 已完成
 
 **前置**：`docs/reviews/musl-recon-2026-07-16.md`（musl 移植调研，阶段A定义）、`docs/adr/0014-libc-syscall-charter.md` D5.2（musl 阶段2 时机更正）。现有 `cfx_smon` responder（QEMU `target/dadao/cpu.c`、gem5 `src/arch/dadao/decoder.cc`）只实现 `write`(64)/`exit`(93)/`exit_group`(94)/`brk`(214)，其余一律 `-ENOSYS`。
 
@@ -50,3 +50,73 @@ python3 tools/run_differential.py 2>&1 | tail -3
 - `docs/adr/0014-libc-syscall-charter.md` D2（syscall ABI：rd16=号/rd17-22=参数/rd31=返回值）
 
 —— 自审见 DS.md §自审流程同等标准（subagent 自己复核，逐条 finding + 判决）。**必须真跑判别性探针（连续 mmap 地址不重叠），不能只验证"不崩溃"**；**严格遵守不碰 patch/git 历史的约束**。
+
+## 完成区
+
+**状态**：已完成
+
+**arena 起始地址选择**：`0x100000000`（4GiB），QEMU（`DADAO_MMAP_ARENA_BASE`，`target/dadao/cpu.h`）与 gem5（`MMAP_ARENA_BASE`，`src/arch/dadao/decoder.cc`）字面量完全一致。核实过的现有布局：`dadao.ld` `.heap` 段止于 `0x87E00000`；`tests/scripts/gen_trampoline.py` 确认 QEMU trampoline 栈 SP=`0x87FF0000`；`~/DADAO-gem5/src/arch/dadao/process.cc:31` 确认 gem5 SE 栈 `stack_base=0x00007FFFFFFFF000`（DG-006a）。`0x100000000` 距三者都有巨大余量（上距 heap/trampoline 区约 1.9GB，下距 gem5 栈约 8×10^7 倍），且远低于 gem5 自身通用 SE `mmap_end`（`process.cc:35`，`0x4000000000000000`，我们的自定义 `trap` responder 并不使用这条路径，仅供交叉核实无冲突）。
+
+**修改文件**：
+- `.work/source/qemu/target/dadao/cpu.c`（`EXCP_CFXTRAP`/`switch(sysno)` 新增 `case 222/215/226`）
+- `.work/source/qemu/target/dadao/cpu.h`（新增 `DADAO_MMAP_ARENA_BASE` 宏）
+- `~/DADAO-gem5/src/arch/dadao/decoder.cc`（`TrapInst::execute` 新增 `case 222/215/226` + `MMAP_ARENA_BASE` 常量）
+- `tests/lit/E2E/mmap_probe.test`（新增，手写 `trap cfx_smon` 判别性探针）
+- `components/qemu/patches/0017-target-dadao-cfx_smon-mmap-munmap-mprotect-handlers-.patch` + `series`
+- `components/gem5/patches/0011-arch-dadao-cfx_smon-mmap-munmap-mprotect-handlers-ML.patch` + `series`
+
+**核心实现（两后端逐字一致）**：
+```c
+// mmap(222): bump allocator，page-align 请求长度后前进
+static uint64_t mmap_cursor = ARENA_BASE;   // 首次 = ARENA_BASE
+uint64_t aligned = (length + 0xFFF) & ~0xFFFULL;
+if (aligned == 0) aligned = 0x1000;
+ret = mmap_cursor;
+mmap_cursor += aligned;
+// munmap(215): ret = 0;（不做真实回收）
+// mprotect(226): ret = 0;（不做真实保护变更）
+```
+
+**验收结果**（架构师亲跑 ground-truth，非估算）：
+- `mmap_probe.test`（3 次 mmap，长度 8192/12288/4096；用寄存器减法+`breq`比较，非立即数比较，因差值超 12-bit 立即数范围）：QEMU exit=42、gem5 exit=42，输出均含 `mmap-ok`（`grep -c` 各=1）——两次地址差分别精确等于 8192、12288，证明游标真实前进而非返回同一地址；`addr1` 非零且 4095-mask 页对齐；munmap/mprotect 均返回 0。
+- 全 E2E：`llvm-lit tests/lit/E2E/` → **55/55 通过**（54 基线 + 新增 `mmap_probe.test`，零回归）。
+- 差分：`python3 tools/run_differential.py` → **AGREE(3-way)=200/DIVERGE=0/HARNESS=6/QEMU-SKIP=0**，**Sail AGREE(4-way)=200/SAIL-DIVERGE=0**，与基线一致。
+- QEMU 侧独立重 build（`ninja qemu-system-dadao`）、gem5 侧独立重 build（`scons build/DADAO/gem5.opt -j6`）均通过（仅预置无关警告，无 error）。
+- `git commit`（普通追加提交，非 amend/rebase）+ `git format-patch` 导出，`.work/source/qemu`、`~/DADAO-gem5` 均未触碰既有历史；`python3 scripts/manifest_check.py` 通过。
+
+**遗留问题**：无阻塞项。subagent review 记的 2 条均为不影响正确性的风格提示（见下），已如实记录、判定无需处置。
+
+## 审阅记录（subagent · 判决 = 通过）
+
+- subagent 已读 reviewer.md 惯例并逐行审 diff（改动文件：QEMU cpu.c/cpu.h、gem5 decoder.cc、mmap_probe.test），核对参照 syscall_hello.test 范式与 spec.md §3.5/§5.2。
+- 核验点：
+  - 页对齐取整逻辑两后端逐字一致（`(length+0xFFF)&~0xFFFULL`，`length=0`兜底`0x1000`）✓，手算/脚本核验 length∈{0,1,4095,4096,4097} 两后端结果一致 ✓。
+  - arena 常量两后端字面量完全相同（`0x100000000ULL`）✓；munmap/mprotect 均无条件 `ret=0` ✓。
+  - 寄存器/状态卫生：仅读 rd16-19、写 rd31，`static` 游标与既有 `brk_base` 模式一致，进程级生命周期正确、无跨测试污染风险 ✓。
+  - 判别性：手推"回退到 -ENOSYS"或"总返回同一固定地址"两种回归场景下 rd31 取值，确认 check1/check2 的 `breq`+`jump fail` 路径会真正拦下 ✓；`add`/`sub` 四操作数用法（`rdha=rd0` 弃高位、`rdhb` 取结果）符合 spec §3.5 legality ✓。
+- 未测输入/边界推敲：mmap_probe.test 本身只探测已页对齐的 3 个长度（8192/12288/4096），非对齐长度（如 1、4097）的取整分支未被运行时探针覆盖——**但逻辑本身经手算证实两后端一致正确**，判定为覆盖面提示、非缺陷。
+- finding：
+  1. 取整逻辑正确性——手算 5 组值两后端一致 → 非缺陷。
+  2. 双后端一致性（常量+取整+munmap/mprotect）——逐字核对一致 → 非缺陷。
+  3. 寄存器/状态卫生——仅涉及文档化寄存器、static 变量作用域正确 → 非缺陷。
+  4. 探针判别力——回归场景手推确认会被拦下 → 非缺陷。
+  5. **风格提示（不阻塞）**：`length+0xFFF` 对接近 `UINT64_MAX` 的长度无溢出防护（会绕回小值而非放大）。处置：❌不修——记账式 bump allocator（ADR-0014 D3）无真实调用方会传此类长度，非真实风险面。
+  6. **风格提示（不阻塞）**：check3（`addr1 != 0`）在当前固定非零 arena 常量下是非判别性的死代码，只有未来改 arena 常量为 0 才有意义。处置：❌不修——保留作为未来改常量时的防御性检查，无害。
+- 判决：**通过**（Accepted，无真实缺陷；2 条非阻塞风格提示均判定不修，理由已附）。
+
+## 架构师复核（ground-truth）
+
+**独立验证方法**：不采信完成区/subagent 判决，从 git 状态开始逐项重跑。
+
+- `.work/source/qemu` `git log`：干净单提交 `3587e17`（"target/dadao: cfx_smon mmap/munmap/mprotect handlers (ML-007a)"），落在已知恢复基线 `a26e252` 之上；`git status` 干净，无未提交改动、无历史重写迹象。
+- `~/DADAO-gem5` `git log`：干净单提交 `215ccc1641`，落在 `61fe302bf2` 之上；`git status` 干净。
+- 逐行读 `cpu.c`/`cpu.h` diff：改动量小（27+11 行），`case 222/215/226` 语义正确；核对 ABI（ADR-0014 D2：rd17=arg0/rd18=arg1/...）确认 `arg1` 即 mmap 的 `length` 参数无误。
+- `ninja -C .work/source/qemu/build qemu-system-dadao`：**干净重 build 通过**（4 步、零 error）——subagent 报告的"本地 -Werror 环境问题"在架构师重 build 中未复现，判定为该 subagent 会话的局部环境问题，非代码缺陷，无需处理。
+- `scons build/DADAO/gem5.opt -j6`（`~/DADAO-gem5`）：已是最新（up to date），零改动重 build 确认。
+- `llvm-lit -v tests/lit/E2E/mmap_probe.test` → **PASS (1/1)**。
+- 读 `mmap_probe.test` 源码逐行核对判别性：三次 mmap（8192/12288/4096）用寄存器减法 + `breq`（非立即数比较，因差值超 12-bit 立即数范围）精确断言游标前进量；`brz`/`and`+`brnz` 断言非空+页对齐；munmap/mprotect 断言返回值为 0；确认非"仅不崩溃"式弱测试，是真判别性探针——与 subagent 自评一致。
+- 全 E2E：`llvm-lit tests/lit/E2E/` → **55/55（100%）**，较基线 54 净增 1，零回归。
+- 差分：`python3 tools/run_differential.py` → **AGREE(3-way)=200/DIVERGE=0/HARNESS=6**，**Sail AGREE(4-way)=200/SAIL-DIVERGE=0**，与基线逐位一致。
+- `python3 scripts/manifest_check.py` → **PASS**（spec 锁 `9f378f4`，enabled 组件 llvm/qemu/gem5/llvm-test-suite 均一致）。
+
+**结论**：subagent 判决（通过）与架构师独立复核完全吻合，2 条风格提示（整数溢出无防护、check3 当前非判别性）判定不修的理由合理，予以采纳。**ML-007a 验收通过，Phase A（syscall handler 补齐）三项 P0/P1 syscall（mmap/munmap/mprotect）全部落地，一任务完成，无需拆分。**

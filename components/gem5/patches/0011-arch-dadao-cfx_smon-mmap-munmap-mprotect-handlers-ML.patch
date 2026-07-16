@@ -1,0 +1,65 @@
+From 215ccc1641ebd8a610c5389757353591d760f809 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 17 Jul 2026 04:13:14 +0800
+Subject: [PATCH] arch/dadao: cfx_smon mmap/munmap/mprotect handlers (ML-007a)
+
+Companion to the QEMU change of the same name: musl mallocng hard-requires
+real mmap. Accounting-style bump allocator identical to QEMU's -- mmap(222)
+hands out fresh, page-aligned, non-overlapping addresses from
+MMAP_ARENA_BASE (0x100000000, matches QEMU's DADAO_MMAP_ARENA_BASE exactly);
+munmap(215)/mprotect(226) unconditionally return 0 (no MMU to enforce real
+semantics). Verified via a hand-assembled trap cfx_smon probe run on both
+backends: two mmap calls with different lengths produce addresses whose
+delta exactly matches the page-aligned first length.
+---
+ src/arch/dadao/decoder.cc | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index fddfce6afd..867695e45d 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -29,6 +29,17 @@ static constexpr uint64_t MASK48 = 0xFFFFFFFFFFFFULL;
+ static constexpr uint64_t MEM_WINDOW_BASE = 0x87FEF000ULL;
+ static constexpr uint64_t MEM_WINDOW_SIZE = 0x3000ULL;   // 12 KiB
+ 
++// cfx_smon SYS_mmap (222) accounting-arena base (ML-007a). Must match the
++// QEMU DADAO_MMAP_ARENA_BASE constant exactly (target/dadao/cpu.h in
++// DADAO-0628) -- both backends hand out addresses from the same bump
++// allocator origin so differential/E2E behavior is identical. Chosen well
++// clear of every existing region: .text/.rodata/.data/.bss/.heap end at
++// 0x87E00000 (dadao.ld), QEMU's trampoline stack sits near 0x87FF0000, and
++// gem5 SE's own stack lives near 0x00007FFFFFFFF000 (DG-006a) -- 4GiB
++// (0x100000000) is far above the former and far below the latter, and
++// trivially fits in DADAO's 48-bit RB address space.
++static constexpr uint64_t MMAP_ARENA_BASE = 0x100000000ULL;
++
+ // DG-003a terminal-state readout (restored): at halt, dump the architectural
+ // RD (rd0-63) and RB (rb0-63) registers on one line to stdout so the gem5
+ // differential adapter can parse the final state. DG-004b adds a second line
+@@ -645,6 +656,22 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+       for(uint64_t i=0;i<len;i++) std::cout.put(d[i]); ret=len; break; }
+     case 93: case 94: exitSimLoop("trap-exit",arg0&0xFF); return NoFault;
+     case 214: { static uint64_t brk=0x90000000; ret=(arg0==0)?brk:arg0; if(arg0)brk=arg0+0x100000; break; }
++    case 222: { /* SYS_mmap: accounting-style bump allocator (ADR-0014 D3,
++                   ML-007a). No MMU/paging on M1 -> no real page mapping;
++                   hand out fresh, page-aligned, non-overlapping addresses
++                   from MMAP_ARENA_BASE. arg1=length; addr hint (arg0), prot
++                   (arg2), flags/fd/offset (rd20-22) ignored -- mallocng
++                   always calls with addr=NULL/fd=-1. */
++      static uint64_t mmap_cursor = MMAP_ARENA_BASE;
++      uint64_t length = arg1;
++      uint64_t aligned = (length + 0xFFF) & ~0xFFFULL;
++      if (aligned == 0) aligned = 0x1000;
++      ret = mmap_cursor; mmap_cursor += aligned; break; }
++    case 215: /* SYS_munmap: accounting-style, no real reclaim (ML-007a) */
++      ret = 0; break;
++    case 226: /* SYS_mprotect: accounting-style, no real protection change --
++                 there is no MMU to enforce it (ML-007a) */
++      ret = 0; break;
+     default: ret=(uint64_t)-(int64_t)38; break;
+     }
+     tc->setReg(intRegId(RD_BASE+31),ret);
+-- 
+2.43.0
+

@@ -1,0 +1,87 @@
+From 3587e179b1b281f9264cdd8243fa26bd9185b0cb Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 17 Jul 2026 04:12:32 +0800
+Subject: [PATCH] target/dadao: cfx_smon mmap/munmap/mprotect handlers
+ (ML-007a)
+
+musl mallocng hard-requires real mmap (never falls back to brk). M1 has
+no MMU/paging, so this is an accounting-style bump allocator: mmap(222)
+hands out fresh, page-aligned, non-overlapping addresses from a dedicated
+arena at DADAO_MMAP_ARENA_BASE (0x100000000, 4GiB) -- chosen clear of the
+existing .text/.rodata/.data/.bss/.heap layout (ends 0x87E00000) and the
+QEMU trampoline stack (~0x87FF0000). munmap(215)/mprotect(226) return 0
+unconditionally (no real reclaim/protection possible without an MMU).
+
+gem5 gets the identical arena base constant in a companion change so both
+backends behave identically (verified via a hand-assembled trap cfx_smon
+probe: two mmap calls with different lengths produce addresses whose
+delta exactly matches the page-aligned first length, not the same address
+twice).
+---
+ target/dadao/cpu.c | 27 +++++++++++++++++++++++++++
+ target/dadao/cpu.h | 11 +++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index e8ec0ff..078befb 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -170,6 +170,33 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+                 }
+                 break;
+             }
++            case 222: { /* SYS_mmap: accounting-style bump allocator (ADR-0014 D3,
++                           ML-007a). No MMU/paging on M1 -> no real page mapping;
++                           just hand out fresh, page-aligned, non-overlapping
++                           addresses from a dedicated arena far above any existing
++                           layout (.text/.rodata/.data/.bss/.heap end at
++                           0x87E00000, QEMU trampoline stack ~0x87FF0000, gem5 SE
++                           stack ~0x00007FFFFFFFF000). arg1=length; addr hint
++                           (arg0), prot (arg2), flags/fd/offset (rd20-22) are
++                           ignored -- mallocng always calls with
++                           addr=NULL/fd=-1. */
++                static uint64_t mmap_cursor = DADAO_MMAP_ARENA_BASE;
++                uint64_t length = arg1;
++                uint64_t aligned = (length + 0xFFF) & ~0xFFFULL;
++                if (aligned == 0) {
++                    aligned = 0x1000;
++                }
++                ret = mmap_cursor;
++                mmap_cursor += aligned;
++                break;
++            }
++            case 215: /* SYS_munmap: accounting-style, no real reclaim (ML-007a) */
++                ret = 0;
++                break;
++            case 226: /* SYS_mprotect: accounting-style, no real protection
++                         change -- there is no MMU to enforce it (ML-007a) */
++                ret = 0;
++                break;
+             default:
+                 ret = (uint64_t)(-(int64_t)38); /* -ENOSYS */
+                 break;
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index 8ca4c7d..38f2683 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -11,6 +11,17 @@
+ #define EXCP_EXIT   4
+ #define EXCP_CFXTRAP 5
+ 
++/* cfx_smon SYS_mmap (222) accounting-arena base (ML-007a). Must match the
++ * gem5 TrapInst::execute() constant exactly (components/gem5/patches) --
++ * both backends hand out addresses from the same bump allocator origin so
++ * differential/E2E behavior is identical. Chosen well clear of every
++ * existing region: .text/.rodata/.data/.bss/.heap end at 0x87E00000
++ * (dadao.ld), the QEMU trampoline stack sits near 0x87FF0000, and gem5 SE's
++ * stack lives near 0x00007FFFFFFFF000 (DG-006a) -- 4GiB (0x100000000) is far
++ * above the former and far below the latter, and trivially fits in DADAO's
++ * 48-bit RB address space. */
++#define DADAO_MMAP_ARENA_BASE 0x100000000ULL
++
+ #define CPU_RESOLVING_TYPE TYPE_DADAO_CPU
+ 
+ #define DADAO_CPU_TYPE_SUFFIX "-" TYPE_DADAO_CPU
+-- 
+2.43.0
+

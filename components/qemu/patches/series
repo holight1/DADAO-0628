@@ -15,3 +15,4 @@
 0014-tb-stop-pc-advance.patch
 0015-precise-exception-pc.patch
 0016-target-dadao-align-brk_base-default-with-dadao.ld-he.patch
+0017-target-dadao-cfx_smon-mmap-munmap-mprotect-handlers-.patch

@@ -1,0 +1,128 @@
+// ML-007a: hand-assembled trap cfx_smon probe for mmap(222)/munmap(215)/
+// mprotect(226). Verifies (discriminating, not just "doesn't crash"):
+//   - two mmap calls with different lengths return non-overlapping,
+//     page-aligned addresses with the bump allocator cursor genuinely
+//     advancing by the *aligned* requested length each time (checked via
+//     exact register-to-register subtraction/comparison, not just
+//     non-zero/non-crash)
+//   - munmap/mprotect both return 0
+// Exit 42 = all checks passed; any other code identifies which check failed
+// (1..6, see labels below) for local debugging.
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %s
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld %t.o -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: grep -c "mmap-ok" %t.out | xargs test 1 -eq
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: grep -c "mmap-ok" %t.gout | xargs test 1 -eq
+.text
+.globl _start
+_start:
+    # Build constants: rd1=1, rd2=4096 (0x1000), rd3=8192 (0x2000), rd4=4095
+    # (page-align mask), rd5=12288 (0x3000, = rd2+rd3).
+    addi rd1, rd0, 1
+    shlu rd2, rd1, 12
+    shlu rd3, rd1, 13
+    addi rd4, rd2, -1
+    add rd0, rd5, rd2, rd3
+
+    # --- mmap(NULL, 8192, PROT_READ|PROT_WRITE, ...) -> rd20 ---
+    addi rd16, rd0, 222      # sysno = SYS_mmap
+    addi rd17, rd0, 0        # addr hint = NULL
+    addi rd18, rd3, 0        # length = 8192
+    addi rd19, rd0, 3        # prot = RW (ignored by responder, no MMU)
+    trap 2, 0
+    addi rd20, rd31, 0       # addr1 = ret
+
+    # --- mmap(NULL, 12288, PROT_READ|PROT_WRITE, ...) -> rd21 ---
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd5, 0        # length = 12288
+    addi rd19, rd0, 3
+    trap 2, 0
+    addi rd21, rd31, 0       # addr2 = ret
+
+    # --- mmap(NULL, 4096, PROT_READ|PROT_WRITE, ...) -> rd22 (3rd call) ---
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd2, 0        # length = 4096
+    addi rd19, rd0, 3
+    trap 2, 0
+    addi rd22, rd31, 0       # addr3 = ret
+
+    # check1: addr2 - addr1 == 8192 (cursor advanced by first request exactly,
+    # not stuck returning the same address)
+    sub rd0, rd6, rd21, rd20
+    breq rd6, rd3, check2
+    addi rd17, rd0, 1
+    jump fail
+
+check2:
+    # addr3 - addr2 == 12288 (second advance also exact)
+    sub rd0, rd7, rd22, rd21
+    breq rd7, rd5, check3
+    addi rd17, rd0, 2
+    jump fail
+
+check3:
+    # addr1 != 0
+    brz rd20, fail_null
+    jump check4
+fail_null:
+    addi rd17, rd0, 3
+    jump fail
+
+check4:
+    # addr1 is page-aligned: addr1 & 4095 == 0
+    and rd8, rd20, rd4
+    brnz rd8, fail_align
+    jump check5
+fail_align:
+    addi rd17, rd0, 4
+    jump fail
+
+check5:
+    # munmap(addr1, 8192) -> must return 0
+    addi rd16, rd0, 215
+    addi rd17, rd20, 0
+    addi rd18, rd3, 0
+    trap 2, 0
+    addi rd9, rd31, 0
+    brnz rd9, fail_munmap
+    jump check6
+fail_munmap:
+    addi rd17, rd0, 5
+    jump fail
+
+check6:
+    # mprotect(addr2, 12288, PROT_READ) -> must return 0
+    addi rd16, rd0, 226
+    addi rd17, rd21, 0
+    addi rd18, rd5, 0
+    addi rd19, rd0, 1
+    trap 2, 0
+    addi rd10, rd31, 0
+    brnz rd10, fail_mprotect
+    jump pass
+fail_mprotect:
+    addi rd17, rd0, 6
+    jump fail
+
+pass:
+    addi rd16, rd0, 64       # sysno = SYS_write
+    addi rd17, rd0, 1        # fd = stdout
+    rela rb8, msg_data
+    addi rb8, rb8, msg_data
+    rb2rd rd18, rb8, 1
+    addi rd19, rd0, 8        # len("mmap-ok\n")
+    trap 2, 0
+    addi rd16, rd0, 93       # sysno = SYS_exit
+    addi rd17, rd0, 42
+    trap 2, 0
+
+fail:
+    addi rd16, rd0, 93       # sysno = SYS_exit, rd17 already set to fail code
+    trap 2, 0
+
+msg_data:
+    .asciz "mmap-ok\n"
