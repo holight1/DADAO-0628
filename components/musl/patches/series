@@ -1,1 +1,2 @@
-# Deferred component. Keep empty until an ADR enables it.
+0001-dadao-add-arch-dadao-compile-time-skeleton-ML-009a.patch
+0002-dadao-fix-CRTJMP-in-reloc.h-subagent-review-finding-.patch

@@ -38,11 +38,11 @@ role = "SingleSource pure-compute regression source (ADR-0012 D4, thin lit wrapp
 
 [[component]]
 name = "musl"
-enabled = false
+enabled = true
 repository = "https://git.musl-libc.org/git/musl"
-commit = ""
+commit = "0784374d561435f7c787a555aeab8ede699ed298"
 patch_series = "components/musl/patches/series"
-role = "Deferred libc and runtime integration"
+role = "musl 1.2.5 (upstream tag v1.2.5) -- arch/dadao compile-time skeleton (ML-009a)"
 
 [[component]]
 name = "linux"

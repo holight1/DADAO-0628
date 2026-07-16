@@ -1,0 +1,66 @@
+From aec6f7b84f308d7f734c450abe02c2d39e8debed Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 17 Jul 2026 05:27:25 +0800
+Subject: [PATCH 2/2] dadao: fix CRTJMP in reloc.h (subagent review finding,
+ ML-009a)
+
+The macro presented a specific asm sequence ("rb2rb rb1,%1,1; ret %0,0") as
+if it correctly jumped to the runtime `pc` argument, but ret's second
+operand is a compile-time literal per contracts/isa/spec.md SS5.5, not a
+substitutable register -- the sequence would zero a register and jump via
+RegRAS, never reaching `pc`. Both call sites (ldso/dynlink.c,
+src/thread/__unmapself.c) are currently unreachable (blocked on the
+still-missing atomic_arch.h, out of ML-009a's scope), so this was dead code,
+but it would have silently miscompiled once a follow-up task adds
+atomic_arch.h. Replaced with a loud compile-time-reachable trap
+(__builtin_trap()) until the real indirect-jump sequence is designed.
+---
+ arch/dadao/reloc.h | 34 +++++++++++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/arch/dadao/reloc.h b/arch/dadao/reloc.h
+index f8d861c6..5bfcf11f 100644
+--- a/arch/dadao/reloc.h
++++ b/arch/dadao/reloc.h
+@@ -46,13 +46,29 @@
+ #define REL_TLSDESC     0  /* R_DADAO_NONE (placeholder; unreachable in M1) */
+ 
+ /* CRTJMP: transfer control to `pc` with stack pointer `sp` set first (used
+- * by ldso to jump into the loaded program's entry point). rb1 = rbsp per
+- * contracts/abi/spec.md SS1.2; rb0 = rbip is read-only (PC), so control
+- * transfer must go through an indirect jump register, not a write to rb0.
+- * [OPEN: DADAO has no dynamic linker yet (ADR-0014 D5) and this macro is
+- * only referenced by ldso/dynlink.c, which is not part of the static-link
+- * path exercised by this task; the exact indirect-jump instruction to use
+- * is left for the dynamic-linking milestone -- not guessed here.]
++ * by ldso to jump into the loaded program's entry point, and by
++ * src/thread/__unmapself.c to jump into a trampoline after unmapping a
++ * detached thread's stack). rb1 = rbsp per contracts/abi/spec.md SS1.2;
++ * rb0 = rbip is read-only (PC), and `ret`'s second operand is a
++ * compile-time literal immediate (contracts/isa/spec.md SS5.5), not a
++ * substitutable register -- so `ret %0, 0` below would NOT actually jump to
++ * `pc` (it pops the hardware RegRAS stack and writes rdha=0), it would just
++ * silently zero whatever register `%0` happened to occupy. An earlier
++ * version of this macro used that sequence, which is wrong; replaced with a
++ * hard compile-time-only trap so a future caller fails loudly instead of
++ * linking broken control transfer.
++ * [OPEN: DADAO has no dynamic linker yet (ADR-0014 D5), and no indirect
++ * absolute jump to a runtime-computed register has been designed and
++ * verified (contracts/isa/spec.md SS5.3 `jump` is iiii-format / PC-relative
++ * immediate, not register-indirect) -- this is unreachable in the current
++ * build (both call sites are unreachable without atomic_arch.h, out of this
++ * task's scope) and is left for whoever designs the dynamic-linking /
++ * thread-teardown milestone.]
+  */
+-#define CRTJMP(pc,sp) __asm__ __volatile__( \
+-	"rb2rb rb1, %1, 1\n\tret %0, 0" : : "r"(pc), "r"(sp) : "memory" )
++#define CRTJMP(pc,sp) __dadao_crtjmp_not_implemented((pc),(sp))
++static inline void __attribute__((noreturn))
++__dadao_crtjmp_not_implemented(void *pc, void *sp)
++{
++	(void)pc; (void)sp;
++	__builtin_trap();
++}
+-- 
+2.43.0
+
