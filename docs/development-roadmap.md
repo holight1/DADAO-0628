@@ -354,6 +354,35 @@ remaining steps (syscall_arch.h/reloc.h/bits skeleton, TLS stub,
 atomic_arch.h, configure integration, static-link E2E) all have
 conclusion-level precedent from the archived toolchain to draw on.**
 
+### Phase B, step 2 complete (ML-009a, 2026-07-17): musl arch/dadao compile-time skeleton
+
+musl is now formally enabled in this repo's component-lock system (same
+model as llvm/qemu/gem5/llvm-test-suite): pinned to upstream v1.2.5
+(`0784374d`), with `syscall_arch.h`/`reloc.h`/`bits/*.h` added under
+`components/musl/patches/`. These map cleanly against the *current*
+ADR-0014 D2 ABI and `contracts/elf/spec.md`'s 10 relocation types — not the
+archived toolchain's incompatible register/relocation numbering. A
+full-tree `make -k lib/libc.a` compiles 766 of ~1600 candidate files;
+zero remaining failures are attributable to the new headers — the rest is
+the already-deferred `atomic_arch.h` and pre-existing backend codegen
+limits (soft-float libcalls, `dynamic_stackalloc`, and the already-tracked
+`codegen-tailcall-lowercall-assert` hitting a few new call sites, not a new
+bug). The subagent's own review caught and fixed a real defect before
+architect review even started: an early `CRTJMP` draft treated `ret`'s
+compile-time-literal operand as a substitutable register, which would have
+silently failed to transfer control once a follow-up task unblocks its
+(currently unreachable) call sites.
+
+**Side fix**: enabling a brand-new component surfaced a second `fetch.py`
+bootstrap bug (independent of the 2026-07-15/16 patch-history incident) —
+a fresh `--no-checkout` clone's dirty-check always fired (empty working
+tree vs. populated HEAD tree reads as "every file deleted"), so `fetch.py`
+could never actually bootstrap a component on its first run. Fixed
+directly (`scripts/fetch.py`, commit `7d98b21`): the freshly-cloned case
+now goes straight to `checkout --detach <pin>`, skipping both the dirty
+check and the ancestor check (neither applies to a clone this same call
+just created).
+
 ### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
 
 While spot-checking the recon report's QEMU source citations, found
