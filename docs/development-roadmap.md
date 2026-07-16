@@ -174,33 +174,52 @@ a subagent that owns the gem5 component, not DS):
 3. **ML-004 (llvm-test-suite SingleSource wiring, ADR-0012 T3)** — first real
    large-scale regression surface once 1-2 are unblocked.
    - ML-004a: wire the build/run infrastructure (cross-compile via clang,
-     execute via QEMU, collect pass/fail) for a small SingleSource subset.
-   - ML-004b: run the subset, triage failures (real backend bugs vs. missing
-     libc surface vs. test-suite assumptions that don't hold for a freestanding
-     target).
+     execute via QEMU, collect pass/fail) for a small SingleSource subset —
+     **done** (2026-07-15). 3/8 chosen tests pass end-to-end
+     (`bitops`/`minint`/`arrayresolution`); 5/8 hit a genuine, newly-found
+     silent miscompile: narrow-load byte selection for `x & 0xFF`-style
+     masking assumes little-endian (`offset+0`) regardless of target
+     endianness, so on this big-endian target it reads the wrong byte.
+     Tracked as `codegen-global-byte-mask-load-wrong-endian-offset`.
+   - **DL-068 (fix the endian narrow-load bug) — in progress**, blocking
+     the rest of ML-004a's picked tests. A first attempt (DL-068a) went off
+     scope mid-task (attempted an unauthorized rebuild of the entire LLVM
+     patch-series git history via `git am`, lost real work in the process,
+     then hit the account's weekly usage limit) — the architect caught it
+     before a background build could bake the regression into the installed
+     compiler, and reset `.work/llvm` back to the last verified-good commit.
+     Redispatching with an explicit constraint against touching patch
+     history (see `feedback_subagent_scope_drift_git_history` memory).
+   - ML-004b: once DL-068 lands, retry the 5 blocked tests, expand the
+     SingleSource subset, and produce a first-round pass/fail report.
    - ML-004c: fix whatever is cheaply fixable from the triage.
    - ML-004d: lock in as a `make check-suite`-style gate (not part of `make
      check`, same pattern as `check-golden`/`check-legality`) and record what's
      still open for a later round.
 
 This list is a plan, not a contract — findings at any step may re-scope later
-steps (e.g. DL-065's root cause may turn out to be multiple independent bugs,
-or ML-004a's wiring may surface gaps that reorder the triage). Progress and any
-re-scoping is tracked in the task files (`code-agent/tasks/DG-007*`,
-`DL-065*`, `ML-004*`) and folded back into this section as it lands.
+steps. Progress and any re-scoping is tracked in the task files
+(`code-agent/tasks/DG-007*`, `DL-065*`, `DL-068*`, `ML-004*`) and folded back
+into this section as it lands.
 
 ## Deferred Milestones
 
-- Fix `gem5-se-lld-elf-load-crash` (unblocks dual-backend verification for
-  the whole picolibc/clang pipeline).
-- Function-pointer indirect call (deferred 2026-07-12, decision C).
+- `codegen-tailcall-lowercall-assert` (`LowerCall` never implemented
+  tail-call opt-out; 113/963 picolibc files still crash on it at `-O1+`,
+  found during DL-065a's verification sweep).
+- `codegen-global-addr-const-offset-dropped` (global address + compile-time
+  constant offset loses the offset when materialized standalone; found
+  during DL-067b's probe design).
+- Function-pointer indirect call (deferred 2026-07-12, decision C — the
+  general `CALL_INDIRECT_PSEUDO`/scheduler case, distinct from the simpler
+  mechanism DL-066a fixed).
 - Complete ABI and runtime; aggregate/struct-by-value, struct return,
   `llvm.mem*` intrinsic inline-expansion (all gated on clang, now available —
   not yet started).
-- `dadao-oz-undef-physreg` (-O1+ codegen gap, needed before llvm-test-suite
-  at -O2).
+- `syscall-hello-write-output-missing` (pre-existing, unrelated to any
+  recent work; `syscall_hello.test`'s SYS_write produces no output on QEMU
+  despite a correct exit code).
 - musl (phase 2 libc; provides the large/variable-size `memcpy`/`memset`
   libcall symbols; gated on a real kernel).
-- llvm-test-suite SingleSource (ADR-0012 T3).
 - Kernel bring-up.
 - Dynamic linking, TLS, signals, atomics, and SMP.
