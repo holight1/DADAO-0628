@@ -336,6 +336,24 @@ crash" — E2E 55/55, differential AGREE(3-way)=200/Sail(4-way)=200 unchanged.
 **Phase A is done.** Next up is Phase B: musl crt0 auxv synthesis, then the
 `arch/dadao/` skeleton, per the task list above.
 
+### Phase B, step 1 complete (ML-008a, 2026-07-17): musl crt0 auxv synthesis
+
+A new crt0 variant (`tests/scripts/crt0_auxv.s`) hand-builds the
+argc/argv/envp/auxv stack layout musl's `crt1.c` / `_start_c(long *p)`
+protocol expects, entirely in user-mode `_start` — no simulator/loader
+changes needed (this was the recon's predicted "genuinely new work" item,
+since the old toolchain relied on a real QEMU linux-user/gem5 loader to
+synthesize argv/auxv, which this project's system-mode harness doesn't have).
+Validated with a discriminating probe (`tests/lit/E2E/musl_crt0_auxv.test`):
+real ASCII byte compare for argv[0], a genuine auxv walk-and-dispatch loop,
+and a match counter that catches both missing keys and wrong values —
+confirmed via an independent architect-run mutation test (corrupted
+AT_PAGESZ → exit 6, the expected fail code). E2E 56/56, differential
+unchanged. **This was the one genuinely new piece of work in Phase B; the
+remaining steps (syscall_arch.h/reloc.h/bits skeleton, TLS stub,
+atomic_arch.h, configure integration, static-link E2E) all have
+conclusion-level precedent from the archived toolchain to draw on.**
+
 ### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
 
 While spot-checking the recon report's QEMU source citations, found
