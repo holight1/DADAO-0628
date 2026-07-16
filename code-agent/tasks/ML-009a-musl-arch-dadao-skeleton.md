@@ -201,3 +201,5 @@ checkout 过"的情形跳过脏检查）。
 - `python3 scripts/manifest_check.py` → **PASS**，`enabled components` 列表现含 `musl`，确认脚本对新 enabled 组件处理正常，无需修改。
 
 **结论**：subagent 自审发现的 `CRTJMP` finding 是真实、有价值的一次自我纠错（拦下了一个会在后续任务解锁 `atomic_arch.h` 后静默触发的错误控制转移），处置得当。唯一的偏差是完成区把已知 tracked issue 误述为"新发现"，已在此更正记录，不影响验收结论。**ML-009a 验收通过**——musl 首次正式进入本仓库 component-lock 体系（`enabled=true`，pin 至 v1.2.5），编译期骨架（syscall_arch.h/reloc.h/bits/*）建立，766/~1600 候选 `.c` 文件可编译，剩余缺口全部落在已知、已规划的后续任务范围内（atomic_arch.h、既有后端 codegen 缺口）。
+
+**附：`scripts/fetch.py` 第二个基础设施 bug（架构师已直接修复，commit `7d98b21`）**——subagent 如实披露但正确地未越界修复：全新组件首次 `fetch.py` 引导时，`--no-checkout` clone 后立刻做的 dirty-check 会把每个文件报告成"已删除"从而必然 `SystemExit`。架构师复核时确认单纯"跳过刚 clone 出来那次的 dirty-check"并不够——`git merge-base --is-ancestor` 的 ancestor-check 紧接着会假阳性（新 clone 的 HEAD 落在远程默认分支 tip，pin commit 几乎总是它的祖先，会被误判成"patch 已应用"从而跳过 `checkout --detach`，留下空工作区+错误 commit）。修法：freshly-cloned 分支直接无条件走 `fetch + checkout --detach <pin>`，完全跳过 dirty-check 和 ancestor-check（同一次调用里刚 clone 出来的仓库不可能已经有 patch 提交）。已用一个独立 scratch 仓库验证首次引导+二次幂等，并对真实仓库的 llvm/qemu/musl（已应用 patch）重跑确认无回归。
