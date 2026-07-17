@@ -517,8 +517,58 @@ retrospective.
 - `syscall-hello-write-output-missing` (pre-existing, unrelated to any
   recent work; `syscall_hello.test`'s SYS_write produces no output on QEMU
   despite a correct exit code).
-- Kernel bring-up.
 - Dynamic linking, signals, atomics, SMP, and user `__thread` TLS relocations
   (musl's own static-single-thread subset does NOT wait on these — see
   ADR-0014 D5.2 / ML-006a; only genuinely thread/kernel-dependent features
   are deferred here).
+
+## Kernel bring-up (ADR-0015, 2026-07-18)
+
+The project's ultimate milestone is QEMU + kernel + a real userspace
+application (the musl work already substantially completed is the
+"userspace application" half of that). Kernel bring-up itself has not
+started yet; ADR-0015 charters it based on a survey of the archived
+`~/toolchain/DADAO` predecessor's three kernel bring-up attempts
+(V1/V2-V4/V5), none of which reached stable userspace execution — V1 got
+as far as printing `Run /init as init process` before crashing on a never-
+activated page table switch (built against an ISA guess later overturned
+by the official spec); V2/V4 (rebuilt against spec, with a bare-metal-TDD-
+first discipline) got architecturally further but stalled before that
+point on RA-stack/interrupt-polarity bugs; V5 (a further spec rewrite)
+never got past QEMU exception-entry plumbing before the project was
+archived. No kernel source/patches are reusable (5+ incompatible ISA
+revisions since); only the ~20-item pitfall list and design conclusions
+carry forward — same "conclusions only" pattern used for the musl port.
+
+**Decisions**: target kernel = Linux 5.4 (non-binding, matches the old
+project's choice); no firmware/SBI-monitor layer for now (continue direct
+`-kernel`/ELF loading, no bootloader handoff — this wasn't what blocked
+the old attempts, so it's not a prerequisite for the milestone).
+
+**Phased plan**:
+- **K0 (recon, next up)**: survey the current wiki pin's (`9f378f4`) full
+  SEE §5/interrupt-model/MMU-SBI definitions against what DADAO-0628 has
+  today (only the `cfx_smon` syscall trap) — produce a gap list; confirm
+  the Linux 5.4 target; distill the old project's ~20 pitfalls into a
+  "required reading" checklist for the tasks that follow. Same shape as
+  the `ML-006a` musl recon that worked well.
+- **K1**: complete the SEE/interrupt/MMU-SBI infrastructure (timer
+  interrupts, page faults, real privilege-mode switching, PTBR/PTHI/PAHI-
+  style TLB ops) on both backends, broken into incremental tasks the way
+  musl Phase A/B was.
+- **K2**: bare-metal kernel-mode regression *before* touching real Linux
+  source — context switch, trap dispatch, MMU enable/disable, all pinned
+  down with dual-backend + differential verification first. This is the
+  single biggest lesson from the old project: V2/V4's TDD-first discipline
+  got further than V1's "just try to boot it" approach.
+- **K3**: the real `arch/dadao` Linux port, written fresh against the
+  current spec (lessons only, no ported code), targeting `do_initcalls`/
+  `kernel_init` as the first real milestone.
+- **K4 (the actual "QEMU+kernel+userspace app" milestone)**: `Run /init`
+  actually executing a real musl-linked program — directly consuming the
+  musl work already done.
+
+ADR-0012 D5's gcc-c-torture goal is expected to keep progressing mostly
+independently of this (most torture cases are single-process compute that
+doesn't need a real kernel); kernel bring-up mainly unblocks the
+fork/exec/signal-dependent subset.
