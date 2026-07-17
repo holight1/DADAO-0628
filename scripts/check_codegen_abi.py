@@ -70,20 +70,38 @@ def read(path):
 # backend parsers
 # ---------------------------------------------------------------------------
 def parse_calling_conv(text):
-    """Return (cc_regs, retcc_regs) as lowercase register-name lists."""
-    def regs_in(defname):
+    """Return (int_regs, ptr_regs, ret_int_regs, ret_ptr_regs) as lowercase
+    register-name lists (None if the CallingConv def itself is missing).
+
+    DL-069a: CC_DADAO/RetCC_DADAO now carry two independently-counted rule
+    families — CCIfPtr<CCAssignToReg<[RB...]>> for pointer args/returns and
+    CCIfType<[i64], CCAssignToReg<[RD...]>> for integer args/returns
+    (contracts/abi/spec.md §2.1/§3.1). They must be parsed separately: a
+    single combined register list (the pre-DL-069a behavior) can no longer
+    distinguish "backend agrees with the pointer contract" from "backend
+    agrees with the integer contract" now that both rule families coexist
+    in the same CallingConv<[...]> body.
+    """
+    def body_of(defname):
         m = re.search(rf"def\s+{defname}\s*:\s*CallingConv<(.*?)>\s*;",
                       text, re.S)
-        if not m:
+        return m.group(1) if m else None
+
+    def regs_for(body, pattern):
+        if body is None:
             return None
-        body = m.group(1)
-        # collect every RD/RB/RF token inside CCAssignToReg<[...]> blocks
         regs = []
-        for block in re.findall(r"CCAssignToReg<\[(.*?)\]>", body, re.S):
+        for block in re.findall(pattern, body, re.S):
             regs += re.findall(r"R[DBF]\d+", block)
         return [r.lower() for r in regs]
 
-    return regs_in("CC_DADAO"), regs_in("RetCC_DADAO")
+    PTR_RULE = r"CCIfPtr<\s*CCAssignToReg<\[(.*?)\]>\s*>"
+    INT_RULE = r"CCIfType<\[i64\],\s*CCAssignToReg<\[(.*?)\]>\s*>"
+
+    cc_body = body_of("CC_DADAO")
+    retcc_body = body_of("RetCC_DADAO")
+    return (regs_for(cc_body, INT_RULE), regs_for(cc_body, PTR_RULE),
+            regs_for(retcc_body, INT_RULE), regs_for(retcc_body, PTR_RULE))
 
 
 def parse_reserved(text):
@@ -112,7 +130,7 @@ def check_calling_conv(abi):
     text = read(CC_TD)
     if text is None:
         return
-    cc, retcc = parse_calling_conv(text)
+    cc, ptr_cc, retcc, ptr_retcc = parse_calling_conv(text)
 
     # integer parameters
     want = expand_range(abi["arguments"]["integer"]["registers"])
@@ -137,13 +155,31 @@ def check_calling_conv(abi):
         record("MISMATCH", "CallingConv",
                f"integer return: backend={retcc} contract={rwant} [{rcite}]")
 
-    # pointer ABI (out of spike scope: GPRD-only backend)
+    # pointer parameters (DL-069a: RB bank, independently counted from RD)
+    pwant = expand_range(abi["arguments"]["pointer"]["registers"])
     pcite = abi["arguments"]["pointer"]["abi_cite"]
-    has_rb_param = bool(cc and any(r.startswith("rb") for r in cc))
-    if not has_rb_param:
+    if not ptr_cc:
         record("INFO", "CallingConv",
-               "pointer params rb16..rb31 / pointer return rb31 not implemented "
-               f"in spike (GPRD-only); contract defines them [{pcite}]")
+               "pointer params rb16..rb31 not implemented in backend "
+               f"(no CCIfPtr rule found); contract defines them [{pcite}]")
+    elif ptr_cc == pwant:
+        record("MATCH", "CallingConv", f"pointer params rb16..rb31 [{pcite}]")
+    else:
+        record("MISMATCH", "CallingConv",
+               f"pointer params: backend={ptr_cc} contract={pwant} [{pcite}]")
+
+    # pointer return (DL-069a: rb31, independently from the integer rd31 rule)
+    prwant = [abi["returns"]["pointer"]["register"].lower()]
+    prcite = abi["returns"]["pointer"]["abi_cite"]
+    if not ptr_retcc:
+        record("INFO", "CallingConv",
+               "pointer return rb31 not implemented in backend "
+               f"(no CCIfPtr rule found); contract defines it [{prcite}]")
+    elif ptr_retcc == prwant:
+        record("MATCH", "CallingConv", f"pointer return rb31 [{prcite}]")
+    else:
+        record("MISMATCH", "CallingConv",
+               f"pointer return: backend={ptr_retcc} contract={prwant} [{prcite}]")
 
 
 def check_reserved(abi):

@@ -1,0 +1,143 @@
+From 4d932e49ac641b7886389a72cb50d0a45eadedfa Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 06:44:13 +0800
+Subject: [PATCH] target/dadao: implement RB bank pointer calling convention
+ (DL-069a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+contracts/abi/spec.md SS2.1/SS3.1 specify that pointer/address arguments
+and return values are passed in the RB bank (rb16..rb31 / rb31),
+independently counted from integer arguments in the RD bank. CC_DADAO/
+RetCC_DADAO (introduced as a GPRD-only Phase 5 spike) never implemented
+this: every i64-representable value, pointers included, was assigned to
+the RD bank. This divergence was latent for ~18 days until ML-012a's
+musl integration work exercised a hand-written-asm-calls-real-compiled-
+function boundary with a pointer argument for the first time.
+
+- DADAOCallingConv.td: add CCIfPtr<CCAssignToReg<[RB16..RB31]>> (params)
+  and CCIfPtr<CCAssignToReg<[RB31]>> (return) rules ahead of the existing
+  CCIfType<[i64],...> integer rules. ArgFlags.isPointer() (already set by
+  SelectionDAGBuilder from the original IR type) distinguishes pointer
+  from integer args without needing a separate MVT. Ordering the CCIfPtr
+  rules first is required since CCState stops at the first matching
+  predicate. Independent per-bank counting and the shared-overflow-area
+  rule (SS2.3) both fall out for free from CCAssignToReg's per-list search
+  and CCAssignToStack's single shared CCState offset.
+- DADAOISelLowering.cpp LowerFormalArguments: derive the incoming
+  argument's virtual register class from which bank CC_DADAO actually
+  assigned (GPRBRegClass.contains(VA.getLocReg())) instead of re-deriving
+  pointer-ness by indexing back into the Function's argument list — more
+  robust and no longer assumes a 1:1 ArgLocs<->Function-arg
+  correspondence. LowerCall/LowerReturn/LowerCallResult needed no changes:
+  they copy to/from explicit physical registers (bank-agnostic at the
+  SelectionDAG level), and DADAORegisterInfo::copyPhysReg already supports
+  cross-bank physical register copies (RD2RB_ORRI/RB2RD_ORRI) for any
+  live-in copy insertion.
+
+Verified: scripts/check_codegen_abi.py pointer params/return now MATCH
+(was INFO); tools/run_differential.py AGREE(3-way)=200/AGREE(4-way)=200/
+DIVERGE=0 unchanged (pure calling-convention change, no instruction
+semantics touched); full tests/lit/E2E/ rerun shows exactly two new
+failures (malloc_hello.test, printf_hello.test), both traced to
+tests/scripts/pico_stubs.s's hand-written _write stub still assuming the
+old all-RD convention — tracked for ML-013a, not fixed here per this
+task's LLVM-only scope.
+---
+ llvm/lib/Target/DADAO/DADAOCallingConv.td   | 30 ++++++++++++++++++++-
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp | 17 ++++++++----
+ 2 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOCallingConv.td b/llvm/lib/Target/DADAO/DADAOCallingConv.td
+index 660b3a25139d..36199b8c5563 100644
+--- a/llvm/lib/Target/DADAO/DADAOCallingConv.td
++++ b/llvm/lib/Target/DADAO/DADAOCallingConv.td
+@@ -1,13 +1,41 @@
+ //===-- DADAOCallingConv.td - Calling Conventions for DADAO --*- tablegen -*-===//
+-// DADAO Calling Conventions — GPRD only (Phase 5 spike)
++// DADAO Calling Conventions (contracts/abi/spec.md §2.1, §3.1)
++//
++// Integer/scalar arguments (i8/i16/i32/i64/enum/_Bool) go to the RD bank
++// (rd16..rd31); pointer/address arguments go to the RB bank (rb16..rb31).
++// The two banks are counted independently starting at register 16 — there
++// is no shared slot numbering (§2.1: "The three banks count independently
++// starting from register 16."). DADAO is a 64-bit target, so both integer
++// and pointer values are legalized to the same MVT (i64); CCIfPtr checks
++// ArgFlags.isPointer() (set by SelectionDAGBuilder from the original IR
++// type, see llvm/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp) rather than
++// the value type, which is how the pointer/integer split is actually made
++// (same CCIfPtr construct used by e.g. M68kCallingConv.td/X86CallingConv.td
++// for their own address-vs-data register class splits).
++//
++// The pointer and integer CCIfPtr/CCIfType<[i64]> rules below are ORDER
++// SENSITIVE: CCState evaluates rules top-to-bottom and stops at the first
++// matching predicate, so the CCIfPtr rules MUST precede the CCIfType<[i64]>
++// rules — otherwise a pointer argument (VT == i64) would incorrectly match
++// the integer rule first and never reach the RB-bank rule. §2.3's "single
++// shared overflow area, ordered by declaration sequence, regardless of
++// bank" falls out for free: CCAssignToStack shares one monotonically
++// increasing byte offset across all rules in the same CCState, and
++// arguments are visited by CCState in declaration order regardless of
++// which rule (pointer or integer) ultimately assigns them.
+ //===----------------------------------------------------------------------===//
+ 
+ def CC_DADAO : CallingConv<[
++  CCIfPtr<CCAssignToReg<[RB16, RB17, RB18, RB19, RB20, RB21, RB22, RB23,
++                          RB24, RB25, RB26, RB27, RB28, RB29, RB30, RB31]>>,
++  CCIfPtr<CCAssignToStack<8, 8>>,
++
+   CCIfType<[i64], CCAssignToReg<[RD16, RD17, RD18, RD19, RD20, RD21, RD22, RD23,
+                                   RD24, RD25, RD26, RD27, RD28, RD29, RD30, RD31]>>,
+   CCIfType<[i64], CCAssignToStack<8, 8>>
+ ]>;
+ 
+ def RetCC_DADAO : CallingConv<[
++  CCIfPtr<CCAssignToReg<[RB31]>>,
+   CCIfType<[i64], CCAssignToReg<[RD31]>>
+ ]>;
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 08b296be1e8c..088d49f6e589 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -10,7 +10,6 @@
+ #include "llvm/CodeGen/MachineRegisterInfo.h"
+ #include "llvm/CodeGen/SelectionDAG.h"
+ #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
+-#include "llvm/IR/Function.h"
+ #include "llvm/Support/ErrorHandling.h"
+ 
+ using namespace llvm;
+@@ -200,7 +199,6 @@ SDValue DADAOTargetLowering::LowerFormalArguments(
+     SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals) const {
+   MachineFunction &MF = DAG.getMachineFunction();
+   MachineRegisterInfo &RegInfo = MF.getRegInfo();
+-  const Function &F = MF.getFunction();
+ 
+   SmallVector<CCValAssign, 16> ArgLocs;
+   CCState CCInfo(CallConv, IsVarArg, MF, ArgLocs, *DAG.getContext());
+@@ -210,9 +208,18 @@ SDValue DADAOTargetLowering::LowerFormalArguments(
+     CCValAssign &VA = ArgLocs[i];
+     if (VA.isRegLoc()) {
+       EVT RegVT = VA.getLocVT();
+-      const TargetRegisterClass *RC = &DADAO::GPRDRegClass;
+-      if (i < F.arg_size() && F.getArg(i)->getType()->isPointerTy())
+-        RC = &DADAO::GPRBRegClass;
++      // Derive the virtual register class from the bank CC_DADAO actually
++      // assigned (RB for pointers, RD for integers — contracts/abi/spec.md
++      // §2.1), not from re-deriving pointer-ness via the original Function
++      // argument list by index: that back-reference silently assumes a 1:1
++      // ArgLocs<->Function-arg correspondence which does not generally hold
++      // (e.g. varargs, split/promoted types), while VA.getLocReg()'s bank
++      // is exactly what determines which physical register class the
++      // subsequent CopyFromReg must match.
++      const TargetRegisterClass *RC =
++          DADAO::GPRBRegClass.contains(VA.getLocReg())
++              ? &DADAO::GPRBRegClass
++              : &DADAO::GPRDRegClass;
+       Register VReg = RegInfo.createVirtualRegister(RC);
+       RegInfo.addLiveIn(VA.getLocReg(), VReg);
+       SDValue Arg = DAG.getCopyFromReg(Chain, DL, VReg, RegVT);
+-- 
+2.43.0
+

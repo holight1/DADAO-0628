@@ -918,10 +918,37 @@
 
 - id: dadao-callingconv-pointer-args-use-rd-bank-not-rb-bank
   title: "DADAOCallingConv.td（\"GPRD only, Phase 5 spike\"）把指针类型的函数参数分配到 RD bank（rd16..），与 contracts/abi/spec.md §2.1 记载的 RB bank（rb16..）不一致"
-  status: open
+  status: closed
   scope: [CodeGen, ABI]
   blocks: null
-  resolved_by: null
+  resolved_by: DL-069a
+  # DL-069a（2026-07-18）：走用户决策路线 (a)——实现真正的 RB bank 指针
+  # 调用约定，而非修订 contracts/abi/spec.md。CC_DADAO/RetCC_DADAO 新增
+  # CCIfPtr<CCAssignToReg<[RB16..RB31]>>/CCIfPtr<CCAssignToReg<[RB31]>>
+  # 规则（置于 CCIfType<[i64],...> 规则之前，靠 ArgFlags.isPointer() 区分
+  # 指针与整数——SelectionDAGBuilder 已经从原始 IR 类型设置这个标志，无需
+  # 新引入 MVT::iPTR 之类的机制）；两个 bank 独立计数天然成立（CCState对
+  # 每个 CCAssignToReg 列表各自查找"第一个未分配"寄存器，RD/RB是不同物理
+  # 寄存器，互不干扰）。DADAOISelLowering.cpp 仅
+  # LowerFormalArguments 一处需要改：改用
+  # `GPRBRegClass.contains(VA.getLocReg())` 派生虚拟寄存器类，替换掉原先
+  # 靠 Function 参数下标反查 isPointerTy() 的写法（更健壮，不假设
+  # ArgLocs<->Function-arg 一一对应）。LowerCall/LowerReturn/
+  # LowerCallResult 均为纯物理寄存器拷贝（bank-agnostic），配合
+  # DADAORegisterInfo::copyPhysReg 已有的跨 bank 拷贝支持（RD2RB_ORRI/
+  # RB2RD_ORRI），无需改动。
+  #
+  # 验收：scripts/check_codegen_abi.py 的 pointer params/pointer return 两
+  # 条从 INFO 变为 MATCH（该脚本本身也需要改：原 parse_calling_conv 把
+  # CC_DADAO 里所有 CCAssignToReg 块的寄存器混在一起返回一个列表，改为按
+  # CCIfPtr/CCIfType<[i64]> 规则分别解析）；tools/run_differential.py 结果
+  # 与改动前基线逐位一致（AGREE 3-way=200/4-way=200/DIVERGE=0，纯调用约定
+  # 改动不触及任何指令语义，符合预期）；全量 tests/lit/E2E 除
+  # malloc_hello.test/printf_hello.test 两个新失败外零变化（这两个失败是
+  # 预期中的——tests/scripts/pico_stubs.s 的手写 `_write` 仍假设旧的
+  # "buf 参数在 rd17" 约定，需要 ML-013a 按本条目已记录的下游文件清单
+  # 更新）。详见 code-agent/tasks/DL-069a-rb-bank-pointer-calling-convention.md
+  # 完成区。
   # ML-012a（2026-07-17）：为落地 musl 首个真实静态链接 E2E 里程碑，
   # crt_arch.h 需要用手写汇编 `call _start_c` 调用一个真实由 clang 编译的
   # 函数 `void _start_c(long *p)`——这是本项目第一次让"手写汇编"与"真实
