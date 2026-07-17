@@ -430,6 +430,57 @@ for a dedicated follow-up. Compiled file count 778 → 937,
 `pthread_arch.h`-related errors 183 → 0. E2E 57/57, differential
 unchanged.
 
+### Phase B, step 5 complete (ML-012a, 2026-07-17): musl crt_arch.h + first real static-link E2E milestone (exit 42)
+
+`int main(void){return 42;}` compiled with clang and linked against
+musl's real `crt1.o` + a 1166-of-1346-file `libc.a` subset now exits 42
+on **both QEMU and gem5** via the real `crt1.c → _start_c →
+__libc_start_main → __init_libc/__init_tls/__init_tp →
+libc_start_main_stage2 → exit() → SYS_exit_group` chain — the first time
+any musl program has actually run end to end on this project.
+
+**Major discovery, ADR-level decision needed**: `DADAOCallingConv.td`
+("GPRD only, Phase 5 spike") passes *all* i64-representable arguments,
+pointers included, in the RD bank (`rd16`) — never the RB bank (`rb16`)
+that `contracts/abi/spec.md §2.1` documents for pointer/address
+parameters. Confirmed by reading the TableGen source, both
+`AnalyzeCallOperands`/`AnalyzeFormalArguments` call sites (so caller and
+callee sides are mutually consistent with each other, just not with the
+written spec), and a disassembled probe. This was invisible until now
+because every previous test had hand-written assembly calling *other*
+hand-written assembly on both ends of a call — this task is the first
+time hand-written asm (`crt_arch.h`) called a real compiler-generated
+function with a pointer argument, which is exactly the boundary that
+exposes the mismatch. Routed around on the musl side only (`crt_arch.h`,
+and a genuine latent bug in ML-011a's `__set_thread_area.s` that had
+never been exercised against a real compiled caller — fixed here); zero
+LLVM changes. Logged as
+`dadao-callingconv-pointer-args-use-rd-bank-not-rb-bank`. **Two paths
+forward, neither decided by this task**: (a) implement the real RB-bank
+pointer calling convention in the backend, or (b) formally revise
+`contracts/abi/spec.md §2.1` via ADR to record current behavior (pointers
+share the RD bank with scalars) as the accepted convention. This will
+resurface at the next musl E2E milestone (malloc+printf, which mixes
+compiled and hand-written code at more boundaries), so it's worth
+resolving before then rather than routing around it repeatedly.
+
+Two more already-tracked backend gaps were routed around musl-side only:
+`-fno-optimize-sibling-calls` in a new `arch/dadao/arch.mak` (works around
+`codegen-tailcall-lowercall-assert`; as a side effect also unblocked
+~229 other musl files tree-wide), and a `volatile`-qualified barrier
+replacing an inline-asm operand trick DADAO can't allocate a register for
+(`musl-inline-asm-empty-clobber-reg-alloc`). One new link-time-only gap
+was found and routed around: a PC-relative relocation for "address of a
+weak-undefined external symbol" has no wide-range fallback
+(`dadao-pcrel-reloc-no-farsym-fallback`) — safe to route around here
+because the affected code path (`_DYNAMIC`/`PT_DYNAMIC`) is also
+runtime-dead in this static-only, no-dynamic-linker configuration.
+
+A `make build-musl` target was added (configure + best-effort `make -k` +
+archive-what-compiled, mirroring `build-picolibc`'s existing pattern) so
+this milestone is reproducible from a clean checkout. E2E 58/58,
+differential unchanged.
+
 ### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
 
 While spot-checking the recon report's QEMU source citations, found
