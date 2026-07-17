@@ -1,0 +1,123 @@
+// ML-011a: tp_probe -- discriminating probe for the DADAO thread-pointer
+// register (rb4/rbtp, contracts/abi/spec.md SS1.2) read/write sequences
+// used by musl's arch/dadao/{get_tp,__set_thread_area}.s. Hand-assembled
+// and independent of the musl source tree (same style as mmap_probe.test,
+// ML-007a) -- the two subroutines below (set_tp_sub / get_tp_sub) are
+// byte-for-byte the same instruction sequences as the real musl arch
+// files (.work/source/musl/src/thread/dadao/__set_thread_area.s and
+// src/thread/dadao/get_tp.s after this task lands), just under local
+// labels since this probe does not link against musl.
+//
+// Verifies (discriminating, not just "doesn't crash"):
+//   - writing a first non-trivial, non-zero value into rb4 via the exact
+//     __set_thread_area sequence (rb2rb rb4, rb16, 1) and reading it back
+//     via the exact __get_tp sequence (rb2rd rd31, rb4, 1) through a real
+//     call/ret subroutine boundary returns the identical value
+//   - overwriting rb4 with a SECOND, different value and reading again
+//     returns the second value (rules out "always returns the hardware
+//     reset value / stuck at first write" false positive)
+//
+// Value choice note: both test values deliberately keep bits[63:48] == 0
+// (i.e. genuine 48-bit pointer range, matching contracts/isa/spec.md SS1.3
+// "Effective address width is 48 bits" -- every real pointer/TP value on
+// this target already has zero high bits by construction of the address
+// space, and musl's TP is always a real pointer, never a synthetic 64-bit
+// pattern). This is NOT an accident of convenience: a broader diagnostic
+// investigation during ML-011a (see docs/issues.yaml
+// "blockcopy-rb-source-64bit-fidelity-backend-divergence") found that
+// QEMU and gem5 genuinely disagree on whether bits[63:48] survive a
+// rb2rb/rd2rb write followed by a rb2rd/rb2rb read when those bits are
+// NONZERO -- a real backend divergence, reported separately, out of this
+// task's scope and irrelevant to real TP/pointer usage (where those bits
+// are always already zero, so both backends agree, as this test confirms
+// with a real call/ret round trip through the exact instruction sequence
+// __get_tp/__set_thread_area use).
+//
+// Exit 42 = all checks passed; any other code identifies which check
+// failed (1..2, see labels below) for local debugging.
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %s
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld %t.o -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: grep -c "tp-ok" %t.out | xargs test 1 -eq
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: grep -c "tp-ok" %t.gout | xargs test 1 -eq
+.text
+.globl _start
+_start:
+    # value1 = 0x0000BABE12345678 (setzw + 2x orw; top wyde left at the
+    # setzw-implied 0, matching real 48-bit pointer range, see note above)
+    setzw rd1, 0, 0x5678
+    orw   rd1, 1, 0x1234
+    orw   rd1, 2, 0xBABE
+
+    # __set_thread_area(p)-equivalent: pointer arg arrives in RB bank
+    # (contracts/abi/spec.md SS2.1); build it there first, then call the
+    # set-tp subroutine (mirrors real ABI: caller places pointer in rb16).
+    rd2rb rb16, rd1, 1
+    call set_tp_sub
+
+    # Clobber rb16 (the register that carried the value into set_tp_sub)
+    # with an unrelated sentinel before reading back, so a compound bug
+    # where the write is a no-op AND get_tp_sub's source operand
+    # accidentally resolved to rb16 instead of rb4 cannot coincidentally
+    # "pass" by reading the stale argument register (subagent review
+    # finding, ML-011a).
+    rela rb16, sentinel
+    addi rb16, rb16, sentinel
+
+    call get_tp_sub
+    # get_tp_sub returns in rd31; compare to rd1 (expected value1).
+    breq rd31, rd1, check2
+    addi rd17, rd0, 1
+    jump fail
+
+check2:
+    # value2 = 0x0000112233445566 (different value; rules out "stuck at
+    # first write / hardware reset value" false positive).
+    setzw rd2, 0, 0x5566
+    orw   rd2, 1, 0x3344
+    orw   rd2, 2, 0x1122
+
+    rd2rb rb16, rd2, 1
+    call set_tp_sub
+    rela rb16, sentinel
+    addi rb16, rb16, sentinel
+    call get_tp_sub
+    breq rd31, rd2, pass
+    addi rd17, rd0, 2
+    jump fail
+
+pass:
+    addi rd16, rd0, 64        # sysno = SYS_write
+    addi rd17, rd0, 1         # fd = stdout
+    rela rb8, msg_data
+    addi rb8, rb8, msg_data
+    rb2rd rd18, rb8, 1
+    addi rd19, rd0, 6         # len("tp-ok\n")
+    trap 2, 0
+    addi rd16, rd0, 93        # sysno = SYS_exit
+    addi rd17, rd0, 42
+    trap 2, 0
+
+fail:
+    addi rd16, rd0, 93        # sysno = SYS_exit, rd17 already set to fail code
+    trap 2, 0
+
+set_tp_sub:
+    # Mirrors musl arch/dadao/src/thread/dadao/__set_thread_area.s body
+    # exactly (ML-011a): pointer arg in rb16, write into rb4 (rbtp).
+    rb2rb rb4, rb16, 1
+    ret rd31, 0
+
+get_tp_sub:
+    # Mirrors musl arch/dadao/src/thread/dadao/get_tp.s body exactly
+    # (ML-011a): read rb4 (rbtp) into rd31 (scalar return register).
+    rb2rd rd31, rb4, 1
+    ret rd0, 0
+
+msg_data:
+    .asciz "tp-ok\n"
+
+sentinel:
+    .byte 0

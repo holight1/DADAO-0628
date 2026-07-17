@@ -820,3 +820,73 @@
   blocks: null
   resolved_by: null
   # ML-010a（2026-07-17）同上，atomic_arch.h 解锁后新曝光，未做根因定位。
+  # ML-011a（2026-07-17）pthread_arch.h 落地后重跑 make -k lib/libc.a：本
+  # 类别文件数不变（仍只有 daemon.c 一处），未新增实例。同批还发现了下面
+  # 一条断言位置不同的 UNREACHABLE（__unmapself.o，DADAOAsmPrinter.cpp:82），
+  # 与本条不是同一断言点，单独立项，见
+  # musl-backend-assert-asmprinter-unmapself。
+
+- id: musl-backend-assert-asmprinter-unmapself
+  title: "musl `thread/__unmapself.o` 编译时撞 UNREACHABLE executed at DADAOAsmPrinter.cpp:82（与 legacy/daemon.c 的 TargetInstrInfo.h:786 断言点不同，独立立项）"
+  status: open
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: null
+  # ML-011a（2026-07-17）pthread_arch.h 落地解锁 183 处编译后，全树
+  # make -k lib/libc.a 首次编译到 src/thread/__unmapself.c 这一步才曝光
+  # （此前被 pthread_arch.h 缺失挡住）。未做根因定位，只记录触发文件和
+  # 断言文本/位置，留给独立后端任务排查。
+
+- id: blockcopy-rb-source-64bit-fidelity-backend-divergence
+  title: "QEMU 与 gem5 对 RB-bank block-copy 指令（rd2rb/rb2rb 写 → rb2rd/rb2rb 读）在源寄存器高 16 位非零时是否保真存在真实分歧，且分歧依赖\"写入该寄存器所用的指令类别\"而非仅寄存器内容——现有逐指令语义向量（per-instruction state injection）测不出这种序列相关性"
+  status: open
+  scope: [QEMU, gem5, ISA]
+  blocks: null
+  resolved_by: null
+  # ML-011a（2026-07-17）为 __get_tp/__set_thread_area 写判别性探针
+  # （tests/lit/E2E/tp_probe.test）时，最初用刻意构造的、高 16 位非零的
+  # 64-bit 测试值（如 0xCAFEBABE12345678）过 rb2rb 写入 rb4 再用 rb2rd
+  # 读回，QEMU 与 gem5 结果不一致（QEMU exit=42 通过；gem5 exit=1，
+  # 读回值高 16 位被清零）。逐层排查（4 个独立最小探针 + 直接 od -tx1 观
+  # 察原始字节，绕开分支比较逻辑本身可能出错的风险）后发现：
+  #
+  #   写入机制 = rd2rb（RD→RB，"Reg copy → RB" 类）
+  #     + 读出机制 = sto（RB reg 整体 store 到内存）+ ldo 读回：
+  #     QEMU=完整 64 位、gem5=完整 64 位（一致，均不截断）
+  #   写入机制 = rd2rb + 读出机制 = rb2rd：
+  #     QEMU=完整 64 位；gem5=截断为 48 位（**分歧**，
+  #     gem5 侧根因见 components/gem5/patches/0007-dadao-controlflow-ras.patch
+  #     的 BlockCopyInst::execute()：`if (srcRb) v &= MASK48;`——按该 patch
+  #     注释，这是刻意实现的"RB source 读回 48 位"语义，依据的是
+  #     tests/vectors/isa/rd-wyde-block.yaml 里 rb2rd/rb2rb 向量
+  #     "48-bit RB zero-extends"的记法，但这与 contracts/isa/spec.md §4.7
+  #     正文"rd2rb/rb2rb/rb2rd all transfer full 64 bits"直接冲突——
+  #     **规范正文 vs 现有独立向量本身就不一致**，这条本身也需要架构师/
+  #     ISA 决策澄清，不是 gem5 单方面的孤立 bug)
+  #   写入机制 = setzw-rb/orw-rb（Wyde immediate RB 类）
+  #     + 读出机制 = rb2rd：
+  #     QEMU=截断为 48 位、gem5=截断为 48 位（一致，均截断——与
+  #     rd-wyde-block.yaml 向量记法相符）
+  #   写入机制 = setzw-rb/orw-rb + 读出机制 = sto（bypass rb2rd）：
+  #     QEMU=截断为 48 位；gem5=完整 64 位（**分歧，方向与上面那条相反**）
+  #
+  #   即：同一个寄存器、同一份"最终应该是什么值"，QEMU 和 gem5 的截断行为
+  #   会依"写入该寄存器所用的指令类别"而变，且两个后端在不同的写入/读出
+  #   组合上互相反着分歧——这明显是两个后端各自内部实现的不一致（很可能
+  #   是把"是否截断"这类应该只取决于读指令本身的元数据，误关联到了写指令
+  #   的历史/来源），而不是单纯某一方"实现了 spec、另一方没实现"。
+  #
+  #   对 ML-011a 本身：真实 musl TP/指针用途永远落在 48 位地址空间内（
+  #   contracts/isa/spec.md §1.3 "Effective address width is 48 bits"），
+  #   高 16 位天然恒为 0，因此上述截断/不截断分歧对真实指针值不可观测——
+  #   已验证：用 48-bit-clean 测试值（0x0000BABE12345678 /
+  #   0x0000112233445566）跑与 __set_thread_area/__get_tp 完全相同的指令
+  #   序列（rd2rb 建值 → rb2rb 写 rb4 → rb2rd 读回），QEMU 与 gem5 结果
+  #   字节级一致，tp_probe.test 用这两个安全值双后端通过。
+  #
+  #   本条不阻塞 ML-011a 交付，但现有 tests/vectors/isa/*.yaml 的逐指令
+  #   状态注入式向量测不出这种"依赖写入历史的读取行为"（向量直接注入
+  #   寄存器初值，不经过真实指令序列执行），建议架构师评估是否需要专门
+  #   的序列级（非单指令）差分回归覆盖这一类 RB-bank 读写组合，并先澄清
+  #   contracts/isa/spec.md §4.7 正文与 tests/vectors/isa/rd-wyde-block.yaml
+  #   两个 rb2rd/rb2rb 向量之间"是否 48-bit 截断"的规范/向量不一致。

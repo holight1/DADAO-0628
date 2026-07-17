@@ -1,0 +1,192 @@
+From f4b0c3d1ec5e5bab3f2a9fc4d97b96dcb9156e19 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 17 Jul 2026 09:50:16 +0800
+Subject: [PATCH] dadao: add arch/dadao/pthread_arch.h +
+ get_tp.s/__set_thread_area.s (ML-011a)
+
+Read/write the thread pointer register (rb4/rbtp, contracts/abi/spec.md
+SS1.2) via real standalone assembly functions rather than inline C asm
+with a named "rb4" register variable, because clang's DADAO target
+(DADAOTargetInfo::getGCCRegNames()) only lists rd0..rd31 -- the entire RB
+bank is absent, so "rb4" is rejected as an unknown register name. This is
+a real, narrow clang-frontend gap (reported, not fixed, per this task's
+scope).
+
+get_tp.s: rb2rd rd31, rb4, 1 (contracts/isa/spec.md SS4.7).
+__set_thread_area.s: rb2rb rb4, rb16, 1 -- a pure register write, not a
+syscall (musl's generic __syscall(SYS_set_thread_area, ...) fallback
+would return -ENOSYS and crash via a_crash(), since DADAO has no such
+syscall and none is needed).
+
+TLS model: TLS_ABOVE_TP, GAP_ABOVE_TP=0 (matches riscv64; musl itself
+never emits compiler __thread access code on this target, ML-006a
+SS3.3, so this choice has no runtime consequence in the current static
+single-threaded phase).
+---
+ arch/dadao/pthread_arch.h            | 67 ++++++++++++++++++++++++++++
+ src/thread/dadao/__set_thread_area.s | 35 +++++++++++++++
+ src/thread/dadao/get_tp.s            | 36 +++++++++++++++
+ 3 files changed, 138 insertions(+)
+ create mode 100644 arch/dadao/pthread_arch.h
+ create mode 100644 src/thread/dadao/__set_thread_area.s
+ create mode 100644 src/thread/dadao/get_tp.s
+
+diff --git a/arch/dadao/pthread_arch.h b/arch/dadao/pthread_arch.h
+new file mode 100644
+index 00000000..17691bc7
+--- /dev/null
++++ b/arch/dadao/pthread_arch.h
+@@ -0,0 +1,67 @@
++/*
++ * DADAO pthread_arch.h (ML-011a).
++ *
++ * TLS model: TLS_ABOVE_TP (matches riscv64/aarch64/mips64/microblaze --
++ * TLS image lives above the thread pointer, growing toward higher
++ * addresses), GAP_ABOVE_TP=0 (matches riscv64 exactly -- no reserved gap).
++ * Chosen because:
++ *   - DADAO has no existing hardware/ABI convention for TLS layout
++ *     (greenfield ISA; contracts/abi/spec.md only defines rb4=rbtp as a
++ *     bare register role -- "Thread pointer", no layout semantics --
++ *     and SS6 lists "Dynamic linking TLS" as Excluded from M1).
++ *   - musl itself (ML-006a SS3.3, re-confirmed here: `grep -rl '__thread '
++ *     src` in this tree has zero matches) never emits compiler __thread
++ *     access code on this target, so this choice has zero *runtime*
++ *     consequence for the static single-threaded phase this task
++ *     targets -- it only needs to be *a* consistent, self-contained model
++ *     so src/env/__init_tls.c's TLS_ABOVE_TP-guarded arithmetic
++ *     type-checks and links (that file is compiled and its
++ *     static_init_tls()/__copy_tls() are called from __libc_start_main
++ *     regardless of whether any __thread variable exists).
++ *
++ * TP_OFFSET / DTP_OFFSET are intentionally left undefined here (both fall
++ * back to their src/internal/pthread_impl.h defaults of 0). Both macros
++ * only matter for compiler-generated __thread access code sequences
++ * (TP_OFFSET biases __pthread_self()'s TCB-from-TP computation to match a
++ * real hardware TP-bias convention; DTP_OFFSET biases the dynamic-TLS
++ * dtv slot value that GD/IE-model access code reads) -- this target never
++ * emits either kind of access code, so 0 is not a guess, it is the
++ * documented "no bias, unreachable" choice (same reasoning already
++ * applied to arch/dadao/reloc.h's REL_TPOFF/REL_DTPOFF placeholders,
++ * ML-006a SS3.3).
++ *
++ * __get_tp()/__set_thread_area() read/write rb4 (rbtp,
++ * contracts/abi/spec.md SS1.2) via real standalone assembly functions
++ * (src/thread/dadao/get_tp.s / __set_thread_area.s), NOT inline C asm
++ * with a named register variable -- unlike every other arch's
++ * pthread_arch.h (e.g. arch/riscv64/pthread_arch.h's `register uintptr_t
++ * tp __asm__("tp")` pattern), because that pattern does not work on the
++ * current DADAO clang target: DADAOTargetInfo::getGCCRegNames()
++ * (.work/llvm/clang/lib/Basic/Targets/DADAO.cpp) only lists "rd0".."rd31"
++ * -- the entire RB register bank (including "rb4") is absent from the
++ * GCC/clang register-name table clang's Sema checks named-register
++ * variables against. Verified directly: `register uintptr_t x
++ * __asm__("rb4");` -> "error: unknown register name 'rb4' in asm". This
++ * is a real, narrow clang-frontend gap (reported to the architect per
++ * this task's hard constraint, not fixed here -- see get_tp.s for the
++ * full note). Real standalone assembly sidesteps it entirely: the
++ * DADAO integrated assembler already accepts "rb2rd"/"rb2rb"/"ret" in
++ * real .s files (tests/scripts/crt0_auxv.s, tests/lit/E2E/mmap_probe.test,
++ * both predate this task), so a hand-written function body is a normal,
++ * fully-supported path -- just not a C-inline-asm one.
++ */
++
++#define TLS_ABOVE_TP
++#define GAP_ABOVE_TP 0
++
++/* MC_PC: arch/dadao/bits/signal.h's mcontext_t is an explicit [OPEN]
++ * size-only placeholder (no reviewed DADAO signal-frame ABI exists yet --
++ * rt_sigaction/rt_sigreturn are not implemented by the cfx_smon trap
++ * responder, ML-006a SS2.3 P3, deferred). __gregs[0] is not a reviewed
++ * "PC lives here" claim, just a placeholder slot inside that same [OPEN]
++ * struct (matching riscv64's `#define MC_PC __gregs[0]` convention
++ * exactly) so src/thread/pthread_cancel.c's `uc->uc_mcontext.MC_PC`
++ * type-checks; real signal delivery is out of this task's scope. */
++#define MC_PC __gregs[0]
++
++hidden uintptr_t __get_tp(void);
+diff --git a/src/thread/dadao/__set_thread_area.s b/src/thread/dadao/__set_thread_area.s
+new file mode 100644
+index 00000000..4b0cd251
+--- /dev/null
++++ b/src/thread/dadao/__set_thread_area.s
+@@ -0,0 +1,35 @@
++# DADAO __set_thread_area (ML-011a): write the thread pointer (rb4/rbtp,
++# contracts/abi/spec.md SS1.2) from the incoming pointer argument via a
++# real RB->RB block-copy instruction (contracts/isa/spec.md SS4.7 rb2rb).
++# See get_tp.s for why this is a standalone .s file rather than inline C
++# asm with a named "rb4" register variable (real, narrow clang frontend
++# gap: DADAOTargetInfo::getGCCRegNames() omits the entire RB bank).
++#
++# This is a PURE REGISTER WRITE, not a syscall: musl's generic fallback
++# (src/thread/__set_thread_area.c) does `return __syscall(SYS_set_thread_area,
++# p)` if SYS_set_thread_area is defined, else `return -ENOSYS`. DADAO's
++# bits/syscall.h.in does not define SYS_set_thread_area, so without this
++# arch override the generic fallback would return -ENOSYS (-38); its
++# caller, src/env/__init_tls.c's __init_tp(), treats any negative return
++# as fatal (`if (r < 0) return -1;` -> static_init_tls() calls a_crash()).
++# Every other real arch (riscv64, aarch64, x86_64, ...) overrides this
++# with a pure register-write .s stub for exactly this reason -- there is
++# no real Linux "set the TP register" syscall on any of them either.
++#
++# ABI: int __set_thread_area(void *p) -- p is a pointer argument, so it
++# arrives in the RB bank at rb16 (contracts/abi/spec.md SS2.1), NOT the RD
++# bank; scalar int return in rd31 (contracts/abi/spec.md SS3.1). Leaf
++# function: no `call` inside, no stack frame needed.
++#
++# `ret rdha, imms18` (contracts/isa/spec.md SS5.5) sets rdha =
++# sext_18(imms18) as a compile-time immediate while popping RegRAS -> PC
++# in the same instruction -- used directly here since the return value
++# (0) is a compile-time constant (contracts/abi/spec.md SS5.3 documents
++# exactly this "ret rd31, N" shortcut).
++
++.text
++.globl __set_thread_area
++.hidden __set_thread_area
++__set_thread_area:
++    rb2rb rb4, rb16, 1
++    ret rd31, 0
+diff --git a/src/thread/dadao/get_tp.s b/src/thread/dadao/get_tp.s
+new file mode 100644
+index 00000000..7bdb0704
+--- /dev/null
++++ b/src/thread/dadao/get_tp.s
+@@ -0,0 +1,36 @@
++# DADAO __get_tp (ML-011a): read the thread pointer (rb4/rbtp,
++# contracts/abi/spec.md SS1.2) into the RD-bank scalar return register
++# (rd31, contracts/abi/spec.md SS3.1) via a real RB->RD block-copy
++# instruction (contracts/isa/spec.md SS4.7 rb2rd).
++#
++# Why a standalone .s file instead of inline C asm (the pattern every
++# other musl arch's pthread_arch.h uses, e.g. arch/riscv64/pthread_arch.h
++# `register uintptr_t tp __asm__("tp")`): clang's DADAO target only lists
++# "rd0".."rd31" in DADAOTargetInfo::getGCCRegNames()
++# (.work/llvm/clang/lib/Basic/Targets/DADAO.cpp) -- the entire RB bank,
++# including "rb4", is absent, so `register uintptr_t x __asm__("rb4");`
++# is rejected by Sema with "unknown register name 'rb4' in asm" (verified
++# directly with clang -S on a standalone probe). This is a real, narrow
++# clang-frontend gap; per this task's hard constraint it is reported to
++# the architect, not fixed here. A real assembly function sidesteps it:
++# the DADAO integrated assembler already accepts "rb2rd"/"ret" in hand-
++# written .s files predating this task (tests/scripts/crt0_auxv.s,
++# tests/lit/E2E/mmap_probe.test).
++#
++# ABI: uintptr_t __get_tp(void) -- no arguments; scalar return in rd31
++# (contracts/abi/spec.md SS3.1). Leaf function: no `call` inside, no
++# stack frame needed (contracts/abi/spec.md SS4/SS5).
++#
++# `ret rdha, imms18` semantics (contracts/isa/spec.md SS5.5): pops
++# RegRAS -> PC, and sets rdha = sext_18(imms18) as an *immediate*, not a
++# copy of a prior register -- so the real return value must already be
++# in rd31 before `ret` executes, and `ret` must target rd0 (a documented
++# legal no-op write, contracts/isa/spec.md SS1.2/SS5.5) to avoid
++# clobbering it with a compile-time constant.
++
++.text
++.globl __get_tp
++.hidden __get_tp
++__get_tp:
++    rb2rd rd31, rb4, 1
++    ret rd0, 0
+-- 
+2.43.0
+
