@@ -611,3 +611,36 @@ ADR-0012 D5's gcc-c-torture goal is expected to keep progressing mostly
 independently of this (most torture cases are single-process compute that
 doesn't need a real kernel); kernel bring-up mainly unblocks the
 fork/exec/signal-dependent subset.
+
+### K0 complete (KL-001a, 2026-07-18): kernel bring-up recon
+
+Full report at `docs/reviews/kernel-bringup-recon-2026-07-18.md`. Two
+high-value findings (both independently re-verified against the wiki
+source):
+
+1. **SEE §5 is a complete spec at the current pin, not a draft** — but
+   DADAO-0628's existing `cfx_smon` implementation is a pure host-side
+   shortcut (QEMU C code directly simulating write/exit/brk); `escape`,
+   `cfx2rd`/`cfx2rc`, `cfxld`/`cfxst`, `inner_run_mode`, and cg5 exception-
+   state registers are entirely unimplemented in both backends (confirmed:
+   zero matches grepping either patch series). K1 is "upgrade the shortcut
+   to the real mechanism," not "start from zero."
+2. **HBI §3 mandates hardware always resets into hypv mode**, requiring a
+   small hypv→supv handoff stub before reaching S-mode — see ADR-0015 D2's
+   clarification. **New finding beyond the original ~20-pitfall list**:
+   `contracts/isa/spec.md §7` excludes both `ldmo-ra`/`stmo-ra` (RA↔memory)
+   and `rd2ra`/`ra2rd` (RA↔RD) from M1, while the AEE wiki mandates saving/
+   restoring all of `ra0-ra63` on process switch — there is currently no
+   ISA-level mechanism at all to persist the RegRAS bank. This is more
+   fundamental than any of the old project's context-switch pitfalls
+   (which at least had *some*, if misused, instruction available) and is
+   the top-priority open item before K1 implementation starts.
+
+The old project's ~20 pitfalls were re-verified one by one for continued
+applicability and condensed to a 10-item checklist (report §4.2); the
+`linux-0504` tree was confirmed to be essentially clean vanilla 5.4.0
+(`arch/dadao` is an external symlink, the only 7 commits ahead of `v5.4`
+are trivial uapi/Makefile tweaks) and reusable as the port baseline
+without re-fetching upstream. The report proposes a 10-task K1 breakdown
+(KL-101a..KL-110a, first task = the hypv→supv handoff stub + privilege-
+mode state modeling) with dependency ordering.
