@@ -464,6 +464,45 @@ resurface at the next musl E2E milestone (malloc+printf, which mixes
 compiled and hand-written code at more boundaries), so it's worth
 resolving before then rather than routing around it repeatedly.
 
+### DL-069a complete (2026-07-18): RB bank pointer calling convention implemented
+
+User decided route (a): implement the real RB-bank pointer convention
+rather than revise the ABI contract. `DADAOCallingConv.td` gained
+`CCIfPtr` rules (RB16..RB31 for params, RB31 for returns) ahead of the
+existing integer rules; `LowerFormalArguments` now derives the incoming
+argument's register class from which bank `CC_DADAO` actually assigned.
+Verified with a dedicated probe reproducing `contracts/abi/spec.md §2.3`'s
+exact cross-bank overflow example (16 ints + 16 pointers + one more of
+each + a third int → stack offsets 0/8/16 by declaration order regardless
+of bank) — confirmed byte-exact, not just plausible. `check_codegen_abi.py`
+now MATCHes on both pointer rules (was INFO); differential unchanged
+(200/200/0); full E2E shows exactly the two predicted new failures
+(`malloc_hello.test`/`printf_hello.test`, both linking
+`tests/scripts/pico_stubs.s`'s hand-written `_write` stub which still
+assumes the old all-RD convention — confirmed via an isolated rerun that
+it's a real crash, i.e. genuinely broken by the ABI fix as expected, not a
+silent wrong-exit-code artifact). This is the first task in the whole musl
+port where LLVM backend code itself was changed, rather than routed
+around.
+
+**Follow-up needed (ML-013a)**: update `tests/scripts/pico_stubs.s`
+(`_write`'s `buf` param moves rd17→rb16; `_sbrk`'s pointer return moves to
+rb31), `.work/source/musl/arch/dadao/crt_arch.h` and
+`src/thread/dadao/__set_thread_area.s` (both currently work around the old
+convention, should revert to the RB-bank form — ML-011a's original
+`__set_thread_area.s` was actually correct and got "fixed" into wrongness
+by ML-012a only because the backend hadn't implemented RB bank yet), and
+`tests/lit/E2E/tp_probe.test`; then rebuild musl and confirm
+`malloc_hello.test`/`printf_hello.test` pass again.
+
+**Side finding (unrelated, tracked separately)**: replaying the full
+38-patch LLVM series from the bare pin commit fails at patch 0005 (long
+predates this session) — nobody had verified a full from-scratch replay
+before; DL-069a's own patch (0038) replays cleanly on its immediate
+predecessor, so this doesn't block anything here, but it's a real
+reproducibility risk worth its own follow-up
+(`llvm-patch-series-full-replay-corrupt-at-0005`).
+
 Two more already-tracked backend gaps were routed around musl-side only:
 `-fno-optimize-sibling-calls` in a new `arch/dadao/arch.mak` (works around
 `codegen-tailcall-lowercall-assert`; as a side effect also unblocked
