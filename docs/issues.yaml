@@ -1029,3 +1029,22 @@
   # 删除并配合后端修复（宽距/绝对寻址取外部符号地址的能力）一起解决，
   # 现在这个 override 只是"当前阶段安全、需要在有动态链接需求时重新审视"
   # 的临时措施，不是长久方案。
+
+- id: llvm-patch-series-full-replay-corrupt-at-0005
+  title: "components/llvm/patches/ 全部38条从裸 pin commit 完整 git am 重放，在第5条(0005-dadao-asmparser.patch)报 corrupt patch at line 447——早于本session的既有问题，此前从未被验证过完整从零重放"
+  status: open
+  scope: [Infra]
+  blocks: null
+  resolved_by: null
+  # DL-069a（2026-07-18）架构师复核时发现：此前每个任务的"patch可重放性"
+  # 验证都只做"新增的最后一条 patch 能否接到当前 .work/llvm 已有状态之
+  # 上"，从未有人真正验证过全部38条从裸 pin commit（ca7933e47d3a）开始
+  # 完整重放。本次首次尝试，`git am`（与 scripts/apply_series.py 同款调
+  # 用）在第5条报 mbox 解析错误"corrupt patch at line 447"，与 DL-069a
+  # 本身无关（该 patch 远早于本 session）。DL-069a 自己新增的 0038 号
+  # patch 独立验证可以从其直接前置 commit 干净重放，不受此问题影响，
+  # 不阻塞 DL-069a 验收。未做根因定位（怀疑是老 patch 文件里某行以
+  # "From " 开头触发 mbox 格式歧义，未证实）。建议开一个独立基础设施
+  # 任务核实根因+修复，避免重蹈 scripts/fetch.py 那次"隐患搁置数周才被
+  # 发现"的覆辙——"这条 38-patch series 理论上不能从零完整复现"如果属
+  # 实，是对项目声称的"组件可复现性"承诺的真实风险。
