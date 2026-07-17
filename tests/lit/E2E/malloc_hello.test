@@ -1,7 +1,13 @@
 // goal② malloc test: real C → clang → picolibc → QEMU
 //
-// Verifies malloc/free via picolibc's nano-malloc, backed by our _sbrk
-// trap syscall.  Requires `make build-picolibc` to have been run first.
+// Verifies malloc/free via picolibc's nano-malloc. NOTE (ML-013a): the
+// actual backing allocator is picolibc's own libos/fallback/sbrk.c
+// (__fallback_sbrk, an in-image bump allocator over the linker-defined
+// __heap_start/__heap_end region in tests/scripts/dadao.ld) — pico_stubs.s's
+// `_sbrk` trap stub is present for ABI completeness but is not the symbol
+// nano-malloc actually calls (it calls `sbrk`, weak-aliased to
+// `__fallback_sbrk`), so it is currently unreferenced/dead code. Requires
+// `make build-picolibc` to have been run first.
 //
 // RUN: %llvm-mc -triple=dadao -filetype=obj %S/../../scripts/crt0.s -o %t.crt0.o
 // RUN: %llvm-mc -triple=dadao -filetype=obj %S/../../scripts/pico_stubs.s -o %t.stubs.o

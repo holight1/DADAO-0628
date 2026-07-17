@@ -1,0 +1,126 @@
+From 5fb13ddb1ccae0fc8f4bbcb15a10ff933a34646f Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 07:28:01 +0800
+Subject: [PATCH] dadao: restore RB-bank pointer calling convention (ML-013a,
+ DL-069a follow-up)
+
+DL-069a implemented the real RB-bank pointer calling convention in the
+DADAO LLVM backend (CC_DADAO now has a CCIfPtr rule assigning pointer
+parameters to RB16..RB31, matching contracts/abi/spec.md SS2.1). This
+restores crt_arch.h's `call _start_c` and __set_thread_area.s to their
+original ML-011a/ML-012a-pre-workaround form: pointer arguments read
+from/written to the RB bank via same-bank rb2rb, not the RD-bank
+rd2rb/rd2rb workaround ML-012a used while the backend gap was still open.
+---
+ arch/dadao/crt_arch.h                | 27 +++++++--------
+ src/thread/dadao/__set_thread_area.s | 51 ++++++++++------------------
+ 2 files changed, 30 insertions(+), 48 deletions(-)
+
+diff --git a/arch/dadao/crt_arch.h b/arch/dadao/crt_arch.h
+index b284d9c5..a02551f6 100644
+--- a/arch/dadao/crt_arch.h
++++ b/arch/dadao/crt_arch.h
+@@ -126,21 +126,18 @@ START ":\n"
+ "    sto rd8, rb1, 144\n"
+ "    sto rd8, rb1, 152\n"
+ "\n"
+-"    # p = rb1, passed to " START "_c(long *p) in **rd16**, not rb16.\n"
+-"    # contracts/abi/spec.md SS2.1 documents pointer arguments as arriving\n"
+-"    # in the RB bank, but the DADAO LLVM backend's actual calling\n"
+-"    # convention (llvm/lib/Target/DADAO/DADAOCallingConv.td, \"GPRD only\n"
+-"    # (Phase 5 spike)\") assigns every i64-representable value -- pointers\n"
+-"    # included, since this backend has no separate pointer register class\n"
+-"    # in its calling-convention lowering -- to the RD bank (rd16..rd31),\n"
+-"    # never RB. Verified directly during ML-012a with a minimal probe\n"
+-"    # (`void store_it(long *p) { *p = 42; }` compiled at -O2: incoming\n"
+-"    # pointer read from rd16, converted to RB internally only because\n"
+-"    # `sto`'s address operand must be an RB register). " START "_c is a\n"
+-"    # real clang-compiled musl function, not hand-written asm, so it\n"
+-"    # follows this real (if ABI-doc-diverging) convention -- reported to\n"
+-"    # the architect as a real gap (docs/issues.yaml), not fixed in LLVM.\n"
+-"    rb2rd rd16, rb1, 1\n"
++"    # p = rb1, passed to " START "_c(long *p) in rb16 (contracts/abi/\n"
++"    # spec.md SS2.1: pointer arguments arrive in the RB bank, independently\n"
++"    # counted from the RD bank). CORRECTED (ML-013a, DL-069a follow-up):\n"
++"    # DL-069a implemented the real RB-bank pointer calling convention in\n"
++"    # the DADAO LLVM backend (DADAOCallingConv.td's CC_DADAO now has a\n"
++"    # CCIfPtr rule assigning pointer params to RB16..RB31, matching this\n"
++"    # spec section), closing the gap that previously forced this call to\n"
++"    # place the pointer in rd16 instead (ML-012a's rb2rd workaround, kept\n"
++"    # only until the backend gap was fixed). rb1 is already an RB-bank\n"
++"    # register, so no cross-bank conversion is needed at all -- a plain\n"
++"    # same-bank move suffices.\n"
++"    rb2rb rb16, rb1, 1\n"
+ "    call " START "_c\n"
+ "\n"
+ "    # " START "_c is expected to call exit()/_Exit() and never return. If\n"
+diff --git a/src/thread/dadao/__set_thread_area.s b/src/thread/dadao/__set_thread_area.s
+index 053f55a0..344e240c 100644
+--- a/src/thread/dadao/__set_thread_area.s
++++ b/src/thread/dadao/__set_thread_area.s
+@@ -16,38 +16,23 @@
+ # with a pure register-write .s stub for exactly this reason -- there is
+ # no real Linux "set the TP register" syscall on any of them either.
+ #
+-# ABI note (CORRECTED, ML-012a): contracts/abi/spec.md SS2.1 documents
+-# pointer arguments as arriving in the RB bank (rb16), but the DADAO LLVM
+-# backend's actual calling-convention implementation
+-# (llvm/lib/Target/DADAO/DADAOCallingConv.td, explicitly commented
+-# "GPRD only (Phase 5 spike)") assigns ALL i64-representable values --
+-# including pointers, since this backend has no separate pointer/address
+-# register class in its calling-convention lowering -- to the RD bank
+-# (rd16..rd31), never RB. Verified directly during ML-012a with a minimal
+-# probe (`void store_it(long *p) { *p = 42; }` compiled with
+-# `clang --target=dadao -O2`): the incoming pointer is read from **rd16**,
+-# then converted to RB internally only because the `sto` instruction's
+-# address operand must be an RB register:
+-#
+-#   store_it:
+-#       rd2rb rb8, rd16, 1      ; p arrives in rd16, converted to rb8
+-#       addi  rd16, rd0, 42
+-#       sto   rd16, rb8, 0
+-#       ret   rd0, 0
+-#
+-# This file originally read the incoming argument from rb16 (matching the
+-# documented-but-unimplemented ABI, never previously exercised against a
+-# real compiler-generated caller -- ML-011a's tp_probe.test only ever
+-# called this sequence from other *hand-written* assembly using the same
+-# not-actually-real convention on both ends, so the mismatch was latent
+-# and undetected). musl's real src/env/__init_tls.c's __init_tp() calls
+-# `__set_thread_area(TP_ADJ(p))` as compiled C, so it actually places `p`
+-# in rd16 -- this was a real, silent bug (would read an unrelated/garbage
+-# rb16 value instead of the intended thread pointer) until fixed here.
+-# Reported to the architect as a real ABI-spec-vs-implementation gap
+-# (docs/issues.yaml); NOT fixed in LLVM (task hard constraint) -- fixed
+-# here by reading the argument from the register the backend actually
+-# uses.
++# ABI note (CORRECTED AGAIN, ML-013a -- back to ML-011a's original,
++# spec-correct form): contracts/abi/spec.md SS2.1 documents pointer
++# arguments as arriving in the RB bank (rb16). ML-011a wrote this file
++# correctly against that spec section. ML-012a then temporarily changed it
++# to read from rd16 instead, because at that time the DADAO LLVM backend's
++# calling-convention implementation (llvm/lib/Target/DADAO/
++# DADAOCallingConv.td, then explicitly commented "GPRD only (Phase 5
++# spike)") assigned ALL i64-representable values -- including pointers --
++# to the RD bank, never RB (verified with a minimal
++# `void store_it(long *p) { *p = 42; }` probe at the time). DL-069a
++# (2026-07-18) closed that backend gap: CC_DADAO now has a CCIfPtr rule
++# assigning pointer parameters to RB16..RB31, matching this spec section,
++# so real compiler-generated callers (e.g. musl's src/env/__init_tls.c's
++# __init_tp() calling `__set_thread_area(TP_ADJ(p))` as compiled C) now
++# really do place `p` in rb16. This file is restored (ML-013a) to read
++# from rb16, the form it should always have had once the backend caught
++# up to the spec.
+ #
+ # Scalar int return still in rd31 (contracts/abi/spec.md SS3.1, matches
+ # RetCC_DADAO, unaffected by the above -- return-value convention was
+@@ -64,5 +49,5 @@
+ .globl __set_thread_area
+ .hidden __set_thread_area
+ __set_thread_area:
+-    rd2rb rb4, rd16, 1
++    rb2rb rb4, rb16, 1
+     ret rd31, 0
+-- 
+2.43.0
+

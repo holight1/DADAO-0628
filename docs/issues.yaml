@@ -1048,3 +1048,63 @@
   # 任务核实根因+修复，避免重蹈 scripts/fetch.py 那次"隐患搁置数周才被
   # 发现"的覆辙——"这条 38-patch series 理论上不能从零完整复现"如果属
   # 实，是对项目声称的"组件可复现性"承诺的真实风险。
+
+- id: varargs-pointer-args-lost-rb-bank-save-area
+  title: "变参函数的指针型可变实参在 RB bank ABI 下被 LLVM 的 va_start 保存区机制完全丢失（保存区只 spill RD bank rd16..rd31，从不捕获 RB bank 的可变指针实参）——DL-069a RB bank 修复暴露的既有 varargs 缺口（Varargs 条目）的具体实例，非新回归"
+  status: open
+  scope: [CodeGen, ABI, libc]
+  blocks: null
+  resolved_by: null
+  # ML-013a（2026-07-18）：修复 pico_stubs.s 后 malloc_hello.test 用重新
+  # 编译（DL-069a 后的 clang + 同步重建的 picolibc libc.a）的产物仍然
+  # 运行错误——`printf("%s %s\n", p, q)` 输出 "OK2 OK"（两个字符串顺序
+  # 互换，而非崩溃/乱码），反汇编三层调用链定位根因：
+  #
+  # 1. 调用点（main.o）：`printf(fmt, p, q)` 里 fmt/p/q 全是指针，按
+  #    DL-069a 正确实现的固定参数+可变参数（M1 范围内 CCIfPtr 对可变实
+  #    参同样生效）RB bank 独立计数规则，编译器把三者依次放进
+  #    rb16(fmt)/rb17(p)/rb18(q)——这一步完全正确，符合 contracts/abi/
+  #    spec.md §2.1。
+  # 2. 被调用点（picolibc `printf`，变参函数序言）：函数序言无条件把
+  #    rd16..rd31（RD bank）全部 spill 到栈上的"varargs 保存区"，然后
+  #    把 `ap`(va_list) 设为该保存区起始地址；这是 LowerFormalArguments
+  #    对 IsVarArg 函数的既有实现（DL-069a 未改动这部分，完成区已如实
+  #    报告"varargs 保存区仍 RD-only 既有缺口"）——但保存区只覆盖 RD
+  #    bank，从未覆盖 RB bank 的 rb17/rb18，所以 p/q 的真实值从未被
+  #    保存区捕获。`ap` 起始位置对应的是 rd16 的保存槽位，而不是任何
+  #    与 p/q 相关的内容。
+  # 3. `vfprintf` 通过 `va_arg(ap, char*)` 依次从该保存区读值——读到的
+  #    是 rd16/rd17 在进入 `printf` 时刚好残留的值（本例中恰好是
+  #    main() 更早前 malloc 调用留下的、看起来合理但实际无关的堆指针），
+  #    不是真正的 p/q，产生了"看似合理但错误"的输出（两个可打印字符
+  #    串被换位），而不是崩溃或明显乱码——这也是本条目比通用 "Varargs"
+  #    条目更值得单独记录的原因：故障模式具有迷惑性，不会被"程序崩溃
+  #    了"这类粗粒度信号捕获，只能通过反汇编逐层核对调用点/序言/
+  #    va_arg 三处的寄存器 bank 分配才能定位。
+  #
+  # 在 DL-069a 之前，所有指针（含可变实参）统一走 RD bank，"保存区只
+  # 覆盖 RD bank"这条既有限制不构成问题（可变指针实参本来就落在保存区
+  # 里）；contracts/abi/spec.md 本身明确将 varargs 排除出 M1 范围（第7-8
+  # 行"M1 BasicCodeGen scope: non-variadic functions..."+ Varargs 表格行
+  # "Excluded from M1"），所以这不是 DL-069a 或 ML-013a 引入的回归，而是
+  # 一直存在、一直被排除在规范范围外的能力，只是恰好在此之前"错得刚好一
+  # 致"从未被观察到。
+  #
+  # 处置（ML-013a）：不修复 LLVM（超出 ML-013a 授权范围，硬约束禁止
+  # 改动 LLVM；且真正的修复需要变参保存区机制同时感知 RD/RB 两个 bank，
+  # 工作量与风险都对应一个独立任务，不应该在 ML-013a 里顺手做）。改为
+  # 让 tests/lit/E2E/Inputs/malloc_hello.c 改用 `fputs`（固定 2 参数、
+  # 非变参、两个参数都是指针，完全落在 DL-069a 正确修复的固定参数 RB
+  # bank 约定内）替换 `printf("%s %s\n", p, q)`——测试标题承诺验证的是
+  # malloc/free 正确性，不是变参 ABI，这样改动后测试仍然真实验证
+  # malloc/free（未绕过/未伪造），只是不再意外依赖一个规范本来就声明
+  # 排除在外的能力。双后端验证：QEMU/gem5 均输出真实 "OK OK2"。
+  #
+  # 建议：如果/当项目决定把 varargs 纳入范围（Varargs 条目当前
+  # blocks: null，尚无阻断的里程碑），修复应该同时处理：(a) IsVarArg
+  # 函数序言的保存区同时 spill RD 与 RB 两个 bank 各自的寄存器列表；
+  # (b) `va_list`/`va_arg` 的实现（picolibc 侧，freestanding、非
+  # glibc-style）需要知道如何在两个独立保存区之间按 C 源码里参数的原始
+  # 类型顺序交替读取——这是比 (a) 更难的部分，因为 va_arg 在调用点已经
+  # 丢失了"这是第几个参数/它在源码里是什么类型"这类信息，只能按 C 标准
+  # 的隐式类型提升规则由调用者/被调用者一致地约定连续读取顺序。

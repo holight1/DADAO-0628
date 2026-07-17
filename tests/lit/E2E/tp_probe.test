@@ -8,27 +8,26 @@
 // src/thread/dadao/get_tp.s after this task lands), just under local
 // labels since this probe does not link against musl.
 //
-// UPDATED (ML-012a): the argument-passing half of this probe (how the
-// pointer value reaches set_tp_sub) was corrected to match a real backend
-// ABI gap found while wiring up musl's real crt/pthread startup path:
-// contracts/abi/spec.md SS2.1 documents pointer arguments as arriving in
-// the RB bank (rb16), but the DADAO LLVM backend's actual calling
-// convention (llvm/lib/Target/DADAO/DADAOCallingConv.td, "GPRD only
-// (Phase 5 spike)") assigns pointers to the RD bank (rd16) like everything
-// else -- verified with a minimal `void store_it(long *p) { *p = 42; }`
-// probe compiled at -O2. musl's real src/env/__init_tls.c calls
-// `__set_thread_area(TP_ADJ(p))` as compiled C, so the real caller places
-// `p` in rd16, not rb16 -- the previous version of this probe (and of the
-// real __set_thread_area.s it claims to mirror) used rb16, which was never
-// exercised against a real compiler-generated caller and was a latent,
-// undetected mismatch. Both this probe and the real .s file were
-// corrected together so the "byte-for-byte identical" claim below stays
-// true. See docs/issues.yaml for the full write-up of this ABI-spec-vs-
-// implementation divergence.
+// UPDATED (ML-013a, DL-069a follow-up): restored to the RB-bank form
+// (mirrors ML-011a's original, spec-correct version). contracts/abi/
+// spec.md SS2.1 documents pointer arguments as arriving in the RB bank
+// (rb16). ML-012a had temporarily changed this probe (and the real
+// __set_thread_area.s it mirrors) to place the pointer argument in rd16,
+// because at that time the DADAO LLVM backend's calling convention
+// (llvm/lib/Target/DADAO/DADAOCallingConv.td, "GPRD only (Phase 5
+// spike)") assigned pointers to the RD bank like everything else --
+// verified with a minimal `void store_it(long *p) { *p = 42; }` probe
+// compiled at -O2. DL-069a (2026-07-18) closed that backend gap: CC_DADAO
+// now has a CCIfPtr rule assigning pointer parameters to RB16..RB31,
+// matching this spec section, so real compiler-generated callers (e.g.
+// musl's src/env/__init_tls.c calling `__set_thread_area(TP_ADJ(p))` as
+// compiled C) now really do place `p` in rb16. Both this probe and the
+// real .s file are restored together (ML-013a) so the "byte-for-byte
+// identical" claim below stays true.
 //
 // Verifies (discriminating, not just "doesn't crash"):
 //   - writing a first non-trivial, non-zero value into rb4 via the exact
-//     __set_thread_area sequence (rd2rb rb4, rd16, 1) and reading it back
+//     __set_thread_area sequence (rb2rb rb4, rb16, 1) and reading it back
 //     via the exact __get_tp sequence (rb2rd rd31, rb4, 1) through a real
 //     call/ret subroutine boundary returns the identical value
 //   - overwriting rb4 with a SECOND, different value and reading again
@@ -69,21 +68,22 @@ _start:
     orw   rd1, 1, 0x1234
     orw   rd1, 2, 0xBABE
 
-    # __set_thread_area(p)-equivalent: pointer arg arrives in the RD bank
-    # at rd16 (contracts/abi/spec.md SS2.1 says RB/rb16, but the real
-    # backend calling convention actually used is RD/rd16 -- see the
-    # file-level comment above); build it there, then call the set-tp
-    # subroutine (mirrors the real caller __init_tls.c's __init_tp()).
-    addi rd16, rd1, 0
+    # __set_thread_area(p)-equivalent: pointer arg arrives in the RB bank
+    # at rb16 (contracts/abi/spec.md SS2.1, real backend calling convention
+    # since DL-069a -- see the file-level comment above); build it there,
+    # then call the set-tp subroutine (mirrors the real caller
+    # __init_tls.c's __init_tp()).
+    rd2rb rb16, rd1, 1
     call set_tp_sub
 
-    # Clobber rd16 (the register that carried the value into set_tp_sub)
+    # Clobber rb16 (the register that carried the value into set_tp_sub)
     # with an unrelated sentinel before reading back, so a compound bug
     # where the write is a no-op AND get_tp_sub's source operand
-    # accidentally resolved to rd16 instead of rb4 cannot coincidentally
+    # accidentally resolved to rb16 instead of rb4 cannot coincidentally
     # "pass" by reading the stale argument register (subagent review
-    # finding, ML-011a; kept after the ML-012a register-bank correction).
+    # finding, ML-011a; kept after the ML-013a register-bank restoration).
     addi rd16, rd0, 0x5A5A
+    rd2rb rb16, rd16, 1
 
     call get_tp_sub
     # get_tp_sub returns in rd31; compare to rd1 (expected value1).
@@ -98,9 +98,10 @@ check2:
     orw   rd2, 1, 0x3344
     orw   rd2, 2, 0x1122
 
-    addi rd16, rd2, 0
+    rd2rb rb16, rd2, 1
     call set_tp_sub
     addi rd16, rd0, 0x5A5A
+    rd2rb rb16, rd16, 1
     call get_tp_sub
     breq rd31, rd2, pass
     addi rd17, rd0, 2
@@ -124,9 +125,10 @@ fail:
 
 set_tp_sub:
     # Mirrors musl arch/dadao/src/thread/dadao/__set_thread_area.s body
-    # exactly (ML-011a, register bank corrected in ML-012a): pointer arg
-    # in rd16 (real backend calling convention), write into rb4 (rbtp).
-    rd2rb rb4, rd16, 1
+    # exactly (ML-011a, temporarily register-bank-corrected in ML-012a,
+    # restored to this RB-bank form in ML-013a): pointer arg in rb16 (real
+    # backend calling convention since DL-069a), write into rb4 (rbtp).
+    rb2rb rb4, rb16, 1
     ret rd31, 0
 
 get_tp_sub:

@@ -31,12 +31,19 @@
 // around (musl-side only, no LLVM/QEMU/gem5 source touched) to reach this
 // milestone -- both documented in detail at the point of the fix and in
 // docs/issues.yaml:
-//   1. DADAOCallingConv.td ("GPRD only, Phase 5 spike") actually passes
+//   1. DADAOCallingConv.td ("GPRD only, Phase 5 spike") originally passed
 //      pointer arguments in the RD bank (rd16), not the RB bank (rb16)
-//      contracts/abi/spec.md SS2.1 documents -- crt_arch.h's `call
-//      _start_c` and src/thread/dadao/__set_thread_area.s (ML-011a) were
-//      both corrected to place/read the pointer argument in rd16 to match
-//      the real compiled callee/caller. tp_probe.test was updated to match.
+//      contracts/abi/spec.md SS2.1 documents -- ML-012a temporarily
+//      corrected crt_arch.h's `call _start_c` and
+//      src/thread/dadao/__set_thread_area.s (ML-011a) to place/read the
+//      pointer argument in rd16 to match that (then-real) backend gap.
+//      DL-069a (2026-07-18) fixed the real gap: CC_DADAO now has a
+//      CCIfPtr rule assigning pointer parameters to RB16..RB31, matching
+//      the spec. ML-013a then restored crt_arch.h/__set_thread_area.s/
+//      tp_probe.test to their spec-correct RB-bank form (rb2rb, not
+//      rd2rb/rb2rd) and rebuilt musl's crt1.o/libc.a against the fixed
+//      clang -- this is the form they should always have had once the
+//      backend caught up.
 //   2. musl's generic __libc_start_main.c/__init_tls.c hit two independent
 //      already-tracked DADAO codegen gaps (codegen-tailcall-lowercall-
 //      assert; musl-inline-asm-empty-clobber-reg-alloc) plus one newly
