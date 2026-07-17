@@ -27,6 +27,8 @@ DADAO-0628 的终极目标是 QEMU + kernel + 用户态应用全链路跑通。�
 
 ADR-0014 D4 曾把"guest 侧真 SEE monitor firmware（OpenSBI 式）"列为未来项。本次决策：**这次 kernel bring-up 暂不做**，继续沿用现有模式（QEMU/gem5 直接 `-kernel`/ELF 裸加载，无引导固件层，无 FDT/DTB）。旧项目 V1-V4 全程也是这个模式，没有因此被卡住——固件层不是达成"kernel 启动到用户态"这个里程碑的必需前置。若未来需要更贴近真实硬件的启动链，作为独立后续项再议。
 
+**D2 补充澄清（KL-001a 调研，2026-07-18）**：`~/DADAO-wiki` HBI §3 规定硬件复位后运行模式**永远初始化为 hypv**（不是 supv），PC 跳到 `cfx_power_hypv_excp_vector`——"裸加载直接进 S-mode"在当前 spec 下没有对应硬件行为。**D2 的"暂不引入固件层"应理解为"不做 OpenSBI 式的复杂固件（设备树解析、多核唤醒协商等），但仍需要 HBI §3 规定的那段最小 hypv→supv 移交桩代码（约15-20条指令，纯 `cfx2rc` delegation + 一次 `escape`，wiki 给出了可参照的示例代码）"**，不是"硬件可以配置为直接从 supv 开始执行"。这段桩代码工作量很小，已列入 K1 任务清单第一项（KL-101a），必须先做，否则后续所有"从 S-mode 视角设计"的任务都建立在错误假设上。
+
 ### D3：分阶段路线图 K0-K4
 
 | 阶段 | 内容 | 方法论参照 |
