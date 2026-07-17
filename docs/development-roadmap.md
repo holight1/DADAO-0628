@@ -409,6 +409,27 @@ commit) — recovered cleanly by resuming the same agent via its transcript
 rather than starting over, after confirming the repo was in a clean,
 undamaged state first.
 
+### Phase B, step 4 complete (ML-011a, 2026-07-17): musl pthread_arch.h + TP register read/write
+
+Adds `arch/dadao/pthread_arch.h` + `get_tp.s`/`__set_thread_area.s`
+reading/writing `rb4` (rbtp). Two real discoveries, both reported and
+logged rather than fixed (out of scope): (1) a clang frontend gap —
+`DADAOTargetInfo::getGCCRegNames()` omits the entire RB register bank, so
+the usual "inline C asm with a named register variable" pattern every
+other musl arch uses for this doesn't work here; worked around with real
+standalone `.s` functions instead. (2) a genuine QEMU/gem5 divergence in
+RB-bank block-copy instruction fidelity when the source's high 16 bits
+are nonzero — gem5's masking depends on which *read* instruction is used,
+QEMU's depends on which *write* instruction was used earlier; both
+internally consistent, but disagreeing with each other, and tangled up
+with a wording/vector inconsistency between `contracts/isa/spec.md §4.7`
+and `tests/vectors/isa/rd-wyde-block.yaml`. Irrelevant to this task (real
+musl TP/pointer values are always 48-bit-clean, verified on both
+backends), logged as `blockcopy-rb-source-64bit-fidelity-backend-divergence`
+for a dedicated follow-up. Compiled file count 778 → 937,
+`pthread_arch.h`-related errors 183 → 0. E2E 57/57, differential
+unchanged.
+
 ### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
 
 While spot-checking the recon report's QEMU source citations, found
