@@ -1,0 +1,700 @@
+From f2fa0f8a24d6887d867f88a6cffb119e8c51d048 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 17 Jul 2026 10:31:44 +0800
+Subject: [PATCH] dadao: add crt_arch.h + arch.mak, override
+ __libc_start_main.c/__init_tls.c, fix __set_thread_area.s ABI (ML-012a)
+
+First real musl static-link E2E milestone (int main(){return 42;} through
+the real crt1.c -> _start_c -> __libc_start_main -> exit() path, both
+QEMU and gem5). Adds arch/dadao/crt_arch.h (musl-standard top-level
+__asm__ text-block _start, reusing the ML-008a-validated argc/argv/envp/
+auxv stack layout verbatim) and arch/dadao/arch.mak
+(-fno-optimize-sibling-calls, works around the already-tracked
+codegen-tailcall-lowercall-assert gap without touching LLVM).
+
+Two arch overrides route around already-tracked/newly-found backend gaps
+in generic musl startup code, each a minimal single-line-intent diff from
+upstream (full rationale in each file's header comment):
+  - src/env/dadao/__libc_start_main.c: replace the empty-template "+r"
+    inline-asm barrier (hits musl-inline-asm-empty-clobber-reg-alloc) with
+    a standard volatile-qualified-pointer barrier.
+  - src/env/dadao/__init_tls.c: drop the dead (in this static/no-PIE/
+    AT_PHNUM=0 configuration) _DYNAMIC base-address computation, which
+    hit a new link-time-only gap (PC-relative relocation with no
+    wide-range/absolute fallback for a weak-undefined external symbol
+    resolving to address 0 while code loads at 0x80000000).
+
+Also fixes a real, previously-latent ABI-spec-vs-implementation bug in
+src/thread/dadao/__set_thread_area.s (ML-011a): DADAOCallingConv.td
+("GPRD only, Phase 5 spike") actually passes pointer arguments in the RD
+bank (rd16), not the RB bank (rb16) contracts/abi/spec.md SS2.1
+documents. tp_probe.test's local mirror of the same sequence is updated
+to match so it stays a faithful, discriminating regression test of the
+corrected file.
+
+No LLVM/QEMU/gem5 source touched.
+---
+ arch/dadao/arch.mak                  |  30 ++++
+ arch/dadao/crt_arch.h                | 160 +++++++++++++++++++
+ src/env/dadao/__init_tls.c           | 223 +++++++++++++++++++++++++++
+ src/env/dadao/__libc_start_main.c    | 154 ++++++++++++++++++
+ src/thread/dadao/__set_thread_area.s |  43 +++++-
+ 5 files changed, 605 insertions(+), 5 deletions(-)
+ create mode 100644 arch/dadao/arch.mak
+ create mode 100644 arch/dadao/crt_arch.h
+ create mode 100644 src/env/dadao/__init_tls.c
+ create mode 100644 src/env/dadao/__libc_start_main.c
+
+diff --git a/arch/dadao/arch.mak b/arch/dadao/arch.mak
+new file mode 100644
+index 00000000..4a810ffa
+--- /dev/null
++++ b/arch/dadao/arch.mak
+@@ -0,0 +1,30 @@
++# DADAO arch-specific Makefile fragment (ML-012a).
++#
++# -fno-optimize-sibling-calls: works around a real, already-tracked DADAO
++# LLVM backend gap (docs/issues.yaml "codegen-tailcall-lowercall-assert":
++# DADAO's TargetLowering never opts out of tail-call/sibling-call codegen,
++# so -O1+ compiling any "call in tail position" -- `return foo(...);` or a
++# void function's last statement being a call -- crashes with "LowerCall
++# emitted a return value for a tail call!"). This is NOT a fix to the LLVM
++# backend (task hard constraint: do not modify LLVM/QEMU/gem5 source); it
++# is a standard, portable, semantics-preserving compiler flag (recognized
++# by both clang and gcc) that tells the *frontend* never to attempt
++# sibling-call codegen in the first place, so the backend code path that
++# crashes is simply never reached. It only disables an optimization
++# (tail-call elimination); it changes no program behavior.
++#
++# This is required for musl's own crt/crt1.c (_start_c's tail call into
++# __libc_start_main) and src/env/__libc_start_main.c
++# (__libc_start_main -> stage2(...) in tail position) to compile at all
++# under the project's default -O2 (see config.mak CFLAGS_AUTO) -- verified
++# directly during ML-012a: both crash with the assert above at plain -O2,
++# and both compile cleanly with this flag added, at the same -O2.
++#
++# Applied globally (all musl/dadao objects, not just CRT_OBJS) because the
++# same crash pattern was already independently observed across ~229 other
++# musl source files during ML-010a/ML-011a's full-tree `make -k` sweeps
++# (docs/issues.yaml "codegen-tailcall-lowercall-assert"); this flag is safe
++# to apply tree-wide and unblocks previously-failing files as a side
++# effect (re-measured in this task's completion notes), not just the two
++# files this task strictly needs.
++CFLAGS_AUTO += -fno-optimize-sibling-calls
+diff --git a/arch/dadao/crt_arch.h b/arch/dadao/crt_arch.h
+new file mode 100644
+index 00000000..b284d9c5
+--- /dev/null
++++ b/arch/dadao/crt_arch.h
+@@ -0,0 +1,160 @@
++/*
++ * DADAO arch/dadao/crt_arch.h (ML-012a).
++ *
++ * musl convention (see crt/crt1.c, ldso/dlstart.c): this header is
++ * #include'd once per crt translation unit (crt1.c with START="_start",
++ * ldso/dlstart.c with START="_dlstart") and defines the raw entry-point
++ * label as a top-level (file-scope) GCC/clang extended-asm string block --
++ * NOT C-level named-register inline asm. This distinction matters here:
++ * ML-011a found that clang's DADAOTargetInfo::getGCCRegNames() does not
++ * list any RB-bank register name, which blocks the "register long x
++ * __asm__(\"rbN\")" C-inline-asm pattern other archs' pthread_arch.h use.
++ * Top-level __asm__ text blocks are a completely different code path: they
++ * are not validated against getGCCRegNames() at all (no C-level register
++ * variable is involved), and are instead handed to clang as LLVM IR module
++ * inline asm, then to the same DADAO integrated-assembler MC layer that
++ * already parses ordinary hand-written .s files (tests/scripts/crt0_auxv.s,
++ * tests/lit/E2E/mmap_probe.test, tp_probe.test). This was verified directly
++ * as part of this task (ML-012a) with a standalone probe: a top-level
++ * __asm__ block containing "addi rb1, rb1, -16" / "sto rd8, rb1, 0" /
++ * "rela rb8, ..." / "rb2rb rb16, rb1, 1" / "call ..." compiled cleanly with
++ * `clang --target=dadao -c` straight to a real object file (confirmed with
++ * llvm-objdump -d --triple=dadao: every instruction decoded correctly, RB
++ * register operands included) -- so the getGCCRegNames() gap is narrower
++ * than "no RB register support in clang" would suggest; it only blocks the
++ * named-register-*variable* C extension, not raw assembly text of any kind.
++ *
++ * Stack layout: the argc/argv/envp/auxv table this entry point builds on
++ * the incoming stack is bit-for-bit the same layout ML-008a already
++ * validated with a discriminating probe (tests/scripts/crt0_auxv.s /
++ * tests/lit/E2E/musl_crt0_auxv.test) -- reused verbatim here, not
++ * reinvented. See that task file for the full cell-by-cell rationale.
++ * Real source of argc/argv/envp/auxv: neither backend's bare-ELF loader
++ * currently constructs a real one --
++ *   - gem5 SE (~/DADAO-gem5/src/arch/dadao/process.cc Process::argsInit):
++ *     maps a single stack page and sets SP to the bottom of it; no
++ *     argc/argv/envp/auxv table is written to memory at all (the function's
++ *     own comment calls this "Minimal argv/stack setup for the skeleton").
++ *   - QEMU (tests/scripts/gen_trampoline.py): sets SP (rb1) to a fixed
++ *     constant (0x87FF0000) and jumps to the RAM entry point; nothing is
++ *     written to that stack memory either.
++ * So per this task's brief, a minimal fixed placeholder table (argc=1,
++ * argv=["prog"], empty envp, a small fixed auxv with the keys musl's
++ * __init_libc()/__init_tls()/static_init_tls() actually read in the
++ * static-single-thread configuration: AT_PAGESZ, AT_UID/EUID/GID/EGID,
++ * AT_SECURE, AT_RANDOM) is synthesized here, entirely in user mode, with no
++ * simulator/loader changes. AT_PHDR/AT_PHNUM are deliberately left absent
++ * (defaulting to 0 in musl's `aux[AUX_CNT]` scratch array): static_init_tls()
++ * in src/env/__init_tls.c loops `for (p=aux[AT_PHDR], n=aux[AT_PHNUM]; n; ...)`
++ * -- with AT_PHNUM==0 the loop body never executes and no PT_TLS phdr is
++ * ever dereferenced, so this is a safe, deliberate omission for the static
++ * single-threaded milestone, not an oversight.
++ * AT_UID==AT_EUID==0 && AT_GID==AT_EGID==0 && !AT_SECURE takes the
++ * early-return branch in __init_libc() (src/env/__libc_start_main.c),
++ * avoiding the poll()-based fd-sanitization syscall path entirely.
++ */
++
++__asm__(
++".text\n"
++".globl " START "\n"
++".type " START ",@function\n"
++START ":\n"
++"    addi rb1, rb1, -160\n"
++"\n"
++"    rela rb8, " START "_prog_str\n"
++"    addi rb8, rb8, " START "_prog_str\n"
++"    rela rb9, " START "_rand_buf\n"
++"    addi rb9, rb9, " START "_rand_buf\n"
++"\n"
++"    # [0] argc = 1\n"
++"    addi rd8, rd0, 1\n"
++"    sto rd8, rb1, 0\n"
++"\n"
++"    # [1] argv[0] = &" START "_prog_str\n"
++"    sto rb8, rb1, 8\n"
++"\n"
++"    # [2] argv terminator = NULL\n"
++"    addi rd8, rd0, 0\n"
++"    sto rd8, rb1, 16\n"
++"\n"
++"    # [3] envp terminator = NULL (empty environment)\n"
++"    sto rd8, rb1, 24\n"
++"\n"
++"    # [4..5] AT_PAGESZ(6) = 4096\n"
++"    addi rd8, rd0, 6\n"
++"    sto rd8, rb1, 32\n"
++"    addi rd8, rd0, 4096\n"
++"    sto rd8, rb1, 40\n"
++"\n"
++"    # [6..7] AT_UID(11) = 0\n"
++"    addi rd8, rd0, 11\n"
++"    sto rd8, rb1, 48\n"
++"    addi rd8, rd0, 0\n"
++"    sto rd8, rb1, 56\n"
++"\n"
++"    # [8..9] AT_EUID(12) = 0\n"
++"    addi rd8, rd0, 12\n"
++"    sto rd8, rb1, 64\n"
++"    addi rd8, rd0, 0\n"
++"    sto rd8, rb1, 72\n"
++"\n"
++"    # [10..11] AT_GID(13) = 0\n"
++"    addi rd8, rd0, 13\n"
++"    sto rd8, rb1, 80\n"
++"    addi rd8, rd0, 0\n"
++"    sto rd8, rb1, 88\n"
++"\n"
++"    # [12..13] AT_EGID(14) = 0\n"
++"    addi rd8, rd0, 14\n"
++"    sto rd8, rb1, 96\n"
++"    addi rd8, rd0, 0\n"
++"    sto rd8, rb1, 104\n"
++"\n"
++"    # [14..15] AT_SECURE(23) = 0\n"
++"    addi rd8, rd0, 23\n"
++"    sto rd8, rb1, 112\n"
++"    addi rd8, rd0, 0\n"
++"    sto rd8, rb1, 120\n"
++"\n"
++"    # [16..17] AT_RANDOM(25) = &" START "_rand_buf\n"
++"    addi rd8, rd0, 25\n"
++"    sto rd8, rb1, 128\n"
++"    sto rb9, rb1, 136\n"
++"\n"
++"    # [18..19] AT_NULL(0), 0 terminator\n"
++"    addi rd8, rd0, 0\n"
++"    sto rd8, rb1, 144\n"
++"    sto rd8, rb1, 152\n"
++"\n"
++"    # p = rb1, passed to " START "_c(long *p) in **rd16**, not rb16.\n"
++"    # contracts/abi/spec.md SS2.1 documents pointer arguments as arriving\n"
++"    # in the RB bank, but the DADAO LLVM backend's actual calling\n"
++"    # convention (llvm/lib/Target/DADAO/DADAOCallingConv.td, \"GPRD only\n"
++"    # (Phase 5 spike)\") assigns every i64-representable value -- pointers\n"
++"    # included, since this backend has no separate pointer register class\n"
++"    # in its calling-convention lowering -- to the RD bank (rd16..rd31),\n"
++"    # never RB. Verified directly during ML-012a with a minimal probe\n"
++"    # (`void store_it(long *p) { *p = 42; }` compiled at -O2: incoming\n"
++"    # pointer read from rd16, converted to RB internally only because\n"
++"    # `sto`'s address operand must be an RB register). " START "_c is a\n"
++"    # real clang-compiled musl function, not hand-written asm, so it\n"
++"    # follows this real (if ABI-doc-diverging) convention -- reported to\n"
++"    # the architect as a real gap (docs/issues.yaml), not fixed in LLVM.\n"
++"    rb2rd rd16, rb1, 1\n"
++"    call " START "_c\n"
++"\n"
++"    # " START "_c is expected to call exit()/_Exit() and never return. If\n"
++"    # it somehow does return, halt with a distinguishing sentinel (99)\n"
++"    # instead of falling through into the data below.\n"
++"    addi rd31, rd0, 99\n"
++"    halt rd31\n"
++"    .size " START ", . - " START "\n"
++"\n"
++"    .align 8, 0\n"
++START "_prog_str:\n"
++"    .asciz \"prog\"\n"
++"\n"
++"    .align 8, 0\n"
++START "_rand_buf:\n"
++"    .fill 16, 1, 0\n"
++);
+diff --git a/src/env/dadao/__init_tls.c b/src/env/dadao/__init_tls.c
+new file mode 100644
+index 00000000..227b561b
+--- /dev/null
++++ b/src/env/dadao/__init_tls.c
+@@ -0,0 +1,223 @@
++/*
++ * DADAO arch override of src/env/__init_tls.c (ML-012a).
++ *
++ * Byte-for-byte identical to the generic musl src/env/__init_tls.c (musl
++ * 1.2.5, commit 0784374d) EXCEPT for one line in static_init_tls()'s
++ * PT_DYNAMIC/_DYNAMIC base-address computation -- see the note at that
++ * line. This file is picked up by musl's own override mechanism (a file
++ * at src/env/dadao/*.c replaces src/env/__init_tls.c for the "dadao" ARCH
++ * build, same mechanism already used by src/env/dadao/__libc_start_main.c
++ * in this same task), NOT a change to musl's generic/shared source tree.
++ *
++ * Root cause (found and diagnosed during ML-012a's first real link
++ * attempt, a genuine DADAO backend/relocation gap, NOT fixed here per
++ * task hard constraint -- reported, not patched, in LLVM/lld):
++ * `(size_t)_DYNAMIC` takes the address of `extern weak hidden const
++ * size_t _DYNAMIC[]` -- a symbol that exists only in dynamically-linked
++ * or PIE executables (populated by the linker's .dynamic section) and is,
++ * by design, weak + undefined + resolves to address 0 in any purely
++ * static, non-PIE link (ADR-0014 D5: DADAO/musl is static-only for the
++ * foreseeable future -- there is no dynamic linker and no PIE support).
++ * Taking the address of a symbol at 0 from code loaded at 0x80000000
++ * (ADR-0004's BINARY_BASE) requires a relocatable displacement of roughly
++ * -0x80000000 (~-2GiB). `ld.lld` fails to resolve it:
++ *
++ *   ld.lld: error: ...(__init_tls.o):(function static_init_tls: ...):
++ *   relocation Unknown (4) out of range: -524289 is not in
++ *   [-131072, 131071]; references '_DYNAMIC'
++ *
++ * i.e. the DADAO backend's codegen for "address of an external/weak
++ * symbol" always emits a short-range PC-relative-style relocation with no
++ * wider-range (absolute or GOT-indirect) fallback for symbols that turn
++ * out to be far away -- a real, narrow backend gap, distinct from (but
++ * same general class as) the other already-tracked DADAO codegen gaps in
++ * docs/issues.yaml. This is reported to the architect (see this task's
++ * completion notes / docs/issues.yaml), not patched in LLVM/lld.
++ *
++ * This reference is *runtime-dead* in the exact configuration this task
++ * targets, independent of the relocation-range bug: musl's arch/dadao
++ * crt_arch.h (ML-012a) deliberately does not provide AT_PHDR/AT_PHNUM in
++ * its synthesized auxv (see that file's header comment), so
++ * static_init_tls()'s enclosing `for (p=...aux[AT_PHDR], n=...aux[AT_PHNUM];
++ * n; ...)` loop body -- which contains this line -- never executes at
++ * runtime (n starts at 0). The *compile-time* relocation still has to be
++ * resolved by the linker regardless of runtime reachability, which is
++ * exactly what fails. Since DADAO has no dynamic linker/PIE support at all
++ * right now (ADR-0014 D5), the `phdr->p_type == PT_DYNAMIC` half of the
++ * condition can also never be true in any real DADAO ELF this project
++ * currently produces (no static-pie or `-shared` output exists), making
++ * removal of just this base-computation line safe and semantics-preserving
++ * for the current milestone. `base` remains used exactly as upstream
++ * elsewhere in this function (PT_PHDR branch); only the PT_DYNAMIC arm's
++ * body is removed, and the `if` condition is kept structurally (as a
++ * dead/no-op check) rather than deleting the whole `if` to keep the diff
++ * minimal and the intent traceable back to upstream.
++ *
++ * MUST be revisited (a real address-of-external-symbol codegen fix in the
++ * backend, or an ABI-level solution) before DADAO ever gains a dynamic
++ * linker or PIE executables -- at that point this arch override should be
++ * deleted and the generic src/env/__init_tls.c used unmodified.
++ */
++
++#define SYSCALL_NO_TLS 1
++#include <elf.h>
++#include <limits.h>
++#include <sys/mman.h>
++#include <string.h>
++#include <stddef.h>
++#include "pthread_impl.h"
++#include "libc.h"
++#include "atomic.h"
++#include "syscall.h"
++
++volatile int __thread_list_lock;
++
++int __init_tp(void *p)
++{
++	pthread_t td = p;
++	td->self = td;
++	int r = __set_thread_area(TP_ADJ(p));
++	if (r < 0) return -1;
++	if (!r) libc.can_do_threads = 1;
++	td->detach_state = DT_JOINABLE;
++	td->tid = __syscall(SYS_set_tid_address, &__thread_list_lock);
++	td->locale = &libc.global_locale;
++	td->robust_list.head = &td->robust_list.head;
++	td->sysinfo = __sysinfo;
++	td->next = td->prev = td;
++	return 0;
++}
++
++static struct builtin_tls {
++	char c;
++	struct pthread pt;
++	void *space[16];
++} builtin_tls[1];
++#define MIN_TLS_ALIGN offsetof(struct builtin_tls, pt)
++
++static struct tls_module main_tls;
++
++void *__copy_tls(unsigned char *mem)
++{
++	pthread_t td;
++	struct tls_module *p;
++	size_t i;
++	uintptr_t *dtv;
++
++#ifdef TLS_ABOVE_TP
++	dtv = (uintptr_t*)(mem + libc.tls_size) - (libc.tls_cnt + 1);
++
++	mem += -((uintptr_t)mem + sizeof(struct pthread)) & (libc.tls_align-1);
++	td = (pthread_t)mem;
++	mem += sizeof(struct pthread);
++
++	for (i=1, p=libc.tls_head; p; i++, p=p->next) {
++		dtv[i] = (uintptr_t)(mem + p->offset) + DTP_OFFSET;
++		memcpy(mem + p->offset, p->image, p->len);
++	}
++#else
++	dtv = (uintptr_t *)mem;
++
++	mem += libc.tls_size - sizeof(struct pthread);
++	mem -= (uintptr_t)mem & (libc.tls_align-1);
++	td = (pthread_t)mem;
++
++	for (i=1, p=libc.tls_head; p; i++, p=p->next) {
++		dtv[i] = (uintptr_t)(mem - p->offset) + DTP_OFFSET;
++		memcpy(mem - p->offset, p->image, p->len);
++	}
++#endif
++	dtv[0] = libc.tls_cnt;
++	td->dtv = dtv;
++	return td;
++}
++
++#if ULONG_MAX == 0xffffffff
++typedef Elf32_Phdr Phdr;
++#else
++typedef Elf64_Phdr Phdr;
++#endif
++
++extern weak hidden const size_t _DYNAMIC[];
++
++static void static_init_tls(size_t *aux)
++{
++	unsigned char *p;
++	size_t n;
++	Phdr *phdr, *tls_phdr=0;
++	size_t base = 0;
++	void *mem;
++
++	for (p=(void *)aux[AT_PHDR],n=aux[AT_PHNUM]; n; n--,p+=aux[AT_PHENT]) {
++		phdr = (void *)p;
++		if (phdr->p_type == PT_PHDR)
++			base = aux[AT_PHDR] - phdr->p_vaddr;
++		/* DADAO: PT_DYNAMIC base-from-_DYNAMIC computation removed --
++		 * see file header comment. No-op condition kept (rather than
++		 * deleting the whole `if`) to keep this diff traceable to
++		 * upstream and to document that this arm is intentionally
++		 * empty, not forgotten. `phdr->p_type == PT_DYNAMIC` can
++		 * never be true for any ELF this project currently produces
++		 * (no dynamic linker/PIE support, ADR-0014 D5), and this
++		 * whole loop body is additionally unreachable at runtime in
++		 * this task's configuration (aux[AT_PHNUM] == 0, see
++		 * arch/dadao/crt_arch.h). */
++		if (phdr->p_type == PT_DYNAMIC) { /* dead: no _DYNAMIC base update */ }
++		if (phdr->p_type == PT_TLS)
++			tls_phdr = phdr;
++		if (phdr->p_type == PT_GNU_STACK &&
++		    phdr->p_memsz > __default_stacksize)
++			__default_stacksize =
++				phdr->p_memsz < DEFAULT_STACK_MAX ?
++				phdr->p_memsz : DEFAULT_STACK_MAX;
++	}
++
++	if (tls_phdr) {
++		main_tls.image = (void *)(base + tls_phdr->p_vaddr);
++		main_tls.len = tls_phdr->p_filesz;
++		main_tls.size = tls_phdr->p_memsz;
++		main_tls.align = tls_phdr->p_align;
++		libc.tls_cnt = 1;
++		libc.tls_head = &main_tls;
++	}
++
++	main_tls.size += (-main_tls.size - (uintptr_t)main_tls.image)
++		& (main_tls.align-1);
++#ifdef TLS_ABOVE_TP
++	main_tls.offset = GAP_ABOVE_TP;
++	main_tls.offset += (-GAP_ABOVE_TP + (uintptr_t)main_tls.image)
++		& (main_tls.align-1);
++#else
++	main_tls.offset = main_tls.size;
++#endif
++	if (main_tls.align < MIN_TLS_ALIGN) main_tls.align = MIN_TLS_ALIGN;
++
++	libc.tls_align = main_tls.align;
++	libc.tls_size = 2*sizeof(void *) + sizeof(struct pthread)
++#ifdef TLS_ABOVE_TP
++		+ main_tls.offset
++#endif
++		+ main_tls.size + main_tls.align
++		+ MIN_TLS_ALIGN-1 & -MIN_TLS_ALIGN;
++
++	if (libc.tls_size > sizeof builtin_tls) {
++#ifndef SYS_mmap2
++#define SYS_mmap2 SYS_mmap
++#endif
++		mem = (void *)__syscall(
++			SYS_mmap2,
++			0, libc.tls_size, PROT_READ|PROT_WRITE,
++			MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
++		/* -4095...-1 cast to void * will crash on dereference anyway,
++		 * so don't bloat the init code checking for error codes and
++		 * explicitly calling a_crash(). */
++	} else {
++		mem = builtin_tls;
++	}
++
++	/* Failure to initialize thread pointer is always fatal. */
++	if (__init_tp(__copy_tls(mem)) < 0)
++		a_crash();
++}
++
++weak_alias(static_init_tls, __init_tls);
+diff --git a/src/env/dadao/__libc_start_main.c b/src/env/dadao/__libc_start_main.c
+new file mode 100644
+index 00000000..940410c1
+--- /dev/null
++++ b/src/env/dadao/__libc_start_main.c
+@@ -0,0 +1,154 @@
++/*
++ * DADAO arch override of src/env/__libc_start_main.c (ML-012a).
++ *
++ * Byte-for-byte identical to the generic musl src/env/__libc_start_main.c
++ * (musl 1.2.5, commit 0784374d) EXCEPT for the single "stage2" barrier
++ * construct in __libc_start_main() -- see the note at that line for why.
++ * This file is picked up by musl's own override mechanism (arch/$(ARCH)
++ * substitution in the top-level Makefile: a file at src/env/dadao/*.c
++ * replaces src/env/__libc_start_main.c for the "dadao" ARCH build), NOT a
++ * change to musl's generic/shared source tree.
++ *
++ * Root cause (verified directly during ML-012a, already independently
++ * flagged as a known-open backend gap in docs/issues.yaml
++ * "musl-inline-asm-empty-clobber-reg-alloc", first observed for
++ * src/string/explicit_bzero.c during ML-009a/ML-010a): the generic line
++ *
++ *     __asm__ ( "" : "+r"(stage2) : : "memory" );
++ *
++ * is an empty-template inline-asm barrier musl uses on every arch purely
++ * to stop the compiler constant-propagating/inlining through `stage2`
++ * (preventing `stage2(main, argc, argv)` -- really
++ * `libc_start_main_stage2(...)` -- from being hoisted/inlined ahead of
++ * `__init_libc()`). It has a real "+r" (read-write, register-class)
++ * operand even though the template is empty, and DADAO's backend cannot
++ * allocate a physical register for that operand when its type is a
++ * function pointer: `clang --target=dadao -c` on the unmodified file fails
++ * with "error: couldn't allocate output register for constraint 'r'" at
++ * every optimization level (verified directly at -O0 and at
++ * -O2 -fno-optimize-sibling-calls; not an optimization-level artifact).
++ * This is a real, narrow clang/LLVM inline-asm operand-allocation gap
++ * (reported, not fixed -- task hard constraint: do not modify LLVM/QEMU/
++ * gem5 source).
++ *
++ * Fix used here: replace the inline-asm operand-barrier idiom with the
++ * standard C mechanism for the exact same guarantee -- a `volatile`-
++ * qualified pointer variable. The C standard requires every access to a
++ * volatile-qualified object to be treated as an observable side effect
++ * that the compiler may not elide, constant-propagate through, or reorder
++ * relative to other volatile accesses -- which is precisely (and, unlike
++ * an operand-less/empty-template asm "+r" trick, *portably* and *without
++ * requiring a real register allocation for a bogus operand*) the barrier
++ * musl's comment above the original line asks for: "Barrier against
++ * hoisting application code ... prior to its initialization above." No
++ * inline asm operand is involved at all, so DADAO's operand-allocation gap
++ * is sidestepped entirely rather than worked around by luck. Every other
++ * line of this file (including the "External linkage ... noinline"
++ * comment and the two-stage main/exit dispatch) is unchanged from the
++ * generic musl source; this is a single-line substitution, not a
++ * reimplementation of the startup contract.
++ */
++
++#include <elf.h>
++#include <poll.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <unistd.h>
++#include "syscall.h"
++#include "atomic.h"
++#include "libc.h"
++
++static void dummy(void) {}
++weak_alias(dummy, _init);
++
++extern weak hidden void (*const __init_array_start)(void), (*const __init_array_end)(void);
++
++static void dummy1(void *p) {}
++weak_alias(dummy1, __init_ssp);
++
++#define AUX_CNT 38
++
++#ifdef __GNUC__
++__attribute__((__noinline__))
++#endif
++void __init_libc(char **envp, char *pn)
++{
++	size_t i, *auxv, aux[AUX_CNT] = { 0 };
++	__environ = envp;
++	for (i=0; envp[i]; i++);
++	libc.auxv = auxv = (void *)(envp+i+1);
++	for (i=0; auxv[i]; i+=2) if (auxv[i]<AUX_CNT) aux[auxv[i]] = auxv[i+1];
++	__hwcap = aux[AT_HWCAP];
++	if (aux[AT_SYSINFO]) __sysinfo = aux[AT_SYSINFO];
++	libc.page_size = aux[AT_PAGESZ];
++
++	if (!pn) pn = (void*)aux[AT_EXECFN];
++	if (!pn) pn = "";
++	__progname = __progname_full = pn;
++	for (i=0; pn[i]; i++) if (pn[i]=='/') __progname = pn+i+1;
++
++	__init_tls(aux);
++	__init_ssp((void *)aux[AT_RANDOM]);
++
++	if (aux[AT_UID]==aux[AT_EUID] && aux[AT_GID]==aux[AT_EGID]
++		&& !aux[AT_SECURE]) return;
++
++	struct pollfd pfd[3] = { {.fd=0}, {.fd=1}, {.fd=2} };
++	int r =
++#ifdef SYS_poll
++	__syscall(SYS_poll, pfd, 3, 0);
++#else
++	__syscall(SYS_ppoll, pfd, 3, &(struct timespec){0}, 0, _NSIG/8);
++#endif
++	if (r<0) a_crash();
++	for (i=0; i<3; i++) if (pfd[i].revents&POLLNVAL)
++		if (__sys_open("/dev/null", O_RDWR)<0)
++			a_crash();
++	libc.secure = 1;
++}
++
++static void libc_start_init(void)
++{
++	_init();
++	uintptr_t a = (uintptr_t)&__init_array_start;
++	for (; a<(uintptr_t)&__init_array_end; a+=sizeof(void(*)()))
++		(*(void (**)(void))a)();
++}
++
++weak_alias(libc_start_init, __libc_start_init);
++
++typedef int lsm2_fn(int (*)(int,char **,char **), int, char **);
++static lsm2_fn libc_start_main_stage2;
++
++int __libc_start_main(int (*main)(int,char **,char **), int argc, char **argv,
++	void (*init_dummy)(), void(*fini_dummy)(), void(*ldso_dummy)())
++{
++	char **envp = argv+argc+1;
++
++	/* External linkage, and explicit noinline attribute if available,
++	 * are used to prevent the stack frame used during init from
++	 * persisting for the entire process lifetime. */
++	__init_libc(envp, argv[0]);
++
++	/* Barrier against hoisting application code or anything using ssp
++	 * or thread pointer prior to its initialization above.
++	 *
++	 * DADAO: volatile-qualified pointer variable instead of the generic
++	 * empty-template "+r" inline-asm operand trick -- see the file-level
++	 * comment above for why (DADAO backend cannot allocate a register for
++	 * a function-pointer "+r" operand; a volatile access is a portable,
++	 * standard-guaranteed equivalent barrier that requires no inline-asm
++	 * operand at all). */
++	lsm2_fn * volatile stage2 = libc_start_main_stage2;
++	return stage2(main, argc, argv);
++}
++
++static int libc_start_main_stage2(int (*main)(int,char **,char **), int argc, char **argv)
++{
++	char **envp = argv+argc+1;
++	__libc_start_init();
++
++	/* Pass control to the application */
++	exit(main(argc, argv, envp));
++	return 0;
++}
+diff --git a/src/thread/dadao/__set_thread_area.s b/src/thread/dadao/__set_thread_area.s
+index 4b0cd251..053f55a0 100644
+--- a/src/thread/dadao/__set_thread_area.s
++++ b/src/thread/dadao/__set_thread_area.s
+@@ -16,10 +16,43 @@
+ # with a pure register-write .s stub for exactly this reason -- there is
+ # no real Linux "set the TP register" syscall on any of them either.
+ #
+-# ABI: int __set_thread_area(void *p) -- p is a pointer argument, so it
+-# arrives in the RB bank at rb16 (contracts/abi/spec.md SS2.1), NOT the RD
+-# bank; scalar int return in rd31 (contracts/abi/spec.md SS3.1). Leaf
+-# function: no `call` inside, no stack frame needed.
++# ABI note (CORRECTED, ML-012a): contracts/abi/spec.md SS2.1 documents
++# pointer arguments as arriving in the RB bank (rb16), but the DADAO LLVM
++# backend's actual calling-convention implementation
++# (llvm/lib/Target/DADAO/DADAOCallingConv.td, explicitly commented
++# "GPRD only (Phase 5 spike)") assigns ALL i64-representable values --
++# including pointers, since this backend has no separate pointer/address
++# register class in its calling-convention lowering -- to the RD bank
++# (rd16..rd31), never RB. Verified directly during ML-012a with a minimal
++# probe (`void store_it(long *p) { *p = 42; }` compiled with
++# `clang --target=dadao -O2`): the incoming pointer is read from **rd16**,
++# then converted to RB internally only because the `sto` instruction's
++# address operand must be an RB register:
++#
++#   store_it:
++#       rd2rb rb8, rd16, 1      ; p arrives in rd16, converted to rb8
++#       addi  rd16, rd0, 42
++#       sto   rd16, rb8, 0
++#       ret   rd0, 0
++#
++# This file originally read the incoming argument from rb16 (matching the
++# documented-but-unimplemented ABI, never previously exercised against a
++# real compiler-generated caller -- ML-011a's tp_probe.test only ever
++# called this sequence from other *hand-written* assembly using the same
++# not-actually-real convention on both ends, so the mismatch was latent
++# and undetected). musl's real src/env/__init_tls.c's __init_tp() calls
++# `__set_thread_area(TP_ADJ(p))` as compiled C, so it actually places `p`
++# in rd16 -- this was a real, silent bug (would read an unrelated/garbage
++# rb16 value instead of the intended thread pointer) until fixed here.
++# Reported to the architect as a real ABI-spec-vs-implementation gap
++# (docs/issues.yaml); NOT fixed in LLVM (task hard constraint) -- fixed
++# here by reading the argument from the register the backend actually
++# uses.
++#
++# Scalar int return still in rd31 (contracts/abi/spec.md SS3.1, matches
++# RetCC_DADAO, unaffected by the above -- return-value convention was
++# never in question). Leaf function: no `call` inside, no stack frame
++# needed.
+ #
+ # `ret rdha, imms18` (contracts/isa/spec.md SS5.5) sets rdha =
+ # sext_18(imms18) as a compile-time immediate while popping RegRAS -> PC
+@@ -31,5 +64,5 @@
+ .globl __set_thread_area
+ .hidden __set_thread_area
+ __set_thread_area:
+-    rb2rb rb4, rb16, 1
++    rd2rb rb4, rd16, 1
+     ret rd31, 0
+-- 
+2.43.0
+

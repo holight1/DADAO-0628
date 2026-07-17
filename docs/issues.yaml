@@ -469,6 +469,21 @@
   # 独立缺口，未修复（本任务范围之外）。是 llvm-test-suite（ADR-0012 T3）
   # 在高于 -O0 跑起来前的另一个必修项，与 dadao-oz-undef-physreg 一起构成
   # -O1+ 支持的两大缺口。
+  #
+  # ML-012a（2026-07-17）：musl 自己的 crt/crt1.c（_start_c 尾部调用
+  # __libc_start_main）和 src/env/__libc_start_main.c（stage2(...) 尾部
+  # 调用）在 config.mak 默认 -O2 下都直接命中这个断言，阻塞了 musl 首个
+  # 真实链接 E2E 里程碑。**未修复 LLVM**——在 `arch/dadao/arch.mak`
+  # （musl 侧、component-lock 允许的 arch 集成文件）里加
+  # `CFLAGS_AUTO += -fno-optimize-sibling-calls`，全树生效，验证直接从
+  # 崩溃变为编译干净（-O2 不变，只是不再尝试 sibling-call 下降）。这是一
+  # 个安全、可移植、只关闭优化的标准编译器开关，不改变任何程序语义，
+  # 不是修复 LowerCall 本身。副作用（有益）：同一批全树 `make -k` 扫描
+  # 显示这个断言此前命中的全部约 229 个 musl 文件在加此开关后全部消失
+  # （ML-012a 完整失败分类：229→0），是这个开关对整个 issue 的一次大规
+  # 模、非侵入性缓解，但 `codegen-tailcall-lowercall-assert` 本身（LLVM
+  # 从未实现 tail-call opt-out）仍未修复、仍是 open——任何不走 musl
+  # arch.mak（例如 llvm-test-suite 的独立 -O1+ 编译路径）的构建仍会命中。
 
 - id: codegen-global-byte-mask-load-wrong-endian-offset
   title: "-O0：对全局/静态 int 做窄化位运算（如 `x & 0xFF`）时，narrow-load combine 选取的字节偏移按小端假设（offset+0），但 DADAO 是大端——取到最高字节而非最低字节，值整体错误"
@@ -786,6 +801,16 @@
   # 编译期屏障，DADAO 后端的寄存器分配器却在没有真实操作数需要分配的情况
   # 下报"couldn't allocate reg for constraint 'r'"——提示内联汇编操作数处理
   # 路径本身有缺口，非 musl 代码问题。未修复，未根因定位。
+  #
+  # ML-012a（2026-07-17）：`src/env/__libc_start_main.c` 这一触发点已在
+  # musl 侧绕开（未修复 LLVM）——新增 arch 覆盖文件
+  # `src/env/dadao/__libc_start_main.c`，把原本的 `__asm__ ( "" :
+  # "+r"(stage2) : : "memory" )` 屏障替换成等价的
+  # `lsm2_fn * volatile stage2 = ...;`（C 标准保证的 volatile 语义屏障，
+  # 不经过任何内联汇编操作数分配路径，完全绕开这个缺口而非碰运气绕过）。
+  # 该文件仅此一行与上游不同，见文件头注释。`src/string/explicit_bzero.c`
+  # 这一触发点**仍未处理**（本任务未涉及该文件，不在 musl 首个 E2E 里程
+  # 碑的必需符号集里），issue 状态维持 open。
 
 - id: musl-backend-assert-illegal-result-number
   title: "musl `intscan.c`/`mallocng/donate.c` 编译时撞 SDNode::getValueType 断言 'ResNo < NumValues && \"Illegal result number!\"'"
@@ -890,3 +915,90 @@
   #   的序列级（非单指令）差分回归覆盖这一类 RB-bank 读写组合，并先澄清
   #   contracts/isa/spec.md §4.7 正文与 tests/vectors/isa/rd-wyde-block.yaml
   #   两个 rb2rd/rb2rb 向量之间"是否 48-bit 截断"的规范/向量不一致。
+
+- id: dadao-callingconv-pointer-args-use-rd-bank-not-rb-bank
+  title: "DADAOCallingConv.td（\"GPRD only, Phase 5 spike\"）把指针类型的函数参数分配到 RD bank（rd16..），与 contracts/abi/spec.md §2.1 记载的 RB bank（rb16..）不一致"
+  status: open
+  scope: [CodeGen, ABI]
+  blocks: null
+  resolved_by: null
+  # ML-012a（2026-07-17）：为落地 musl 首个真实静态链接 E2E 里程碑，
+  # crt_arch.h 需要用手写汇编 `call _start_c` 调用一个真实由 clang 编译的
+  # 函数 `void _start_c(long *p)`——这是本项目第一次让"手写汇编"与"真实
+  # 编译产物"在一个带指针参数的调用边界上互操作（此前所有 hand-written
+  # .s 探针要么零参数返回值、要么调用的也是同一探针文件里另一段手写汇编，
+  # 双方一致地用同一套约定，从未真正验证过 ABI 文档记载的约定是否与编译
+  # 器实现一致）。
+  #
+  # 直接验证：`void store_it(long *p) { *p = 42; }` 用
+  # `clang --target=dadao -O2 -c` 编译，反汇编结果：
+  #
+  #     store_it:
+  #         rd2rb rb8, rd16, 1      ; 指针参数从 rd16（RD bank）读入
+  #         addi  rd16, rd0, 42
+  #         sto   rd16, rb8, 0      ; sto 的地址操作数要求 RB，故内部转换
+  #         ret   rd0, 0
+  #
+  # 确认：`llvm/lib/Target/DADAO/DADAOCallingConv.td` 里
+  # `CC_DADAO`（注释显式写"GPRD only (Phase 5 spike)"）把所有
+  # i64-representable 值（含指针，因为这个后端的调用约定 lowering 里指针
+  # 没有独立的寄存器类）无条件分配到 RD16..RD31，从不使用 RB bank——即
+  # `contracts/abi/spec.md §2.1`"指针参数走 RB bank rb16-31"这条 ABI 合约
+  # 目前**完全没有被后端实现**，是一个规范与实现之间真实的、此前从未被
+  # 测试暴露过的分歧（因为暴露它的前提恰好是"手写汇编 call 真实编译函数
+  # 且带指针参数"，此前没有任何测试这样做过）。
+  #
+  # ML-012a 未修改 LLVM——在 musl 侧按"后端真实实现"而非"文档 ABI"来适配：
+  # `arch/dadao/crt_arch.h`（`call _start_c` 前用 `rb2rd rd16, rb1, 1`
+  # 而非 `rb2rb rb16, ...`）、`src/thread/dadao/__set_thread_area.s`
+  # （ML-011a 落地时误按文档 ABI 写成从 rb16 读，本任务改为从 rd16 读，
+  # 同步更新 `tests/lit/E2E/tp_probe.test`）。get_tp.s 不受影响（无参数，
+  # 仅涉及 RetCC_DADAO 的 rd31 返回值约定，该约定本身与 RD/RB 分歧无关且
+  # 已验证正确）。
+  #
+  # 建议架构师后续评估：(a) 是否要实现 RB bank 的真实指针调用约定（较大
+  # 改动，需要 DADAOISelLowering.cpp 里区分指针类型与普通整数类型），
+  # 还是 (b) 正式修订 `contracts/abi/spec.md §2.1`，把"指针参数走 RB
+  # bank"降级为 M1 之后的路线图项、当前阶段明确记录"指针参数与整数参数
+  # 共用 RD bank"作为现状约定（更小改动，但需要走 ADR 变更流程，因为
+  # contracts 是 wiki 的 M1 归一化投影，变更需要走既定流程而非本任务自行
+  # 决定）。
+
+- id: dadao-pcrel-reloc-no-farsym-fallback
+  title: "为\"取弱未定义外部符号地址\"生成的窄距 PC-relative 重定位没有宽距/绝对值兜底；当该符号按弱符号惯例落到地址 0、而代码装载在 0x80000000 附近时，链接器报重定位越界"
+  status: open
+  scope: [CodeGen, Linker]
+  blocks: null
+  resolved_by: null
+  # ML-012a（2026-07-17）：musl 通用 `src/env/__init_tls.c` 的
+  # `static_init_tls()` 有一行 `base = (size_t)_DYNAMIC - phdr->p_vaddr;`
+  # ——`_DYNAMIC`（`extern weak hidden const size_t _DYNAMIC[]`）只在动态
+  # 链接/PIE 可执行文件里由链接器提供 `.dynamic` 段；在纯静态、非 PIE 的
+  # 链接（DADAO/musl 当前和可预见未来的唯一形态，ADR-0014 D5：无动态链
+  # 接器）里，这个弱符号按约定解析为地址 0。取一个解析为地址 0 的符号地
+  # 址、而代码装载在 `0x80000000`（ADR-0004 BINARY_BASE）附近，需要约
+  # `-0x80000000`（~-2GiB）的位移——`ld.lld` 直接报错：
+  #
+  #     ld.lld: error: ...(__init_tls.o):(function static_init_tls: ...):
+  #     relocation Unknown (4) out of range: -524289 is not in
+  #     [-131072, 131071]; references '_DYNAMIC'
+  #
+  # 即 DADAO 后端为"取一个外部/弱符号地址"这类模式生成的重定位固定是窄距
+  # （±131072 量级，远小于 contracts/isa/spec.md §4.8 `rela` 本身文档化
+  # 的 ±512MB 单指令量级，说明实际触发的是配对里另一半更窄的重定位），
+  # 且没有为"符号实际很远"这种情况提供更宽范围/绝对寻址的兜底路径——这是
+  # 一个真实的后端代码生成缺口，未修复 LLVM/lld。
+  #
+  # ML-012a 未修改 LLVM/lld——这一行在当前静态单线程配置下本来就是运行时
+  # 死代码（本任务的 `arch/dadao/crt_arch.h` 故意不提供 AT_PHDR/AT_PHNUM，
+  # 见该文件头注释，`aux[AT_PHNUM]==0` 使这整个 for 循环体在运行时从不执
+  # 行；DADAO 目前也没有任何动态链接器/PIE 产物，`phdr->p_type ==
+  # PT_DYNAMIC` 这半个条件本身也从不为真）——新增 arch 覆盖文件
+  # `src/env/dadao/__init_tls.c`，只删除这一行的函数体（保留 `if` 判断本
+  # 身，只是内容清空，便于对照上游），其余与上游逐字节相同，见文件头注释
+  # 完整说明。
+  #
+  # 建议架构师后续评估：DADAO 未来若要支持动态链接/PIE，这个覆盖文件必须
+  # 删除并配合后端修复（宽距/绝对寻址取外部符号地址的能力）一起解决，
+  # 现在这个 override 只是"当前阶段安全、需要在有动态链接需求时重新审视"
+  # 的临时措施，不是长久方案。

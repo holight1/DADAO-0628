@@ -1,0 +1,67 @@
+// ML-012a: first real musl static-link E2E milestone. A real
+// `int main(void) { return 42; }` (Inputs/musl_e2e_exit.c, no headers, no
+// libc calls beyond the implicit startup path) compiled with
+// `clang --target=dadao`, then linked -- via the manual llvm-mc-family
+// pipeline this project's lit suite already uses for real compiler output
+// (same style as clang_hello.test/malloc_hello.test: feed the pieces
+// directly to ld.lld rather than going through the full clang driver
+// link) -- against musl's REAL crt1.o and the subset of libc.a that
+// currently compiles clean (.work/build/musl/lib/{crt1.o,libc.a}, built
+// from arch/dadao/{crt_arch.h,arch.mak} + src/env/dadao/
+// {__libc_start_main.c,__init_tls.c} + the already-landed ML-007a..011a
+// arch files). This exercises the real crt1.c -> _start_c ->
+// __libc_start_main -> __init_libc/__init_tls/__init_tp ->
+// libc_start_main_stage2 -> exit() -> _Exit() -> SYS_exit_group syscall
+// path end to end on both backends -- not a hand-assembled probe.
+//
+// Object-file scope actually linked (see this task's completion notes for
+// the full picture): crt1.o (this task, arch/dadao/crt_arch.h) + a
+// manually-archived libc.a built from the 1166 (of 1346 candidate)
+// src/*.c/.s files that currently compile clean under
+// `clang --target=dadao` -- musl's own static-link model only pulls in
+// .o's whose symbols are actually referenced, so the ~180 files that still
+// fail to compile (all in already-tracked docs/issues.yaml backend-gap
+// categories: libcall lowering, dynamic_stackalloc, sign_extend_inreg,
+// three internal SelectionDAG assertions, un-analyzable-fallthrough, one
+// AsmPrinter UNREACHABLE, one remaining inline-asm-operand-allocation
+// case) are simply absent from the archive and never referenced by this
+// minimal program's startup path, so their absence causes no link error.
+//
+// Two real, previously-latent backend/ABI gaps were found and routed
+// around (musl-side only, no LLVM/QEMU/gem5 source touched) to reach this
+// milestone -- both documented in detail at the point of the fix and in
+// docs/issues.yaml:
+//   1. DADAOCallingConv.td ("GPRD only, Phase 5 spike") actually passes
+//      pointer arguments in the RD bank (rd16), not the RB bank (rb16)
+//      contracts/abi/spec.md SS2.1 documents -- crt_arch.h's `call
+//      _start_c` and src/thread/dadao/__set_thread_area.s (ML-011a) were
+//      both corrected to place/read the pointer argument in rd16 to match
+//      the real compiled callee/caller. tp_probe.test was updated to match.
+//   2. musl's generic __libc_start_main.c/__init_tls.c hit two independent
+//      already-tracked DADAO codegen gaps (codegen-tailcall-lowercall-
+//      assert; musl-inline-asm-empty-clobber-reg-alloc) plus one newly
+//      found link-time-only gap (a PC-relative relocation used for
+//      "address of a weak-undefined external symbol" has no wide-range/
+//      absolute fallback, so referencing `_DYNAMIC` -- always weak-
+//      undefined-resolves-to-0 in this static-only, no-dynamic-linker
+//      project, ADR-0014 D5 -- from code loaded at 0x80000000 overflows
+//      the relocation's range). Routed around with arch/dadao/arch.mak
+//      (-fno-optimize-sibling-calls, safe/portable, disables an
+//      optimization only) and two minimal, single-line-diff arch
+//      overrides (src/env/dadao/__libc_start_main.c,
+//      src/env/dadao/__init_tls.c) -- see those files' header comments
+//      for the full diagnosis. Neither LLVM, QEMU, nor gem5 source was
+//      modified.
+//
+// Exit 42 = int main(void) { return 42; } really executed via the real
+// musl startup chain and its return value really propagated through
+// exit()/_Exit()/SYS_exit_group all the way to process exit code, on
+// BOTH backends.
+// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O0 \
+// RUN:   -c -o %t.o %S/Inputs/musl_e2e_exit.c
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld \
+// RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \
+// RUN:   -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'

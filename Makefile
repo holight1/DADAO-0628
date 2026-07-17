@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .DEFAULT_GOAL := help
 
-.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc build-picolibc check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi check-golden check-legality
+.PHONY: help manifest-check doctor status fetch apply-series prepare build-qemu build-mc build-picolibc build-musl check check-wiki-drift check-wiki-refs check-wiki-refs-abi docker-image clean-work lint check-issues check-trans check-qfc check-lit-bytes check-codegen-abi check-golden check-legality
 
 help:
 	@echo "DADAO-0628 greenfield orchestration"
@@ -16,6 +16,7 @@ help:
 	@echo "  make build-qemu      Configure and compile QEMU (Phase 3)"
 	@echo "  make build-mc        Build LLVM MC components for DADAO (Phase 2)"
 	@echo "  make build-picolibc  Build picolibc for DADAO (meson + ninja, Phase 5)"
+	@echo "  make build-musl      Configure + best-effort build musl for DADAO (Phase B)"
 	@echo "  make check           Run repository-level structural checks"
 	@echo "  make docker-image    Build the reproducible development image"
 	@echo "  make clean-work      Remove generated .work content only"
@@ -85,6 +86,37 @@ build-picolibc: manifest-check
 	.work/build/llvm/bin/llvm-ar rcs $(PICOLIBC_BUILD)/libc.a \
 	  $$(find $(PICOLIBC_BUILD)/libc.a.p -name '*.o')
 	@echo "build-picolibc: PASS (libc.a at $(PICOLIBC_BUILD)/libc.a)"
+
+MUSL_SRC   ?= .work/source/musl
+MUSL_BUILD ?= .work/build/musl
+MUSL_PREFIX ?= /tmp/musl-dadao-install
+
+# musl (ADR-0014 D5 static-only libc port, phase B: ML-007a..012a).
+# Best-effort, matching build-picolibc's own pattern: `make -k` continues
+# past the ~180 already-tracked/known DADAO backend codegen gaps
+# (docs/issues.yaml) instead of stopping the whole build, then this
+# target manually archives whichever object files DID compile clean into
+# lib/libc.a -- musl's own `lib/libc.a: $(AOBJS)` recipe refuses to run
+# `ar` at all under `-k` if even one prerequisite object failed (that is
+# by design: make correctly treats a missing prerequisite as "target not
+# remade"), so this target reproduces "package what actually compiled"
+# without patching musl's Makefile to tolerate partial object lists.
+build-musl: manifest-check
+	@mkdir -p $(MUSL_BUILD)
+	cd $(MUSL_BUILD) && \
+	  CC="$(PWD)/.work/build/llvm/bin/clang --target=dadao" \
+	  AR=$(PWD)/.work/build/llvm/bin/llvm-ar \
+	  RANLIB=$(PWD)/.work/build/llvm/bin/llvm-ranlib \
+	  $(PWD)/$(MUSL_SRC)/configure --target=dadao --disable-shared \
+	  --prefix=$(MUSL_PREFIX)
+	$(MAKE) -C $(MUSL_BUILD) -k -j$$(nproc) lib/crt1.o lib/libc.a || true
+	@echo "=== Packaging libc.a from successfully-compiled objects only ==="
+	rm -f $(MUSL_BUILD)/lib/libc.a
+	.work/build/llvm/bin/llvm-ar rc $(MUSL_BUILD)/lib/libc.a \
+	  $$(find $(MUSL_BUILD)/obj/src $(MUSL_BUILD)/obj/compat -name '*.o' 2>/dev/null)
+	.work/build/llvm/bin/llvm-ranlib $(MUSL_BUILD)/lib/libc.a
+	@test -f $(MUSL_BUILD)/lib/crt1.o
+	@echo "build-musl: PASS (crt1.o + best-effort libc.a subset at $(MUSL_BUILD)/lib/; ~180 known-failing files excluded, see docs/issues.yaml)"
 
 check-wiki-drift:
 	@$(PYTHON) scripts/check_wiki_drift.py
