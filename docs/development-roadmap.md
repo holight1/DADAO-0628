@@ -495,6 +495,26 @@ by ML-012a only because the backend hadn't implemented RB bank yet), and
 `tests/lit/E2E/tp_probe.test`; then rebuild musl and confirm
 `malloc_hello.test`/`printf_hello.test` pass again.
 
+### ML-013a complete (2026-07-18): downstream files reconciled, full E2E back to 58/58
+
+All 4 files updated as planned. Two real issues found and root-caused
+along the way: (1) **stale build artifacts** — `.work/picolibc/build-dadao/
+libc.a` and `.work/build/musl`'s objects were compiled by the pre-DL-069a
+clang; incremental builds don't track the compiler binary itself, only
+source mtimes, so they silently kept mixing old- and new-ABI object files
+until a clean rebuild was forced (see
+`feedback_stale_build_artifacts_after_toolchain_rebuild` memory — worth
+remembering for any future LLVM-backend-touching task). (2) **a genuine
+new LLVM gap**: variadic functions' save-area logic only spills the RD
+bank, so pointer varargs are silently lost post-DL-069a (confirmed via
+disassembly — a 3-pointer-arg `printf` call places everything in
+`rb16/rb17/rb18`, entirely missed by the RD-only save area). Not a
+regression (varargs was always excluded from M1 scope); worked around at
+the test level (`fputs` instead of variadic `printf`) and logged as
+`varargs-pointer-args-lost-rb-bank-save-area` for a future task. Full E2E
+58/58, differential unchanged, all 6 musl patches independently
+reproducible from the pin commit.
+
 **Side finding (unrelated, tracked separately)**: replaying the full
 38-patch LLVM series from the bare pin commit fails at patch 0005 (long
 predates this session) — nobody had verified a full from-scratch replay
