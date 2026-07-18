@@ -150,6 +150,38 @@ mallocng 算法或 ML-014a 整体验收。
   对两个剩余失败保留真实 exit/fault，没有用“越过 brk fault”代替整体验收。
 - 自审结论：**Confirmed（SYS_brk backing 修复）；等待独立 reviewer**。
 
+### 有限时长复核（2026-07-18）
+
+- 按 60 秒上限执行增量构建：
+
+  ```text
+  timeout 60s scons build/DADAO/gem5.opt -j6
+  scons_exit=0
+  ```
+
+  实际约 5 秒完成；仅出现既有主机依赖 warning（`protoc`、`capstone`、
+  `png.h`、HDF5 等），没有新的编译或链接错误。
+
+- 按 30 秒/probe 上限重跑五个关键 gem5 probe，结果仍为：
+
+  ```text
+  return42             exit=42
+  mmap_real            exit=42
+  mallocng_real        exit=42
+  malloc_pointer_after exit=13
+  malloc_rw_after      exit=134  (Page table fault at 0xfffffffb)
+  ```
+
+  重跑日志位于 `.work/ML-014o-gem5-sysbrk-vma-backing/rerun-20260718/`。
+  `mallocng_real`、`malloc_pointer_after` 和 `malloc_rw_after` 均未重新出现
+  `0x90001000` fault。
+
+- 本任务没有无限等待完整工程回归。以下项目**未在 ML-014o 本轮重跑**：
+  clean-room gem5 全量重编、LLVM patch 从零 replay、完整 `llvm-lit` E2E、
+  全量三方 differential、QEMU 重跑以及独立 reviewer 复核；这些均不属于本
+  任务 gem5 ownership，ML-014m 的既有结果仍作为基线。上述未跑项目不影响本
+  任务已完成的增量构建和五个关键 probe 记录。
+
 ## 审阅记录
 
 （待独立 reviewer 复核；请重点检查初始 `BrkBase` 与 ELF heap 边界、冲突/收缩
