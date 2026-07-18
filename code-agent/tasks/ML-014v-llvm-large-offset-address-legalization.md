@@ -2,7 +2,7 @@
 
 **执行环境**：本地 subagent worker；承接 Accepted ML-014u
 
-**状态**：Completed awaiting independent review（2026-07-18）
+**状态**：Accepted（2026-07-18）
 
 ## 目标
 
@@ -98,3 +98,16 @@ FileCheck 逐函数确认：`2047/-2048` 直接作为 load/store immediate；
 或 manifests；没有触碰原始未跟踪 ML-014a，没有导出 root patch，也不宣称
 mallocng、ML-014f 或 ML-014a 完成。本任务为 **Completed awaiting independent
 review**。
+
+## 审阅记录
+
+- **Accepted（2026-07-18，独立 review）**：核对 source commit
+  `1697be42b5b1` 相对父提交仅修改 selector 与两项 DADAO CodeGen 测试文件；实现
+  只在 `ADD + Constant` 被拆为 memory offset 前增加 `isInt<12>` 门控，符合
+  `imms12` 的 `[-2048, 2047]` 边界，没有扩大到 MC 或其他后端路径。回归对 i8
+  load/store 均覆盖 `2047/2048/-2048/-2049/131051`，并以 i16 load、i32 store、
+  i64 load 覆盖宽度路径。独立增量构建 `llc` 退出 `0`；默认与 `-O0` 的两条
+  `llc | FileCheck` 均退出 `0`；ML-014u `minimal_direct.ll` smoke 退出 `0`。
+  汇编抽查确认边界内立即数直接折叠，越界值完整物化、相加后以 offset `0`
+  访存。既有 `llvm-lit` 初始化缺少 `llvm-config` 是测试环境依赖限制，不作为
+  实现失败；RUN-line 等价验证已实际通过。
