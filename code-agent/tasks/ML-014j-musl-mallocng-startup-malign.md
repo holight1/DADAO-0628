@@ -102,3 +102,11 @@ ELF 在两个后端均于 `main` 前退出 MALIGN=129，尚未证明是 malloc �
 
 **独立复核判定：Accepted（诊断任务）。** 诊断验收证据充分；实现状态仍为
 **Blocked（实现未完成）**，不应将该 Accepted 解读为 mallocng 运行时已通过。
+
+### 后续处理
+
+ML-014l 将共同故障进一步定位为 DADAO `R_DADAO_RELA_PAGE` 页差错误；
+ML-014m 已修复并集成该 linker 问题。修复后 `return42`/真实 `mmap` 双后端
+仍为 42，mallocng 已越过本任务记录的 startup `MALIGN=129`，但 allocator
+随后仍在 `0x90001000` 映射访问处阻塞，故本任务的“诊断 Accepted”不等同于
+mallocng 链路完成。

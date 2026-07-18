@@ -71,6 +71,13 @@ SYS_mmap 收到畸变 length `0xa000c000e00e8` 并返回 `-EINVAL`。
   `__init_libc`/`__init_tls` 对 `libc.tls_size`、`main_tls` 及 ELF 全局映像的
   形成顺序；优先判断是链接器/relocation 数据布局还是 musl TLS 代码输入。
 
+### 后续处理
+
+上述遗留问题已由 ML-014l 完成更窄的 ELF/relocation 证据定位，并由 ML-014m
+修复 `R_DADAO_RELA_PAGE`。ML-014k 本身仍保持“本轮 worker 未完成新增证据”的
+Blocked 记录，不重复改写为实现任务；当前剩余阻塞已转移到 mallocng 进入
+`main` 后的 `0x90001000` 映射/allocator 路径。
+
 ## 审阅记录（subagent）
 
 > 这是链接映像隔离诊断，不在本任务直接修 LLVM/backend/musl。

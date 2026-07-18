@@ -149,3 +149,12 @@ patch/series、后端、issues 或其他用户文件；也没有把阻塞状态�
    完整复跑。
 
 **最终结论：Blocked / Not Accepted。**
+
+### 后续状态（ML-014m，2026-07-18）
+
+ML-014m 已修复并集成 linker 的 TLS startup 页差错误；修复后的
+`return42`/真实 `mmap` 双后端均为 42，mallocng 已越过原先的 startup
+`MALIGN=129`。但 mallocng 的后续路径仍未达到本任务要求的双后端 42：当前
+probe 在访问 `0x90001000` 时出现 QEMU/gem5 后端差异（QEMU 13/14，gem5
+134），因此 ML-014f 仍为 **Blocked / Not Accepted**，需要另开 allocator/
+memory-mapping 诊断后再重开验收。

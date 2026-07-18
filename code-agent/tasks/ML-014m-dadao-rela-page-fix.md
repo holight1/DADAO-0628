@@ -102,6 +102,9 @@ free、allocator 算法或 ML-014a 整体验收。
   通过；`manifest_check.py`、`check_issues.py`、`check_wiki_drift.py` 通过。
 - 尚未重跑完整 39 条 patch 从零 replay；历史上 0005 已有独立 corrupt-patch
   blocker，避免把该既有问题与本次修复混在一起。
+- linker 修复后的常规回归：`llvm-lit tests/lit/E2E` 为 **59/59**；
+  `tools/run_differential.py` 为 `AGREE(3-way)=200`、
+  `AGREE(4-way)=200`、`DIVERGE=0`。
 
 ## 审阅记录
 
