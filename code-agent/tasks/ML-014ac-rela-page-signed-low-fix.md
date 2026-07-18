@@ -53,3 +53,25 @@ boundary 三布局；不扩展到 allocator 语义。
   while boundary/failure reached `0x7ffff800`/`0x7ffff804` (QEMU 130; gem5 0).
 - ML-014y was not rerun in this stopped run; its existing record reports QEMU and
   gem5 exit 42 for the prior locked artifact, not validation of this source fix.
+
+### Completion / verified results (2026-07-19)
+
+- Verification was performed after rebuilding lld. External source commit
+  `f5a06de81358` is clean and contains the DADAO.cpp rounding fix plus the focused
+  lld test files.
+- Task-owned artifacts are under
+  `/home/holight/DADAO-0628/.work/ML-014ac-rela-page-signed-low-fix`:
+  `success/`, `boundary/`, `failure/`, and `single-large/`.
+- Compile, link, and objcopy all returned `0` for `success`, `boundary`, `failure`,
+  and `single-large`.
+- QEMU returned `rc=42` for all four: `success`, `boundary`, `failure`, and
+  `single-large`.
+- gem5 returned `rc=42` for all four, with `SIM_END` trap-exit code `42`:
+  `success`, `boundary`, `failure`, and `single-large`.
+- QEMU traces at
+  `/home/holight/DADAO-0628/.work/ML-014ac-rela-page-signed-low-fix/{success,boundary,failure,single-large}/qemu.trace`
+  all contain `0x80000110` (`main`) and contain no incorrect `0x7ffff` target.
+- gem5 traces at
+  `/home/holight/DADAO-0628/.work/ML-014ac-rela-page-signed-low-fix/{success,boundary,failure,single-large}/gem5.exec.trace`
+  reach normal completion.
+- This record makes no dual-large allocator claim.
