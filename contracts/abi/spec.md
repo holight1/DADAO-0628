@@ -315,7 +315,7 @@ of rb2, avoiding the high-16-bit preservation issue of `addi` (ISA §4.4).
 
 | Issue | Impact | Reference |
 |-------|--------|-----------|
-| Varargs | Excluded from M1; varargs save area layout defined in wiki but not needed for scalar non-variadic | `docs/open-spec-issues.md` |
+| Varargs | Excluded from M1; varargs save area layout defined in wiki but not needed for scalar non-variadic. **Concrete gap confirmed 2026-07-18 (ML-013a/DL-069a)**: current LLVM `IsVarArg` prologue only spills the RD bank to the save area, never RB — so pointer-typed variadic arguments (now correctly placed in the RB bank per §2.1) are silently lost (`docs/issues.yaml` `varargs-pointer-args-lost-rb-bank-save-area`). Fix direction: mirror §2.3's shared-overflow-area rule (one save area ordered by original declaration sequence, not one area per bank) rather than two separate per-bank save areas — this sidesteps the "callee doesn't know which bank the next `va_arg` should read from" problem the same way §2.3 already solves it for stack overflow. Scheduled: after the musl malloc+printf E2E milestone (ML-014a), before the first large-scale gcc-c-torture/llvm-test-suite sweep or kernel K1 work (2026-07-18 architect/user decision — avoids conflating this known gap with genuine torture-suite failures at scale). | `docs/open-spec-issues.md` |
 | HFA/HPA | Excluded from M1; aggregate classification rules defined in wiki | `docs/open-spec-issues.md` |
 | Mixed-bank multi-return | [OPEN] Excluded from M1; Wiki ordering conflict must be resolved before Advanced CodeGen | `docs/open-spec-issues.md` |
 | Complex aggregate ABI | Struct splitting rules for >64-bit non-HFA/HPA aggregates; deferred post-M2 | — |

@@ -540,6 +540,25 @@ archive-what-compiled, mirroring `build-picolibc`'s existing pattern) so
 this milestone is reproducible from a clean checkout. E2E 58/58,
 differential unchanged.
 
+### Scheduling decision (2026-07-18): fix varargs pointer-arg loss before the torture sweep
+
+`varargs-pointer-args-lost-rb-bank-save-area` (found during ML-013a) is
+scheduled: **not** an immediate priority (ML-014a's malloc+printf
+milestone works around it fine with `puts`/integer-only `printf`), but
+**not deferred indefinitely** either — it needs to land after ML-014a and
+before the first large-scale gcc-c-torture/llvm-test-suite sweep or
+kernel K1 work, so this known gap doesn't get conflated with genuine
+torture-suite failures at scale (`printf`/`sprintf`-with-`%s` diagnostic
+output is pervasive in gcc-c-torture). Fix direction: mirror
+`contracts/abi/spec.md §2.3`'s shared-overflow-area rule (one save area
+ordered by original declaration sequence across both banks, not two
+separate per-bank save areas) — this is the same mechanism that already
+solves "how does the callee know which bank the next value came from"
+for the stack-overflow case, independently re-verified during DL-069a's
+ground-truth review with a probe matching §2.3's own cross-bank example.
+See `contracts/abi/spec.md §6` and `docs/open-spec-issues.md` for the
+now-annotated Varargs entry.
+
 ### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
 
 While spot-checking the recon report's QEMU source citations, found

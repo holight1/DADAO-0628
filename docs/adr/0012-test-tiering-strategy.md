@@ -75,6 +75,7 @@ ADR-0007 定了**向量怎么设计**（独立预期值、五类向量、两条 
 1. gcc-c-torture 里大量用例依赖较完整的 hosted libc（`printf`/`malloc`/`string.h` 全套/`setjmp` 等）——当前 picolibc（ADR-0014 阶段1）大概率不足以覆盖，达到旧工具链同等通过率很可能需要先完成 **musl 移植（ADR-0014 阶段2）**。这不改变 D4"picolibc 先行"的阶段顺序，但明确了"全量通过"这个终极里程碑的真实前置是 musl，不是 picolibc。
 2. llvm-test-suite 的封装方式（本仓库 D4 定的"薄 lit 封装"vs 旧工具链的"CMake 直接集成"）暂不改变——ML-004a/b 已验证薄封装路线可行且更符合本仓库 freestanding/QEMU-exit-code 的测试哲学；若未来薄封装规模上不去（用例数量大到手写 lit 封装不现实），再考虑评估 CMake 集成路线，需要专门 ADR 决策，不是现在的默认选项。
 3. 当前 ML-004 系列（SingleSource 纯计算子集）是通往 gcc-c-torture 全量目标的第一步（不依赖 libc I/O），后续随 musl 完成再扩大到 gcc-c-torture 全集。
+4. **变参指针保存区缺口必须先修（2026-07-18 架构师/用户决策）**：DL-069a/ML-013a 发现并确认 `varargs-pointer-args-lost-rb-bank-save-area`（LLVM 变参保存区只 spill RD bank，RB bank 的指针型可变实参被静默丢失，`contracts/abi/spec.md §6`/`docs/open-spec-issues.md` 已同步记录）。gcc-c-torture 里大量用例用 `printf`/`sprintf` 等变参函数做诊断输出，其中相当一部分带指针格式化参数（`%s` 等）——若不先修，正式大规模跑 gcc-c-torture/llvm-test-suite 时这个已知缺口会和真正的后端 bug 混在一起，排查成本高。**排期**：在 musl 第二个 E2E 里程碑（ML-014a，malloc+printf）之后、正式开始大规模 gcc-c-torture/llvm-test-suite 扫描或 kernel K1 任务之前，插入一个专门任务修复（预计沿用 §2.3 的"共享溢出区、按声明顺序排列"思路统一保存区设计，而不是简单地"RD 保存区旁边加一个 RB 保存区"）。
 
 ## 后果
 

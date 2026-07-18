@@ -8,7 +8,7 @@ These issues remain open after Wiki update to `13a414d` (SimRISC 0.4.1).
 | TLB fault return | Successful repair currently appears to skip instead of retry the faulting instruction | System QEMU, Kernel |
 | PTW SBI ABI | PTE/PTHI/PAHI register-bank classification is inconsistent with scalar ABI | SBI, Kernel |
 | VA2PA result | Signed error encoding conflicts with full 64-bit physical addresses | SBI, MMU tools |
-| Varargs | Save area, overflow area, aggregate values, and incoming-SP base need one layout | Complete ABI, libc |
+| Varargs | Save area, overflow area, aggregate values, and incoming-SP base need one layout. Concrete confirmed gap (2026-07-18): current save area only spills the RD bank, silently losing RB-bank (pointer) variadic args (`docs/issues.yaml` `varargs-pointer-args-lost-rb-bank-save-area`); fix direction is a single shared save area ordered by declaration sequence, mirroring `contracts/abi/spec.md` §2.3's overflow-area rule. Scheduled after ML-014a, before the first large-scale gcc-c-torture sweep or kernel K1 work. | Complete ABI, libc |
 | Cross-cfx escape | Previous cfx state and nested return policy are not fully specified | Exception nesting |
 | Multiple returns | Mixed RD/RB/RF ordering is ambiguous | Advanced CodeGen |
 | ~~ELF/object ABI~~ | **Closed by ADR-0003** (2026-06-29): EM_DADAO=0x0DA0, e_flags=0x1 (M1), ELFCLASS64/ELFDATA2MSB, 10 relocation types | — |
