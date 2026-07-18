@@ -1,0 +1,163 @@
+From 6dd0d7c9f162fa4e414e8824f6129ff5c78a35ed Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 12:44:19 +0800
+Subject: [PATCH] arch/dadao: back mmap arena with SE VMAs
+
+---
+ src/arch/dadao/decoder.cc | 73 +++++++++++++++++++++++++++++++--------
+ src/arch/dadao/process.cc |  3 +-
+ src/arch/dadao/process.hh | 11 ++++++
+ 3 files changed, 72 insertions(+), 15 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 867695e45d..7db5a6b0e3 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -3,6 +3,7 @@
+ #include "arch/dadao/decoder.hh"
+ #include "arch/dadao/faults.hh"
+ #include "arch/dadao/pcstate.hh"
++#include "arch/dadao/process.hh"
+ #include "arch/dadao/registers.hh"
+ #include "base/cprintf.hh"
+ #include "cpu/exec_context.hh"
+@@ -10,9 +11,11 @@
+ #include "cpu/thread_context.hh"
+ #include "mem/request.hh"
+ #include "mem/se_translating_port_proxy.hh"
++#include "sim/process.hh"
+ #include "sim/sim_exit.hh"
+ 
+ #include <iostream>
++#include <limits>
+ #include <vector>
+ 
+ namespace gem5 { namespace DADAOISA {
+@@ -38,7 +41,11 @@ static constexpr uint64_t MEM_WINDOW_SIZE = 0x3000ULL;   // 12 KiB
+ // gem5 SE's own stack lives near 0x00007FFFFFFFF000 (DG-006a) -- 4GiB
+ // (0x100000000) is far above the former and far below the latter, and
+ // trivially fits in DADAO's 48-bit RB address space.
+-static constexpr uint64_t MMAP_ARENA_BASE = 0x100000000ULL;
++static constexpr uint64_t MMAP_ARENA_BASE = DADAOISA::Process::MmapArenaBase;
++static constexpr uint64_t MMAP_ARENA_END = DADAOISA::Process::MmapArenaEnd;
++static constexpr int64_t ERR_EINVAL = -22;
++static constexpr int64_t ERR_ENOMEM = -12;
++static constexpr int64_t ERR_EEXIST = -17;
+ 
+ // DG-003a terminal-state readout (restored): at halt, dump the architectural
+ // RD (rd0-63) and RB (rb0-63) registers on one line to stdout so the gem5
+@@ -656,19 +663,57 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+       for(uint64_t i=0;i<len;i++) std::cout.put(d[i]); ret=len; break; }
+     case 93: case 94: exitSimLoop("trap-exit",arg0&0xFF); return NoFault;
+     case 214: { static uint64_t brk=0x90000000; ret=(arg0==0)?brk:arg0; if(arg0)brk=arg0+0x100000; break; }
+-    case 222: { /* SYS_mmap: accounting-style bump allocator (ADR-0014 D3,
+-                   ML-007a). No MMU/paging on M1 -> no real page mapping;
+-                   hand out fresh, page-aligned, non-overlapping addresses
+-                   from MMAP_ARENA_BASE. arg1=length; addr hint (arg0), prot
+-                   (arg2), flags/fd/offset (rd20-22) ignored -- mallocng
+-                   always calls with addr=NULL/fd=-1. */
+-      static uint64_t mmap_cursor = MMAP_ARENA_BASE;
+-      uint64_t length = arg1;
+-      uint64_t aligned = (length + 0xFFF) & ~0xFFFULL;
+-      if (aligned == 0) aligned = 0x1000;
+-      ret = mmap_cursor; mmap_cursor += aligned; break; }
+-    case 215: /* SYS_munmap: accounting-style, no real reclaim (ML-007a) */
+-      ret = 0; break;
++    case 222: { /* SYS_mmap: fixed M1 arena with lazy VMA backing. */
++      auto *process = static_cast<DADAOISA::Process *>(tc->getProcessPtr());
++      const Addr page_size = process->pTable->pageSize();
++      const Addr page_mask = page_size - 1;
++      const uint64_t length = arg1;
++
++      // M1 only exposes anonymous NULL-hint mappings. Rejecting a non-NULL
++      // hint avoids silently changing the requested address into an alias.
++      if (arg0 != 0 || length == 0 ||
++          length > std::numeric_limits<uint64_t>::max() - page_mask) {
++        ret = static_cast<uint64_t>(ERR_EINVAL);
++        break;
++      }
++
++      const Addr aligned = (length + page_mask) & ~page_mask;
++      const Addr cursor = process->mmapArenaCursor();
++      if (aligned == 0 || cursor < MMAP_ARENA_BASE ||
++          cursor > MMAP_ARENA_END || aligned > MMAP_ARENA_END - cursor) {
++        ret = static_cast<uint64_t>(ERR_ENOMEM);
++        break;
++      }
++
++      // isUnmapped checks both VMA intervals and page-table-only mappings;
++      // mapRegion records the VMA before any first access occurs.
++      if (!process->memState->isUnmapped(cursor, aligned)) {
++        ret = static_cast<uint64_t>(ERR_EEXIST);
++        break;
++      }
++      process->memState->mapRegion(cursor, aligned, "dadao-mmap");
++      process->mmapArenaCursor(cursor + aligned);
++      ret = cursor;
++      break;
++    }
++    case 215: { /* SYS_munmap: remove VMA and lazily allocated pages. */
++      auto *process = static_cast<DADAOISA::Process *>(tc->getProcessPtr());
++      const Addr page_size = process->pTable->pageSize();
++      const Addr page_mask = page_size - 1;
++      const Addr start = arg0;
++      const uint64_t length = arg1;
++      if (length == 0 || (start & page_mask) != 0 ||
++          (length & page_mask) != 0 || start < MMAP_ARENA_BASE ||
++          start >= process->mmapArenaCursor() ||
++          length > process->mmapArenaCursor() - start ||
++          process->memState->isUnmapped(start, length)) {
++        ret = static_cast<uint64_t>(ERR_EINVAL);
++        break;
++      }
++      process->memState->unmapRegion(start, length);
++      ret = 0;
++      break;
++    }
+     case 226: /* SYS_mprotect: accounting-style, no real protection change --
+                  there is no MMU to enforce it (ML-007a) */
+       ret = 0; break;
+diff --git a/src/arch/dadao/process.cc b/src/arch/dadao/process.cc
+index 715c89f3b6..b46ba72fda 100644
+--- a/src/arch/dadao/process.cc
++++ b/src/arch/dadao/process.cc
+@@ -19,7 +19,8 @@ namespace DADAOISA
+ Process::Process(const ProcessParams &params, loader::ObjectFile *objFile)
+     : gem5::Process(params,
+           new EmulationPageTable(params.name, params.pid, PageBytes),
+-          objFile)
++          objFile),
++      _mmapArenaCursor(MmapArenaBase)
+ {
+     fatal_if(params.useArchPT, "Arch page tables not implemented for DADAO.");
+ 
+diff --git a/src/arch/dadao/process.hh b/src/arch/dadao/process.hh
+index 54c02965db..09987e80e8 100644
+--- a/src/arch/dadao/process.hh
++++ b/src/arch/dadao/process.hh
+@@ -20,11 +20,22 @@ class Process : public gem5::Process
+   protected:
+     void argsInit(int pageSize);
+ 
++    Addr _mmapArenaCursor;
++
+   public:
++    static constexpr Addr MmapArenaBase = 0x100000000ULL;
++    // DADAO effective addresses are 48-bit (contracts/isa/spec.md §1.3).
++    // Lazy SE backing does not require a pre-sized host allocation, so the
++    // representable address space is the natural M1 arena capacity.
++    static constexpr Addr MmapArenaEnd = 0x1000000000000ULL;
++
+     Process(const ProcessParams &params, loader::ObjectFile *objFile);
+ 
+     void initState() override;
+     bool mmapGrowsDown() const override { return false; }
++
++    Addr mmapArenaCursor() const { return _mmapArenaCursor; }
++    void mmapArenaCursor(Addr cursor) { _mmapArenaCursor = cursor; }
+ };
+ 
+ } // namespace DADAOISA
+-- 
+2.43.0
+

@@ -1,0 +1,114 @@
+From ac58f31acddc7f583e5087002df100297f2f87f9 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 12:40:25 +0800
+Subject: [PATCH] target/dadao: add mmap arena host backing (ML-014c)
+
+---
+ hw/dadao/dadao-machine.c |  7 +++++++
+ target/dadao/cpu.c       | 45 ++++++++++++++++++++++++++++------------
+ target/dadao/cpu.h       |  5 +++++
+ 3 files changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/hw/dadao/dadao-machine.c b/hw/dadao/dadao-machine.c
+index 4a44646..a501a6d 100644
+--- a/hw/dadao/dadao-machine.c
++++ b/hw/dadao/dadao-machine.c
+@@ -57,6 +57,7 @@ static void dadao_machine_init(MachineState *machine)
+     MemoryRegion *sys_mem = get_system_memory();
+     MemoryRegion *rom = g_new(MemoryRegion, 1);
+     MemoryRegion *exit_mmio = g_new(MemoryRegion, 1);
++    MemoryRegion *mmap_arena = g_new(MemoryRegion, 1);
+ 
+     memory_region_init_ram(rom, NULL, "dadao.rom", rom_size, &error_fatal);
+     memory_region_set_readonly(rom, true);
+@@ -66,6 +67,12 @@ static void dadao_machine_init(MachineState *machine)
+                           "dadao.exit", exit_size);
+     memory_region_add_subregion(sys_mem, exit_base, exit_mmio);
+ 
++    /* Keep mmap at its fixed high address, in a separate host-backed RAM
++     * region. This does not alias the image RAM or alter its 128 MiB layout. */
++    memory_region_init_ram(mmap_arena, NULL, "dadao.mmap-arena",
++                           DADAO_MMAP_ARENA_SIZE, &error_fatal);
++    memory_region_add_subregion(sys_mem, DADAO_MMAP_ARENA_BASE, mmap_arena);
++
+     if (machine->ram_size == 0) {
+         machine->ram_size = ram_size;
+     }
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 078befb..547f7bd 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -170,22 +170,41 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+                 }
+                 break;
+             }
+-            case 222: { /* SYS_mmap: accounting-style bump allocator (ADR-0014 D3,
+-                           ML-007a). No MMU/paging on M1 -> no real page mapping;
+-                           just hand out fresh, page-aligned, non-overlapping
+-                           addresses from a dedicated arena far above any existing
+-                           layout (.text/.rodata/.data/.bss/.heap end at
+-                           0x87E00000, QEMU trampoline stack ~0x87FF0000, gem5 SE
+-                           stack ~0x00007FFFFFFFF000). arg1=length; addr hint
+-                           (arg0), prot (arg2), flags/fd/offset (rd20-22) are
+-                           ignored -- mallocng always calls with
+-                           addr=NULL/fd=-1. */
++            case 222: { /* SYS_mmap: fixed-arena host backing (ADR-0014 D3,
++                           ML-014c). The machine registers a separate RAM
++                           MemoryRegion at DADAO_MMAP_ARENA_BASE; this cursor
++                           allocates fresh, page-aligned ranges within it.
++                           arg1=length; addr hint (arg0), prot (arg2),
++                           flags/fd/offset (rd20-22) remain ignored as in
++                           ML-007a -- mallocng passes addr=NULL/fd=-1. */
+                 static uint64_t mmap_cursor = DADAO_MMAP_ARENA_BASE;
+                 uint64_t length = arg1;
+-                uint64_t aligned = (length + 0xFFF) & ~0xFFFULL;
+-                if (aligned == 0) {
+-                    aligned = 0x1000;
++                uint64_t aligned;
++
++                /* The syscall ABI returns negative errno in rd31, as the
++                 * existing -ENOSYS path does. Do not wrap a length while
++                 * rounding it, and do not consume the cursor on failure. */
++                if (length == 0 || length > UINT64_MAX -
++                    (DADAO_MMAP_PAGE_SIZE - 1)) {
++                    ret = (uint64_t)(-(int64_t)EINVAL);
++                    break;
+                 }
++
++                aligned = (length + DADAO_MMAP_PAGE_SIZE - 1) &
++                          ~(DADAO_MMAP_PAGE_SIZE - 1);
++
++                /* mmap_cursor only moves forward and munmap does not reclaim
++                 * ranges in M1. Therefore every successful interval is
++                 * disjoint; this bound check rejects both exhaustion and any
++                 * would-be wrap/overlap before returning an address. */
++                if (aligned > DADAO_MMAP_ARENA_SIZE ||
++                    mmap_cursor < DADAO_MMAP_ARENA_BASE ||
++                    mmap_cursor > DADAO_MMAP_ARENA_BASE +
++                                   DADAO_MMAP_ARENA_SIZE - aligned) {
++                    ret = (uint64_t)(-(int64_t)ENOMEM);
++                    break;
++                }
++
+                 ret = mmap_cursor;
+                 mmap_cursor += aligned;
+                 break;
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index 38f2683..02f5b78 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -21,6 +21,11 @@
+  * above the former and far below the latter, and trivially fits in DADAO's
+  * 48-bit RB address space. */
+ #define DADAO_MMAP_ARENA_BASE 0x100000000ULL
++/* M1's fixed mmap arena is deliberately bounded: 16 MiB is enough for the
++ * static musl mallocng/E2E workload while keeping the additional host-backed
++ * machine memory small and making exhaustion observable. */
++#define DADAO_MMAP_ARENA_SIZE (16ULL * 1024 * 1024)
++#define DADAO_MMAP_PAGE_SIZE  0x1000ULL
+ 
+ #define CPU_RESOLVING_TYPE TYPE_DADAO_CPU
+ 
+-- 
+2.43.0
+
