@@ -39,3 +39,25 @@
 ## 完成区
 
 （由 worker 填写；完成后由不同 subagent 独立 review）
+
+## Completion（fresh post-fix run）
+
+本次记录来自现有产物 `.work/ML-014af-dual-large-post-fix-runtime/`，是修复后的
+fresh post-fix run；未重新运行实验。`malloc_dual_large_free.c` 是 ML-014z 的
+exact source，使用 `A_SIZE=131052`、`B_SIZE=262144`，包含 page sentinels、
+overlap/alignment checks、reverse free 和 `phase_marker`。compile/link/objcopy
+均为 `0`。
+
+- QEMU：rc=`42`；`qemu.trace` 命中 `0x80000110 main`。
+- gem5：rc=`42`；`gem5.exec.trace` 到达 `__libc_start_main` 并正常完成，
+  以 `SIM_END` trap-exit code=`42` 结束。
+- 两端均无 `0x7ffff` wrong-target 证据；exit `42` 与 source control flow
+  共同满足完整 dual-large contract：双块分配、对齐/非重叠、page sentinel
+  写读、逆序 free 及 phase-marker 检查均通过。
+
+结论：ML-014af 完成。上述结果没有 dual-large ambiguity；记录路径为
+`.work/ML-014af-dual-large-post-fix-runtime/malloc_dual_large_free.c`、
+`.work/ML-014af-dual-large-post-fix-runtime/qemu.trace`、
+`.work/ML-014af-dual-large-post-fix-runtime/gem5.exec.trace`，以及对应的
+`malloc_dual_large_free.elf`、`malloc_dual_large_free.bin`、`.map` 和
+`m5out/` 产物。
