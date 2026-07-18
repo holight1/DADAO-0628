@@ -1,0 +1,202 @@
+// ML-014e: raw mmap backing probe.  This deliberately avoids libc, printf,
+// and varargs so a passing result is evidence about the syscall/backing path.
+// Exit 42 is the only success result; each failure branch has its own code.
+// The test exercises both fixed-arena cursor accounting and actual memory
+// traffic through the returned addresses.
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %s
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld %t.o -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: grep -c "mmap-backing-ok" %t.out | xargs test 1 -eq
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: grep -c "mmap-backing-ok" %t.gout | xargs test 1 -eq
+
+.text
+.globl _start
+_start:
+    # Constants: 0x1000, 0x2000, 0x3000, 0x3001, 0x4000, 0x1001.
+    addi rd1, rd0, 1
+    shlu rd2, rd1, 12
+    shlu rd3, rd1, 13
+    add rd0, rd4, rd2, rd3
+    addi rd5, rd4, 1
+    add rd0, rd6, rd3, rd3
+    addi rd7, rd2, 1
+    addi rd8, rd3, 1
+
+    # First mapping: 0x3001 rounds to 0x4000 and must be real writable memory.
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd4, 1
+    addi rd19, rd0, 3        # PROT_READ|PROT_WRITE
+    trap 2, 0
+    addi rd20, rd31, 0       # addr1
+    rd2rb rb20, rd31, 1
+    brz rd31, fail_alloc1
+
+    # Independent 64-bit store/load markers in the first page.
+    addi rd24, rd0, 0x11
+    addi rd25, rd0, 0x22
+    sto rd24, rb20, 0
+    sto rd25, rb20, 8
+    ldo rd26, rb20, 0
+    breq rd26, rd24, first_marker2
+    jump fail_sto1
+first_marker2:
+    ldo rd27, rb20, 8
+    breq rd27, rd25, boundary1
+    jump fail_sto2
+
+    # Cross-page byte traffic at offsets 0x0fff/0x1000.
+boundary1:
+    rb2rb rb23, rb20, 1
+    addi rb23, rb23, 2047
+    addi rb23, rb23, 2047
+    addi rb23, rb23, 1
+    stb rd24, rb23, 0
+    addi rb24, rb23, 1
+    stb rd25, rb24, 0
+    ldbu rd26, rb23, 0
+    breq rd26, rd24, boundary1_right
+    jump fail_boundary1_left
+boundary1_right:
+    ldbu rd27, rb24, 0
+    breq rd27, rd25, boundary2
+    jump fail_boundary1_right
+
+    # Cross-page byte traffic at offsets 0x1fff/0x2000.
+boundary2:
+    rb2rb rb25, rb20, 1
+    addi rb25, rb25, 2047
+    addi rb25, rb25, 2047
+    addi rb25, rb25, 2047
+    addi rb25, rb25, 2047
+    addi rb25, rb25, 3
+    stb rd24, rb25, 0
+    addi rb26, rb25, 1
+    stb rd25, rb26, 0
+    ldbu rd28, rb25, 0
+    breq rd28, rd24, boundary2_right
+    jump fail_boundary2_left
+boundary2_right:
+    ldbu rd29, rb26, 0
+    breq rd29, rd25, alloc2
+    jump fail_boundary2_right
+
+    # Second mapping: 0x1001 rounds to 0x2000; cursor delta must be 0x4000.
+alloc2:
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd7, 0
+    addi rd19, rd0, 3
+    trap 2, 0
+    addi rd21, rd31, 0       # addr2, retained for the third cursor check
+    rd2rb rb21, rd31, 1
+    brz rd31, fail_alloc2
+    sub rd0, rd30, rd31, rd20
+    breq rd30, rd6, alloc3
+    jump fail_delta2
+
+    # Third mapping: length 1 rounds to 0x1000; delta must be 0x2000.
+alloc3:
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd1, 0
+    addi rd19, rd0, 3
+    trap 2, 0
+    rd2rb rb22, rd31, 1
+    brz rd31, fail_alloc3
+    sub rd0, rd30, rd31, rd21
+    breq rd30, rd3, fail_zero
+    jump fail_delta3
+
+    # Zero length is an explicit EINVAL failure and must not consume cursor.
+fail_zero:
+    addi rd9, rd0, -22       # -EINVAL
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd0, 0
+    addi rd19, rd0, 3
+    trap 2, 0
+    breq rd31, rd9, fail_rounding_overflow
+    jump fail_zero_code
+
+    # UINT64_MAX must fail before page-rounding wraps, also EINVAL.
+fail_rounding_overflow:
+    setow rd18, 0, 65535
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd19, rd0, 3
+    trap 2, 0
+    breq rd31, rd9, fail_capacity
+    jump fail_overflow_code
+
+    # Both backends must reject a length beyond the fixed arena boundary with
+    # ENOMEM.  The same 0xffff00000000 request is above QEMU's 16 MiB arena
+    # and gem5's fixed [0x100000000, 0x1000000000000) arena.
+fail_capacity:
+    addi rd10, rd0, -12      # -ENOMEM
+    setzw rd18, 2, 65535
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd19, rd0, 3
+    trap 2, 0
+    breq rd31, rd10, cleanup
+    jump fail_capacity_code
+
+    # M1 munmap is accounting-only and mprotect is deferred/no-op; both must
+    # retain their documented zero return without being mistaken for full MMU
+    # permission or reclaim semantics.
+cleanup:
+    addi rd16, rd0, 215
+    rb2rd rd17, rb20, 1
+    addi rd18, rd4, 0
+    trap 2, 0
+    brz rd31, cleanup_protect
+    jump fail_munmap
+cleanup_protect:
+    addi rd16, rd0, 226
+    rb2rd rd17, rb21, 1
+    addi rd18, rd7, 0
+    addi rd19, rd0, 1
+    trap 2, 0
+    brz rd31, pass
+    jump fail_mprotect
+
+pass:
+    addi rd16, rd0, 64
+    addi rd17, rd0, 1
+    rela rb8, msg_data
+    addi rb8, rb8, msg_data
+    rb2rd rd18, rb8, 1
+    addi rd19, rd0, 16
+    trap 2, 0
+    addi rd16, rd0, 93
+    addi rd17, rd0, 42
+    trap 2, 0
+
+# Failure codes are intentionally distinct to make a backend regression local.
+fail_alloc1:          addi rd17, rd0, 1;  jump fail
+fail_sto1:            addi rd17, rd0, 2;  jump fail
+fail_sto2:            addi rd17, rd0, 3;  jump fail
+fail_boundary1_left:  addi rd17, rd0, 4;  jump fail
+fail_boundary1_right: addi rd17, rd0, 5;  jump fail
+fail_boundary2_left:  addi rd17, rd0, 6;  jump fail
+fail_boundary2_right: addi rd17, rd0, 7;  jump fail
+fail_alloc2:          addi rd17, rd0, 8;  jump fail
+fail_delta2:          addi rd17, rd0, 9;  jump fail
+fail_alloc3:          addi rd17, rd0, 10; jump fail
+fail_delta3:          addi rd17, rd0, 11; jump fail
+fail_zero_code:       addi rd17, rd0, 12; jump fail
+fail_overflow_code:   addi rd17, rd0, 13; jump fail
+fail_capacity_code:   addi rd17, rd0, 14; jump fail
+fail_munmap:          addi rd17, rd0, 15; jump fail
+fail_mprotect:        addi rd17, rd0, 16; jump fail
+
+fail:
+    addi rd16, rd0, 93
+    trap 2, 0
+
+.align 8, 0
+msg_data:
+    .asciz "mmap-backing-ok\n"

@@ -4,6 +4,61 @@
 # Schema / field definitions are documented in docs/issues.yaml's header.
 # Search with: grep -r 'keyword' docs/issues-archive.yaml
 
+- id: mmap-arena-unbacked-real-memory-qemu-gem5
+  title: "Phase A cfx_smon mmap(222) responder returns addresses in a region with no real memory backing on either backend -- QEMU silently drops writes/reads-as-zero, gem5 SE hard-panics the whole simulator process on first real access -- discovered by ML-014a while trying to build a real malloc()-triggers-mmap E2E milestone"
+  status: closed
+  scope: [QEMU, gem5, libc, M1]
+  blocks: []
+  resolved_by: "ML-014c (QEMU ac58f31) + ML-014d (gem5 6dd0d7c9f1) + ML-014e (mmap_backing_probe.test)"
+  # Original ML-014a discovery and evidence (2026-07-18): the second musl
+  # E2E milestone (malloc() a block large enough to force mallocng's
+  # individual-mmap path, write/read-back real content, and prove the mmap
+  # syscall path is really exercised) hit a hard blocker that pre-dates the
+  # task. ML-007a's mmap/munmap/mprotect "accounting-style bump allocator"
+  # only tracked an address value (`mmap_cursor`, starting at
+  # DADAO_MMAP_ARENA_BASE / MMAP_ARENA_BASE = 0x100000000, i.e. 4GiB) and
+  # never backed that address range with real memory in either backend.
+  #
+  #   - QEMU (`hw/dadao/dadao-machine.c`): the only MemoryRegions registered
+  #     before ML-014c were `dadao.rom` (64KiB @ 0x00100000), `dadao.exit`
+  #     (1 page @ 0x10000000), and `machine->ram` (128MiB @ 0x80000000,
+  #     hard-enforced exact size). 0x100000000 fell outside all three, so
+  #     QEMU default unassigned access silently dropped writes and returned
+  #     zero on reads. A hand-assembled probe (mmap(4096) -> rd2rb -> sto
+  #     0x1234 -> ldo -> exit(low byte)) observed exit code 0: the write did
+  #     not land; no guest error was raised.
+  #   - gem5 (`~/DADAO-gem5/src/arch/dadao/decoder.cc`, TrapInst::execute,
+  #     case 222): the bump counter had no `process->allocateMem()` or
+  #     equivalent EmulationPageTable backing. The same probe through gem5
+  #     SE hard-aborted on first access with
+  #     `src/sim/faults.cc:103: panic: ... Page table fault when accessing
+  #     virtual address 0x100000000` (SIGABRT, not a graceful exit code).
+  #     The panic was reproduced twice with the same diagnostic.
+  #
+  # Why ML-007a's `mmap_probe.test` did not catch this: it checked only the
+  # returned address values via register arithmetic (`sub`/`breq` on rd31),
+  # never issuing a real `sto`/`ldo` to the returned address. ML-014a was the
+  # first probe to dereference an mmap-arena address.
+  #
+  # Why this blocked ML-014a's full scope: mallocng itself unconditionally
+  # writes bookkeeping metadata to the freshly mmap'd buffer before returning,
+  # in both `alloc_group` (mallocng/malloc.c:277-278) and the direct
+  # `n >= MMAP_THRESHOLD` path (mallocng/malloc.c:321-322). Therefore every
+  # allocation that really triggers mmap reaches the unbacked address before
+  # user code can run; choosing a safer size or avoiding user stores could not
+  # bypass the blocker. On gem5 the process aborted before malloc returned.
+  #
+  # Resolution evidence: ML-014c (QEMU ac58f31) adds a host-backed fixed RAM
+  # region at the mmap arena and bounds the cursor; ML-014d (gem5 6dd0d7c9f1)
+  # adds VMA/page-table backing and lifecycle handling. ML-014e's committed raw
+  # probe performs actual sto/ldo traffic, two cross-page marker pairs, three
+  # cursor allocations, EINVAL/ENOMEM failure checks, and munmap/mprotect
+  # checks. It passes both backends with strict exit=42 and marker checks; the
+  # full E2E suite is 59/59 and the four-way differential is
+  # AGREE(4-way)=200/DIVERGE=0. A temporary QEMU mutation removing the arena
+  # registration makes the probe fail (lit rc=1), and restoring it returns the
+  # probe to rc=0.
+
 - id: C-18
   title: "Hardware reset values (RD, RB[1-63], RF, RA power-on)"
   status: closed
