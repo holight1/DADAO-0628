@@ -68,3 +68,20 @@ ML-014ac 的 `RELA_PAGE` signed-low 页舍入修复，保持现有 0039 之后�
   run; no manifests, issues/wiki, QEMU/gem5/musl, or original `ML-014a` was
   modified. Independent review remains required by this task’s acceptance
   criteria.
+
+### Independent review
+
+- Source chain verified in `.work/source/llvm`: `1697be42b5b1` has parent
+  `92dd91c67c08`, and `f5a06de81358` has parent `1697be42b5b1`.
+- `git format-patch` output hashes match the recorded SHA-256 values exactly.
+  Each patch has the same three-file list and change counts as its source
+  commit; reverse apply checks against the source HEAD passed.
+- Root `series` was append-only after `0039`, with `0040` followed by `0041`.
+  The replay record is correctly bounded to the temporary sequential/static
+  check and explicitly does not claim full root-series replay, build, or
+  runtime validation.
+- The integration change set contains only this task record, the two new LLVM
+  patches, and `components/llvm/patches/series`; no forbidden QEMU, gem5,
+  musl, manifest, issue/wiki, or original `ML-014a` file was changed.
+
+**Verdict: Accepted.**
