@@ -41,3 +41,15 @@ boundary 三布局；不扩展到 allocator 语义。
 ## 完成区
 
 （由 worker 填写；完成后由不同 subagent 独立 review）
+
+### Completion / limitation (2026-07-19)
+
+- Source fix commit: `f5a06de8135832a56d14b677ccfbf08d8121064a` (`f5a06de`).
+- The rebuilt `.work/build/llvm/bin/ld.lld` was present, but this run was stopped
+  before relinking the ML-014ab probes or running QEMU/gem5; no new task-owned
+  ML-014ac runtime artifacts were produced.
+- Therefore ML-014ac does not claim the fix works at runtime. The only available
+  test evidence remains the pre-fix ML-014ab record: success reached `main`/42,
+  while boundary/failure reached `0x7ffff800`/`0x7ffff804` (QEMU 130; gem5 0).
+- ML-014y was not rerun in this stopped run; its existing record reports QEMU and
+  gem5 exit 42 for the prior locked artifact, not validation of this source fix.
