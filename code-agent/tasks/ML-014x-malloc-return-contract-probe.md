@@ -2,7 +2,7 @@
 
 **执行环境**：本地 subagent worker；承接 Accepted ML-014w
 
-**状态**：Completed（2026-07-18，等待独立 review）
+**状态**：Accepted（2026-07-18，独立 review）
 
 ## 目标
 
@@ -119,3 +119,33 @@ dump、退出码、timeout、fault focus 和 gem5 `m5out/` 已完整保留：
 - 完整证据只位于指定 `.work/ML-014x-malloc-return-contract-probe/`。未修改
   LLVM/QEMU/gem5/musl、patch series、issues、contracts、manifests、root tests
   或原始 ML-014a；等待不同 reviewer 独立复核。
+
+## 审阅记录
+
+### 独立 reviewer 复核（2026-07-18）
+
+**Reviewer decision：Accepted（Finding=0；仅限单次 `malloc(131052)` 返回指针
+合同，不等价于 allocator、ML-014f 或 ML-014a 完成）。**
+
+- 独立核对 C、object/ELF symbols 与反汇编：object undefined 仅 `malloc`、
+  `write`，最终 ELF 无 undefined；两个 call 分别落到 `malloc@0x80002cac` 和
+  `write@0x80001484`。输出由手工 16-nibble 小写 hex 转换构造，固定调用
+  `write(1, out, 21)`；无 printf/varargs/puts 依赖。
+- `main` 反汇编逐项闭合返回分流：write 短写→10、NULL→11、非 16-byte
+  对齐→12、低于 `0x100000000`→13、不低于 `0x100020000`→14、首字节
+  `0xa5` 写读不符→15，全部通过后才生成 42。首字节访问是
+  `stb/ldbu ..., rb8, 0`；未见历史 `p+0x1ffeb` 或 `-21` payload 访问，
+  `0x1ffec` 只用于形成 malloc 请求大小 131052。
+- 独立重算 `artifacts.sha256`、`locked.before.sha256` 与
+  `runtime-inputs.sha256` 全部通过；locked before/after、runtime-tools
+  before/after 均 `cmp=0`。现有 ELF/BIN hash 分别保持
+  `0c0668a0...f7`、`aa5af1b1...f37`。
+- 未重编译，使用同一现有 BIN/ELF 独立复跑：QEMU 与 gem5 均各输出恰一条
+  21-byte `p=0x0000000100000010\n`，两端 host/guest exit 均为 42；gem5 同时
+  报告 `SIM_END: trap-exit code=42`，两端均无 fault，复跑前后 ELF/BIN hash
+  不变。
+
+结论保持最窄边界：本任务规定的真实 malloc 返回指针、固定 write 输出、判定
+分流、locked identity 与 QEMU/gem5 同值/exit 42 均闭合，故 **Accepted**。
+未验证 free、复用、多尺寸、末字节、优化矩阵、高层输出、allocator 总体、
+ML-014f 或 ML-014a，不得由本结论外推。
