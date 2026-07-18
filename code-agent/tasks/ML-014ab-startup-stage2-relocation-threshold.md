@@ -2,7 +2,7 @@
 
 **执行环境**：本地 subagent worker；承接 ML-014aa 的 startup→main 未命中
 
-**状态**：Ready（30-task run：8/30）
+**状态**：Complete（已记录/关闭）
 
 ## 目标
 
@@ -40,3 +40,57 @@
 ## 完成区
 
 （由 worker 填写；完成后由不同 subagent 独立 review）
+
+## Completion / Closure
+
+### Facts
+
+- All three probes compiled, linked, and converted successfully (`compile=0`,
+  `link=0`, `objcopy=0`). The locked-input and runtime-tool comparisons are
+  unchanged (`locked_cmp=0`, `runtime_tools_cmp=0`).
+- Success layout: `libc_start_main_stage2 = 0x800005ec`, signed low
+  `+1516` (`0x5ec`). QEMU reaches `main` at `0x80000110` and exits `42`;
+  gem5 reaches the same `main` PC and reports `trap-exit code=42`.
+- Failure layout: `libc_start_main_stage2 = 0x80000804`, signed low
+  `-2044` (`0x804 - 0x1000`). QEMU repeatedly fetches the wrong target
+  `0x7ffff804` and returns `130`; gem5 halts at `0x7ffff804` with code `0`.
+- Boundary layout: `libc_start_main_stage2 = 0x80000800`, signed low
+  `-2048` (`0x800 - 0x1000`). The artifacts support this as the first
+  signed-low boundary: QEMU repeatedly fetches `0x7ffff800` and returns
+  `130`; gem5 halts at `0x7ffff800` with code `0`.
+- The relocation decode shows relocations in the input `crt1.o` for `main`,
+  `_init`, `_fini`, and `__libc_start_main`. The generated success/failure/
+  boundary probe objects report empty relocation lists, and the final ELF
+  relocation lists are empty in all three cases.
+
+### Exact arithmetic
+
+The materialization behaves as a page base of `0x80000000` followed by a
+sign-extended 12-bit low immediate:
+
+```text
+success: 0x80000000 + signed(0x5ec) = 0x80000000 + 1516  = 0x800005ec
+boundary: 0x80000000 + signed(0x800) = 0x80000000 - 2048 = 0x7ffff800
+failure: 0x80000000 + signed(0x804) = 0x80000000 - 2044 = 0x7ffff804
+```
+
+Thus the signed-low threshold is raw low `0x800`: values through `0x7ff`
+remain positive, while `0x800` and above become negative. For the two
+cross-page targets, a compatible rounded target page would make the arithmetic
+explicit: `0x80001000 - 0x800 = 0x80000800` and
+`0x80001000 - 0x7fc = 0x80000804`.
+
+### Inference
+
+The first proven layout difference is the stage2 low half crossing `0x800`;
+the input probe objects do not carry the failing address materialization as
+relocations, while the linked instructions do. The most likely responsibility
+is linker `RELA_PAGE` handling: it likely needs a rounded target page that is
+compatible with the signed `RELA_LO` value. This task records the diagnosis
+only; it makes no compiler/linker implementation fix.
+
+### Unresolved
+
+- The exact linker implementation site and whether other `RELA_PAGE` users
+  have the same cross-page condition remain for a follow-up fix task.
+- This closure does not validate allocator or mallocng semantics.
