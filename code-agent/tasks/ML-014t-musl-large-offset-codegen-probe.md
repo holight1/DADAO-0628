@@ -2,7 +2,7 @@
 
 **执行环境**：本地 subagent worker；承接 ML-014s independent review
 
-**状态**：Completed（诊断证据已收口；等待独立 reviewer，2026-07-18）
+**状态**：Accepted（仅限显式大偏移 codegen/EA probe，2026-07-18）
 
 ## 目标
 
