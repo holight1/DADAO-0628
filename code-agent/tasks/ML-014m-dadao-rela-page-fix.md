@@ -98,4 +98,67 @@ free、allocator 算法或 ML-014a 整体验收。
 
 ## 审阅记录
 
-（待填写。）
+### Independent review（2026-07-18）
+
+**Finding：Accepted（限定为 linker `R_DADAO_RELA_PAGE` / TLS startup 修复）。**
+
+#### 核验结果
+
+1. **`R_PC` 输入与 `S+A-P` 可靠性**
+
+   `InputSection::getRelocTargetVA` 的 `R_PC` 分支使用
+   `r.sym->getVA(ctx, a) - p`，其中 `a` 是 relocation addend，故传入
+   `DADAO::relocate` 的 `val` 确实是 `S+A-P`。修复再次使用
+   `rel.sym->getVA(ctx, rel.addend)` 得到同一个 `S+A`，再用无符号模
+   `2^64` 的 `target - val` 恢复 `P`；对负的 PC-relative delta 仍能恢复
+   原 place。symbol/addend 语义没有被丢弃。
+
+   `checkInt(ctx, loc, page, 18, rel)` 保留，仍会按有符号 18-bit 检查页
+   immediate 的溢出；写入时只掩码指令 immediate，不改变高位语义。
+
+2. **ISA §4.8 与 `RELA_LO`**
+
+   contracts/isa/spec.md §4.8 要求 `rela` 以下一条指令地址 `P+4` 的页为
+   base。当前实现计算的正是
+
+   ```text
+   ((S+A)>>12) - ((P+4)>>12)
+   ```
+
+   而不是旧的带 `0x800` 四舍五入的 byte delta。`R_DADAO_RELA_LO` 分支
+   未修改，仍从绝对目标 `S+A` 的 low12 取值。
+
+3. **验证充分性**
+
+   lld 构建通过；普通跨页场景生成 `rela rb8, 6`，`P=page_end-4` 场景
+   生成 `rela rb8, 1`，两者的 `addi` low12 均为 `0x30`。这同时覆盖了
+   旧公式的跨页误差和 `P+4` 跨页边界。真实 musl probes 中
+   `return42`、`mmap_real` 均为 QEMU/gem5 `42/42`，mallocng probe 已
+   越过原 `__init_tls` 的 `MALIGN=129` startup fault。
+
+   现有最小 probe 主要覆盖正向页差；负向 delta、非零 addend 以及明确的
+   18-bit overflow rejection 尚未作为独立运行时断言记录。它们不构成本次
+   startup 修复的阻塞项，因为上游 `R_PC` 公式、`getVA(addend)`、恢复
+   place 的等价性和 `checkInt` 均已由源码核对；后续 linker regression 可
+   再补齐这些边界样例。
+
+4. **剩余 blocker 的边界**
+
+   mallocng 后续结果被正确保留：QEMU 的 `mallocng_real` 返回 42，但
+   gem5 及 pointer/read-write probes 在 startup 之后于
+   `0x90001000` page-table fault（退出 134/13/14）。这不是本任务的
+   startup 通过证明，也没有被写成 ML-014f 或 ML-014a 完成。
+
+5. **越权检查**
+
+   source commit `92dd91c67c08` 的 diff 只有
+   `.work/source/llvm/lld/ELF/Arch/DADAO.cpp`；未改 QEMU、gem5、musl、
+   patch series、docs/issues.yaml、contracts、manifests 或 ML-014a。root
+   worktree 中唯一既有未跟踪项仍是用户原始的 ML-014a 任务文件。
+
+#### 审阅结论
+
+本 commit 可接受并可作为后续 allocator 调试的前置修复；不要因此导出
+mallocng/ML-014f 的完成结论。后续若将该修复导出到 root patch series，建议
+先补充负向 delta、非零 addend 和 overflow 的 linker regression，再继续
+独立开题处理 `0x90001000` 的 allocator/backend 映射问题。
