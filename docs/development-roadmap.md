@@ -559,6 +559,26 @@ ground-truth review with a probe matching §2.3's own cross-bank example.
 See `contracts/abi/spec.md §6` and `docs/open-spec-issues.md` for the
 now-annotated Varargs entry.
 
+### ML-014 mmap backing and musl malloc follow-up status (2026-07-18)
+
+The original ML-014a malloc milestone exposed that the fixed mmap arena had
+only address accounting, not real backing. This has now been split and closed
+as follows:
+
+- ML-014c (QEMU) and ML-014d (gem5) add backend-specific arena backing;
+- ML-014e adds `tests/lit/E2E/mmap_backing_probe.test`, including real
+  `sto/ldo`, cross-page markers, cursor/error-path checks, and
+  `munmap`/`mprotect` checks. It passes both backends, and the full E2E gate is
+  59/59 with four-way differential `AGREE(4-way)=200/DIVERGE=0`;
+- the former open issue `mmap-arena-unbacked-real-memory-qemu-gem5` is archived
+  with the complete discovery and resolution evidence;
+- ML-014f is the continuation of ML-014a. It confirmed the mallocng direct
+  `mmap` threshold (`131052`) and generated a musl-side `-O0/optnone`
+  candidate, but its malloc/free/output runtime still fails to reach exit 42
+  (QEMU 130/hang, gem5 0). The candidate test and patch are not in the main
+  series; ML-014a remains open and must not be reported as complete until an
+  independent rerun reaches both-backend exit 42.
+
 ### Infrastructure fix found while reviewing ML-006a: `scripts/fetch.py` silently discarded applied patches
 
 While spot-checking the recon report's QEMU source citations, found
