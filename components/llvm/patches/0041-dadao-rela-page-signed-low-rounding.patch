@@ -1,0 +1,92 @@
+From f5a06de8135832a56d14b677ccfbf08d8121064a Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 19 Jul 2026 07:06:31 +0800
+Subject: [PATCH] lld: round DADAO RELA_PAGE for signed low12
+
+---
+ lld/ELF/Arch/DADAO.cpp                        |  8 +++-
+ .../ELF/Inputs/dadao-rela-page-signed-low.lds |  5 +++
+ lld/test/ELF/dadao-rela-page-signed-low.s     | 38 +++++++++++++++++++
+ 3 files changed, 49 insertions(+), 2 deletions(-)
+ create mode 100644 lld/test/ELF/Inputs/dadao-rela-page-signed-low.lds
+ create mode 100644 lld/test/ELF/dadao-rela-page-signed-low.s
+
+diff --git a/lld/ELF/Arch/DADAO.cpp b/lld/ELF/Arch/DADAO.cpp
+index 413d8a5891c9..b66aa048f7cf 100644
+--- a/lld/ELF/Arch/DADAO.cpp
++++ b/lld/ELF/Arch/DADAO.cpp
+@@ -122,10 +122,14 @@ void DADAO::relocate(uint8_t *loc, const Relocation &rel,
+     // instruction uses the page of the next instruction (P + 4) as its
+     // base. Recover the absolute target and place here rather than rounding
+     // the byte delta: page(S + A) - page(P + 4) is not equivalent to
+-    // (S + A - P + 0x800) >> 12 at page boundaries.
++    // (S + A - P + 0x800) >> 12 at page boundaries. The target page also
++    // needs signed-12-compatible rounding: RELA_LO values in 0x800..0xfff
++    // are negative after sign extension, so they belong to the next page.
+     const uint64_t target = rel.sym->getVA(ctx, rel.addend);
+     const uint64_t place = target - val;
+-    const int64_t page = static_cast<int64_t>(target >> 12) -
++    const int64_t targetPage = static_cast<int64_t>(target >> 12) +
++                               ((target & 0xFFF) >= 0x800);
++    const int64_t page = targetPage -
+                          static_cast<int64_t>((place + 4) >> 12);
+     checkInt(ctx, loc, page, 18, rel);
+     uint32_t mask = 0x3FFFF;
+diff --git a/lld/test/ELF/Inputs/dadao-rela-page-signed-low.lds b/lld/test/ELF/Inputs/dadao-rela-page-signed-low.lds
+new file mode 100644
+index 000000000000..8d0dd5d1d9d8
+--- /dev/null
++++ b/lld/test/ELF/Inputs/dadao-rela-page-signed-low.lds
+@@ -0,0 +1,5 @@
++SECTIONS {
++  . = 0x1000;
++  .text : { *(.text) }
++  .targets 0x4000 : { *(.targets) }
++}
+diff --git a/lld/test/ELF/dadao-rela-page-signed-low.s b/lld/test/ELF/dadao-rela-page-signed-low.s
+new file mode 100644
+index 000000000000..8adaba2d94e8
+--- /dev/null
++++ b/lld/test/ELF/dadao-rela-page-signed-low.s
+@@ -0,0 +1,38 @@
++# REQUIRES: asserts
++
++# RUN: llvm-mc -filetype=obj -triple=dadao %s -o %t.o
++# RUN: ld.lld -T %p/Inputs/dadao-rela-page-signed-low.lds %t.o -o %t
++# RUN: llvm-objdump -d --no-show-raw-insn --triple=dadao %t | FileCheck %s
++
++# The low immediate is signed 12-bit.  A target low half through 0x7ff stays
++# on its page; 0x800 and above must round the target page up before the page
++# delta is formed.  The last pair also checks that rela uses page(P+4).
++
++.text
++.global _start
++_start:
++  rela rb8, target_7ff
++  addi rb8, rb8, target_7ff
++  rela rb9, target_800
++  addi rb9, rb9, target_800
++  .space 0xfec
++  rela rb10, target_fff
++  addi rb10, rb10, target_fff
++
++.section .targets,"a"
++.org 0x7ff
++target_7ff:
++  .byte 0
++.org 0x1800
++target_800:
++  .byte 0
++  .org 0x2fff
++target_fff:
++  .byte 0
++
++# CHECK:      rela rb8, 3
++# CHECK-NEXT: addi rb8, rb8, 2047
++# CHECK-NEXT: rela rb9, 5
++# CHECK-NEXT: addi rb9, rb9, -2048
++# CHECK:      rela rb10, 5
++# CHECK-NEXT: addi rb10, rb10, -1
+-- 
+2.43.0
+

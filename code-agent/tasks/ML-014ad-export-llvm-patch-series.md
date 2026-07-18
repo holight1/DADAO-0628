@@ -40,3 +40,31 @@ ML-014ac 的 `RELA_PAGE` signed-low 页舍入修复，保持现有 0039 之后�
 ## 完成区
 
 （由 worker 填写；完成后由不同 subagent 独立 review）
+
+### Completion
+
+- Source correspondence:
+  - `1697be42b5b13cf468043ec8bf9fc612fec17a33` (`1697be42b5b1`, parent
+    `92dd91c67c08`) →
+    `components/llvm/patches/0040-dadao-large-offset-address-legalization.patch`;
+    SHA-256
+    `961827db79eecca361361e9314313e545b200124c427c2626732aa973d7e6e4f`.
+  - `f5a06de8135832a56d14b677ccfbf08d8121064a` (`f5a06de81358`, parent
+    `1697be42b5b1`) →
+    `components/llvm/patches/0041-dadao-rela-page-signed-low-rounding.patch`;
+    SHA-256
+    `7c5ef457031beaef3f7c25a346ec7c0e928b12766310121bbf7653c840c766a3`.
+- `components/llvm/patches/series` was append-only after existing `0039`, in
+  order: `0040-dadao-large-offset-address-legalization.patch`, then
+  `0041-dadao-rela-page-signed-low-rounding.patch`.
+- Static checks passed: generated patch headers and file lists match the two
+  source commits; `git apply --stat` reported 3 files changed for each patch;
+  `git diff --check` was clean after replay.
+- Replay check passed in a temporary clean clone at
+  `92dd91c67c08f6b680d11c7b713f87c496cd5d94`: `git apply --check` for `0040`,
+  apply `0040`, then `git apply --check` for `0041`, followed by applying
+  `0041`.
+- Limitations: no full root patch-series replay, build, or runtime test was
+  run; no manifests, issues/wiki, QEMU/gem5/musl, or original `ML-014a` was
+  modified. Independent review remains required by this task’s acceptance
+  criteria.

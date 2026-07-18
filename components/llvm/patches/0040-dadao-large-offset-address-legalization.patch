@@ -1,0 +1,203 @@
+From 1697be42b5b13cf468043ec8bf9fc612fec17a33 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 20:07:51 +0800
+Subject: [PATCH] DADAO: legalize out-of-range memory offsets
+
+---
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp   |  11 +-
+ llvm/test/CodeGen/DADAO/lit.local.cfg         |   2 +
+ .../CodeGen/DADAO/load-store-offset-range.ll  | 139 ++++++++++++++++++
+ 3 files changed, 149 insertions(+), 3 deletions(-)
+ create mode 100644 llvm/test/CodeGen/DADAO/lit.local.cfg
+ create mode 100644 llvm/test/CodeGen/DADAO/load-store-offset-range.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index b15fba75a345..340d1c07029c 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -6,6 +6,7 @@
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineFunction.h"
+ #include "llvm/CodeGen/SelectionDAGISel.h"
++#include "llvm/Support/MathExtras.h"
+ 
+ using namespace llvm;
+ 
+@@ -166,8 +167,12 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+ 
+   if (Addr.getOpcode() == ISD::ADD &&
+       isa<ConstantSDNode>(Addr.getOperand(1))) {
+-    BaseAddr = Addr.getOperand(0);
+-    GEPOff = cast<ConstantSDNode>(Addr.getOperand(1))->getSExtValue();
++    int64_t Offset =
++        cast<ConstantSDNode>(Addr.getOperand(1))->getSExtValue();
++    if (isInt<12>(Offset)) {
++      BaseAddr = Addr.getOperand(0);
++      GEPOff = Offset;
++    }
+   }
+ 
+   if (BaseAddr.getOpcode() == ISD::FrameIndex ||
+@@ -359,4 +364,4 @@ INITIALIZE_PASS(DADAODAGToDAGISelLegacy, "dadao-isel",
+ 
+ FunctionPass *llvm::createDADAOISelDag(DADAOTargetMachine &TM) {
+   return new DADAODAGToDAGISelLegacy(TM);
+-}
+\ No newline at end of file
++}
+diff --git a/llvm/test/CodeGen/DADAO/lit.local.cfg b/llvm/test/CodeGen/DADAO/lit.local.cfg
+new file mode 100644
+index 000000000000..a1863582825a
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/lit.local.cfg
+@@ -0,0 +1,2 @@
++if not "DADAO" in config.root.targets:
++    config.unsupported = True
+diff --git a/llvm/test/CodeGen/DADAO/load-store-offset-range.ll b/llvm/test/CodeGen/DADAO/load-store-offset-range.ll
+new file mode 100644
+index 000000000000..9ac40e36b1a7
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/load-store-offset-range.ll
+@@ -0,0 +1,139 @@
++; RUN: llc -mtriple=dadao < %s | FileCheck %s
++
++; Signed 12-bit offsets stay folded into the memory instruction. Larger
++; offsets must be materialized without truncation, added to the base, and
++; accessed with a zero memory offset.
++
++define i8 @load_i8_2047(ptr %base) {
++; CHECK-LABEL: load_i8_2047:
++; CHECK:       ldbu {{rd[0-9]+}}, {{rb[0-9]+}}, 2047
++  %addr = getelementptr i8, ptr %base, i64 2047
++  %value = load i8, ptr %addr, align 1
++  ret i8 %value
++}
++
++define i8 @load_i8_2048(ptr %base) {
++; CHECK-LABEL: load_i8_2048:
++; CHECK:       setzw [[LOAD2048:rd[0-9]+]], 0, 2048
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[LOAD2048]]
++; CHECK:       ldbu {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 2048
++  %value = load i8, ptr %addr, align 1
++  ret i8 %value
++}
++
++define i8 @load_i8_neg2048(ptr %base) {
++; CHECK-LABEL: load_i8_neg2048:
++; CHECK:       ldbu {{rd[0-9]+}}, {{rb[0-9]+}}, -2048
++  %addr = getelementptr i8, ptr %base, i64 -2048
++  %value = load i8, ptr %addr, align 1
++  ret i8 %value
++}
++
++define i8 @load_i8_neg2049(ptr %base) {
++; CHECK-LABEL: load_i8_neg2049:
++; CHECK:       setzw [[LOADNEG2049:rd[0-9]+]], 0, 63487
++; CHECK:       orw [[LOADNEG2049]], 1, 65535
++; CHECK:       orw [[LOADNEG2049]], 2, 65535
++; CHECK:       orw [[LOADNEG2049]], 3, 65535
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[LOADNEG2049]]
++; CHECK:       ldbu {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 -2049
++  %value = load i8, ptr %addr, align 1
++  ret i8 %value
++}
++
++define i8 @load_i8_131051(ptr %base) {
++; CHECK-LABEL: load_i8_131051:
++; CHECK:       setzw [[LOAD131051:rd[0-9]+]], 0, 65515
++; CHECK:       orw [[LOAD131051]], 1, 1
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[LOAD131051]]
++; CHECK:       ldbu {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 131051
++  %value = load i8, ptr %addr, align 1
++  ret i8 %value
++}
++
++define void @store_i8_2047(ptr %base, i8 %value) {
++; CHECK-LABEL: store_i8_2047:
++; CHECK:       stb {{rd[0-9]+}}, {{rb[0-9]+}}, 2047
++  %addr = getelementptr i8, ptr %base, i64 2047
++  store i8 %value, ptr %addr, align 1
++  ret void
++}
++
++define void @store_i8_2048(ptr %base, i8 %value) {
++; CHECK-LABEL: store_i8_2048:
++; CHECK:       setzw [[STORE2048:rd[0-9]+]], 0, 2048
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[STORE2048]]
++; CHECK:       stb {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 2048
++  store i8 %value, ptr %addr, align 1
++  ret void
++}
++
++define void @store_i8_neg2048(ptr %base, i8 %value) {
++; CHECK-LABEL: store_i8_neg2048:
++; CHECK:       stb {{rd[0-9]+}}, {{rb[0-9]+}}, -2048
++  %addr = getelementptr i8, ptr %base, i64 -2048
++  store i8 %value, ptr %addr, align 1
++  ret void
++}
++
++define void @store_i8_neg2049(ptr %base, i8 %value) {
++; CHECK-LABEL: store_i8_neg2049:
++; CHECK:       setzw [[STORENEG2049:rd[0-9]+]], 0, 63487
++; CHECK:       orw [[STORENEG2049]], 1, 65535
++; CHECK:       orw [[STORENEG2049]], 2, 65535
++; CHECK:       orw [[STORENEG2049]], 3, 65535
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[STORENEG2049]]
++; CHECK:       stb {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 -2049
++  store i8 %value, ptr %addr, align 1
++  ret void
++}
++
++define void @store_i8_131051(ptr %base, i8 %value) {
++; CHECK-LABEL: store_i8_131051:
++; CHECK:       setzw [[STORE131051:rd[0-9]+]], 0, 65515
++; CHECK:       orw [[STORE131051]], 1, 1
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[STORE131051]]
++; CHECK:       stb {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 131051
++  store i8 %value, ptr %addr, align 1
++  ret void
++}
++
++define i16 @load_i16_2048(ptr %base) {
++; CHECK-LABEL: load_i16_2048:
++; CHECK:       setzw [[LOAD16:rd[0-9]+]], 0, 2048
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[LOAD16]]
++; CHECK:       ldwu {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 2048
++  %value = load i16, ptr %addr, align 2
++  ret i16 %value
++}
++
++define void @store_i32_neg2052(ptr %base, i32 %value) {
++; CHECK-LABEL: store_i32_neg2052:
++; CHECK:       setzw [[STORE32:rd[0-9]+]], 0, 63484
++; CHECK:       orw [[STORE32]], 1, 65535
++; CHECK:       orw [[STORE32]], 2, 65535
++; CHECK:       orw [[STORE32]], 3, 65535
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[STORE32]]
++; CHECK:       stt {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 -2052
++  store i32 %value, ptr %addr, align 4
++  ret void
++}
++
++define i64 @load_i64_131056(ptr %base) {
++; CHECK-LABEL: load_i64_131056:
++; CHECK:       setzw [[LOAD64:rd[0-9]+]], 0, 65520
++; CHECK:       orw [[LOAD64]], 1, 1
++; CHECK:       add rd0, {{rd[0-9]+}}, {{rd[0-9]+}}, [[LOAD64]]
++; CHECK:       ldo {{rd[0-9]+}}, {{rb[0-9]+}}, 0
++  %addr = getelementptr i8, ptr %base, i64 131056
++  %value = load i64, ptr %addr, align 8
++  ret i64 %value
++}
+-- 
+2.43.0
+

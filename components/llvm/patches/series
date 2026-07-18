@@ -37,3 +37,5 @@
 0037-jumptable-same-section-fixup-fix.patch
 0038-rb-bank-pointer-calling-convention.patch
 0039-dadao-rela-page-cross-page-fix.patch
+0040-dadao-large-offset-address-legalization.patch
+0041-dadao-rela-page-signed-low-rounding.patch
