@@ -2,7 +2,7 @@
 
 **执行环境**：本地 subagent worker；承接 Accepted ML-014w/x
 
-**状态**：Completed（2026-07-18，等待独立 review）
+**状态**：Accepted（2026-07-18，独立 review）
 
 ## 目标
 
@@ -111,3 +111,43 @@ gem5 trace 的连续关键 PC 为 `0x80001404`（free）、`0x8000140c`
   allocator 总体、ML-014f 或 ML-014a，也不由本结果外推这些项目完成。
 - 全部证据只位于指定 `.work/ML-014y-mallocng-single-large-free-probe/`，等待不同
   reviewer 独立复核。
+
+## 审阅记录
+
+### 独立 reviewer 复核（2026-07-18）
+
+**Reviewer decision：Accepted（Finding=0；仅限单次真实 `malloc(131052)` 的
+首尾 byte 写读、真实 `free`/`munmap` 返回链和双后端 exit 42，不等价于 allocator、
+ML-014f 或 ML-014a 完成）。**
+
+- 独立核对 probe C、object undefined 与 `main` 完整反汇编：object undefined
+  恰为 `malloc`、`free`；源码在 `free(p)` 后不再使用 `p`，反汇编在
+  `0x80000200` 调用 `free` 后也只访问全局 `phase_marker` 和返回值栈槽，没有
+  payload 地址计算或访存，因此无 UAF。ELF 未拉入 `write`/printf/puts/varargs，
+  `forbidden-output-dependencies.txt` 为空；QEMU 独立复跑输出仅为 63-byte monitor
+  banner，没有 guest 输出。
+- 末地址路径与 C 一致：`0x80000184..0x8000018c` 由 `setzw 0xffeb`、
+  `orw ...,1,1` 形成完整 `0x1ffeb=131051`，与 malloc 返回指针相加后，末字节
+  `stb`/`ldbu` 在 `0x800001a0`/`0x800001ac` 均使用立即数 0；未见把低位
+  `-21` 当作完整偏移。
+- 独立核对 archive 与逐跳反汇编：archive 中两个同名 `free.o` 分别提供
+  wrapper `free` 和 mallocng `__libc_free`；`--why-extract` 显示 probe →
+  wrapper `free.o` → mallocng `free.o` → `munmap.o`。实际调用链为
+  `main@0x80000200` → `free@0x80001404` → `__libc_free@0x8000140c` →
+  `munmap@0x80002b64`，后者装入 syscall 215 并在 `0x80002b88` 执行
+  `trap 2,0`，不是 stub/no-op。
+- 独立执行 `sha256sum -c`：六项 artifacts、五项 locked inputs 和四项 runtime
+  inputs 全部通过；locked before/after、runtime-tools before/after 均 `cmp=0`。
+  五项 locked SHA-256 仍为 clang `08a8067c...3ab4`、ld.lld
+  `2c24e98f...85a8`、crt1.o `aaa32285...ced9`、libc.a
+  `1b62bd67...07ee`、dadao.ld `bc3c1bf4...5b39`；既有 ELF/BIN hash 仍为
+  `606bd7b0...6a61`、`f5eb8c44...d8de`。
+- 未重编译或覆盖 `.work`，直接使用上述同一 BIN/ELF 独立复跑：QEMU host/guest
+  exit 42；gem5 host exit 42 且报告 `SIM_END: trap-exit code=42`。新 gem5 Exec
+  trace 再次连续命中 `free`、`__libc_free+932`、`munmap` 与 `munmap+36` trap；
+  两端均在 15 秒内结束、无 fault，运行前后 ELF/BIN hash 不变。
+
+因此本任务规定的单次大块首尾访问、无 UAF/guest 输出依赖、完整末地址、真实
+free/munmap 链、locked identity 与同一产物 QEMU/gem5 exit 42 均已独立闭合，
+故 **Accepted**。未验证第二次分配、复用、多尺寸、优化矩阵、allocator 总体、
+ML-014f 或 ML-014a；不得由本结论外推。
