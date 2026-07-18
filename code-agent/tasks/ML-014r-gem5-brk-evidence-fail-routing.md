@@ -108,4 +108,52 @@ fault。负向路径在 check 5 失败后退出，未执行 check 6 marker 写�
 
 ## 审阅记录
 
-（待独立 reviewer 复核）
+### 独立 reviewer 复核（2026-07-18）
+
+**Reviewer decision：Accepted（仅限 direct `SYS_brk` probe failure-routing
+evidence；不等同于 allocator、ML-014f 或 ML-014a 完成）。**
+
+本轮只读本任务记录、ML-014q 任务及其 Needs-fix review，并检查
+`.work/ML-014r-gem5-brk-evidence-fail-routing/` 下的源文件、normal/negative
+ELF 与 BIN、launcher stdout/stderr、exit.code、stats/config 和 VMA/debug
+日志；没有修改实现或删除证据。
+
+#### 1. 正常与 check5 负向运行
+
+- `run_normal/exit.code` 的内容为 `42\n`；`launcher.stdout` 的末尾包含
+  `SIM_END: trap-exit code=42` 和 `ML-014q PASS`。normal debug log 记录
+  `[0x87e00000 - 0x87e01000]`、`[0x87e01000 - 0x87e02000]` 两个 heap VMA，
+  未出现 `fault` 或 `page-table` fault 文本。
+- `run_negative_check5/exit.code` 的内容为 `5\n`；`launcher.stdout` 的末尾
+  包含 `SIM_END: trap-exit code=5` 和 `ML-014q FAIL-5`。负向源只把 check 5
+  的比较目标从 `rd4` 改成已知错误的 `rd2`，check 1–4 保持不变，因此该
+  运行确实到达 `fail5`；它在 check 5 退出而未执行 check 6 marker，是预期的
+  failure isolation。
+- 两个 `launcher.stderr` 文件实际为空；既有 gem5 warning 出现在
+  `launcher.stdout`，且不包含 fault。该 stream 归属与 worker 文字描述略有
+  出入，但不影响 probe 结果或 routing 结论。
+
+#### 2. FAIL-1..6 分发核查
+
+- 正常和负向源的 `fail1` 到 `fail6` 分别装载编号 1 到 6 到 `rd17`，然后
+  进入统一 `fail`；这是条件失败路径，不是无条件退出。
+- `fail` 先逐次把 1、2、3、4、5 装入 scratch `rd5`，分别分支到
+  `fail1_msg`、`fail2_msg`、`fail3_msg`、`fail4_msg`、`fail5_msg`；剩余的
+  有效编号 6 进入唯一的 `fail6_msg` 兜底。因此由实际断言产生的 FAIL-1..6
+  与对应消息/退出编号一一对应；不再依赖 ML-014q review 指出的历史
+  `rd5` 残值问题。
+- `negative_check5/brk_assert_probe_check5_fail.s` 与正常源的唯一语义差异
+  是 check 5 的故意错误比较；两个 ELF 均为 DADAO ELF、入口均为
+  `0x80000000`，产物和运行目录均实际存在。
+
+#### 3. 范围与完成边界
+
+- root commit `2f1f460` 只新增本任务 MD；root 工作树唯一未跟踪项仍是用户
+  原始 `code-agent/tasks/ML-014a-musl-e2e-malloc-printf.md`。没有发现对
+  ML-014q 记录、`docs/issues.yaml`、contracts、manifests、root patch
+  series 或其他实现文件的修改。
+- `/home/holight/DADAO-gem5` 工作树 clean，仍为 `c7e92c7f804febcdfee0b8e4ac19792683a8fea5`；本轮没有修改 gem5/QEMU/LLVM/musl。
+- 本证据只接受 direct brk probe 的 failure routing 修正；没有验证或宣称
+  allocator、pointer/read-write、QEMU、全量 E2E、ML-014f 或 ML-014a 完成。
+
+**Finding：Accepted（仅 probe routing evidence）。**
