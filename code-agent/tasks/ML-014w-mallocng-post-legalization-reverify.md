@@ -2,7 +2,7 @@
 
 **执行环境**：本地 subagent worker；承接 Accepted ML-014v
 
-**状态**：Completed；等待独立 reviewer（2026-07-18）
+**状态**：Accepted（2026-07-18，独立 review）
 
 ## 目标
 
@@ -166,3 +166,36 @@ page-table fault、panic、fatal 或 abort。rw 的 42 闭合了修复后真实 
 - worker 自审：命令、hash、object/map/why-extract、完整反汇编、stdout/stderr、
   timeout 与退出码 sidecar 均已保留；验收在上述最窄边界内通过，等待不同
   reviewer 独立复核。
+
+## 审阅记录
+
+### 独立 reviewer 复核（2026-07-18）
+
+**Reviewer decision：Accepted（仅限修复后真实 mallocng 两个最小 probe 的
+locked-input、codegen/archive-selection 与双后端复验；不等价于 allocator、
+ML-014f 或 ML-014a 完成）。**
+
+- 独立重算确认 `ld.lld`、`crt1.o`、`libc.a`、`dadao.ld` 的 SHA-256 分别为
+  `2c24e98...5a8`、`aaa3228...ed9`、`1b62bd6...eee`、`bc3c1bf...b39`，与
+  `locked.before/after-build/after-all.sha256` 一致，两次 `cmp=0`。两个现有
+  object/ELF/bin 的实际 hash 也与各自 identity/artifacts sidecar 一致。
+- 两个新 object 均仅有一条 `.rela.text+0xc` 到 undefined `malloc` 的 relocation，
+  undefined symbol 也仅为 `malloc`。pointer old/new object 虽 identity 不同，但
+  规范化后的完整 `objdump -dr` 无指令或 relocation 差异；rw old object 的末端
+  `stb/ldbu ..., -21` 在新 object/ELF 中均已消失。
+- rw 新 object/ELF 以 `setzw 0xffeb`、`orw ...,1,1` 形成完整
+  `0x1ffeb=131051`，再与 malloc 返回地址相加；末端 store/load immediate 均为
+  `0`。这与 C 源的 `p[131051]` 一致，没有把低 12 位 `-21` 当作完整偏移。
+- 独立从两个 map 重提取的 `libc.a` member 集合各为同一 19 项，并分别与 sidecar
+  及旧 map 集合一致；两份 `--why-extract` 均为 19 条记录，包含
+  `lite_malloc.o` 解析 `malloc`、`malloc.o` 解析 `__libc_malloc_impl`。
+- 使用未改动的同一 flat BIN/ELF 独立重跑：QEMU 为 pointer `13`、rw `42`；
+  gem5 为 `SIM_END: trap-exit code=13`、`code=42`，四次均在 15 秒内结束且无
+  simulator fault。pointer 的 `13` 是源码比较 malloc 返回值与硬编码
+  `0x100000000` 后的显式返回码，不是 rw 失败、selector 回归或 raw pointer
+  直接观测；rw 的 `42` 才表示首尾 byte 写读条件均通过。
+
+结论保持最窄边界：ML-014v 后的两个既有真实 mallocng probe 在锁定链接输入及
+当前 QEMU/gem5 上完成本任务规定的复验，故本任务 **Accepted**。未验证 free、
+输出语义、优化级别矩阵、allocator 总体、全量 E2E/differential、ML-014f 或
+ML-014a；这些项目不得由本结论外推。
