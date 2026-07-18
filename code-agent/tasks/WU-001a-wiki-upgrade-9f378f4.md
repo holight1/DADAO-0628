@@ -2,7 +2,7 @@
 
 **执行环境**: subagent · DADAO-0628（wiki 只读 + 差分回归 + spec.lock/审计文档）
 
-**状态**: 待执行
+**状态**: 已完成（IN-003a reconciliation，2026-07-18）
 
 **前置**: ADR-0013（wiki 升级流程）；ML-001a（recon 发现远端 8 commits ahead）。首次按 ADR-0013 五阶段走一遍。
 
@@ -69,3 +69,9 @@ git diff --stat 13a414d..9f378f4            # 改了哪些文件
 - DL-039a/b/c（wiki-ref audit 先例，同类分类方法）
 
 —— 这是**审计+回归确认**任务，A 桶实现变更不在此做（如有交架构师）。**只读 wiki、只动 lock+审计文档、贴证据不口头断言**。返回前自审（读自己的分类表：每 commit 判定有 git 证据吗？A 桶结论有 SimRISC-01/02 diff 证实吗？）。
+
+## 完成记录（IN-003a reconciliation）
+
+- 目标完整 pin `9f378f4426e131903d60a208766086ae74a53c89` 已在 `/home/holight/DADAO-wiki` 安全切换为 detached checkout；切换前工作树干净，未编辑 Wiki 内容、未拉取新内容。
+- Phase 5 的 lock pin 已由既有 WU-001a 记录落地；本次仅将 ISA/ABI provenance Source 头与该 pin 对齐，未修改 `manifests/spec.lock.toml` 或 contract 正文语义。
+- 完整命令与结果见 `code-agent/tasks/IN-003a-wiki-pin-reconciliation.md` 及 `docs/reviews/wiki-upgrade-9f378f4.md` 的 reconciliation 记录。

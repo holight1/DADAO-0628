@@ -1,7 +1,7 @@
 # ISA Contract — DADAO SimRISC (M1 Scope)
 
 **Version**: 0.4.0
-**Source**: Wiki commit `13a414da158dc780ae5501c1443acbffd15cbf4a` (SimRISC 0.4.1)
+**Source**: Wiki commit `9f378f4426e131903d60a208766086ae74a53c89` (SimRISC 0.4.1)
 **Status**: Accepted (2026-06-29)
 
 M1 scope is defined by `code-agent/designs/0002-detailed-roadmap.md` §Scope

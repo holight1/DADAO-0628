@@ -175,3 +175,14 @@ $ cd ~/DADAO-0628 && python3 tools/run_differential.py 2>&1 | tail
 - **差分真跑了吗？** 跑了。Phase 4 贴 `run_differential.py` 尾部输出 = AGREE(4-way)=200/DIVERGE=0/HARNESS=6。
 - **spec.md 语义 / impl 确实没动吗？** 确认。本次仅改 `manifests/spec.lock.toml`（pin）+ 新建本审计文档 + issues.yaml note 一行；未触 `contracts/isa/spec.md` 语义、未触 interp/QEMU/gem5/Sail 任何 impl（`git diff --stat` 复核）。
 - **结论**：A 桶空 + 差分不回归 → 按 ADR-0013 Phase 5 门槛推进 pin 至 `9f378f4`。无需架构师定夺的 A 桶实现变更。
+
+## IN-003a Reconciliation（2026-07-18）
+
+本节记录已落地的状态对齐，不改变 WU-001a 的分类结论或 Wiki 内容：
+
+- `/home/holight/DADAO-wiki` 切换前为干净工作树，目标对象
+  `9f378f4426e131903d60a208766086ae74a53c89` 存在；随后以 detached checkout 切换到该完整 SHA。
+- `contracts/isa/spec.md` 与 `contracts/abi/spec.md` 的 Source provenance 头均已更新为完整目标 SHA；正文语义未改。
+- `manifests/spec.lock.toml` 未修改，仍固定目标 SHA；`docs/issues.yaml` 用户未提交改动保留。
+- WU-001a 状态已更新为已完成，Phase 5 reconciliation 由 IN-003a 收口。
+- 检查命令、退出码及四方 differential 结果见 IN-003a 任务完成区；若任一命令失败，按原始输出记录，不降级为 warning。
