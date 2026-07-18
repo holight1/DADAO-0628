@@ -176,3 +176,79 @@ probe 判定/地址计算、跨后端 memory backing 还是其他 runtime 路径
 ## 审阅记录
 
 （待独立 reviewer 复核；本记录不提前写 Accepted）
+
+### 独立 reviewer 复核（2026-07-18）
+
+**Reviewer decision：Needs-fix（仅限诊断证据层级；不否定已关闭的 brk blocker，
+不宣称 allocator、ML-014f 或 ML-014a 完成）。**
+
+本轮只读本任务及 ML-014p/q/r 记录、真实 C 源、ML-014m ELF/map/反汇编、
+ML-014s 的 gem5 `ExecAll/Vma/Faults` 与 QEMU `in_asm`/stderr 产物；没有修改
+LLVM/QEMU/gem5/musl、删除产物或回滚改动。`/home/holight/DADAO-gem5` 工作树
+保持 clean，root 工作树仍只保留用户原始未跟踪的 `ML-014a`。
+
+#### 1. pointer=13：显式判定成立，但 raw pointer 的归属需要收紧
+
+- `malloc_pointer_after.c` 确实调用 `malloc(131052UL)`，排除 NULL 和 `-1` 后
+  返回 42/13；最终 ELF 的 `main` 在 `0x80000120` 用 `rb2rd` 取得返回值、
+  `0x80000124` 保存并在 `0x80000164` 重载，`0x80000168` 的
+  `setzw rd17, 2, 1` 构造 `0x100000000`，随后 `cmps`/`csz` 选择 42 或 13。
+  因此 gem5 的 pointer=13 是真实 probe 的显式比较判定，不是 fault 或无条件
+  退出。
+- 但是现有 gem5 pointer 产物只有普通运行 stdout 的 `trap-exit code=13`，没有
+  `ExecAll` 或寄存器/有效地址日志。`0x100000010` 是 **rw probe** 同一 malloc
+  尺寸的 gem5 `ExecAll` 中 `0x80000150 stb` 的直接观测地址；把它迁移为
+  pointer probe 自身的“实际原始返回值”是强交叉 probe 推断，不是 pointer run
+  的直接观测。该区别应在完成区和后续任务记录中明确，或补一份 pointer run 的
+  raw-return/有效地址证据后再使用“实际 pointer payload”措辞。
+
+#### 2. rw 首字节、末端 `-21` 与 fault VA 的证据层级
+
+- C 源的顺序确实是 `p[0]=0x11`、`p[131051]=0x22`、再读回首尾字节。最终
+  `malloc_rw_after.elf` 的 `main` 直接反汇编为：`0x80000150 stb ..., 0`，
+  `0x80000160 stb ..., -21`，之后才是 `0x8000016c ldbu ..., 0` 和
+  `0x80000190 ldbu ..., -21`。
+- gem5 `ExecAll` 直接观测到 `0x80000150` 的首字节 store，有效地址
+  `0x100000010`，并继续执行到 `0x8000015c rd2rb`；日志最后一条是 tick
+  `5,002,000` 的 `0x8000015c`，没有提交 `0x80000160`，所以这里直接证明的
+  是首字节 **写入** 通过，不能写成 gem5 已经完成首字节 readback。第二次
+  store 之前发生 fault，首字节读回尚未被 gem5 这次 run 执行。
+- stderr 的 `Page table fault ... 0xfffffffb` 和 tick `5,003,000` 是 fault VA/
+  abort 的直接观测；`0x80000160` 是候选 faulting PC，而不是 ExecAll 尾部
+  直接观测。利用已经直接观测到的 `p=0x100000010`、反汇编中的 `-21`
+  （`-0x15`）和 ISA EA 规则重建 `0x100000010-0x15=0xfffffffb` 是合理且
+  高置信度的重建，但必须继续这样标注，不能升级为完整寄存器快照或已执行
+  faulting instruction。
+- QEMU `in_asm` 确实进入 `0x80000160` 末端 store、`0x80000190` 末端读回及
+  14 分支的控制流；QEMU 没有 fault stderr。但该产物没有寄存器/内存有效地址
+  dump，因此不能把 gem5 的 `p` 或 EA 数值转写成 QEMU 的直接观测。
+
+#### 3. brk blocker、syscall/VMA 顺序与旧地址排除
+
+- gem5 `ExecAll/Vma` 直接显示 mmap VMA `[0x100000000,0x100020000)` 在 tick
+  `3,979,000` 创建，heap VMA `[0x87e00000,0x87e02000)` 在 tick
+  `4,437,000` 创建，随后第二次 mmap trap 在 tick `4,539,000`；当前 rw 日志
+  和 stderr 没有 `0x90001000`，最终 fault 是 `0xfffffffb`。因此旧
+  `0x90001000` brk backing 归因已被当前基线排除。
+- `__syscall6`/`__syscall1` wrapper 与 VMA 事件足以支持 mmap、brk query、brk
+  growth、mmap 的顺序；但 syscall 数字 222/214 是由 wrapper/ABI 反汇编语义
+  解码得到的，ExecAll 本身没有打印 trap 时的完整参数寄存器，记录时不应把
+  数字描述成寄存器级直接观测。
+
+#### 4. QEMU=14 与 gem5=134 的边界
+
+两者没有被粗暴归并：QEMU 的 14 是末端读回失败路径，且无 simulator fault
+日志；gem5 的 134 是在第二次 store 前由 page-table fault abort。当前证据仍
+不足以决定是 LLVM 大偏移 lowering、QEMU/gem5 EA/backing 语义，还是两者的
+组合，任务保留 `Needs-further-isolation` 是正确的。下一步先做显式构造
+`p`/`p+131051` 的 codegen probe，再决定 LLVM/backend 任务，边界合理且不应
+扩大到 `-O X`、puts、free、varargs 或 allocator 总体修复。
+
+#### 5. 范围结论与复核要求
+
+越权范围审计成立：本轮未见实现源码、patch series、docs/issues、contracts、
+manifests 或 `ML-014a` 变更，也未使用或传递 `~/toolchain`、`~/knowledge-graph`。
+ML-014f 和 ML-014a 未被宣称完成。需要修正的仅是完成区中 pointer raw 值的
+证据归属，以及 gem5 首字节“通过”措辞；修正记录或补齐 pointer raw-return
+证据后，再可把本诊断记录提升为 Accepted（仍须保留
+`Needs-further-isolation`，不等于 allocator 完成）。
