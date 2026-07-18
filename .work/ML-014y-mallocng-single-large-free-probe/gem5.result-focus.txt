@@ -1,0 +1,1 @@
+/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/gem5.stdout:13:SIM_END: trap-exit code=42

@@ -1,0 +1,8 @@
+
+/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/malloc_single_large_free.elf:	file format elf64-unknown
+
+Disassembly of section .text:
+
+0000000080001404 <free>:
+80001404: 6c 00 00 01  	call 1
+80001408: 6e 00 00 00  	ret rd0, 0

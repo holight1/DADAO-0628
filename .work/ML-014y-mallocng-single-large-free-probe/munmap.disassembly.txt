@@ -1,0 +1,21 @@
+
+/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/malloc_single_large_free.elf:	file format elf64-unknown
+
+Disassembly of section .text:
+
+0000000080002b64 <munmap>:
+80002b64: 49 04 1f f0  	addi rb1, rb1, -16
+80002b68: 3b 20 10 08  	sto rd8, rb1, 8
+80002b6c: 19 21 00 00  	addi rd8, rd16, 0
+80002b70: 4b 40 10 00  	sto rb16, rb1, 0
+80002b74: 6c ff ff fa  	call -6
+80002b78: 19 40 00 d7  	addi rd16, rd0, 215
+80002b7c: 43 20 10 00  	ldo rb8, rb1, 0
+80002b80: 10 a9 12 01  	rb2rd rd17, rb8, 1
+80002b84: 19 48 80 00  	addi rd18, rd8, 0
+80002b88: 76 08 00 00  	trap 2, 0
+80002b8c: 19 41 f0 00  	addi rd16, rd31, 0
+80002b90: 6c ff ff df  	call -33
+80002b94: 33 20 10 08  	ldo rd8, rb1, 8
+80002b98: 49 04 10 10  	addi rb1, rb1, 16
+80002b9c: 6e 00 00 00  	ret rd0, 0
