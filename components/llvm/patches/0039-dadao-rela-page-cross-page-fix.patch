@@ -1,0 +1,32 @@
+From 92dd91c67c08f6b680d11c7b713f87c496cd5d94 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 16:24:48 +0800
+Subject: [PATCH] lld: fix DADAO RELA_PAGE page delta
+
+---
+ lld/ELF/Arch/DADAO.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/lld/ELF/Arch/DADAO.cpp b/lld/ELF/Arch/DADAO.cpp
+index ae28c2ac1190..413d8a5891c9 100644
+--- a/lld/ELF/Arch/DADAO.cpp
++++ b/lld/ELF/Arch/DADAO.cpp
+@@ -118,7 +118,15 @@ void DADAO::relocate(uint8_t *loc, const Relocation &rel,
+   }
+ 
+   case R_DADAO_RELA_PAGE: {
+-    int64_t page = (static_cast<int64_t>(val) + 0x800) >> 12;
++    // `val` is S + A - P for R_PC relocations, while the DADAO `rela`
++    // instruction uses the page of the next instruction (P + 4) as its
++    // base. Recover the absolute target and place here rather than rounding
++    // the byte delta: page(S + A) - page(P + 4) is not equivalent to
++    // (S + A - P + 0x800) >> 12 at page boundaries.
++    const uint64_t target = rel.sym->getVA(ctx, rel.addend);
++    const uint64_t place = target - val;
++    const int64_t page = static_cast<int64_t>(target >> 12) -
++                         static_cast<int64_t>((place + 4) >> 12);
+     checkInt(ctx, loc, page, 18, rel);
+     uint32_t mask = 0x3FFFF;
+     uint32_t insn = read32be(loc);
+-- 
+2.43.0

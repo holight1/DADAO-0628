@@ -68,8 +68,7 @@ free、allocator 算法或 ML-014a 整体验收。
   `page(S+A)-page(P+4)`；保留 18-bit `checkInt`。
 - `R_DADAO_RELA_LO` 未修改，仍使用目标绝对地址 low12。
 - source commit：`92dd91c67c08 lld: fix DADAO RELA_PAGE page delta`。
-- 未导出 root patch series；未修改 QEMU/gem5/musl、docs/issues.yaml、
-  contracts、manifests 或 ML-014a。
+- 未修改 QEMU/gem5/musl、docs/issues.yaml、contracts、manifests 或 ML-014a。
 
 ### 验证命令与结果
 
@@ -94,7 +93,15 @@ free、allocator 算法或 ML-014a 整体验收。
   mallocng 真实 probe；退出码均按原样记录。
 - 自审判定：**Fixed（linker startup 范围）；mallocng allocator 后续为 Blocked**。
 
-独立 reviewer 待补充。
+### 集成整理
+
+- 已将 source commit 导出为
+  `components/llvm/patches/0039-dadao-rela-page-cross-page-fix.patch`，并追加
+  到 `components/llvm/patches/series`。
+- 用 `git apply --check --reverse` 对已应用 source worktree 做反向一致性检查，
+  通过；`manifest_check.py`、`check_issues.py`、`check_wiki_drift.py` 通过。
+- 尚未重跑完整 39 条 patch 从零 replay；历史上 0005 已有独立 corrupt-patch
+  blocker，避免把该既有问题与本次修复混在一起。
 
 ## 审阅记录
 
