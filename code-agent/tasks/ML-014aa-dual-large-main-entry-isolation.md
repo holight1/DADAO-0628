@@ -106,3 +106,47 @@ ELF/代码布局阈值复现地址物化转折，并解码/对照对应 relocati
 本收口依据既有 aa 与 ML-014z 产物完成；没有新增实验或实现修改。判定保持
 **Completed/Needs-further-isolation**，后续范围限定为上述 ELF/code-layout 与
 relocation decode 边界。
+
+### Independent review（2026-07-19；独立复核）
+
+**Verdict：Accepted-as-isolation。** 该 verdict 仅接受本任务作为
+startup→main-entry 的隔离收口，不接受 main-entry 命中，也不接受任何 allocator
+阶段结论。复核未运行新实验、未重编译、未修改实现或 `.work` 产物。
+
+- `.work/ML-014aa-dual-large-main-entry-isolation/result.txt` 与对应 sidecar
+  明确记录 `qemu_rc=130`、`qemu_timeout=no-timeout`、`gem5_rc=0`、
+  `gem5_timeout=no-timeout`、`validation_rc=1`。
+  `.work/ML-014aa-dual-large-main-entry-isolation/qemu.in_asm.trace`
+  在 startup 间接调用后的 trace block 反复执行 `0x7ffffcb8`；
+  `.work/ML-014aa-dual-large-main-entry-isolation/m5out/gem5.exec.trace` 在 `0x80000ca8
+  @__libc_start_main+100` 的间接 `call` 后执行
+  `0x7ffffcb8 @__fini_array_end+3256` 的 `halt`，而
+  `.work/ML-014aa-dual-large-main-entry-isolation/gem5.result-focus.txt` 对应记录
+  `SIM_END: halt code=0`。
+  因此两个 backend 的错误目标均为 `0x7ffffcb8`；这两个 host rc 都不是
+  `EXIT_MAIN_ENTRY=73`，也不是双大块成功码 `42`。
+- `.work/ML-014aa-dual-large-main-entry-isolation/elf.nm.txt`、
+  `.work/ML-014aa-dual-large-main-entry-isolation/main.disassembly.txt` 与
+  `.work/ML-014aa-dual-large-main-entry-isolation/runtime-main-entry-focus.txt`
+  将 `main` 固定为 `0x80000110`；对 QEMU
+  in_asm 和 gem5 Exec trace 检索 `0x80000110`/`@main` 均无命中，且没有
+  main-entry marker 或 allocator (`malloc`/`free`/`munmap`) runtime 命中。
+  这支持“未证明进入 main”的窄结论，不把 gem5 halt 或 QEMU 130 误报为阶段成功。
+- `.work/ML-014aa-dual-large-main-entry-isolation/libc-members-vs-z.rc=0` 且
+  `.work/ML-014aa-dual-large-main-entry-isolation/libc-members.txt` 与
+  `.work/ML-014z-dual-large-allocation-free-probe/libc-members.txt` 完全相同，
+  均为 21 个 members；`.work/ML-014aa-dual-large-main-entry-isolation/locked-hash-cmp.rc=0`、
+  `runtime-tools-hash-cmp.rc=0`，并且 aa 与 ML-014z 的 locked/runtime
+  before/after sidecar 逐项相同。该证据证明输入与 runtime identity 未漂移，
+  不证明控制流正确。ML-014y 的 Accepted 记录只支持单次
+  `malloc(131052)`/真实 `free` 的既有边界；ML-014z 的 Needs-isolation 记录
+  明确把 startup→main 作为 allocator 前的阻断边界，故本 verdict 不扩大两者结论。
+- `.work/ML-014aa-dual-large-main-entry-isolation/startup-layout-comparison.txt`
+  与 `.work/ML-014aa-dual-large-main-entry-isolation/relocation-comparison.txt`
+  支持把下一边界收口到 startup address materialization，尤其是
+  `RELA`/global-page 形态与 `0x80000c84`--`0x80000ca8` 的间接 target 物化。
+  这是优先检查方向而非已证根因；下一任务应保持为 minimal ELF/code-layout
+  threshold plus relocation decode，在闭合前不进入 malloc/free/mmap/munmap。
+
+**Correction：无。** 本次独立复核未发现需修正的事实或范围声明；上述“未命中
+main”和下一边界均按现有 trace/static evidence 的上限表述。
