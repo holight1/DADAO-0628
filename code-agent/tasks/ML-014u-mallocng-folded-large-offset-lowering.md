@@ -2,7 +2,7 @@
 
 **执行环境**：本地 subagent worker；承接 ML-014s/t
 
-**状态**：Completed awaiting independent review（2026-07-18）
+**状态**：Accepted（2026-07-18）
 
 ## 目标
 
@@ -182,4 +182,7 @@ pointer ABI、puts/free/varargs、全量 E2E、ML-014f 或 ML-014a。
 
 ## 审阅记录
 
-（待不同 reviewer 独立复核；本记录不提前写 Accepted）
+- **Accepted（2026-07-18，独立 review）**：只读核对既有产物与 selector 源码；IR
+  保留 `131051`，finalize-isel 为 `STB_RRII/LDBU_RRII ... 131051`，编码后
+  `0xfeb` 反汇编为 `-21`，且 non-FI/non-PCREL load/store fold 确实缺少
+  signed-12 范围检查。结论与完成区一致。
