@@ -115,3 +115,30 @@ ML-014a 完成。
 
 该任务的第一道门仅是 startup 到 `main` 入口，符合当前证据所支持的最小前移；
 在这道门闭合前，不继续声称或定位双大块 allocator 语义。
+
+### Independent review（2026-07-19）
+
+**判决：同意 Needs-isolation/Not Accepted；该判决准确。** 本 review 仅复核本
+task MD 与既有 `.work/ML-014z-dual-large-allocation-free-probe/`，未修改实现、未
+重跑 probe，也未新增实验。
+
+- `QEMU=130`、`gem5=0` 均不是合同成功码 42，`validation=1` 因而足以否决验收。
+  其中 validation 还受旧绝对 PC 和 `write_pages` 假阳性影响，所以只能作为总失败
+  信号，不能反推具体 guest 阶段。
+- QEMU 现有证据只有 host rc 130、`no-timeout` 和 monitor banner；没有 guest PC、
+  marker 或 syscall trace。130 不在源码的 10--26/42 分阶段码中，故 QEMU 连
+  `main` 是否进入都不能判定。
+- gem5 Exec trace 可支持到更窄的 startup 交接边界：执行到
+  `__libc_start_main+100@0x80000c70` 的间接 call，下一条却是
+  `0x7ffffc80` 的 halt；它没有命中 `main@0x80000110`，也没有命中本 probe 的
+  `malloc/free/munmap`。gem5 host rc 0 与 `SIM_END: halt code=0` 只描述该错误 halt，
+  不构成 guest probe 成功。
+- 源码、main 反汇编、map/why-extract、free 与 munmap 反汇编能证明两次分配、条件
+  检查、反序 `free(b); free(a);` 以及真实 free→munmap syscall 链被编入且静态
+  可达；不能证明任一分配、双块并存读写或任一次 free/munmap 在运行时发生。
+
+因此当前动态证据上限是：gem5 定位到 startup 调用 `main` 的交接点发生偏离；
+QEMU 尚未定位到任何源码阶段。下一最小阶段只应隔离 **startup → main-entry**：用
+不含 allocator 的最小 main-entry 专用返回码先要求双后端共同命中。该门未闭合前，
+不进入第一次 malloc 及其后的分阶段变体；原“第一次 malloc 返回至 free(a) 返回”
+序列只能作为 main-entry 双端成立后的后续阶段，不能并入当前最小定位边界。
