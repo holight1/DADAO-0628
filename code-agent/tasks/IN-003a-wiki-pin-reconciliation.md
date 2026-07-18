@@ -101,3 +101,35 @@ Source 头和 `/home/holight/DADAO-wiki` 当前 checkout 仍是 `13a414d`，WU-0
   修改仍在，未被本任务覆盖。
 
 **Finding**：无。**最终判定**：Accepted，IN-003a 可关闭。
+
+## 独立 Reviewer（本次实际复跑，2026-07-18）
+
+本节为独立 reviewer 的 second pass；不采信上方预填的“独立 Review”结论，按
+`26999ab` 的实际 diff 和当前工作区重新核对。除本节外未修改本任务文件，也未修改
+contracts、manifests、Wiki 内容、实现源码或 `docs/issues.yaml`。
+
+### Findings
+
+1. **提交边界：无问题。** `git diff --name-status 26999ab^ 26999ab` 仅包含本任务、
+   WU-001a 记录、两个 contract Source 头和 wiki upgrade 审计记录；无实现源码、
+   `manifests/spec.lock.toml` 或 `docs/issues.yaml` 变更。`git diff --check` 通过。
+2. **三方 pin：无问题。** `manifests/spec.lock.toml`、Wiki detached HEAD、
+   `contracts/isa/spec.md` Source 头和 `contracts/abi/spec.md` Source 头均为完整 SHA
+   `9f378f4426e131903d60a208766086ae74a53c89`。WU-001a 状态为已完成，并包含 IN-003a
+   completion；`docs/reviews/wiki-upgrade-9f378f4.md` 包含对应 reconciliation 记录。
+3. **Wiki 内容完整性：无问题。** `/home/holight/DADAO-wiki` 显示 `HEAD (no branch)`，
+   `git rev-parse HEAD` 为目标完整 SHA；工作树和 index 的 `git diff --quiet` 均返回 0，
+   `git status --porcelain` 无内容。
+4. **drift/ref/仓库检查：无问题。** 独立执行 `python3 scripts/check_wiki_drift.py`、
+   `python3 scripts/check_wiki_refs.py`、`python3 scripts/check_wiki_refs.py --profile abi`
+   和 `make check` 均 exit 0；分别得到 drift `PASS (3 contract(s) verified)`、ISA
+   `DANGLING=0`/missing ref=0、ABI `RESOLVED=10`/`DANGLING=0`/missing ref=0，及
+   `repository checks: PASS`。ISA 的既有 3 条 UNPARSEABLE 仍明确作为 warning 输出，未被隐藏。
+5. **A 桶：无问题。** 独立执行
+   `git -C /home/holight/DADAO-wiki diff --exit-code 13a414d..9f378f4426e131903d60a208766086ae74a53c89 -- '*SimRISC-01*' '*SimRISC-02*'`，exit 0 且无输出。
+6. **四方回归：无问题。** 独立执行 `python3 -u tools/run_differential.py`，exit 0，
+   `AGREE(3-way)=200`、`DIVERGE=0`、`HARNESS=6`、`AGREE(4-way)=200`、
+   `SAIL-DIVERGE=0`、`QEMU-SKIP=0`。
+
+**独立 reviewer 判定：Finding=0，Accepted。** IN-003a 的实际变更和验收证据一致，
+可以关闭；不需要修复或扩大范围。
