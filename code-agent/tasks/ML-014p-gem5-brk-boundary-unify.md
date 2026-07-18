@@ -202,3 +202,11 @@ ABI 或 ML-014a 整体验收。
 - 因为 probe 历史失败被遗漏，且最终 probe 没有实际断言关键返回/读回条件，
   本任务不能在当前记录上判为整体 `Accepted`。实现部分可保留为“边界统一
   已实现”，整体状态待 ML-014q 补齐可审计证据后再决定。
+
+### 后续证据收口（2026-07-18）
+
+ML-014q 新增了带六项条件断言的 direct brk probe，并完整索引本任务历史失败；
+ML-014r 修正了 check 5 的失败编号分发，且经独立 reviewer Accepted（提交
+`36fe0d5`）。因此本任务 reviewer 指出的证据缺口已闭合：`BrkBase=0x87e00000`
+的实现与 direct brk/query/page backing 证据可接受。该接受仅限 brk 边界和证据
+链路，不代表 mmap 本轮新验证、mallocng、ML-014f 或 ML-014a 完成。

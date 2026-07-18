@@ -228,3 +228,10 @@ ML-014p 旧目录中的原始文件均保留，未删除或覆盖；本任务补
 **Reviewer decision：Needs-fix。** 修正 `fail5` 失败消息分发，并用显式失败
 运行证明 check 5 的退出编号/消息后，可重新复核 direct brk evidence；在此之前
 不接受“所有失败项均可定位”的验收项。
+
+### 后续修正（2026-07-18）
+
+独立 reviewer 发现的 check 5 失败消息误报已由 ML-014r 修正并经独立 reviewer
+Accepted（`2f1f460`、`36fe0d5`）；ML-014q 的直接断言证据应与 ML-014r 的
+`PASS/42`、`FAIL-5/5` 路由结果联合阅读。ML-014q 原始 `Needs-fix` 记录保留为
+历史审计，不再作为当前 evidence routing blocker。

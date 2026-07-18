@@ -265,3 +265,11 @@ ABI/ELF heap 边界不一致，故 ML-014o 整体暂不 Accepted）**
 - `mallocng` 仅有 `mallocng_real` 的 gem5 probe 返回 42；pointer probe 为 13，
   read/write probe 为 134。`ML-014f` 仍为 Blocked/Not Accepted，原始
   `ML-014a` 仍未完成且保持原记录不变。
+
+### 后续收口记录（2026-07-18）
+
+ML-014o 的 `Needs-fix` 原因已由 ML-014p 处理：gem5 `BrkBase` 从
+`0x90000000` 对齐到当前 ELF/QEMU 的 `0x87e00000`，并保留本任务已验证的
+`MemState` VMA/fault-in 机制。ML-014q/r 又补齐并接受了 direct brk 断言证据，
+因此本任务的本地 backing 机制作为后续实现基础保留；本任务历史 review 不被
+改写。mallocng/pointer/rw、ML-014f 和 ML-014a 仍未完成。
