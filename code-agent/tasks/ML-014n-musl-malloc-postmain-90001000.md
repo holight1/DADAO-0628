@@ -159,4 +159,59 @@ probe 双后端验证。该任务不应顺带修改 mallocng 算法、puts、fre
 
 ## 审阅记录
 
-（待独立 reviewer 复核；本轮未修改实现。）
+### 独立 reviewer 复核（2026-07-18）
+
+**Finding：Accepted（限定为 gem5 `brk` backing/VMA blocker 的诊断结论；不代表 mallocng、ML-014f 或 ML-014a 完成）**
+
+本轮按完成区逐项核对，没有继续实验，也没有修改实现。
+
+1. **`brk(0)` 与 `mmap` 返回值**
+
+   - `.work/ML-014n-musl-malloc-postmain-90001000/gem5-real/exec.log` 的
+     `__syscall1` 记录显示 `rd16=0xd6`（214）、`rd17=0`，trap 前
+     `rd31=0x90000000`；返回值随后被保存并继续进入 mallocng。
+   - 同一 trace 的首次 `mmap` 调用显示 `rd16=0xde`（222），长度为
+     `0x20000`，trap 后 `rd31=0x100000000`，guest 随后读回同一值。
+   - 因而 `0x90001000` 不可能是该次 mmap 返回地址；它来自 `brk` 返回值的
+     mallocng metadata 计算链。
+
+2. **`0x90001000` 的形成与最终 fault**
+
+   - tick `4590000`、PC `0x80001554`（`__malloc_alloc_meta+512`）执行
+     `sub rd16, rd16, rd17`，输入为 `0x90002000 - 0x1000`，结果首次形成
+     `0x90001000`。
+   - 最终 fault 发生在 tick `4652000`、PC `0x80001798`
+     （`__malloc_alloc_meta+1092`）的 `blockcopy`；fault address 为
+     `0x90001000`，前一条加载已将该地址置入 `rd73`。stdout 中的 gem5
+     panic 同样明确为访问 `0x90001000` 的 page-table fault。
+
+3. **gem5 responder 证据与 mmap ABI 排除**
+
+   独立查看当前 `/home/holight/DADAO-gem5/src/arch/dadao/decoder.cc`：
+
+   - `case 214` 仅以静态 `brk=0x90000000` 返回/推进记账值，没有调用
+     `process->memState->mapRegion`，因此不能为 `0x90001000` 建立 VMA 或
+     对应的 fault-in backing。
+   - 相邻的 `case 222` 则明确检查 arena 范围，并调用
+     `process->memState->mapRegion(cursor, aligned, "dadao-mmap")` 后返回
+     cursor；这与 trace 中的 mmap 返回 `0x100000000` 一致。
+   - 因此缺失 brk backing 足以解释 gem5 在 metadata 首次访问处的
+     page-table fault；现有证据也足以将 mmap ABI/返回桥排除为本次
+     `0x90001000` fault 的首因。后续修复仍应只处理 brk backing 的 VMA/PTE
+     语义，不顺带改 mmap ABI。
+
+4. **QEMU 结果语义**
+
+   复核 ML-014m 的既有结果表：`mallocng_real` 为 QEMU=42、gem5=134，
+   `malloc_pointer_after` 为 QEMU=13、gem5=134，`malloc_rw_after` 为
+   QEMU=14、gem5=134。42 只表示该 probe 返回了非空/正常退出，13/14 是
+   QEMU 侧 pointer 与读写判定失败码；它们不能与 gem5 的 page-table fault
+   退出 134 归并成同一种错误，也不能被写成 mallocng allocator 已通过。
+
+5. **范围与下一任务边界**
+
+   完成区没有把 mallocng、ML-014f 或 ML-014a 写成完成；本轮也没有修改
+   QEMU、gem5、musl、LLVM、patch series、docs 或 ML-014a。下一任务边界
+   保持为：只修 gem5 `SYS_brk=214` 的 VMA/PTE/backing 与统一 heap 边界，
+   然后复跑 malloc-only、pointer、read/write；不扩展到 mmap ABI、puts、free、
+   varargs 或 `-O`。
