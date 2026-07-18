@@ -75,3 +75,27 @@ boundary 三布局；不扩展到 allocator 语义。
   `/home/holight/DADAO-0628/.work/ML-014ac-rela-page-signed-low-fix/{success,boundary,failure,single-large}/gem5.exec.trace`
   reach normal completion.
 - This record makes no dual-large allocator claim.
+
+### Independent review (2026-07-19)
+
+- Chronology reconciles cleanly: the earlier limitation records the run state
+  before relinking and simulator verification; the later verified-results
+  section records the subsequent post-rebuild closure and is authoritative for
+  the final result.
+- Reviewed source commit
+  `f5a06de8135832a56d14b677ccfbf08d8121064a` in the clean detached source
+  worktree. Its scope is limited to `lld/ELF/Arch/DADAO.cpp` and the focused
+  signed-low RELA_PAGE test plus linker script. The implementation rounds the
+  target page for low12 `0x800..0xfff` and retains the `P + 4` place calculation;
+  the test covers `0x7ff`, `0x800`, `0xfff`, and the place-page boundary.
+- The task-owned `success`, `boundary`, `failure`, and `single-large` sets each
+  contain object, ELF, binary, map, QEMU trace, and gem5 trace outputs. The
+  recorded compile/link/objcopy statuses are `0` for all four; QEMU and gem5
+  are recorded as `42` for all four. Existing maps and traces place `main` at
+  `0x80000110`; each QEMU trace contains that address and none contains the
+  incorrect `0x7ffff` target. The gem5 traces reach normal completion with
+  the recorded `SIM_END` trap-exit code `42`.
+- The evidence covers the stated source/test scope and the single-large
+  malloc/free regression only. It makes no dual-large allocator claim.
+
+**Verdict: Accepted.**
