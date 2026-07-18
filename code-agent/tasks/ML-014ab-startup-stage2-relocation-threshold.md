@@ -94,3 +94,33 @@ only; it makes no compiler/linker implementation fix.
 - The exact linker implementation site and whether other `RELA_PAGE` users
   have the same cross-page condition remain for a follow-up fix task.
 - This closure does not validate allocator or mallocng semantics.
+
+## 审阅记录
+
+### Independent review（2026-07-19；仅使用既有 artifacts）
+
+**Verdict：Accepted（Finding=0；仅限本任务的 startup stage2 地址物化阈值诊断，不等价于 linker 修复或 allocator/mallocng 完成）。**
+
+- `layout-comparison.txt`、三个 map 和三个最终反汇编彼此一致：`main` 固定为
+  `0x80000110`，stage2 分别为 `0x800005ec`、`0x80000800`、`0x80000804`；
+  `success.c` 无 padding，`boundary.c`/`failure.c` 的 532/536-byte padding 正好
+  形成 `0x800`/`0x804` 两个相邻布局。
+- 物化指令记录为同一 `rela rb8, 0` 后接 signed-low `+1516`、`-2048`、
+  `-2044`。因此 `0x80000000 + signed(low)` 分别得到
+  `0x800005ec`、`0x7ffff800`、`0x7ffff804`；`0x800` 是 12-bit signed-low
+  从正数转负数的首个边界。
+- `result.txt`、各 `runtime-focus.txt` 及 QEMU/gem5 sidecar 同时提供 guest
+  证据：success 两端命中 `main` 并 exit 42；boundary/failure 两端均未命中
+  `main`，QEMU 重复取指 `0x7ffff800`/`0x7ffff804` 后为 130，gem5 在相同错误
+  地址 halt 为 0，且三组均 `no-timeout`。没有以 host rc 替代 guest 行为。
+- `relocation-decode.txt` 正确区分层级：输入 `crt1.o` 有 `main`、`_init`、
+  `_fini`、`__libc_start_main` relocations；三个 probe object 与三个最终 ELF
+  的 relocation 列表为空。结合最终 `rela`/`addi` 反汇编，这支持“输入对象未携带
+  该失败地址物化 relocation、链接后指令呈现问题”的窄结论；RELA_PAGE 责任仍被
+  正确标为推断而非已证实现位置。
+- `locked-hash-cmp.rc=0`、`runtime-tools-hash-cmp.rc=0`，且 LLVM/QEMU/gem5
+  当前 HEAD 与 `baseline-state.txt` 一致；本复核未运行实验、未重编译、未修改
+  implementation 或 `.work` 产物。
+
+据此，本任务的 success/failure/boundary 布局、精确 signed-low 算术、输入与最终
+relocation 区分、双后端结果及“未改实现”约束均已闭合，判定 **Accepted**。
