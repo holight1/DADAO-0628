@@ -105,6 +105,8 @@ free、allocator 算法或 ML-014a 整体验收。
 - linker 修复后的常规回归：`llvm-lit tests/lit/E2E` 为 **59/59**；
   `tools/run_differential.py` 为 `AGREE(3-way)=200`、
   `AGREE(4-way)=200`、`DIVERGE=0`。
+- `make check`：通过（仅保留既有 3 条 wiki reference warning，无 dangling
+  reference）。
 
 ## 审阅记录
 
