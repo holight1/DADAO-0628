@@ -98,3 +98,20 @@ artifacts. This result does not claim that the dual-large allocator is solved;
 that remains outside this task and requires independent review.
 
 **Status: Complete (bounded runtime reuse; gates freshly passed).**
+
+## Independent review (2026-07-19)
+
+- **Accepted.** The three preserved raw gate logs each report `rc: 0` and
+  `PASS`.
+- The locked manifest covers eight inputs (clang, ld.lld, crt1.o, libc.a,
+  linker script, QEMU, gem5, and trampoline); checksum verification from the
+  repository root returned `OK` for all eight.
+- Runtime scope is correctly bounded: `runtime-reuse.txt` explicitly records
+  no fresh ML-014ae rerun and cites ML-014ac as the source. All eight copied
+  QEMU/gem5 traces are byte-identical to the corresponding ML-014ac traces,
+  with the recorded guest rc 42 evidence retained.
+- The record explicitly excludes dual-large allocator completion. Git scope
+  shows no forbidden implementation, patch-series, manifest, issues, wiki, or
+  ML-014a changes; the unrelated untracked task file was left untouched.
+
+**Review verdict: Accepted.**
