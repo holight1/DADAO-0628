@@ -119,3 +119,25 @@ overflow/non-overlap、page sentinel 首中尾写读、`free(b); free(a);`、pha
 free、两次 munmap 与最终 `_Exit` trap，QEMU trace 对应计数为 malloc/free/munmap
 各 2 次、main/_Exit 各 1 次；两份 trace 均无 `0x7ffffc80`/`0x7ffffcb8` wrong-target。
 `result.txt` 报告完整 dual-large contract PASS，证据闭合。
+
+## Independent review (2026-07-21, final post-sidecar correction)
+
+**Verdict：Accepted（覆盖此前两条 Needs-fix verdict）。** 未运行新实验；按要求仅复核
+现有 task-owned 记录。此前 Needs-fix 的唯一阻断项是缺少原始 rc、命令、输出、timeout、
+result/validation 与 hash sidecar；这些 sidecar 现已存在且内容一致：`compile.rc=0`、
+`link.rc=0`、`objcopy.rc=0`、`qemu.rc=42`、`gem5.rc=42`，两端 `timeout=no-timeout`，
+QEMU/gem5 stdout/stderr 均可读，`result.txt` 与 `validation.rc=0` 均存在；
+`artifacts.sha256` 和 `runtime-inputs.sha256` 的所有条目均通过 `sha256sum -c`。
+
+- af 与 ML-014z 的 exact `malloc_dual_large_free.c` `cmp=0`，SHA-256 均为
+  `ed3551d57c4013779bebf147318b54a7f33ce578e9ec2a04ec71b880077d35b5`。
+- source control flow 保留双块 `malloc(131052)`/`malloc(262144)`、16-byte 对齐与
+  非重叠检查、两块 page sentinel 写读、`free(b); free(a);` 逆序释放、phase-marker
+  检查，并以 `return 42` 收束；任何失败分支均返回 10--26。
+- QEMU trace 命中 `main`、两次 malloc 实现路径、`free`、`munmap` 与最终 `_Exit`；
+  gem5 trace 明确命中 `main`、`0x8000011c`/`0x80000180` 两次 malloc call、
+  `0x8000051c`/`0x80000570` 两次 reverse-free call、两次 `munmap` trap 及
+  `_Exit` trap。两端均无 `0x7ffffc80`/`0x7ffffcb8` wrong-target 证据。
+
+因此 sidecar correction 已闭合原 review 缺口；双后端 guest rc=`42` 与 exact source
+contract、trace control flow 一致，ML-014af 可接受并闭合。
