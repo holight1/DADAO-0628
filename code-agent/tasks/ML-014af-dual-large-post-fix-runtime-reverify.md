@@ -42,8 +42,8 @@
 
 ## Completion（fresh post-fix run）
 
-本次记录来自现有产物 `.work/ML-014af-dual-large-post-fix-runtime/`，是修复后的
-fresh post-fix run；未重新运行实验。`malloc_dual_large_free.c` 是 ML-014z 的
+本次记录来自现有产物 `.work/ML-014af-dual-large-post-fix-runtime/`，是本轮实际
+执行的 fresh post-fix run。`malloc_dual_large_free.c` 是 ML-014z 的
 exact source，使用 `A_SIZE=131052`、`B_SIZE=262144`，包含 page sentinels、
 overlap/alignment checks、reverse free 和 `phase_marker`。compile/link/objcopy
 均为 `0`。
