@@ -133,6 +133,17 @@ scope for this chain).
 
 ## M2.6: dual-backend unblock + llvm-test-suite on-ramp (2026-07-14 architect roadmap)
 
+### Current route decision (2026-07-21)
+
+After the mallocng chain closed, the next priority is to stabilize the LLVM + QEMU
+side independently: rebuild QEMU after each scoped patch, keep the M1 bare-metal
+harness green, and maintain a fresh `tests/lit/E2E/` baseline including the
+`llvm-test-suite/` subdirectory. Kernel/SEE/CFX implementation is intentionally
+paused at the accepted KL-101a/KL-102a recon and KL-102b QEMU state scaffold until
+this baseline and the remaining LLVM ABI gaps are under control. This is a route
+decision, not a claim that the kernel prerequisites are complete; the task ledger
+and fresh-test artifacts remain authoritative.
+
 Architect-proposed sequence, executed via subagent (not DS — the first thread
 is gem5-internal work, which per `feedback_ds_gem5_semantic_unreliable` goes to
 a subagent that owns the gem5 component, not DS):
