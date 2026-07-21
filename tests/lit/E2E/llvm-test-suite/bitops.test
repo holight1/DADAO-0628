@@ -5,3 +5,4 @@
 // RUN: %clang --target=dadao-unknown-elf -nostdlib -Wl,-T,%S/../../../scripts/dadao.ld %t.crt0.o %S/Inputs/bitops.c -o %t.elf
 // RUN: %llvm-objcopy -O binary %t.elf %t.bin
 // RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 249'
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 249'
