@@ -61,3 +61,27 @@ overlap/alignment checks、reverse free 和 `phase_marker`。compile/link/objcop
 `.work/ML-014af-dual-large-post-fix-runtime/gem5.exec.trace`，以及对应的
 `malloc_dual_large_free.elf`、`malloc_dual_large_free.bin`、`.map` 和
 `m5out/` 产物。
+
+## Independent review（2026-07-21）
+
+**Verdict：Needs-fix。** 未运行新实验；现有证据支持 source/control-flow 与运行轨迹
+已越过 startup，但不足以独立确认任务声称的全部精确 rc。
+
+- `.work/ML-014af-dual-large-post-fix-runtime/malloc_dual_large_free.c` 与
+  `.work/ML-014z-dual-large-allocation-free-probe/malloc_dual_large_free.c`
+  `cmp=0`（同一 SHA-256），且保留 ML-014z 的 `131052`/`262144`、对齐/非重叠、
+  page sentinel 首中尾写读、`free(b); free(a);` 和 phase-marker 合同。
+- `gem5.exec.trace` 命中 `main@0x80000110`、两次 malloc（`0x8000011c`、
+  `0x80000180`）、两次 reverse-free（`0x8000051c`、`0x80000570`），两次
+  `munmap` 路径，并到达最终 `_Exit` trap；`qemu.trace` 命中 main、free、munmap
+  代码块。两份 trace 均未出现旧错误目标 `0x7ffffc80`/`0x7ffffcb8`。
+- 但 af `.work` 目录没有 `compile.rc`、`link.rc`、`objcopy.rc`、QEMU/gem5
+  rc、stdout/stderr、timeout、commands 或 result/validation sidecar；因此
+  `compile/link/objcopy=0` 与 QEMU/gem5 `rc=42` 只能由 task MD 声称，不能由现有
+  产物独立复核。源代码的最终 `return 42` 加 gem5 的成功路径支持“若 guest rc=42
+  已被保存，则 full contract 的控制流闭合”，但不能替代两端精确 guest/host rc
+  记录，尤其不能独立确认 QEMU 的完整结果。
+
+**Correction：** 保留同一 exact ML-014z source/contract 和现有 ELF/traces，补存
+compile/link/objcopy rc、两端原始 rc 与 stdout/stderr/timeout、commands 及统一
+result/validation sidecars；补齐后再将 verdict 改为 Accepted。
