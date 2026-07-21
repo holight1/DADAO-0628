@@ -438,10 +438,11 @@
     word: "0x65000000"
   input_state: {}
   expected_state: null
-  expected_fault: ILLI
-  status: active
+  expected_fault: null
+  status: deferred
+  deferred_reason: "当前 harness 没有 encoding-only non-executing mode；待独立 harness 任务提供安全目标/静态路径"
   wiki_cite: "spec.md §5.3"
-  notes: "encoding-only: rb0=0 → addr=0 → halt rd0 → ILLI"
+  notes: "encoding-only: rbha=rb0 is the §5.3 relative-jump special case; deferred so execution cannot be confused with a no-fault result"
 
 - mnemonic: call
   format: iiii
@@ -452,7 +453,7 @@
   expected_state: null
   expected_fault: null
   status: active
-  wiki_cite: "spec.md §5.3"
+  wiki_cite: "spec.md §5.4"
   notes: "encoding-only: imm=0 (call to next instruction)"
 
 - mnemonic: call
@@ -462,10 +463,11 @@
     word: "0x6D000000"
   input_state: {}
   expected_state: null
-  expected_fault: ILLI
-  status: active
-  wiki_cite: "spec.md §5.3"
-  notes: "encoding-only: rb0=0 → addr=0 → halt rd0 → ILLI"
+  expected_fault: null
+  status: deferred
+  deferred_reason: "当前 harness 没有 encoding-only non-executing mode；待独立 harness 任务提供安全目标/静态路径"
+  wiki_cite: "spec.md §5.4"
+  notes: "encoding-only: rbha=rb0 is a legal RB source for call; deferred so execution cannot be confused with a no-fault result"
 
 - mnemonic: ret
   format: riii
@@ -474,45 +476,60 @@
     word: "0x6E040000"
   input_state: {}
   expected_state: null
-  expected_fault: ILLI
-  status: active
+  expected_fault: null
+  status: deferred
+  deferred_reason: "当前 harness 没有 encoding-only non-executing mode；待独立 harness 任务提供安全目标/静态路径"
   wiki_cite: "spec.md §5.5"
-  notes: "encoding-only: RA stack cold=0 → jump to addr=0 → halt rd0 → ILLI"
+  notes: "encoding-only: ret field layout only; deferred so execution cannot be confused with the separate §5.6 cold-RAS boundary fault"
+
+- mnemonic: ret
+  format: riii
+  class: boundary
+  encoding:
+    word: "0x6E040000"
+  input_state: {}
+  expected_state: {}
+  expected_fault: RASUF
+  status: active
+  wiki_cite: "spec.md §5.6"
+  notes: "cold RegRAS ret; empty ra63 causes precise RASUF, with PC and RA unchanged; downstream halt/ILLI is not the ret fault"
 
 # ─── Legality test stubs ────────────────────────────────────────────────────────
 
 - mnemonic: jump
   format: rrii
-  class: legality
+  class: encoding
   encoding:
     word: "0x65000000"
   input_state: {}
   expected_state: null
-  expected_fault: ILLI
-  status: active
+  expected_fault: null
+  status: deferred
+  deferred_reason: "当前 harness 没有 encoding-only non-executing mode；待独立 harness 任务提供安全目标/静态路径"
   wiki_cite: "spec.md §5.3"
-  notes: "jump_r rb0,rd0,0; addr=0 → halt rd0 → ILLI"
+  notes: "encoding-only duplicate confirmation: rbha=rb0 is legal relative jump; deferred rather than executed as a no-fault case"
 
 - mnemonic: call
   format: rrii
-  class: legality
+  class: encoding
   encoding:
     word: "0x6D000000"
   input_state: {}
   expected_state: null
-  expected_fault: ILLI
-  status: active
-  wiki_cite: "spec.md §5.3"
-  notes: "call_r rb0,rd0,0; addr=0 → halt rd0 → ILLI"
+  expected_fault: null
+  status: deferred
+  deferred_reason: "当前 harness 没有 encoding-only non-executing mode；待独立 harness 任务提供安全目标/静态路径"
+  wiki_cite: "spec.md §5.4"
+  notes: "encoding-only duplicate confirmation: rbha=rb0 is a legal call source; deferred rather than executed as a no-fault case"
 
 - mnemonic: ret
   format: riii
-  class: legality
+  class: boundary
   encoding:
     word: "0x6E000000"
   input_state: {}
-  expected_state: null
-  expected_fault: ILLI
+  expected_state: {}
+  expected_fault: RASUF
   status: active
-  wiki_cite: "spec.md §5.5"
-  notes: "ret rd0,0; RA=0 → jump to addr=0 → halt rd0 → ILLI"
+  wiki_cite: "spec.md §5.6"
+  notes: "cold RegRAS ret rd0,0; §2.6.1 makes rdha=rd0 legal, while §5.6 makes empty ra63 a precise RASUF; downstream halt/ILLI is not the ret fault"
