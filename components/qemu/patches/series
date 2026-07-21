@@ -17,3 +17,4 @@
 0016-target-dadao-align-brk_base-default-with-dadao.ld-he.patch
 0017-target-dadao-cfx_smon-mmap-munmap-mprotect-handlers-.patch
 0018-target-dadao-mmap-arena-backing-ML-014c.patch
+0019-dadao-cfx-state-scaffold.patch

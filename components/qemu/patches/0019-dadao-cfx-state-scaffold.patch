@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 21 Jul 2026 00:00:00 +0800
+Subject: [PATCH] target/dadao: add CFX state scaffold (KL-102b)
+
+Add per-CPU CFX mode/code/mask state and the minimal cfx_power exception
+frame. Reset exposes the hypv/power/all-ones scaffold while retaining the
+M1 test-machine entry PC at 0x00100000. This patch intentionally does not
+add CFX dispatch, cfx2rc, escape, permissions, vectors, MMU, nested traps,
+or changes to the existing host cfx_smon shortcut.
+---
+ target/dadao/cpu.c |  6 ++++++
+ target/dadao/cpu.h | 26 ++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 547f7bd..137ed5c 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -52,6 +52,12 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+     }
+     /* rf[0] reset = QNaN per ISA spec §1.2 (contracts/isa/spec.md) */
+     env->rf[0] = UINT64_C(0x7FF800007FC00000);
++    env->inner_run_mode = DADAO_RUN_MODE_HYPV;
++    env->inner_cfx_code = DADAO_CFX_CODE_POWER;
++    env->inner_cfx_mask = DADAO_CFX_MASK_ALL;
++    env->cfx_power_frame.prev_run_mode = DADAO_RUN_MODE_HYPV;
++    env->cfx_power_frame.prev_cfx_mask = DADAO_CFX_MASK_ALL;
++    env->cfx_power_frame.cause_ip = 0;
+     env->pc = 0x00100000;
+     cs->exception_index = -1;
+ }
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index 02f5b78..369778f 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -34,6 +34,28 @@
+ 
+ #define TARGET_INSN_START_EXTRA_WORDS 1
+ 
++/* CFX state scaffold. These values are architectural state, not register
++ * bank aliases; transition and dispatch semantics are deferred. */
++typedef enum DADAORunMode {
++    DADAO_RUN_MODE_USER = 0,
++    DADAO_RUN_MODE_JAIL = 1,
++    DADAO_RUN_MODE_SUPV = 2,
++    DADAO_RUN_MODE_HYPV = 3,
++} DADAORunMode;
++
++typedef enum DADAOCfxCode {
++    DADAO_CFX_CODE_SMON = 2,
++    DADAO_CFX_CODE_POWER = 63,
++} DADAOCfxCode;
++
++#define DADAO_CFX_MASK_ALL UINT64_MAX
++
++typedef struct DADAOCfxPowerFrame {
++    target_ulong prev_run_mode;
++    target_ulong prev_cfx_mask;
++    target_ulong cause_ip;
++} DADAOCfxPowerFrame;
++
+ typedef struct CPUArchState CPUDADAOState;
+ typedef struct ArchCPU DADAOCPU;
+ typedef struct DADAOCPUClass DADAOCPUClass;
+@@ -52,6 +74,10 @@ struct CPUArchState {
+     target_ulong rf[64];
+     target_ulong ra[64];
+     target_ulong pc;
++    DADAORunMode inner_run_mode;
++    DADAOCfxCode inner_cfx_code;
++    target_ulong inner_cfx_mask;
++    DADAOCfxPowerFrame cfx_power_frame;
+     /* Scratch for a pending trap (cfx) syscall, passed helper -> do_interrupt.
+        Must NOT reuse rb[1]/rb[2] — rb1 is the stack pointer (ADR-0004). */
+     target_ulong trap_cfxcode;
+-- 
+2.43.0
