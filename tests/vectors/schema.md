@@ -51,6 +51,14 @@ input_state:
       width: 8
 ```
 
+### Runtime comparison boundary
+
+The current QEMU vector runtime compares only `expected_state.rd`,
+`expected_state.rb`, and `expected_state.memory`. It does not observe or compare
+PC or RA; those fields are rejected by the binary builder rather than silently
+treated as verified. An expected fault is classified by the existing QEMU exit
+protocol and does not by itself prove the fault source or faulting PC/RA.
+
 ### class Definitions
 
 | class | expected_state | expected_fault | Purpose |

@@ -11,6 +11,61 @@ OP_STO_RR = 0x3B
 OP_HALT = 0x00
 
 
+EXPECTED_STATE_KEYS = frozenset({'rd', 'rb', 'memory'})
+REGISTER_BANKS = frozenset({'rd', 'rb'})
+
+
+def validate_expected_state(expected_state):
+    """Reject expected state fields that this runtime cannot compare."""
+    if expected_state is None:
+        return
+    if not isinstance(expected_state, dict):
+        raise ValueError('expected_state must be an object or null')
+
+    for key in expected_state:
+        if key in ('pc', 'ra'):
+            raise ValueError(
+                f"unsupported expected_state key '{key}': "
+                'runtime comparison supports only rd, rb, and memory; '
+                'PC/RA observation is not implemented'
+            )
+        if key not in EXPECTED_STATE_KEYS:
+            raise ValueError(
+                f"unsupported expected_state key '{key}': "
+                'expected rd, rb, or memory'
+            )
+
+    for bank in REGISTER_BANKS:
+        registers = expected_state.get(bank, {})
+        if registers is None:
+            registers = {}
+        if not isinstance(registers, dict):
+            raise ValueError(f'expected_state.{bank} must be an object')
+        for name in registers:
+            prefix = bank
+            suffix = name[len(prefix):] if isinstance(name, str) and name.startswith(prefix) else ''
+            if not suffix.isdigit():
+                raise ValueError(
+                    f"unsupported expected_state.{bank} key '{name}': "
+                    f'expected {bank} register name'
+                )
+            if not 0 <= int(suffix) < 64:
+                raise ValueError(f'expected_state.{bank} register out of range: {name}')
+
+    memory = expected_state.get('memory', [])
+    if memory is None:
+        memory = []
+    if not isinstance(memory, list):
+        raise ValueError('expected_state.memory must be a list')
+    for index, entry in enumerate(memory):
+        if not isinstance(entry, dict):
+            raise ValueError(f'expected_state.memory[{index}] must be an object')
+        missing = {'address', 'value'} - set(entry)
+        if missing:
+            names = ', '.join(sorted(missing))
+            raise ValueError(f'expected_state.memory[{index}] missing key(s): {names}')
+
+
 def write_rwii(out, op, reg, ww, imm16):
     imm_hi = (imm16 >> 12) & 0xF
     imm_mid = (imm16 >> 6) & 0x3F
@@ -104,6 +159,7 @@ def emit_state_compare(out, expected_state):
       If all match (rd29==0): patch with swym (NOP) → fall through to halt → PASS
       If mismatch (rd29!=0):  patch with unimp → ILLI (exit 0x82) → FAIL
     """
+    validate_expected_state(expected_state)
     rd = expected_state.get('rd', {}) if expected_state else {}
     rb = expected_state.get('rb', {}) if expected_state else {}
 
@@ -275,6 +331,7 @@ def build_branch_test_binary(case):
 
 
 def build_test_binary(case):
+    validate_expected_state(case.get('expected_state'))
     if 'branch_behavior' in case:
         return build_branch_test_binary(case)
 
