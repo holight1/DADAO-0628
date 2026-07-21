@@ -2,7 +2,7 @@
 
 **执行环境**：本地 subagent，纯调研，不写实现
 
-**状态**：Ready（30-task run：14/30）
+**状态**：Accepted（30-task run：14/30）
 
 ## 背景
 
@@ -46,4 +46,27 @@ KL-001a 的 kernel bring-up recon 发现：当前 M1 将 `ldmo-ra`/`stmo-ra` 以
 
 ## 完成区
 
-（由 worker 填写；完成后由不同 subagent 独立 review）
+### 结果
+
+- worker 报告：`docs/reviews/kernel-regras-save-restore-20260721.md`
+- 结论：当前 M1 没有可读写 RegRAS bank 的通路；K1 推荐把整 bank save/restore
+  作为独立 ISA/spec decision，优先评估 `ldmo-ra`/`stmo-ra`，不把硬件 trap
+  frame 假定为现有行为。
+- 三个 bare-metal 测试已明确标注为“contract 冻结后的验收草案”，当前 M1
+  尚不可执行；需先冻结指令、布局、初始化/读取通路及精确异常语义。
+
+### 独立 review
+
+- 首轮 reviewer：`docs/reviews/KL-105a-independent-review-20260721.md`，
+  `Needs-fix`；指出 AEE 外部要求、现行 ISA 契约、待决方案和测试可执行性
+  的边界混淆。
+- 修订后 reviewer：`docs/reviews/KL-105a-independent-review-20260721-r2.md`，
+  `Accepted`；确认上述边界已收紧，无阻断问题。
+
+### 可复核命令
+
+```bash
+nl -ba docs/reviews/kernel-regras-save-restore-20260721.md
+rg -n -i 'AEE|RegRAS|ra0|ra63|ldmo-ra|stmo-ra|rd2ra|ra2rd|M1 Excluded' \
+  contracts/isa/spec.md docs/reviews/kernel-bringup-recon-2026-07-18.md
+```
