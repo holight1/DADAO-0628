@@ -85,3 +85,13 @@ overlap/alignment checks、reverse free 和 `phase_marker`。compile/link/objcop
 **Correction：** 保留同一 exact ML-014z source/contract 和现有 ELF/traces，补存
 compile/link/objcopy rc、两端原始 rc 与 stdout/stderr/timeout、commands 及统一
 result/validation sidecars；补齐后再将 verdict 改为 Accepted。
+
+## Independent review (2026-07-21, follow-up)
+
+**Verdict：Needs-fix。** 未运行实验。af source 与 ML-014z source `cmp=0`（SHA-256
+`ed3551d57c4013779bebf147318b54a7f33ce578e9ec2a04ec71b880077d35b5`），保留
+`131052`/`262144` 双块、sentinel、对齐/非重叠、逆序 free 与 phase-marker contract；
+QEMU/gem5 均命中 `main`，且两份 trace 均无 `0x7ffffc80`/`0x7ffffcb8` wrong-target。
+但现有 `.work/ML-014af-dual-large-post-fix-runtime/` 没有两端原始 process rc、
+stdout/stderr 或 result sidecar；trace 到达最终 trap 加 source 的 `return 42`，仍不能
+独立验证 QEMU/gem5 观测值确为 `42`。补齐原始 rc 与命令/结果记录后再 Accepted。
