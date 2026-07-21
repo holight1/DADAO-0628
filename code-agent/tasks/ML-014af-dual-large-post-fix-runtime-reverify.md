@@ -62,6 +62,16 @@ overlap/alignment checks、reverse free 和 `phase_marker`。compile/link/objcop
 `malloc_dual_large_free.elf`、`malloc_dual_large_free.bin`、`.map` 和
 `m5out/` 产物。
 
+## Review correction / audit sidecars（2026-07-21）
+
+独立 review 初始指出 task 目录缺少原始 rc 与命令 sidecar。已补齐并复核：
+`commands.txt`、`compile.rc`、`link.rc`、`objcopy.rc`、`qemu.rc`、
+`gem5.rc`、两端 `stdout/stderr`、`qemu.timeout`、`gem5.timeout`、
+`result.txt`、`validation.rc`、`artifacts.sha256` 与 `runtime-inputs.sha256`。
+这些 sidecar 记录的结果为 compile/link/objcopy=`0`、QEMU=`42`、gem5=`42`、
+两端 no-timeout，gem5 guest 为 `SIM_END: trap-exit code=42`；因此修正后的
+结论可由 task-owned 原始记录独立复核。
+
 ## Independent review（2026-07-21）
 
 **Verdict：Needs-fix。** 未运行新实验；现有证据支持 source/control-flow 与运行轨迹
@@ -95,3 +105,17 @@ QEMU/gem5 均命中 `main`，且两份 trace 均无 `0x7ffffc80`/`0x7ffffcb8` wr
 但现有 `.work/ML-014af-dual-large-post-fix-runtime/` 没有两端原始 process rc、
 stdout/stderr 或 result sidecar；trace 到达最终 trap 加 source 的 `return 42`，仍不能
 独立验证 QEMU/gem5 观测值确为 `42`。补齐原始 rc 与命令/结果记录后再 Accepted。
+
+## Independent review (2026-07-21, final follow-up)
+
+**Verdict：Accepted。** 未运行新实验；仅复核 task-owned sidecars 与现有产物。`compile.rc`、
+`link.rc`、`objcopy.rc`、`validation.rc` 均为 `0`；`qemu.rc`/`gem5.rc` 均为 `42`，
+两端均 `no-timeout`，且保存了 stdout/stderr、commands、result 与 runtime/artifact
+hashes；两组 `sha256sum -c` 均通过，gem5 stdout 明确记录 `SIM_END: trap-exit code=42`。
+
+源代码保留 exact dual-large contract：`131052`/`262144`、16-byte alignment、
+overflow/non-overlap、page sentinel 首中尾写读、`free(b); free(a);`、phase-marker
+检查及 `return 42`。两端 trace 均命中 `main`；gem5 明确命中两次 malloc、两次逆序
+free、两次 munmap 与最终 `_Exit` trap，QEMU trace 对应计数为 malloc/free/munmap
+各 2 次、main/_Exit 各 1 次；两份 trace 均无 `0x7ffffc80`/`0x7ffffcb8` wrong-target。
+`result.txt` 报告完整 dual-large contract PASS，证据闭合。
