@@ -825,3 +825,47 @@ architect (fresh `ninja`/`scons` rebuilds + reruns) before commit
 Roadmap B (`vfprintf`/`vfscanf`/157-cluster libcall), C (optional
 be99→d3bd causal isolation), D (mallocng e2e / ML-014a itself), E
 (kernel) remain untouched and unblocked by this task's scope.
+
+### ML-020a complete (2026-07-22): roadmap B partial — f64 libcall names fixed, deeper CodeGen defect found
+
+`DADAOISelLowering.cpp` had never registered any f32/f64 register class
+or operation action, so DADAO had zero floating-point support. The
+first real `double` comparison in musl (`vfprintf.c`'s `printf_core`)
+hit `report_fatal_error: unsupported library call operation` — LLVM's
+new TableGen-based `RTLIB::LibcallImpl` infrastructure
+(`llvm/include/llvm/IR/RuntimeLibcalls.td`) had no entry telling it
+GNU-style soft-float libcalls (`__adddf3`, `__eqdf2`, ...) exist for the
+`dadao` triple. Fixed with a 16-line `DADAOSystemLibrary` entry mirroring
+Lanai's soft-float-only pattern (`components/llvm/patches/0047-...`,
+commit `9bb9dffdaeb7`) — no `DADAOISelLowering.cpp` changes needed,
+since not registering a float register class already routes f32/f64
+through LLVM's generic softening path once a libcall name resolves.
+
+This unblocked compilation broadly (`vfscanf.o` now compiles; musl
+fresh-build failures for the two relevant issue clusters went from 9
+combined trigger files to 103) but exposed a real, pre-existing,
+unrelated SelectionDAG glue-chain defect once floating-point code
+actually type-legalizes: any block with 2+ independent
+libcall-originated `CALL`s breaks DADAO's hand-built glue chain in
+`DADAOISelDAGToDAG.cpp` (`ScheduleDAGSDNodes` assertion — same assertion
+as the deferred 2026-07-12 `DL-063c` indirect-call investigation, though
+that specific indirect-call issue has since been independently resolved
+via a `Pat<>`-based `CALL_PSEUDO_INDIRECT`; the *direct*-call path
+(`CALL_IIII`) never got the same treatment and still hand-builds its
+`MachineNode`, which is the prime suspect). `vfprintf.o` itself still
+fails to compile on this. Recorded with full reproduction evidence
+(2-line minimal case, gdb-located faulty glue operand) in
+`docs/issues.yaml`'s `musl-backend-assert-illegal-result-number` /
+`musl-backend-assert-node-already-inserted` entries.
+
+E2E 60/60, differential AGREE=200/DIVERGE=0, manifest/issues PASS
+(architect-verified independently: rebuilt clang/llc/lld, reproduced
+both the 2-line minimal case and the `vfprintf.o` failure signature
+directly, commit `253a84f`).
+
+**Follow-up dispatched**: `ML-021a` — attempt to convert the direct-call
+path to `Pat<>`-based selection (mirroring the already-working indirect
+path) to fix the glue-chain defect. Explicitly flagged as a third
+attempt at a related class of bug (after two deferred DL-063b/c rounds)
+with permission to stop and report rather than force a low-confidence
+fix.
