@@ -46,6 +46,6 @@ musl、QEMU、Gem5 或 tracker；不修改原有未跟踪的
 - [x] 核对 30/30 worker、29/30 reviewed、tracker 未改写的状态口径。
 - [x] 核对 puts-success 阻塞、be99→d3bd isolation 未做，以及 A→E 每项的边界。
 
-最终状态：**Audit-accepted-with-findings**。artifact 计数为 30/30，独立 review 为
-30/30；tracker 原始 `29–30 Pending` 作为非阻塞同步 finding 保留。puts-success
+最终状态：**Audit-accepted-with-findings**。artifact 计数、独立 review 和主 tracker
+均已完成 30/30；review 时的原始 `29–30 Pending` 已由主 agent 集成更新。puts-success
 仍未闭合。

@@ -15,7 +15,7 @@
 |---|---:|---|
 | 文件级 worker 交付 | **30/30** | ML-016a~z、ML-017a~c 加本 ML-017d 均已有 task/report 交付 |
 | 独立 review | **30/30** | ML-016a~z、ML-017a~c 与 ML-017d 均已有独立 review；ML-017d 为 Accepted-with-findings |
-| tracker | 不改写 | `ML-016-30-task-run-20260721.md` 原有 29–30 Pending 行保留不动 |
+| tracker | 已由主 agent 集成 | review 时曾为 `29–30 Pending`；最终已补入 ML-017c/ML-017d 两行并记录独立 review 状态 |
 
 “30/30”是本 handoff 的 worker artifact 计数，不是把待 review 的 ML-017d 标成已
 独立验收；最终 task 文件明确保持“Worker completed；待独立 review”。
@@ -149,5 +149,6 @@ final d3bd object matrix 为 1166/181、stdio 为 114/116；final-head varargs �
 `docs/issues.yaml`、wiki 和原 ML-014a 未跟踪文件均保持不动。
 
 本报告对应 ML-017d 独立 review：[ML-017d-independent-review-20260721.md](ML-017d-independent-review-20260721.md)。
-review 保留两个边界：puts-success 尚未通过；tracker 原始 `29–30 Pending` 与 artifact
-30/30 是不同口径的非阻塞同步 finding。
+review 保留 puts-success 尚未通过这一边界。review 时的 tracker 同步 finding 已由主
+agent 在最终交接提交中补入 ML-017c/ML-017d 两行；当前 tracker 与 30/30 artifact/review
+口径一致。
