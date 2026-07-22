@@ -1,0 +1,32 @@
+// ML-019a: musl puts() -> __stdio_write -> SYS_writev(66) E2E marker test.
+//
+// Verifies that a real `int main(void) { puts("..."); return 42; }` program,
+// compiled with clang --target=dadao against musl headers and statically
+// linked against the real musl crt1.o/libc.a (the same 1166-member partial
+// archive musl_e2e_exit.test links against), actually produces the puts()
+// output string on stdout via musl's real buffered stdio path
+// (puts -> fputs -> __stdio_write -> syscall(SYS_writev, fd, iov, 2)) on
+// BOTH QEMU and gem5, and that FileCheck asserts the marker string itself
+// -- not just the exit code. This is exactly the gap ML-017d's
+// puts_return_bypass/PUTS_RC_ERR finding identified: rc=42 alone does not
+// prove puts() succeeded, because rc=42 comes from `return 42` regardless
+// of whether puts() silently failed with F_ERR/ENOSYS. Closing gate for
+// roadmap route A (ML-019a: cfx_smon SYS_writev(66) responder, both
+// backends).
+//
+// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O0 \
+// RUN:   -I%S/../../../.work/source/musl/arch/dadao \
+// RUN:   -I%S/../../../.work/source/musl/arch/generic \
+// RUN:   -I%S/../../../.work/source/musl/include \
+// RUN:   -I%S/../../../.work/build/musl/obj/include \
+// RUN:   -c -o %t.o %S/Inputs/musl_puts_writev.c
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld \
+// RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \
+// RUN:   -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.out
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.gout
+//
+// MARKER: DADAO_WRITEV_PUTS_OK

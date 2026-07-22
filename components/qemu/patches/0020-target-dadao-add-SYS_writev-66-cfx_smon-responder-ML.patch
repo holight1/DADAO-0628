@@ -1,0 +1,78 @@
+From cf5c06bbcf7ac0e176b7f5e52fca48868c3d03a9 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 22 Jul 2026 14:31:38 +0800
+Subject: [PATCH] target/dadao: add SYS_writev(66) cfx_smon responder (ML-019a)
+
+musl's buffered stdio write path (src/stdio/__stdio_write.c) calls
+syscall(SYS_writev, fd, iov, iovcnt), not SYS_write -- the cfx_smon
+responder only implemented case 64 (SYS_write), so puts()/fputs()/
+integer printf() all silently failed with -ENOSYS (ML-017d
+puts_return_bypass/PUTS_RC_ERR finding).
+
+Adds case 66: reads iovcnt struct iovec {void *iov_base; size_t
+iov_len;} entries (16 bytes each, big-endian per spec 2.1) from guest
+memory via the existing byte-at-a-time cpu_physical_memory_read
+pattern case 64 uses, writes each iovec's payload to stdout/stderr
+when fd is 1/2, and returns the sum of iov_len across iovecs on
+success (matching __stdio_write.c's cnt==rem full-success check).
+Unknown fd leaves ret at 0, mirroring case 64's existing behavior.
+---
+ target/dadao/cpu.c | 42 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 137ed5c..d0cbf6d 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -161,6 +161,48 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+                 ret = written;
+                 break;
+             }
++            case 66: { /* SYS_writev: fd=arg0, iov=arg1 (struct iovec *),
++                          iovcnt=arg2. struct iovec { void *iov_base;
++                          size_t iov_len; } is 16 bytes on this ABI (both
++                          fields 8-byte, no padding); memory is read
++                          big-endian per spec 2.1 data-access convention, so
++                          each 8-byte field is assembled MSB-first from the
++                          bytes at its offset -- mirrors the byte-at-a-time
++                          cpu_physical_memory_read pattern case 64 uses for
++                          the buffer bytes themselves. fd handling mirrors
++                          case 64: only fd==1/2 write and count, any other fd
++                          leaves ret at 0 (ML-019a). */
++                uint64_t fd = arg0;
++                uint64_t iov_addr = arg1;
++                uint64_t iovcnt = arg2;
++                uint64_t total = 0;
++                FILE *out = (fd == 1 || fd == 2) ? (fd == 1 ? stdout : stderr) : NULL;
++                for (uint64_t i = 0; i < iovcnt; i++) {
++                    uint64_t entry_addr = iov_addr + i * 16;
++                    uint8_t raw[16];
++                    uint64_t base = 0, len = 0;
++                    cpu_physical_memory_read(entry_addr, raw, 16);
++                    for (int k = 0; k < 8; k++) {
++                        base = (base << 8) | raw[k];
++                    }
++                    for (int k = 0; k < 8; k++) {
++                        len = (len << 8) | raw[8 + k];
++                    }
++                    if (out) {
++                        for (uint64_t j = 0; j < len; j++) {
++                            uint8_t byte;
++                            cpu_physical_memory_read(base + j, &byte, 1);
++                            fputc(byte, out);
++                        }
++                        total += len;
++                    }
++                }
++                if (out) {
++                    fflush(out);
++                }
++                ret = total;
++                break;
++            }
+             case 93: /* SYS_exit */
+             case 94: /* SYS_exit_group */
+                 qemu_system_shutdown_request_with_code(
+-- 
+2.43.0
+

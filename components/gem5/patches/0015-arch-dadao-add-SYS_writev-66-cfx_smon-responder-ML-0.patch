@@ -1,0 +1,70 @@
+From ca12f8261eb6c096d48b50ff206293f32a7d1daa Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 22 Jul 2026 14:31:41 +0800
+Subject: [PATCH] arch/dadao: add SYS_writev(66) cfx_smon responder (ML-019a)
+
+Same responder gap as the QEMU side: musl's buffered stdio write path
+uses syscall(SYS_writev, ...), which the TrapInst cfx_smon switch did
+not implement, so puts()/fputs()/integer printf() failed silently.
+
+Adds case 66 using the same SETranslatingPortProxy::tryReadBlob
+pattern case 64 uses: reads each 16-byte struct iovec {void *iov_base;
+size_t iov_len;} entry, assembles the two 8-byte fields big-endian
+(spec 2.1), and writes the payload to std::cout/std::cerr when
+fd==1/2 -- returning the sum of iov_len on success. fd handling is
+deliberately made to match the new QEMU case 66 responder exactly
+(only fd==1/2 counts; other fd leaves ret at 0) so the two backends
+stay differential-equal for writev, even though the pre-existing
+case 64 above writes to stdout unconditionally regardless of fd.
+---
+ src/arch/dadao/decoder.cc | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index e134622552..2f8191a8fd 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -661,6 +661,40 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     case 64: { uint64_t len=arg2; std::vector<uint8_t> d(len);
+       SETranslatingPortProxy(tc).tryReadBlob(arg1,d.data(),len);
+       for(uint64_t i=0;i<len;i++) std::cout.put(d[i]); ret=len; break; }
++    case 66: { /* SYS_writev: fd=arg0, iov=arg1 (struct iovec *), iovcnt=arg2.
++                  struct iovec { void *iov_base; size_t iov_len; } is 16
++                  bytes on this ABI (both fields 8-byte, no padding); memory
++                  is big-endian per spec 2.1, so each 8-byte field is
++                  assembled MSB-first from the raw bytes read via the same
++                  SETranslatingPortProxy::tryReadBlob pattern case 64 uses
++                  for the payload buffer. fd handling: only fd==1 (stdout)
++                  or fd==2 (stderr) write and count; any other fd leaves
++                  ret at 0 -- chosen to match the QEMU case 66 responder
++                  (ML-019a) so the two backends stay differential-equal for
++                  writev, even though the pre-existing case 64 above writes
++                  to stdout unconditionally regardless of fd (out of scope
++                  here, unchanged). */
++      uint64_t iovcnt = arg2;
++      uint64_t total = 0;
++      bool to_stream = (arg0 == 1 || arg0 == 2);
++      std::ostream &stream = (arg0 == 1) ? std::cout : std::cerr;
++      for (uint64_t i = 0; i < iovcnt; i++) {
++        Addr entry_addr = arg1 + i * 16;
++        uint8_t raw[16] = {};
++        SETranslatingPortProxy(tc).tryReadBlob(entry_addr, raw, 16);
++        uint64_t base = 0, len = 0;
++        for (int k = 0; k < 8; k++) base = (base << 8) | raw[k];
++        for (int k = 0; k < 8; k++) len = (len << 8) | raw[8 + k];
++        if (to_stream) {
++          std::vector<uint8_t> d(len);
++          SETranslatingPortProxy(tc).tryReadBlob(base, d.data(), len);
++          for (uint64_t j = 0; j < len; j++) stream.put(d[j]);
++          total += len;
++        }
++      }
++      ret = total;
++      break;
++    }
+     case 93: case 94: exitSimLoop("trap-exit",arg0&0xFF); return NoFault;
+     case 214: { /* SYS_brk: use the process MemState heap/VMA lifecycle. */
+       auto *process = static_cast<DADAOISA::Process *>(tc->getProcessPtr());
+-- 
+2.43.0
+
