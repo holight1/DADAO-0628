@@ -1,0 +1,75 @@
+From 9bb9dffdaeb71df61000c7487a8b6f583ea529c2 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 22 Jul 2026 15:40:51 +0800
+Subject: [PATCH] DADAO: register f32/f64 soft-float RTLIB libcalls (ML-020a)
+
+DADAOISelLowering.cpp never registered any f32/f64 register class or
+operation actions, so DADAO had no floating-point support at all. The
+first time musl code performed a `double` comparison (vfprintf.c's
+printf_core), LLVM's softenSetCCOperands legalization path tried to
+emit a standard GNU soft-float libcall (e.g. __eqdf2/__gedf2) and hit
+`report_fatal_error: unsupported library call operation`, because no
+target had ever told the new RTLIB::LibcallImpl infrastructure
+(llvm/include/llvm/IR/RuntimeLibcalls.td) that these libcalls exist
+for the dadao triple.
+
+Add a DADAOSystemLibrary entry (matching the minimal pattern used by
+other software-floating-point-only targets such as Lanai) that maps
+DefaultRuntimeLibcallImpls -- the standard GNU-style names
+(__adddf3/__eqdf2/__floatsidf/... ) -- to any triple with
+Triple::getArch() == Triple::dadao. This requires no DADAOISelLowering.cpp
+changes: DADAO registers no f32/f64 register class, so these types
+remain "illegal" and the existing generic SelectionDAG type-legalizer
+softening path picks them up automatically once a libcall name is
+available -- exactly as it does for Lanai/MSP430/plain RV32I.
+
+Verified: `report_fatal_error: unsupported library call operation` is
+completely eliminated. `vfscanf.o` (previously failing on this error)
+now compiles clean. `vfprintf.o` and roughly 100 math/complex .o files
+that previously failed on the same error now progress further into
+instruction selection/scheduling and hit a separate, pre-existing
+SelectionDAG glue-chain defect already tracked in docs/issues.yaml
+(musl-backend-assert-illegal-result-number /
+musl-backend-assert-node-already-inserted, first seen 2026-07-17/
+ML-010a, related to the deferred DL-063c indirect-call scheduler
+investigation) -- not introduced by this change, just reached far
+more often now that floating-point code type-legalizes successfully.
+
+No DADAOISelLowering.cpp/DADAOSubtarget.cpp/DADAOTargetMachine.cpp
+changes were needed; the fix is entirely in the shared, cross-target
+llvm/include/llvm/IR/RuntimeLibcalls.td (same file every other target's
+SystemRuntimeLibrary entry lives in).
+---
+ llvm/include/llvm/IR/RuntimeLibcalls.td | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/llvm/include/llvm/IR/RuntimeLibcalls.td b/llvm/include/llvm/IR/RuntimeLibcalls.td
+index e7d636841c4b..2cf373126413 100644
+--- a/llvm/include/llvm/IR/RuntimeLibcalls.td
++++ b/llvm/include/llvm/IR/RuntimeLibcalls.td
+@@ -2699,6 +2699,22 @@ def AVRSystemLibrary
+               // Trigonometric rtlib functions
+               avr_sin, avr_cos)>;
+ 
++//===----------------------------------------------------------------------===//
++// DADAO Runtime Libcalls
++//===----------------------------------------------------------------------===//
++
++// DADAO has no floating-point registers/instructions (contracts/isa/spec.md):
++// all f32/f64 arithmetic, comparison, and int<->float conversion is lowered
++// to the standard GNU-style soft-float libcalls (__adddf3, __eqdf2, etc, all
++// members of DefaultRuntimeLibcallImpls). This mirrors Lanai's minimal
++// soft-float-only SystemRuntimeLibrary entry below; DADAO does not implement
++// a stack-protector feature so __stack_chk_fail/__stack_chk_guard are
++// intentionally omitted (unlike Lanai).
++def isDADAO : RuntimeLibcallPredicate<"TT.getArch() == Triple::dadao">;
++
++def DADAOSystemLibrary
++    : SystemRuntimeLibrary<isDADAO, (add DefaultRuntimeLibcallImpls)>;
++
+ //===----------------------------------------------------------------------===//
+ // DXIL Runtime Libcalls
+ //===----------------------------------------------------------------------===//
+-- 
+2.43.0
+

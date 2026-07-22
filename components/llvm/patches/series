@@ -44,3 +44,4 @@
 0044-DADAO-Expand-i1-sign-extension.patch
 0045-DADAO-round-frame-size-to-ABI-alignment.patch
 0046-dadao-call-defs-rb31-missing.patch
+0047-DADAO-register-f32-f64-soft-float-RTLIB-libcalls.patch

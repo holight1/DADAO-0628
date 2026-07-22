@@ -234,6 +234,50 @@
   # 本类别多一个新触发文件 `src/multibyte/btowc.o`（此前一直被 `-O0` 掩盖，
   # 同一断言点，非新类别）。当前本类别共 3 个触发对象：intscan.c、
   # mallocng/donate.c、multibyte/btowc.c。
+  #
+  # ML-020a（2026-07-22，f64 soft-float libcall 注册任务）：给 DADAO 补上
+  # `RTLIB::LibcallImpl` 注册（`components/llvm/patches/0047-...patch`，
+  # `llvm/include/llvm/IR/RuntimeLibcalls.td` 新增 `DADAOSystemLibrary`）
+  # 后，`report_fatal_error: unsupported library call operation` 这个更早
+  # 的编译期错误被消除，大量此前卡在那一步的浮点相关 musl 源文件第一次真
+  # 正走到指令选择/调度阶段，本类别触发对象从 3 个暴涨到 **15 个**（新增
+  # 12 个，全部是浮点相关：`complex/__cexpf.c`、`math/atanf.c`、
+  # `math/fdimf.c`、`math/log2f.c`、`math/logf.c`、`math/sincosf.c`、
+  # `math/sincos.c`、`math/sinf.c`、`math/sin.c`、`math/tanf.c`、
+  # `math/tan.c`、**`stdio/vfprintf.c`**——即本任务的直接目标文件）。
+  #
+  # **根因定位（本任务首次给出，非猜测）**：最小 2 行复现（无 musl 依赖）：
+  # `double cmp(double a,double b){ return (a>=b)+(a==0); }`
+  # 用 `clang --target=dadao -O1`（-O0 不复现，-O1/-O2/-O3 都复现）编译，
+  # 100% 复现同一断言。gdb 定位到 `ScheduleDAGSDNodes.cpp:372`
+  # （`BuildSchedUnits` "scan up to find glued preds" 循环）：某个
+  # `CopyFromReg`（读回 libcall 返回值 `$rd31`）节点的 Glue 操作数指向了
+  # 一个只有 1 个结果值的 `ADDI_RRII`（materialize-constant）节点的 ResNo=1
+  # ——即 DADAO 手写的 `LowerCall`（`DADAOISelLowering.cpp`）在**同一基本
+  # 块出现 2 个独立的 `TargetLowering::makeLibCall` 发起的 CALL**时，产出
+  # 的 glue 链拓扑不满足 SelectionDAG "每个节点至多一个 glue 输入/输出、
+  # glue 链必须是单一线性链"的不变量。**这不是本任务引入的新 bug**——
+  # `code-agent/tasks/DL-063c-debug-indirect-call-scheduler.md`
+  # （2026-07-12，deferred，`.work/llvm` 仍有其 git stash 未清理）已经在
+  # **间接调用**场景独立撞到完全同一断言/同一崩溃点（`CALL_INDIRECT_PSEUDO`
+  # 产出 NumValues==0 的节点），三轮未解后转去做 clang 里程碑；ML-010a/
+  # ML-018a 又在**直接调用**（intscan.c 等，无间接调用）场景独立撞到第三
+  # 次。三次独立触发路径（间接调用单个 call / 直接调用两个 call / libcall
+  # 合成两个 call）指向同一个更底层缺陷：**DADAO `LowerCall` 手工构造的
+  # glue chain，在"一个基本块内有 ≥2 个独立 CALL"或"CALL 的 pseudo 节点
+  # 结果类型与调度器假设不符"这两类情形下都会破坏 glue 拓扑不变量**。
+  # 之前只在 11 个孤立文件里偶发，这次 f64 libcall 注册让"一个函数里出现
+  # 2+ 次比较/运算触发的独立 libcall"变得极其常见（几乎任何非平凡浮点代
+  # 码），才把同一个缺陷的触发面从个位数扩大到 100+ 对象。
+  #
+  # **不在本任务范围内修复**（属于"需要先想清楚再动手"的深层 CodeGen 改
+  # 动，且 DL-063c 的 subagent 已经在更窄的间接调用场景磨了 3 轮未解）。
+  # 建议架构师开一个独立、专门授权改 `DADAOISelLowering.cpp`/
+  # `DADAOISelDAGToDAG.cpp` 的任务，参照 RISC-V 的 pattern-based call
+  # selection（DL-063c 已给出具体对标指针 `RISCVInstrInfo.td` 的
+  # `PseudoCALL`/`PseudoCALLIndirect`），一次性解决三条已知触发路径共同的
+  # 根因，而不是逐文件打补丁。这是当前 roadmap B（vfprintf/vfscanf）以及
+  # 未来 gcc-c-torture 扫描（ADR-0012 D5）最大的单一已知阻断项。
 
 - id: musl-backend-assert-node-already-inserted
   title: "musl `setrlimit.c`/`res_query.c`/`vfwprintf.c` 编译时撞 ScheduleDAGSDNodes::BuildSchedUnits 断言 'N->getNodeId() == -1 && \"Node already inserted!\"'"
@@ -248,6 +292,24 @@
   # `-O0` 掩盖、非被修复；另新发现 3 个同断言点触发文件：`locale/iconv.c`、
   # `thread/pthread_mutex_consistent.c`、`thread/pthread_mutex_timedlock.c`
   # （同一断言，非新类别）。当前本类别共 6 个触发对象。
+  #
+  # ML-020a（2026-07-22）：同 `musl-backend-assert-illegal-result-number`
+  # 条目所述的 DADAO f64 libcall 注册修复（`components/llvm/patches/
+  # 0047-...patch`）之后，本类别触发对象从 6 个暴涨到 **88 个**——几乎
+  # 全部是 `src/math/*`、`src/complex/*` 浮点函数（`acos`/`asin`/`atan`/
+  # `exp`/`log`/`pow`/`sinh`/`cosh`/`hypot`/`j0`/`j1`/`jn`/`lgamma_r`/
+  # `tgamma`/`__rem_pio2`/`__expo2` 等及其 f 后缀变体，完整清单见本任务
+  # `code-agent/tasks/ML-020a-f64-softfloat-libcall-vfprintf.md` 完成区），
+  # 外加 `internal/floatscan.c`（vfscanf 依赖的浮点扫描辅助，本任务另一
+  # 目标文件 vfscanf.o 自身能编译，但它依赖的 floatscan.o 撞这个断言，
+  # 意味着 scanf 浮点路径实际仍不可用）。
+  #
+  # **根因与 `musl-backend-assert-illegal-result-number` 条目是同一个更
+  # 底层缺陷的两种断言表现**（同一 `ScheduleDAGSDNodes::BuildSchedUnits`
+  # 的 "scan up to find glued preds" 循环，372/374 两行相邻断言）——见该
+  # 条目的完整根因分析（DL-063c 间接调用 WIP + 本任务 2 行浮点比较最小复
+  # 现），不重复展开。同样建议合并到同一个独立任务里一次性处理，不要分
+  # 别打补丁。
 
 - id: musl-backend-assert-unanalyzable-fallthrough
   title: "musl `regex/glob.c`/`regex/regcomp.c` 编译时撞 MachineBlockPlacement::buildCFGChains 断言 'Unexpected block with un-analyzable fallthrough!'"
