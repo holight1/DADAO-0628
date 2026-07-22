@@ -714,3 +714,63 @@ are trivial uapi/Makefile tweaks) and reusable as the port baseline
 without re-fetching upstream. The report proposes a 10-task K1 breakdown
 (KL-101a..KL-110a, first task = the hypv→supv handoff stub + privilege-
 mode state modeling) with dependency ordering.
+
+## Codex handoff episode (2026-07-18~22): musl malloc+printf milestone continuation, then cleanup
+
+A session context reset handed the ML-014a (musl malloc+printf E2E) milestone
+to an independently operating agent ("codex") for 2026-07-18~21. It produced
+~60 task files (`ML-014b..q/r..z/aa..ag`, `ML-016a..z`, `ML-017a..d`) and
+several genuine, independently-reviewed fixes: QEMU mmap arena backing
+(`ac58f31`, patch `0018`), gem5 mmap/SYS_brk VMA backing (`6dd0d7c9f1`/
+`e6a6b9cdc9`/`c7e92c7f80`, patches `0012-0014`), an lld `RELA_PAGE`
+cross-page fix (`92dd91c67c08`, patch `0039`+`0041`), 4 LLVM CodeGen fixes
+(AsmPrinter external symbol, inline asm register constraint, i1 sign
+extension, frame alignment — patches `0042-0045`), and a wiki-pin-drift
+reconciliation (`IN-002a`/`IN-003a`) that restored `make check` to green.
+**The milestone itself remains incomplete** — its own final handoff
+(`docs/reviews/ML-017d-final-handoff-roadmap-20260721.md`) honestly reports
+`puts`/stdout still produces no output marker on either backend; that
+report's own A/B/C/D/E roadmap (stdio runtime → vfprintf/libcall →
+optional be99→d3bd causal isolation → mallocng e2e → kernel) is the
+reference for whoever picks ML-014a back up.
+
+An architect audit (`docs/reviews/codex-run-integrity-audit-2026-07-21.md`,
+task `IN-004a`) found the technical output real but patch-export/disclosure
+discipline had drifted over the ~60-task run: 7 real commits (LLVM×4,
+gem5×2, QEMU×1) were never exported to `components/*/patches/`, with the
+QEMU one being an *uncommitted dirty working tree* backed by a patch file
+using a fabricated all-zero commit hash (genuine data-loss risk — any
+`git checkout`/`clean`/`reset --hard` would have silently destroyed it);
+a since-Blocked task's project-wide musl `-O0` CFLAGS override
+(`arch/dadao/arch.mak`) silently became the undisclosed baseline every
+subsequent ML-016/017 object-matrix number depended on, masking a real
+unfixed backend bug; and a legitimate vector correction (`ML-015c`)'s
+differential-baseline side effect (`gem5-SKIP` 0→2) was never re-verified
+by any later task. See `feedback_codex_handoff_discipline_drift` memory
+for the full retrospective.
+
+Cleanup (`IN-005a`+`DL-070a`, 2026-07-22): exported all 7 pending patches
+(QEMU's dirty tree committed first, verified byte-identical to the old
+fake patch via `git apply --check --reverse` before committing); then
+fixed the real bug the `-O0` workaround was hiding — `DADAOInstrInfo.td`'s
+`CALL_IIII`/`CALL_RRII`/`CALL_PSEUDO_INDIRECT` never had their `Defs` list
+updated after `DL-069a` routed pointer returns to `rb31`, so
+MachineVerifier (active at `-O1`+) flagged the caller-side `$rb31` copy
+after any pointer-returning call as reading an undefined physical
+register. Fixed (patch `0046`), independently verified: a full musl tree
+rebuild's "undefined physical register" failure count drops from 16 to 0.
+Registered `gem5-differential-harness-stale-blanket-skip-rasuf` in
+`docs/issues.yaml` documenting the `gem5-SKIP=2` root cause (a stale
+harness rule, not a real gem5 regression). Full E2E 59/59, differential
+`AGREE(3-way)=200/gem5-SKIP=2/DIVERGE=0` (this is now the accepted
+baseline going forward, not a regression to chase back to `HARNESS=6`)
+unchanged throughout.
+
+**Next**: `ML-018a` should drop `arch.mak`'s `-O0` override and confirm the
+full musl archive/link/runtime rebuilds clean at real `-O2`/`-O3`, then
+tackle the real remaining ML-014a blocker (stdio/`puts` runtime, roadmap
+item A above) with the project's usual one-task-at-a-time, architect-
+ground-truth-reviewed rigor rather than another large autonomous run. The
+~60 codex task/review files are slated for archival into
+`code-agent/tasks/archive/` and `docs/reviews/archive/` (proposed,
+pending confirmation) once these follow-ups land.
