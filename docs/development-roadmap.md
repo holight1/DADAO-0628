@@ -792,3 +792,36 @@ alongside this task's own change, as `components/musl/patches/0007-0009`.
 runtime, roadmap item A above) with the project's usual one-task-at-a-
 time, architect-ground-truth-reviewed rigor rather than another large
 autonomous run.
+
+### ML-019a complete (2026-07-22): roadmap A (stdio/writev/stdout) closed
+
+Root cause (architect-diagnosed by reading the code directly, before
+dispatch): musl's buffered stdio write path (`__stdio_write.c`) calls
+`syscall(SYS_writev, ...)`, not `SYS_write` — but both QEMU's
+(`target/dadao/cpu.c`) and gem5's (`src/arch/dadao/decoder.cc`) cfx_smon
+syscall responder only ever implemented `case 64`
+(`write`)/`93`/`94`(exit)/`214`(`brk`)/`222`(`mmap`)/`215`(`munmap`)/`226`
+(`mprotect`); anything else, `writev`(66) included, fell through to
+`default: ret = -ENOSYS`. That is exactly why `puts`/`fputs`/integer
+`printf` returned negative with nonzero errno on both backends
+(ML-017d's blocking finding) while a raw `write()` control test worked.
+
+Fix: added a differential-equal `case 66` to both responders (16-byte
+big-endian `struct iovec` parsed with each backend's existing
+byte-read primitive, sum of `iov_len` returned on success, matching
+`__stdio_write.c`'s `cnt==rem` contract; only `fd==1/2` write/count,
+deliberately overriding gem5's pre-existing unconditional-stdout quirk
+in `case 64` so the two backends agree on `writev`). New
+`tests/lit/E2E/musl_puts_writev.test` asserts the actual output marker
+via FileCheck, not just exit code — closing the exact blind spot that
+let ML-017c's "targeted gate" pass while stdout stayed broken.
+QEMU `cf5c06b`, gem5 `ca12f826`; patches exported immediately
+(`components/qemu/patches/0020-...`, `components/gem5/patches/0015-...`).
+E2E 59→60/60 zero regression, differential AGREE=200/DIVERGE=0
+unchanged, manifest/issues PASS — all re-verified independently by the
+architect (fresh `ninja`/`scons` rebuilds + reruns) before commit
+(`3b943f7`), not just taken on the subagent's report.
+
+Roadmap B (`vfprintf`/`vfscanf`/157-cluster libcall), C (optional
+be99→d3bd causal isolation), D (mallocng e2e / ML-014a itself), E
+(kernel) remain untouched and unblocked by this task's scope.
