@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From f638e620f794b281ebe440b4775044e63bb93543 Mon Sep 17 00:00:00 2001
 From: suiyan <suiyan@sunmmio.com>
-Date: Tue, 21 Jul 2026 00:00:00 +0800
+Date: Wed, 22 Jul 2026 09:55:41 +0800
 Subject: [PATCH] target/dadao: add CFX state scaffold (KL-102b)
 
 Add per-CPU CFX mode/code/mask state and the minimal cfx_power exception
@@ -76,3 +76,4 @@ index 02f5b78..369778f 100644
      target_ulong trap_cfxcode;
 -- 
 2.43.0
+

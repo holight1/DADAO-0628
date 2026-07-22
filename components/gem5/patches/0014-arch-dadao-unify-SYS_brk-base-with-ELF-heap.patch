@@ -1,0 +1,29 @@
+From c7e92c7f804febcdfee0b8e4ac19792683a8fea5 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 17:39:52 +0800
+Subject: [PATCH 14/14] arch/dadao: unify SYS_brk base with ELF heap
+
+---
+ src/arch/dadao/process.hh | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/arch/dadao/process.hh b/src/arch/dadao/process.hh
+index e993479437..154146668f 100644
+--- a/src/arch/dadao/process.hh
++++ b/src/arch/dadao/process.hh
+@@ -24,9 +24,9 @@ class Process : public gem5::Process
+ 
+   public:
+     // Keep the DADAO user-space heap ABI used by the libc probes.  The
+-    // program image ends below this address; brk growth is backed lazily by
+-    // MemState starting at this page.
+-    static constexpr Addr BrkBase = 0x90000000ULL;
++    // linker reserves .heap through 0x87e00000, and QEMU uses the same
++    // address for SYS_brk(0); growth is backed lazily by MemState.
++    static constexpr Addr BrkBase = 0x87e00000ULL;
+     static constexpr Addr MmapArenaBase = 0x100000000ULL;
+     // DADAO effective addresses are 48-bit (contracts/isa/spec.md §1.3).
+     // Lazy SE backing does not require a pre-sized host allocation, so the
+-- 
+2.43.0
+

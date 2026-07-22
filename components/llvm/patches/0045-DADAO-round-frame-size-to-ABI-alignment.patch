@@ -1,0 +1,183 @@
+From d3bd9c15434fd7a48c0b7bab87354778cd932a72 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 21 Jul 2026 20:58:18 +0800
+Subject: [PATCH 45/45] DADAO: round frame size to ABI alignment
+
+---
+ llvm/lib/Target/DADAO/DADAOFrameLowering.cpp  | 55 ++++++++++-----
+ .../DADAO/frame-lowering-stack-alignment.ll   | 67 +++++++++++++++++++
+ 2 files changed, 106 insertions(+), 16 deletions(-)
+ create mode 100644 llvm/test/CodeGen/DADAO/frame-lowering-stack-alignment.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+index 91a002662afb..64d3dd098d9f 100644
+--- a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+@@ -7,6 +7,7 @@
+ #include "llvm/CodeGen/MachineFunction.h"
+ #include "llvm/CodeGen/MachineInstrBuilder.h"
+ #include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/Support/MathExtras.h"
+ 
+ #define GET_REGINFO_ENUM
+ #include "DADAOGenRegisterInfo.inc"
+@@ -16,16 +17,33 @@
+ 
+ using namespace llvm;
+ 
++namespace {
++
++constexpr uint64_t DADAOFrameAlignment = 8;
++
++// MFI does not include the fixed varargs register-save object in its stack
++// size.  Keep the allocation and all SP-relative references based on the same
++// rounded total.  For the varargs object itself, getFrameIndexReference below
++// places the save area below the local frame so that its final slot cannot
++// overlap a local or callee-saved object.
++uint64_t getDADAOFrameSize(const MachineFunction &MF) {
++  const MachineFrameInfo &MFI = MF.getFrameInfo();
++  uint64_t FrameSize = MFI.getStackSize();
++  const DADAOMachineFunctionInfo *DFI =
++      MF.getInfo<DADAOMachineFunctionInfo>();
++  if (DFI)
++    FrameSize += DFI->getVarArgsSaveSize();
++  return alignTo(FrameSize, DADAOFrameAlignment);
++}
++
++} // namespace
++
+ void DADAOFrameLowering::emitPrologue(MachineFunction &MF,
+                                        MachineBasicBlock &MBB) const {
+-  MachineFrameInfo &MFI = MF.getFrameInfo();
+   const DADAOInstrInfo *TII =
+       MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
+ 
+-  uint64_t StackSize = MFI.getStackSize();
+-  DADAOMachineFunctionInfo *DFI = MF.getInfo<DADAOMachineFunctionInfo>();
+-  if (DFI)
+-    StackSize += DFI->getVarArgsSaveSize();
++  uint64_t StackSize = getDADAOFrameSize(MF);
+   if (StackSize == 0)
+     return;
+ 
+@@ -39,14 +57,10 @@ void DADAOFrameLowering::emitPrologue(MachineFunction &MF,
+ 
+ void DADAOFrameLowering::emitEpilogue(MachineFunction &MF,
+                                        MachineBasicBlock &MBB) const {
+-  MachineFrameInfo &MFI = MF.getFrameInfo();
+   const DADAOInstrInfo *TII =
+       MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
+ 
+-  uint64_t StackSize = MFI.getStackSize();
+-  DADAOMachineFunctionInfo *DFI = MF.getInfo<DADAOMachineFunctionInfo>();
+-  if (DFI)
+-    StackSize += DFI->getVarArgsSaveSize();
++  uint64_t StackSize = getDADAOFrameSize(MF);
+   if (StackSize == 0)
+     return;
+ 
+@@ -63,12 +77,21 @@ StackOffset DADAOFrameLowering::getFrameIndexReference(
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
+   FrameReg = DADAO::RB1;
+ 
+-  uint64_t StackSize = MFI.getStackSize();
++  int64_t FrameSize = static_cast<int64_t>(getDADAOFrameSize(MF));
+   const DADAOMachineFunctionInfo *DFI =
+       MF.getInfo<DADAOMachineFunctionInfo>();
+-  unsigned VarSave = 0;
+-  if (DFI && FI != DFI->getVarArgsFrameIndex())
+-    VarSave = DFI->getVarArgsSaveSize();
++  if (DFI && FI == DFI->getVarArgsFrameIndex() &&
++      DFI->getVarArgsSaveSize() != 0) {
++    // The register-save area occupies the part of the rounded frame below
++    // the ordinary MFI frame.  Do not apply this adjustment when no registers
++    // need saving: then this fixed object denotes incoming stack arguments.
++    uint64_t Padding = static_cast<uint64_t>(FrameSize) -
++                       DFI->getVarArgsSaveSize() - MFI.getStackSize();
++    // The save area contains 64-bit stores, so its base must itself remain
++    // 8-byte aligned.  Rounding down leaves any residual padding above it,
++    // between the save area and the ordinary local frame.
++    FrameSize = static_cast<int64_t>(alignDown(Padding, DADAOFrameAlignment));
++  }
+ 
+-  return StackOffset::getFixed(MFI.getObjectOffset(FI) + StackSize + VarSave);
+-}
+\ No newline at end of file
++  return StackOffset::getFixed(MFI.getObjectOffset(FI) + FrameSize);
++}
+diff --git a/llvm/test/CodeGen/DADAO/frame-lowering-stack-alignment.ll b/llvm/test/CodeGen/DADAO/frame-lowering-stack-alignment.ll
+new file mode 100644
+index 000000000000..8435959324e9
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/frame-lowering-stack-alignment.ll
+@@ -0,0 +1,67 @@
++; RUN: llc -mtriple=dadao-unknown-elf -O0 < %s | FileCheck %s
++; RUN: llc -mtriple=dadao-unknown-elf -O0 -stop-after=prologepilog < %s | \
++; RUN:   FileCheck %s --check-prefix=MIR
++
++; A narrow local frame is rounded up for both SP adjustments.  The local
++; object reference also includes the padding introduced by that rounding.
++define i32 @frame_i32() {
++; MIR-LABEL: name:            frame_i32
++; MIR:          $rb1 = ADDI_RBRRII $rb1, -8
++; MIR:          $rb8 = ADDI_RBRRII $rb1, 4
++; MIR:          $rb1 = ADDI_RBRRII $rb1, 8
++; CHECK-LABEL: frame_i32:
++; CHECK:       addi rb1, rb1, -8
++; CHECK:       addi rb8, rb1, 4
++; CHECK:       stt {{rd[0-9]+}}, rb8, 0
++; CHECK:       addi rb1, rb1, 8
++  %slot = alloca i32, align 4
++  store i32 42, ptr %slot, align 4
++  %value = load i32, ptr %slot, align 4
++  ret i32 %value
++}
++
++; An already aligned frame is unchanged.
++define i64 @frame_i64() {
++; MIR-LABEL: name:            frame_i64
++; MIR:          $rb1 = ADDI_RBRRII $rb1, -8
++; MIR:          $rb1 = ADDI_RBRRII $rb1, 8
++; CHECK-LABEL: frame_i64:
++; CHECK:       addi rb1, rb1, -8
++; CHECK:       sto {{rd[0-9]+}}, rb1, 0
++; CHECK:       addi rb1, rb1, 8
++  %slot = alloca i64, align 8
++  store i64 42, ptr %slot, align 8
++  %value = load i64, ptr %slot, align 8
++  ret i64 %value
++}
++
++; A direct trap with no frame remains frame-free.
++define void @direct_trap() {
++; MIR-LABEL: name:            direct_trap
++; MIR:          stackSize:       0
++; MIR:          INLINEASM &"trap 2, 0"
++; CHECK-LABEL: direct_trap:
++; CHECK-NOT:   addi rb1, rb1
++; CHECK:       trap 2, 0
++; CHECK-NOT:   addi rb1, rb1
++  call void asm sideeffect "trap 2, 0", "~{memory}"()
++  ret void
++}
++
++; A variadic function with a small local frame has a 120-byte register-save
++; area.  Its effective frame is 128 bytes; the ordinary local/callee-saved
++; slots remain above the lower save area.
++define i32 @varargs_narrow(i32 %count, ...) {
++; MIR-LABEL: name:            varargs_narrow
++; MIR:          stackSize:       8
++; MIR:          $rb1 = ADDI_RBRRII $rb1, -128
++; MIR:          STO_RRII {{.*}}, $rb1, 0
++; MIR:          STO_RRII {{.*}}, $rb1, 112
++; MIR:          $rb1 = ADDI_RBRRII $rb1, 128
++; CHECK-LABEL: varargs_narrow:
++; CHECK:       addi rb1, rb1, -128
++; CHECK:       sto rd17, rb1, 0
++; CHECK:       sto rd{{[0-9]+}}, rb1, 112
++; CHECK:       addi rb1, rb1, 128
++  ret i32 %count
++}
+-- 
+2.43.0
+

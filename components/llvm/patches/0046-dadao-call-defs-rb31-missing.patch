@@ -1,0 +1,73 @@
+From b72d02c8a864176f6264acee4c52de717a32194b Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 22 Jul 2026 10:05:24 +0800
+Subject: [PATCH] DADAO: add RB31 to CALL Defs for pointer-return ABI (DL-070a)
+
+DL-069a routed pointer return values to rb31 (RetCC_DADAO CCIfPtr rule),
+but the CALL_IIII/CALL_RRII/CALL_PSEUDO_INDIRECT Defs list was never
+updated to match -- it still only declared RD31. MachineVerifier flags
+the caller-side COPY reading $rb31 right after the call as 'Using an
+undefined physical register' once liveness tracking is active (-O1+;
+RegAllocFast at -O0 never enables tracksLiveness(), so the gap went
+unnoticed there). This affected any -O1+ compiled call site whose callee
+returns a pointer -- including 16 real musl objects (posix_memalign.o,
+memmem.o, etc, see docs/reviews/ML-017a-post-frame-musl-object-matrix-20260721.md).
+
+RET_RIII is intentionally left unchanged: it never defines the return
+value register from the verifier's point of view (its $rdha outs operand
+is hardwired to RD0, a fixed encoding-format slot -- see expandPostRAPseudo
+in DADAOInstrInfo.cpp). The actual definition of rd31/rb31 that matters to
+the caller happens via LowerReturn's glued CopyToReg chain before RET_RIII
+executes, and the reaching-definition the verifier needs is the CALL at
+the call site, not the RET in the callee.
+---
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index fc58ecb82205..eddb6d332557 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -139,8 +139,14 @@ def RET_PSEUDO : DADAOPseudo<(outs), (ins), [(DADAORetGlue)]>;
+ // an undefined physical register" once register-liveness tracking is
+ // active (post-RA, i.e. -O1+; -O0 uses RegAllocFast and never turns
+ // tracksLiveness() on, so the bogus uses go unchecked there).
++// Defs = [RD31, RB31] (DL-070a): since DL-069a, RetCC_DADAO routes pointer
++// return values to RB31 instead of RD31 (contracts/abi/spec.md §3.1). This
++// Defs list must declare both banks' return register — the caller-side
++// COPY reading $rb31 right after this call needs a reaching definition, or
++// MachineVerifier flags "Using an undefined physical register" once
++// liveness tracking is on (-O1+, same mechanism as the Uses note above).
+ let isCall = 1,
+-    Defs = [RD31],
++    Defs = [RD31, RB31],
+     isPseudo = 1,
+     isCodeGenOnly = 1,
+     Size = 0 in
+@@ -343,10 +349,22 @@ let op = 0x65 in def JUMP_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb
+ // NOTE: no static Uses=[...] list (DL-065a) — see the identical rationale on
+ // CALL_PSEUDO_INDIRECT above; LowerCall's glued CopyToReg chain already
+ // contributes the correct per-call-site implicit-use set.
++// Defs = [RD31, RB31] (DL-070a): see the identical rationale on
++// CALL_PSEUDO_INDIRECT above — both call forms need to declare RB31 as
++// defined now that pointer return values are routed there (DL-069a).
+ let isCall = 1,
+-    Defs = [RD31] in
++    Defs = [RD31, RB31] in
+ let op = 0x6C in def CALL_IIII : F_IIII<(outs), (ins imms24:$imm24), "call $imm24", []>;
+ let op = 0x6D in def CALL_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb, imms12:$imm12), "call $rbha, $rdhb, $imm12", []>;
++// RET_RIII does NOT need RB31 in its (implicit) Defs (DL-070a analysis):
++// unlike CALL above, `ret` does not *define* a return-value register from
++// anyone's point of view that MachineVerifier tracks here. The value is
++// already placed into rd31/rb31 by LowerReturn's glued CopyToReg chain
++// before this instruction executes (see RET_PSEUDO/expandPostRAPseudo);
++// RET_RIII's own $rdha outs operand is always hardwired to RD0 (a fixed
++// encoding-format slot, not a real destination — see the RET_PSEUDO case
++// in DADAOInstrInfo.cpp). The reaching definition that matters to the
++// verifier is the CALL at the *call site*, not the RET in the callee.
+ let op = 0x6E in def RET_RIII  : F_RIII_RD<(outs GPRD:$rdha), (ins imms18:$imm18), "ret $rdha, $imm18", []>;
+ 
+ // trap (op=0x76) — ciii format: cfxcode in ha, imm18 in hb+hc+hd
+-- 
+2.43.0
+

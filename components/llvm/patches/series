@@ -39,3 +39,8 @@
 0039-dadao-rela-page-cross-page-fix.patch
 0040-dadao-large-offset-address-legalization.patch
 0041-dadao-rela-page-signed-low-rounding.patch
+0042-DADAO-Handle-external-symbols-in-AsmPrinter.patch
+0043-DADAO-Map-generic-inline-asm-registers.patch
+0044-DADAO-Expand-i1-sign-extension.patch
+0045-DADAO-round-frame-size-to-ABI-alignment.patch
+0046-dadao-call-defs-rb31-missing.patch

@@ -1,0 +1,28 @@
+From be99e5505abe341100c62d70cd955b2df7e4711e Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 21 Jul 2026 18:59:33 +0800
+Subject: [PATCH 44/45] [DADAO] Expand i1 sign extension
+
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 03d73e7e4277..ce0f74dd5fa0 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -28,6 +28,11 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::ADD, MVT::i64, Legal);
+   setOperationAction(ISD::SUB, MVT::i64, Legal);
+ 
++  // SIGN_EXTEND_INREG is queried using its inner type.  DADAO has no direct
++  // i1 sign-extension pattern; use the generic boolean expansion (mask then
++  // negate) so true becomes -1 and false remains 0.
++  setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i1, Expand);
++
+   // Legalize looks up BR_CC's action using the compared operand's type
+   // (Node->getOperand(2), i.e. LHS), not the chain type (MVT::Other) that
+   // BR_CC itself produces. i64 is DADAO's only legal integer type.
+-- 
+2.43.0
+

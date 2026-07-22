@@ -11,3 +11,5 @@
 0010-dadao-trap-syscall.patch
 0011-arch-dadao-cfx_smon-mmap-munmap-mprotect-handlers-ML.patch
 0012-arch-dadao-mmap-arena-vma-backing-ML.patch
+0013-arch-dadao-back-SYS_brk-with-MemState-VMAs.patch
+0014-arch-dadao-unify-SYS_brk-base-with-ELF-heap.patch

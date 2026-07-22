@@ -1,0 +1,74 @@
+From e6a6b9cdc952a783af3e1b66832b87a925355164 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 17:30:05 +0800
+Subject: [PATCH 13/14] arch/dadao: back SYS_brk with MemState VMAs
+
+---
+ src/arch/dadao/decoder.cc | 21 ++++++++++++++++++++-
+ src/arch/dadao/process.cc |  2 +-
+ src/arch/dadao/process.hh |  4 ++++
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 7db5a6b0e3..e134622552 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -662,7 +662,26 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+       SETranslatingPortProxy(tc).tryReadBlob(arg1,d.data(),len);
+       for(uint64_t i=0;i<len;i++) std::cout.put(d[i]); ret=len; break; }
+     case 93: case 94: exitSimLoop("trap-exit",arg0&0xFF); return NoFault;
+-    case 214: { static uint64_t brk=0x90000000; ret=(arg0==0)?brk:arg0; if(arg0)brk=arg0+0x100000; break; }
++    case 214: { /* SYS_brk: use the process MemState heap/VMA lifecycle. */
++      auto *process = static_cast<DADAOISA::Process *>(tc->getProcessPtr());
++      const Addr current = process->memState->getBrkPoint();
++
++      // Keep brk above the loaded image and below the separate DADAO mmap
++      // arena.  On failure Linux returns the unchanged break value.
++      if (arg0 == 0 || arg0 == current) {
++        ret = current;
++      } else if (arg0 < DADAOISA::Process::BrkBase ||
++                 arg0 >= DADAOISA::Process::MmapArenaBase) {
++        ret = current;
++      } else {
++        // updateBrkRegion performs page alignment, VMA conflict checking,
++        // lazy fault-in setup, and shrink/unmap handling.  If expansion
++        // collides with an existing mapping it leaves the old break intact.
++        process->memState->updateBrkRegion(current, arg0);
++        ret = process->memState->getBrkPoint();
++      }
++      break;
++    }
+     case 222: { /* SYS_mmap: fixed M1 arena with lazy VMA backing. */
+       auto *process = static_cast<DADAOISA::Process *>(tc->getProcessPtr());
+       const Addr page_size = process->pTable->pageSize();
+diff --git a/src/arch/dadao/process.cc b/src/arch/dadao/process.cc
+index b46ba72fda..1f3db65e3d 100644
+--- a/src/arch/dadao/process.cc
++++ b/src/arch/dadao/process.cc
+@@ -32,7 +32,7 @@ Process::Process(const ProcessParams &params, loader::ObjectFile *objFile)
+     const Addr stack_base = 0x00007FFFFFFFF000L;
+     const Addr max_stack_size = params.maxStackSize;
+     const Addr next_thread_stack_base = stack_base - max_stack_size;
+-    const Addr brk_point = roundUp(image.maxAddr(), PageBytes);
++    const Addr brk_point = BrkBase;
+     const Addr mmap_end = 0x4000000000000000L;
+     memState = std::make_shared<MemState>(this, brk_point, stack_base,
+             max_stack_size, next_thread_stack_base, mmap_end);
+diff --git a/src/arch/dadao/process.hh b/src/arch/dadao/process.hh
+index 09987e80e8..e993479437 100644
+--- a/src/arch/dadao/process.hh
++++ b/src/arch/dadao/process.hh
+@@ -23,6 +23,10 @@ class Process : public gem5::Process
+     Addr _mmapArenaCursor;
+ 
+   public:
++    // Keep the DADAO user-space heap ABI used by the libc probes.  The
++    // program image ends below this address; brk growth is backed lazily by
++    // MemState starting at this page.
++    static constexpr Addr BrkBase = 0x90000000ULL;
+     static constexpr Addr MmapArenaBase = 0x100000000ULL;
+     // DADAO effective addresses are 48-bit (contracts/isa/spec.md §1.3).
+     // Lazy SE backing does not require a pre-sized host allocation, so the
+-- 
+2.43.0
+

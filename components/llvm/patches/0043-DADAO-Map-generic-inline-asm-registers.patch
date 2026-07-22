@@ -1,0 +1,68 @@
+From 40bc313742b00848d341e77e1a38441211971729 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 21 Jul 2026 18:00:39 +0800
+Subject: [PATCH 43/45] [DADAO] Map generic inline asm registers
+
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp | 17 ++++++++++++++++-
+ llvm/lib/Target/DADAO/DADAOISelLowering.h   |  6 +++++-
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 088d49f6e589..03d73e7e4277 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -80,6 +80,21 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   computeRegisterProperties(STI.getRegisterInfo());
+ }
+ 
++std::pair<unsigned, const TargetRegisterClass *>
++DADAOTargetLowering::getRegForInlineAsmConstraint(
++    const TargetRegisterInfo *TRI, StringRef Constraint, MVT VT) const {
++  // DADAO has separate address (GPRB) and data (GPRD) banks, but LLVM's
++  // inline-asm constraint hook has no pointer/value provenance.  Use the
++  // allocatable data bank as the target's generic scalar "r" class; existing
++  // cross-bank copies preserve pointer values when they enter or leave asm.
++  // Narrow integer operands are extended/truncated by RegsForValue against
++  // the i64 class type, so keep the mapping width-bounded to this bank.
++  if (Constraint == "r" && VT.isInteger() && VT.getSizeInBits() <= 64)
++    return std::make_pair(0U, &DADAO::GPRDRegClass);
++
++  return TargetLowering::getRegForInlineAsmConstraint(TRI, Constraint, VT);
++}
++
+ SDValue DADAOTargetLowering::LowerCall(
+     TargetLowering::CallLoweringInfo &CLI,
+     SmallVectorImpl<SDValue> &InVals) const {
+@@ -568,4 +583,4 @@ SDValue DADAOTargetLowering::PerformDAGCombine(SDNode *N,
+     break;
+   }
+   return SDValue();
+-}
+\ No newline at end of file
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index d831382ff28a..148e75c2209e 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -52,6 +52,10 @@ public:
+   SDValue LowerCall(TargetLowering::CallLoweringInfo &CLI,
+                     SmallVectorImpl<SDValue> &InVals) const override;
+ 
++  std::pair<unsigned, const TargetRegisterClass *>
++  getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
++                               StringRef Constraint, MVT VT) const override;
++
+   SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
+ 
+   SDValue PerformDAGCombine(SDNode *N, DAGCombinerInfo &DCI) const override;
+@@ -69,4 +73,4 @@ private:
+ };
+ 
+ } // namespace llvm
+-#endif
+\ No newline at end of file
++#endif
+-- 
+2.43.0
+
