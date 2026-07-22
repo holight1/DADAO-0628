@@ -766,11 +766,29 @@ harness rule, not a real gem5 regression). Full E2E 59/59, differential
 baseline going forward, not a regression to chase back to `HARNESS=6`)
 unchanged throughout.
 
-**Next**: `ML-018a` should drop `arch.mak`'s `-O0` override and confirm the
-full musl archive/link/runtime rebuilds clean at real `-O2`/`-O3`, then
-tackle the real remaining ML-014a blocker (stdio/`puts` runtime, roadmap
-item A above) with the project's usual one-task-at-a-time, architect-
-ground-truth-reviewed rigor rather than another large autonomous run. The
-~60 codex task/review files are slated for archival into
-`code-agent/tasks/archive/` and `docs/reviews/archive/` (proposed,
-pending confirmation) once these follow-ups land.
+### ML-018a complete (2026-07-22): musl `-O0` workaround fully removed
+
+An exploratory (not foregone-conclusion) verification of whether
+`arch.mak`'s project-wide `-O0` override could be dropped now that
+DL-070a fixed the RB31 bug it was masking. Method mattered here: musl's
+`OPTIMIZE_GLOBS` forces `internal/*.c`/`malloc/*.c`/`string/*.c` to `-O3`
+regardless of `arch.mak` (clang's last `-O` flag wins), so DL-070a's own
+2 representative files were never actually protected by `-O0` — the real
+open question was the rest of the tree (`stdio/`, `stdlib/`, `unistd/`,
+etc.), stuck at `-O0` and never tested at `-O1`+ since ML-014f landed.
+Clean, serial (`-j1`) from-scratch rebuilds both with and without the
+line (parallel `-j6` builds were found to have real nondeterministic
+target-discovery gaps and were discarded) showed removing `-O0` takes
+total failures 165→176, but every one of the 11 net-new failures matches
+an already-open `docs/issues.yaml` entry discovered at real `-O2` back in
+ML-010a/ML-011a (2026-07-17, before `-O0` ever existed) — no new/unknown
+failure category appeared, and RB31 held at 0 failures across the full
+1170/1346-object sweep, confirming DL-070a's fix tree-wide. Decision:
+fully removed (not partial); also exported the two prior un-exported
+musl commits (`8ecf6f6e`, `4741d4d1`) IN-004a's audit had flagged,
+alongside this task's own change, as `components/musl/patches/0007-0009`.
+
+**Next**: tackle the real remaining ML-014a blocker (stdio/`puts`
+runtime, roadmap item A above) with the project's usual one-task-at-a-
+time, architect-ground-truth-reviewed rigor rather than another large
+autonomous run.
