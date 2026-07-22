@@ -1,0 +1,32 @@
+From 4741d4d1105849adf551a7998503866ed4f8b961 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 18 Jul 2026 15:01:36 +0800
+Subject: [PATCH 8/9] dadao: make mallocng public entry point extractable
+
+---
+ src/malloc/mallocng/malloc.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/malloc/mallocng/malloc.c b/src/malloc/mallocng/malloc.c
+index d695ab8e..9b7c5ab3 100644
+--- a/src/malloc/mallocng/malloc.c
++++ b/src/malloc/mallocng/malloc.c
+@@ -385,3 +385,15 @@ int is_allzero(void *p)
+ 	return g->sizeclass >= 48 ||
+ 		get_stride(g) < UNIT*size_classes[g->sizeclass];
+ }
++
++/*
++ * The mallocng implementation is internally namespaced through glue.h.
++ * Keep a strong public entry point in this same archive member so that a
++ * static link extracts mallocng when resolving malloc, instead of stopping
++ * at the weak lite_malloc fallback that is also present for interposition.
++ */
++#undef malloc
++void *malloc(size_t n)
++{
++	return __libc_malloc_impl(n);
++}
+-- 
+2.43.0
+

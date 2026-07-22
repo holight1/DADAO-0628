@@ -4,3 +4,6 @@
 0004-dadao-add-arch-dadao-pthread_arch.h-get_tp.s-__set_t.patch
 0005-dadao-add-crt_arch.h-arch.mak-override-__libc_start_.patch
 0006-dadao-restore-RB-bank-pointer-calling-convention-ML-.patch
+0007-dadao-build-mmap-and-mallocng-free-at-O0-for-ML-014f.patch
+0008-dadao-make-mallocng-public-entry-point-extractable.patch
+0009-dadao-drop-O0-workaround-and-optnone-attributes-ML-0.patch

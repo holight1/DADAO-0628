@@ -229,6 +229,11 @@
   # ML-010a（2026-07-17）atomic_arch.h 落地后这两个文件首次真正编译到这
   # 一步（此前被 atomic_arch.h 缺失挡住）才曝光。未做根因定位，只记录触
   # 发文件和断言文本，留给独立后端任务排查。
+  # ML-018a（2026-07-22）去掉 ML-014f 引入的全项目 `-O0` workaround 后，
+  # 全树 `make -k lib/libc.a`（干净 `-j1` 串行重建，逐对象独立复测）确认
+  # 本类别多一个新触发文件 `src/multibyte/btowc.o`（此前一直被 `-O0` 掩盖，
+  # 同一断言点，非新类别）。当前本类别共 3 个触发对象：intscan.c、
+  # mallocng/donate.c、multibyte/btowc.c。
 
 - id: musl-backend-assert-node-already-inserted
   title: "musl `setrlimit.c`/`res_query.c`/`vfwprintf.c` 编译时撞 ScheduleDAGSDNodes::BuildSchedUnits 断言 'N->getNodeId() == -1 && \"Node already inserted!\"'"
@@ -237,6 +242,12 @@
   blocks: null
   resolved_by: null
   # ML-010a（2026-07-17）同上，atomic_arch.h 解锁后新曝光，未做根因定位。
+  # ML-018a（2026-07-22）去掉 ML-014f 引入的全项目 `-O0` workaround 后，
+  # 全树 `make -k lib/libc.a`（干净 `-j1` 串行重建，逐对象独立复测）确认
+  # 本类别原 3 个触发文件（setrlimit.c/res_query.c/vfwprintf.c）确实是被
+  # `-O0` 掩盖、非被修复；另新发现 3 个同断言点触发文件：`locale/iconv.c`、
+  # `thread/pthread_mutex_consistent.c`、`thread/pthread_mutex_timedlock.c`
+  # （同一断言，非新类别）。当前本类别共 6 个触发对象。
 
 - id: musl-backend-assert-unanalyzable-fallthrough
   title: "musl `regex/glob.c`/`regex/regcomp.c` 编译时撞 MachineBlockPlacement::buildCFGChains 断言 'Unexpected block with un-analyzable fallthrough!'"
@@ -245,6 +256,10 @@
   blocks: null
   resolved_by: null
   # ML-010a（2026-07-17）同上，atomic_arch.h 解锁后新曝光，未做根因定位。
+  # ML-018a（2026-07-22）去掉 ML-014f 引入的全项目 `-O0` workaround 后，
+  # 全树 `make -k lib/libc.a`（干净 `-j1` 串行重建，逐对象独立复测）确认
+  # 本类别 2 个触发文件（glob.c/regcomp.c）确实是被 `-O0` 掩盖、非被修复，
+  # 未发现新增触发文件。
 
 - id: musl-backend-assert-instrinfo-unreachable
   title: "musl `legacy/daemon.c` 编译时撞 UNREACHABLE executed at TargetInstrInfo.h:786"
@@ -258,6 +273,9 @@
   # 一条断言位置不同的 UNREACHABLE（__unmapself.o，DADAOAsmPrinter.cpp:82），
   # 与本条不是同一断言点，单独立项，见
   # musl-backend-assert-asmprinter-unmapself。
+  # ML-018a（2026-07-22）去掉 ML-014f 引入的全项目 `-O0` workaround 后，
+  # 全树 `make -k lib/libc.a`（干净 `-j1` 串行重建，逐对象独立复测）确认
+  # daemon.c 确实是被 `-O0` 掩盖、非被修复，未发现新增触发文件。
 
 - id: musl-backend-assert-asmprinter-unmapself
   title: "musl `thread/__unmapself.o` 编译时撞 UNREACHABLE executed at DADAOAsmPrinter.cpp:82（与 legacy/daemon.c 的 TargetInstrInfo.h:786 断言点不同，独立立项）"

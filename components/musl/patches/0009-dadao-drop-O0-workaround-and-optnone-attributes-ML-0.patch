@@ -1,0 +1,128 @@
+From 9e51f0ed740b1d9194a8a751085832c715711fb3 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 22 Jul 2026 10:51:25 +0800
+Subject: [PATCH 9/9] dadao: drop -O0 workaround and optnone attributes
+ (ML-018a, DL-070a follow-up)
+
+DL-070a fixed the real backend bug (CALL_IIII/CALL_RRII/CALL_PSEUDO_INDIRECT
+Defs missing RB31) that ML-014f's project-wide -O0 override and the two
+__attribute__((optnone)) markers on mallocng/free.c and mman/mmap.c were
+working around. ML-018a exhaustively re-verified via a from-scratch serial
+make -k lib/libc.a comparison (with/without -O0, 341 individual failing
+objects reclassified by exact error signature) that removing -O0 does not
+introduce any new/unknown failure category: total failures go from 165 to
+176, but every one of the 13 newly-regressed files matches an
+already-open, already-registered docs/issues.yaml entry
+(musl-backend-assert-instrinfo-unreachable/illegal-result-number/
+node-already-inserted/unanalyzable-fallthrough) that predates ML-014f's
+-O0 (discovered at real -O2 during ML-010a/ML-011a, 2026-07-17) and was
+merely hidden as an unintended side effect of -O0. Both optnone attributes
+were independently confirmed unnecessary (both files compile clean at real
+-O2/-O3 without them). Full matrix and decision rationale in
+code-agent/tasks/ML-018a-musl-drop-O0-workaround.md.
+---
+ arch/dadao/arch.mak        | 47 ++++++++++++++++++++++++++++++++------
+ src/malloc/mallocng/free.c | 13 ++++++-----
+ src/mman/mmap.c            |  6 ++---
+ 3 files changed, 50 insertions(+), 16 deletions(-)
+
+diff --git a/arch/dadao/arch.mak b/arch/dadao/arch.mak
+index bb30715d..d70e0ea9 100644
+--- a/arch/dadao/arch.mak
++++ b/arch/dadao/arch.mak
+@@ -29,10 +29,43 @@
+ # files this task strictly needs.
+ CFLAGS_AUTO += -fno-optimize-sibling-calls
+ 
+-# ML-014f: mallocng/free.c and src/mman/mmap.c currently hit the DADAO
+-# register allocator's undefined-RB31 verifier failure at -O2.  Keep the
+-# upstream musl algorithms and syscall path unchanged, but use the portable
+-# no-optimization build mode for this early DADAO musl port until the backend
+-# issue is fixed.  This is intentionally the final CFLAGS_AUTO assignment so
+-# it overrides configure's -O2 for reproducible musl builds.
+-CFLAGS_AUTO += -O0
++# ML-018a (2026-07-22): the project-wide `CFLAGS_AUTO += -O0` workaround that
++# used to sit here (added by ML-014f/commit 8ecf6f6e, "build mmap and mallocng
++# free at O0") is REMOVED after DL-070a fixed the real backend bug it was
++# working around (DADAOInstrInfo.td CALL_IIII/CALL_RRII/CALL_PSEUDO_INDIRECT
++# Defs lists were missing RB31, so any -O1+ call to a pointer-returning
++# function tripped MachineVerifier's "Using an undefined physical register").
++#
++# ML-018a exhaustively re-verified before removing this line: a from-scratch,
++# serial (`-j1`, to avoid `-j6`'s nondeterministic target-discovery gaps)
++# `make -k lib/libc.a` was run both with this `-O0` line present and with it
++# removed, and EVERY one of the 341 individual failing objects across both
++# runs was recompiled in isolation and classified by exact error signature
++# (not just grep counts on a merged parallel-build log, which undercounts).
++# Result: with `-O0` (165 total failures): unsupported library call
++# operation=157, Cannot select: dynamic_stackalloc=7, SelectionDAG illegal
++# result number=1, undefined physical register (RB31)=0. Without `-O0` (176
++# total failures): the same three counts are 157/7/3, plus ScheduleDAGSDNodes
++# "Node already inserted!"=6, MachineBlockPlacement "un-analyzable
++# fallthrough!"=2, UNREACHABLE TargetInstrInfo.h:786=1, and undefined physical
++# register (RB31) is still 0 (DL-070a's fix holds at full-tree scale, not
++# just the 2 representative files DL-070a itself checked).
++#
++# All 13 files that regress when `-O0` is removed (daemon.c, iconv.c,
++# mallocng/donate.c, __fpclassify.c/__fpclassifyf.c, setrlimit.c, btowc.c,
++# res_query.c, regex/glob.c, regex/regcomp.c, vfwprintf.c,
++# pthread_mutex_consistent.c, pthread_mutex_timedlock.c) fail with signatures
++# that exactly match already-open, already-registered `docs/issues.yaml`
++# entries (`musl-backend-assert-instrinfo-unreachable`,
++# `musl-backend-assert-illegal-result-number`,
++# `musl-backend-assert-node-already-inserted`,
++# `musl-backend-assert-unanalyzable-fallthrough`) originally discovered at
++# real -O2 during ML-010a/ML-011a (2026-07-17), i.e. BEFORE ML-014f's `-O0`
++# ever existed -- removing `-O0` does not introduce any new/unknown failure
++# category, it simply un-masks bugs that were already known, already open,
++# and had only ever been hidden as an unintended side effect of a workaround
++# whose real target (the RB31 bug) is now fixed. 2 files (complex/cproj.c,
++# complex/cprojf.c) go the other way (fail at `-O0`, succeed at real -O2),
++# so `-O0` was not even a uniformly "safer" setting for this codebase.
++# Full before/after matrix, per-file classification, and decision rationale:
++# `code-agent/tasks/ML-018a-musl-drop-O0-workaround.md` completion section.
+diff --git a/src/malloc/mallocng/free.c b/src/malloc/mallocng/free.c
+index 4484c963..a61691fc 100644
+--- a/src/malloc/mallocng/free.c
++++ b/src/malloc/mallocng/free.c
+@@ -99,13 +99,14 @@ static struct mapinfo nontrivial_free(struct meta *g, int i)
+ }
+ 
+ /*
+- * DADAO's current register allocator can leave an undefined RB31 value in
+- * this high-optimization shape (the backend issue is outside musl's scope).
+- * Keep the real mallocng implementation and semantics, but compile this
+- * entry point without optimization so the musl static-link E2E can include
+- * its required free path until that backend issue is fixed.
++ * ML-014f (2026-07-18) had marked this function __attribute__((optnone))
++ * to dodge a DADAO register-allocator bug (CALL Defs missing RB31, causing
++ * MachineVerifier to see an undefined RB31 after a pointer-returning call).
++ * DL-070a (2026-07-22) fixed that bug at its source in DADAOInstrInfo.td;
++ * ML-018a re-verified this file compiles clean at real -O2/-O3 without
++ * optnone (see code-agent/tasks/ML-018a-musl-drop-O0-workaround.md) and
++ * removed the attribute.
+  */
+-__attribute__((optnone))
+ void free(void *p)
+ {
+ 	if (!p) return;
+diff --git a/src/mman/mmap.c b/src/mman/mmap.c
+index 608454c9..1d02b79a 100644
+--- a/src/mman/mmap.c
++++ b/src/mman/mmap.c
+@@ -11,9 +11,9 @@ weak_alias(dummy, __vm_wait);
+ #define UNIT SYSCALL_MMAP2_UNIT
+ #define OFF_MASK ((-0x2000ULL << (8*sizeof(syscall_arg_t)-1)) | (UNIT-1))
+ 
+-/* See mallocng/free.c: this is a narrow musl-side compile workaround for the
+- * current DADAO register allocator, not a replacement for the mmap syscall. */
+-__attribute__((optnone))
++/* See mallocng/free.c: the __attribute__((optnone)) workaround that used to
++ * be here (ML-014f) is removed by ML-018a after DL-070a fixed the underlying
++ * DADAO backend bug (CALL Defs missing RB31); re-verified at real -O2/-O3. */
+ void *__mmap(void *start, size_t len, int prot, int flags, int fd, off_t off)
+ {
+ 	long ret;
+-- 
+2.43.0
+
