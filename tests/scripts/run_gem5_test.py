@@ -101,6 +101,16 @@ def build_gem5_binary(case):
     # Structural abstain: jump/call/ret 'ILLI' vectors are harness artifacts
     # (jump to addr 0 → trampoline halt → ILLI), not single-instruction faults;
     # gem5 relative-jumps / RASUFs instead. Keep the 6 HARNESS cases SKIP.
+    #
+    # KNOWN STALE (docs/issues.yaml gem5-differential-harness-stale-blanket-
+    # skip-rasuf, 2026-07-22): ML-015c reclassified 2 of these 6 vectors from
+    # ILLI to a real, gem5-implemented RASUF fault, but this blanket
+    # mnemonic+expected_fault predicate was never narrowed to stop SKIPping
+    # them -- they are now real, reproducible gem5 semantics, not harness
+    # artifacts. Fix direction: key off `status == 'deferred'` (matching
+    # run_differential.py's own check) instead of re-deriving a
+    # mnemonic/fault heuristic that can drift out of sync with the vector
+    # file again.
     if case.get('mnemonic') in ('jump', 'call', 'ret') \
             and case.get('expected_fault') is not None:
         return None

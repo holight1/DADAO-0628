@@ -12,6 +12,63 @@
 # docs/issues-archive.yaml (same schema) -- day-to-day lookup/registration
 # of new issues only needs this file.
 
+- id: gem5-differential-harness-stale-blanket-skip-rasuf
+  title: "run_gem5_test.py's blanket jump/call/ret+expected_fault SKIP rule (tests/scripts/run_gem5_test.py:104-106) predates ML-015c's vector reclassification and now structurally skips 2 real RASUF vectors gem5 already implements correctly, inflating gem5-SKIP from 0 to 2 in tools/run_differential.py"
+  status: open
+  scope: [gem5, ISA, testing]
+  blocks: null
+  resolved_by: null
+  # Found 2026-07-22 during an architect ground-truth spot-check of
+  # tools/run_differential.py after a ~60-task run by an independently
+  # operating agent ("codex", 2026-07-18~21) working on the musl
+  # malloc+printf E2E milestone (ML-014a) touched an unrelated vector file.
+  # Confirmed via IN-004a's independent audit (docs/reviews/
+  # codex-run-integrity-audit-2026-07-21.md §2):
+  #
+  # - This session's stable baseline throughout was
+  #   `AGREE(3-way)=200 DIVERGE=0 HARNESS=6` (interp/QEMU/gem5) with
+  #   `AGREE(4-way)=200` (Sail). It is now
+  #   `AGREE(3-way)=200 gem5-SKIP=2 HARNESS=0` (total coverage 202, not 200).
+  # - Root cause traced to commit `b5b8c57` (task ML-015c, "align control
+  #   flow vectors with spec"): a legitimate, twice-independently-reviewed
+  #   correction to `tests/vectors/isa/control-flow.yaml` that moved 4
+  #   jump/call/ret encoding-only records from `active` to `deferred`
+  #   (correctly no longer counted anywhere) and reclassified 2 `ret`
+  #   (cold-RegRAS) records' `expected_fault` from `ILLI` to `RASUF`
+  #   (matching `contracts/isa/spec.md §5.6`) while keeping them `active`.
+  # - `tests/scripts/run_gem5_test.py:104-106` has a blanket rule dating
+  #   from the DG-004d era: any vector with
+  #   `mnemonic in (jump, call, ret) and expected_fault is not None` is
+  #   unconditionally SKIPped for gem5, because at the time all 6 such
+  #   vectors really were harness artifacts (a trampoline-halt producing a
+  #   spurious ILLI, not a real single-instruction fault) that gem5's G1
+  #   single-instruction model could not reproduce. ML-015c's 2 reclassified
+  #   RASUF vectors are now *real*, reproducible gem5 semantics -- gem5
+  #   already implements RASUF correctly (see the closed
+  #   `rasof-rasuf-exit-code-unpinned` entry in `docs/issues-archive.yaml`,
+  #   DL-057b: "architect independently reran: QEMU+gem5 each RASUF=133/
+  #   RASOF=132") -- but the blanket rule was never updated after ML-015c
+  #   landed, so these 2 vectors keep getting structurally SKIPped instead
+  #   of actually exercised.
+  # - This is NOT a real gem5 semantic regression -- it's a differential
+  #   harness adapter that fell one step behind a vector correction it
+  #   didn't need to react to at the time it was written. No task or
+  #   review file between ML-015c and this entry ever re-ran
+  #   `tools/run_differential.py` to notice the `gem5-SKIP` count change
+  #   (`grep -rl "run_differential" code-agent/tasks/ML-01[5-7]*.md
+  #   docs/reviews/ML-01[5-7]*.md` is empty), so the current
+  #   `AGREE=200/gem5-SKIP=2/HARNESS=0` composition is now the correct,
+  #   accepted baseline going forward (not a regression to chase back to
+  #   `HARNESS=6`), but the harness rule itself should be narrowed so gem5
+  #   actually exercises the 2 RASUF vectors instead of skipping them.
+  #
+  # Fix direction: narrow the blanket-skip predicate in
+  # `run_gem5_test.py:104-106` to only match the vectors that are still
+  # genuinely harness-artifact encoding-only cases (or invert the check to
+  # key off `status == 'deferred'` the same way `run_differential.py`
+  # itself already does, rather than re-deriving mnemonic/fault-based
+  # heuristics that can drift out of sync with the vector file again).
+
 - id: C-27
   title: "csn/csz/csp/cseq/csne src=dst overlap snapshot rule"
   status: open
