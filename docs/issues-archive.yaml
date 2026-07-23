@@ -908,3 +908,83 @@
   # 共用 RD bank"作为现状约定（更小改动，但需要走 ADR 变更流程，因为
   # contracts 是 wiki 的 M1 归一化投影，变更需要走既定流程而非本任务自行
   # 决定）。
+
+- id: musl-vfscanf-missing-single-precision-and-divide-softfloat-symbols
+  title: "musl vfscanf.o 间接依赖的 floatscan.o 在链接期还需要 6 个 ML-022a 双精度 shim 未覆盖的符号（f32 家族 __extendsfdf2/__floatsisf/__mulsf3/__truncdfsf2 + __divdf3/__gedf2），整数格式 scanf 尚未真正 link+跑通"
+  status: closed
+  scope: [CodeGen, libc, ABI]
+  blocks: null
+  resolved_by: "ML-025a (2026-07-23，components/musl/patches/0012-...patch)"
+  # ML-022a（2026-07-23）在实现 vfprintf 侧的 10 符号双精度 softfloat
+  # shim（src/internal/dadao/softfloat_shim.c：__adddf3/__subdf3/__muldf3/
+  # __nedf2/__eqdf2/__unorddf2/__fixdfdi/__fixunsdfdi/__floatsidf/
+  # __floatunsidf，link+双后端跑通+FileCheck 断言输出内容，见
+  # tests/lit/E2E/musl_printf_int.test）并真正解决 printf 侧的链接缺口后，
+  # 按任务要求独立验证了 scanf 侧、不假设"printf 通了 scanf 也一定通"：
+  #
+  #   scanf("%d", &x) 编译通过（clang --target=dadao -O2）后
+  #   ld.lld --static 链接 crt1.o + libc.a 报 6 个未定义符号：
+  #   __divdf3 __extendsfdf2 __floatsisf __gedf2 __mulsf3 __truncdfsf2
+  #
+  # 根因：`src/stdio/vfscanf.o` 本身不直接引用任何 double 软浮点符号，
+  # 而是引用 `__floatscan`/`__intscan`（`src/internal/floatscan.c`/
+  # `intscan.c`）；`floatscan.o` 才是真正需要软浮点支持的对象，且它需要
+  # 的符号集合比 vfprintf.o 大得多、精度族也不同：
+  #   __adddf3/__subdf3/__muldf3/__nedf2（ML-022a 已覆盖）
+  #   __gedf2（同 double 精度族的另一个比较函数，ML-022a 未覆盖，
+  #     因为链接 printf 路径时从未被报出）
+  #   __divdf3（double 除法——比 add/sub/mul 更复杂的迭代/长除法算法，
+  #     ML-022a 完全未实现除法）
+  #   __extendsfdf2/__floatsisf/__mulsf3/__truncdfsf2（全部是**单精度
+  #     f32 精度族**——float<->double 转换 + float 乘法 + int->float——
+  #     ML-022a 的 shim 完全只实现了 double(f64) 精度，没有 float(f32)
+  #     的位布局常量/算法，这是一个新的、独立的精度族，不是"再加几个同类
+  #     符号"那么简单）。
+  # `copysignl`/`fabsl`/`fmodl`/`scalbn`/`scalbnl`（floatscan.o 也引用，
+  # 见完整 `llvm-nm -u` 输出）已经由 musl 自己 `src/math/` 下已编译成功
+  # 的对象解析，不在缺口内。
+  #
+  # 范围判断：6 个符号数量本身不大（"个位数"），但引入了一个全新的精度族
+  # （f32）+ 一个 ML-022a 完全没写过的算法（除法），不是 ML-022a 那 10
+  # 个符号"发现链接期还差几个、同精度族顺手补"的延伸，按 DS-common
+  # 任务分级原则（"改动超过3行或需要先想清楚再动手→下发任务"）应该是独立
+  # 任务，未在 ML-022a 内顺手实现。ML-022a 的验收范围（printf 侧
+  # link+双后端跑通+FileCheck）已经完全达成，本条只记录 scanf 侧仍是
+  # open gap，供后续任务（f32 softfloat shim + __divdf3）参考。
+  #
+  # ML-025a（2026-07-23，本条目关闭任务）：在同一个
+  # src/internal/dadao/softfloat_shim.c 里追加了这 6 个符号，同一套
+  # 自包含位模式实现方法论（不引入 compiler-rt int_lib.h/fp_lib.h，只用
+  # rep_t/uint32_t 整数运算，不用原生 float/double 运算符）。验证链：
+  # (1) 独立 host fuzz 对拍原生硬件 float/double 运算，6 个符号共 210 万
+  # 随机+边界向量、**0 处不一致**；负控制（故意在 __gedf2/__divdf3 里
+  # 各注入一个 bug）证明 fuzz 工具真的会抓到错误，非形同虚设。
+  # (2) 独立用真实 `clang --target=dadao -O2` 单文件交叉编译，
+  # `llvm-nm -u` 确认 **0 个新增未定义符号**（`__mulsf3` 用单个 64 位
+  # rep_t 直接做 24x24-bit 宽乘法，`__divdf3` 用纯移位-减法长除法，均
+  # 刻意避开 `unsigned __int128` 除法——那会引入新的
+  # `__udivti3`/`__umodti3`-类隐藏 libcall 依赖，与 `__muldf3` 已验证过
+  # 的 `__int128` **乘法**不产生隐藏依赖是两回事）。
+  # (3) `llvm-objdump -dr` 反汇编全文核查（1042 行整个文件，非仅
+  # `nm -u`）：整个文件只有 1 处 `call` 指令（`__subdf3` 调
+  # `__adddf3`，ML-022a 既有的，非本任务新增），本任务新增的 6 个函数
+  # **零** call 指令——排除自递归风险，比"零自调用"更强（是"零调用"）。
+  # (4) `make build-musl` 全量重建：`libc.a` 成功对象数与 ML-022a 基线
+  # 完全一致（1337，源文件数不变，只是同一文件内追加函数），既有 10 个
+  # 已知失败对象（`daemon.o`/`dcngettext.o`/`res_msend.o`/
+  # `exec{le,l,lp,vp}.o`/`glob.o`/`regcomp.o`/`getcwd.o`）逐一核对
+  # 完全一致，零新增失败、零回归。
+  # (5) `scanf("%d", &x)` 最小复现：`ld.lld --static` 链接
+  # `crt1.o`+该`.o`+`libc.a` **成功**（此前 6 个未定义符号，现在 0 个）
+  # ——本条目标题承诺的链接缺口**已彻底关闭**。
+  #
+  # **新发现的运行时阻断（不属于本条目范围，已登记在
+  # `varargs-pointer-args-lost-rb-bank-save-area` 条目下）**：链接通过
+  # 后双后端实际运行 `scanf("%d", &x)` 崩溃（MALIGN），根因定位到
+  # `&x` 这个输出型指针可变实参触发已有的、独立追踪的
+  # varargs-pointer-args-lost-rb-bank-save-area 缺陷（非本任务引入、
+  # 非本任务 6 个软浮点符号的算术问题——已用
+  # `sscanf("hello","hello")`（零指针可变实参）负对照排除，纯计算复现
+  # 排除 I/O 因素）。scanf 的语义决定任何转换调用都无法绕开这个指针可
+  # 变实参，因此"scanf 双后端运行结果正确"这一验收项在该 varargs 缺陷
+  # 修复前无法达成，详见 ML-025a 完成区与 varargs 条目本身新增的记录。

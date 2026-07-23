@@ -1,0 +1,79 @@
+From 79ee086d6d99f443b3bdce184f518f914c826ca0 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 23 Jul 2026 17:18:59 +0800
+Subject: [PATCH] target/dadao: add SYS_read(63) cfx_smon responder (ML-025a)
+
+Symmetric with the existing SYS_write(64)/SYS_writev(66) responders:
+only fd==0 (stdin) is backed, any other fd leaves ret at 0 (same
+"unsupported fd -> inert" convention those cases already use). Reads
+byte-at-a-time via fgetc()/host stdin, writes each byte into guest
+memory with cpu_physical_memory_write() (mirror image of SYS_write's
+cpu_physical_memory_read()). Stops early on EOF or a genuine host
+stream error, returning the actual byte count read so far (0 on
+immediate EOF, matching POSIX read() semantics musl's stdio layer
+expects) -- does not synthesize an error for EOF.
+
+Needed because musl's __stdio_read (src/internal/dadao's musl) issues
+a plain SYS_read for the unbuffered/getc-refill case, and previously
+this backend had no SYS_read at all (fell to the default -ENOSYS
+path), so no DADAO program could read real host stdin through any
+buffered stdio path. Verified with a getchar()-based E2E probe
+(dual-backend PASS, see tests/lit/E2E/musl_stdin_getchar.test in the
+DADAO-0628 repo) -- reads back the correct byte values from real
+piped stdin.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ target/dadao/cpu.c | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index d0cbf6d..d93c29c 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -142,6 +142,42 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+             uint64_t ret = 0;
+ 
+             switch (sysno) {
++            case 63: { /* SYS_read: fd=arg0, buf=arg1, len=arg2 (ML-025a).
++                          Symmetric with case 64/SYS_write below: only
++                          fd==0 is backed (by the real host stdin FILE*),
++                          any other fd leaves ret at 0 (no bytes read) --
++                          same "unsupported fd -> inert" convention case 64/
++                          66 already use, rather than synthesizing an error.
++                          Reads byte-at-a-time via fgetc()/host stdin and
++                          writes each byte into guest memory with
++                          cpu_physical_memory_write() (the mirror-image of
++                          case 64's cpu_physical_memory_read() for the
++                          write buffer). Stops early on EOF or a read error,
++                          returning the actual number of bytes read so far
++                          (0 on immediate EOF) -- matches POSIX read()
++                          semantics musl's stdio layer expects; does not
++                          synthesize -ENOSYS/-EIO for EOF, only a genuine
++                          host ferror() is surfaced as an error to be
++                          consistent with "EOF is not an error". */
++                uint64_t fd = arg0;
++                uint64_t buf_addr = arg1;
++                uint64_t len = arg2;
++                uint64_t nread = 0;
++                bool io_error = false;
++                if (fd == 0) {
++                    for (uint64_t i = 0; i < len; i++) {
++                        int c = fgetc(stdin);
++                        if (c == EOF)
++                            break;
++                        uint8_t byte = (uint8_t)c;
++                        cpu_physical_memory_write(buf_addr + i, &byte, 1);
++                        nread++;
++                    }
++                    io_error = (nread == 0 && ferror(stdin));
++                }
++                ret = io_error ? (uint64_t)(-(int64_t)EIO) : nread;
++                break;
++            }
+             case 64: { /* SYS_write: fd=arg0, buf=arg1, len=arg2 */
+                 uint64_t fd = arg0;
+                 uint64_t buf_addr = arg1;
+-- 
+2.43.0
+

@@ -449,45 +449,27 @@
   # 两块分开），这样被调用方就不需要凭空"猜"下一个变参在哪个 bank——
   # 顺序信息已经隐含在保存区的物理布局里，和 §2.3 的解法完全对应。
 
-- id: musl-vfscanf-missing-single-precision-and-divide-softfloat-symbols
-  title: "musl vfscanf.o 间接依赖的 floatscan.o 在链接期还需要 6 个 ML-022a 双精度 shim 未覆盖的符号（f32 家族 __extendsfdf2/__floatsisf/__mulsf3/__truncdfsf2 + __divdf3/__gedf2），整数格式 scanf 尚未真正 link+跑通"
-  status: open
-  scope: [CodeGen, libc, ABI]
-  blocks: null
-  resolved_by: null
-  # ML-022a（2026-07-23）在实现 vfprintf 侧的 10 符号双精度 softfloat
-  # shim（src/internal/dadao/softfloat_shim.c：__adddf3/__subdf3/__muldf3/
-  # __nedf2/__eqdf2/__unorddf2/__fixdfdi/__fixunsdfdi/__floatsidf/
-  # __floatunsidf，link+双后端跑通+FileCheck 断言输出内容，见
-  # tests/lit/E2E/musl_printf_int.test）并真正解决 printf 侧的链接缺口后，
-  # 按任务要求独立验证了 scanf 侧、不假设"printf 通了 scanf 也一定通"：
   #
-  #   scanf("%d", &x) 编译通过（clang --target=dadao -O2）后
-  #   ld.lld --static 链接 crt1.o + libc.a 报 6 个未定义符号：
-  #   __divdf3 __extendsfdf2 __floatsisf __gedf2 __mulsf3 __truncdfsf2
-  #
-  # 根因：`src/stdio/vfscanf.o` 本身不直接引用任何 double 软浮点符号，
-  # 而是引用 `__floatscan`/`__intscan`（`src/internal/floatscan.c`/
-  # `intscan.c`）；`floatscan.o` 才是真正需要软浮点支持的对象，且它需要
-  # 的符号集合比 vfprintf.o 大得多、精度族也不同：
-  #   __adddf3/__subdf3/__muldf3/__nedf2（ML-022a 已覆盖）
-  #   __gedf2（同 double 精度族的另一个比较函数，ML-022a 未覆盖，
-  #     因为链接 printf 路径时从未被报出）
-  #   __divdf3（double 除法——比 add/sub/mul 更复杂的迭代/长除法算法，
-  #     ML-022a 完全未实现除法）
-  #   __extendsfdf2/__floatsisf/__mulsf3/__truncdfsf2（全部是**单精度
-  #     f32 精度族**——float<->double 转换 + float 乘法 + int->float——
-  #     ML-022a 的 shim 完全只实现了 double(f64) 精度，没有 float(f32)
-  #     的位布局常量/算法，这是一个新的、独立的精度族，不是"再加几个同类
-  #     符号"那么简单）。
-  # `copysignl`/`fabsl`/`fmodl`/`scalbn`/`scalbnl`（floatscan.o 也引用，
-  # 见完整 `llvm-nm -u` 输出）已经由 musl 自己 `src/math/` 下已编译成功
-  # 的对象解析，不在缺口内。
-  #
-  # 范围判断：6 个符号数量本身不大（"个位数"），但引入了一个全新的精度族
-  # （f32）+ 一个 ML-022a 完全没写过的算法（除法），不是 ML-022a 那 10
-  # 个符号"发现链接期还差几个、同精度族顺手补"的延伸，按 DS-common
-  # 任务分级原则（"改动超过3行或需要先想清楚再动手→下发任务"）应该是独立
-  # 任务，未在 ML-022a 内顺手实现。ML-022a 的验收范围（printf 侧
-  # link+双后端跑通+FileCheck）已经完全达成，本条只记录 scanf 侧仍是
-  # open gap，供后续任务（f32 softfloat shim + __divdf3）参考。
+  # ML-025a（2026-07-23，独立确认新实例，非新回归）：本任务补齐了 musl
+  # vfscanf.o 链接期缺失的 6 个 f32/除法 softfloat 符号后（见
+  # `musl-vfscanf-missing-single-precision-and-divide-softfloat-symbols`
+  # 归档条目），`scanf("%d", &x)` 首次真正编译+链接成功（0 个未定义符
+  # 号），但双后端运行时崩溃：QEMU/gem5 均在 `SIM_END`/进程退出码
+  # `129`（`0x81` MALIGN）终止。用 `sscanf("42", "%d", &x)`（纯计算，
+  # 排除一切 I/O/SYS_read 因素）复现同一崩溃；用
+  # `sscanf("hello", "hello")`（zero 个输出型指针可变实参，
+  # 无 `%` 转换符）作负对照，干净通过（`exit=42`），证明 vfscanf/
+  # intscan 解析机制本身在此目标上是健全的——崩溃 100% 由 `&x` 这个
+  # **输出型指针可变实参**触发，与本任务新增的 6 个 softfloat 符号的
+  # 算术正确性无关（后者已经过 210 万次 host fuzz 零失败 + 反汇编
+  # 全文核查零自递归独立验证，见 ML-025a 完成区）。`scanf` 的语义决定
+  # 了它的转换说明符**总是**需要至少一个输出型指针可变实参（这是
+  # `scanf` 存在的意义），所以本条目对**任意** `scanf`/`vscanf`
+  # 转换调用都是无法绕过的阻断，不是"换个格式说明符就能避开"的情形
+  # （不同于 ML-022a 的 printf 测试能靠只用 `%d`/`%u` 避开——printf 的
+  # `%d` 按值传递 `int`，不涉及指针可变实参，但 scanf 没有这种"按值"
+  # 形式）。ML-025a 因此把 `tests/lit/E2E/musl_scanf_int.test` 的验收
+  # 范围收窄为"链接成功 + 一个不使用 scanf/仅验证新增 SYS_read 基础设施
+  # 的 stdin 读取双后端测试"（`musl_stdin_getchar.test`），未按原计划
+  # 交付"scanf 双后端 PASS + FileCheck 断言解析结果"——那一项在这条
+  # varargs 缺陷修复前不可能真正做到，详见 ML-025a 完成区。

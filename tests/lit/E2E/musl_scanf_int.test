@@ -1,0 +1,59 @@
+// ML-025a: real integer-format scanf() E2E, mirroring musl_printf_int.test's
+// pipeline (real clang --target=dadao compile, real ld.lld link against
+// crt1.o + libc.a, real QEMU/gem5 dual-backend run). The RUN lines below
+// assert the INTENDED (bug-fixed) behavior of scanf("%d", &x): read "42"
+// from stdin (fed via ordinary shell stdin redirection -- there is no
+// existing lit.cfg stdin substitution to reuse, and none was needed: plain
+// `<` redirection composes fine inside the existing `bash -c '...'` RUN
+// pattern every other E2E test already uses for stdout redirection),
+// parse it, print it back, and exit with that value.
+//
+// Expected to fail (see the XFAIL directive below): this currently fails
+// on BOTH backends (QEMU and gem5 agree:
+// process exits 129 == 0x81 == MALIGN, or some other non-42 exit and/or
+// wrong stdout content, depending on exact code shape -- see below) --
+// NOT because of this task's own work (the 6 softfloat symbols
+// __extendsfdf2/__truncdfsf2/__floatsisf/__mulsf3/__divdf3/__gedf2 this
+// task added to close the link gap are independently verified correct:
+// ~2.1M host-fuzz cases against native hardware float/double arithmetic,
+// 0 mismatches, plus disassembly confirms 0 self-recursion and 0 new
+// undefined-symbol dependencies -- see docs/issues-archive.yaml's closed
+// `musl-vfscanf-missing-single-precision-and-divide-softfloat-symbols`
+// entry). Root cause is the separate, pre-existing, already-tracked
+// `varargs-pointer-args-lost-rb-bank-save-area` bug (docs/issues.yaml):
+// `&x` is an output-type pointer passed as scanf's variadic argument, and
+// LLVM's varargs save-area prologue only spills the RD register bank,
+// never the RB bank a pointer argument actually lives in, so va_arg reads
+// back garbage instead of the real address. This is unavoidable for ANY
+// scanf()/vscanf() call with a conversion specifier (unlike printf's %d,
+// which passes an int by value and has no pointer-vararg involved at all
+// -- see musl_printf_int.test, which is why THAT test could dodge this gap
+// by sticking to integer format specifiers, but scanf has no equivalent
+// "pass by value" form to dodge to). Confirmed via an isolated negative
+// control: sscanf("hello", "hello") (zero pointer varargs, no conversion
+// specifiers) runs clean on both backends, proving vfscanf/intscan parsing
+// itself is sound and the fault is 100% attributable to the pointer
+// vararg.
+//
+// This test is intentionally kept (not deleted/skipped) so it flips to an
+// unexpected pass -- and demands attention -- the day the
+// varargs-pointer-args-lost-rb-bank-save-area fix lands.
+// XFAIL: *
+//
+// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O2 \
+// RUN:   -I%S/../../../.work/source/musl/arch/dadao \
+// RUN:   -I%S/../../../.work/source/musl/arch/generic \
+// RUN:   -I%S/../../../.work/source/musl/include \
+// RUN:   -I%S/../../../.work/build/musl/obj/include \
+// RUN:   -c -o %t.o %S/Inputs/musl_scanf_int.c
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld \
+// RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \
+// RUN:   -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: echo 42 > %t.stdin
+// RUN: bash -c '%qemu -M dadao-m1 -display none -nodefaults -bios %trampoline -kernel %t.bin < %t.stdin > %t.out 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.out
+// RUN: bash -c '%gem5 %gem5_se %t.elf < %t.stdin > %t.gout 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.gout
+//
+// MARKER: got=42

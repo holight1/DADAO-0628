@@ -1,0 +1,37 @@
+// ML-025a: real stdin-read E2E, both backends. Validates the SYS_read(63)
+// cfx_smon responder this task added to both QEMU (target/dadao/cpu.c) and
+// gem5 (arch/dadao/decoder.cc) -- previously neither backend implemented
+// SYS_read at all (any read(2) syscall fell to the default -ENOSYS path),
+// so no DADAO program could ever read real host stdin. Deliberately uses
+// getchar() rather than scanf() to avoid the separate, pre-existing
+// varargs-pointer-args-lost-rb-bank-save-area bug that blocks
+// musl_scanf_int.test (XFAIL, see that file) -- this test exists to prove
+// the new SYS_read host<->guest plumbing itself is correct, independent of
+// that unrelated, still-open blocker.
+//
+// QEMU needs `-display none -nodefaults` instead of the `-nographic` other
+// E2E tests use: this DADAO machine model has no UART/serial chardev at
+// all (cfx_smon is the only host I/O path), so with no other console
+// requested, `-nographic`'s default monitor binds itself to the process's
+// stdio and consumes redirected stdin as monitor commands instead of
+// letting the guest's SYS_read see it. `-nodefaults` suppresses that
+// default monitor so host stdin passed via ordinary shell `<` redirection
+// reaches the new cfx_smon SYS_read handler undisturbed.
+//
+// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O2 \
+// RUN:   -I%S/../../../.work/source/musl/arch/dadao \
+// RUN:   -I%S/../../../.work/source/musl/arch/generic \
+// RUN:   -I%S/../../../.work/source/musl/include \
+// RUN:   -I%S/../../../.work/build/musl/obj/include \
+// RUN:   -c -o %t.o %S/Inputs/musl_stdin_getchar.c
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld \
+// RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \
+// RUN:   -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: echo -n 42 > %t.stdin
+// RUN: bash -c '%qemu -M dadao-m1 -display none -nodefaults -bios %trampoline -kernel %t.bin < %t.stdin > %t.out 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.out
+// RUN: bash -c '%gem5 %gem5_se %t.elf < %t.stdin > %t.gout 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.gout
+//
+// MARKER: c1=52 c2=50

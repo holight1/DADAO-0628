@@ -1,0 +1,76 @@
+From 62c1264698c554bada9fe52bfd684794437575fe Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 23 Jul 2026 17:19:33 +0800
+Subject: [PATCH] arch/dadao: add SYS_read(63) cfx_smon responder (ML-025a)
+
+Symmetric with the existing SYS_write(64)/SYS_writev(66) responders:
+only arg0==0 (stdin) is backed, any other fd leaves ret at 0 (same
+"unsupported fd -> inert" convention those cases already use). Reads
+byte-at-a-time from the real host std::cin, writes the bytes into
+guest memory in one shot via SETranslatingPortProxy::tryWriteBlob (the
+mirror image of SYS_write's tryReadBlob for the write buffer). Stops
+early on EOF, returning the actual byte count read so far (0 on
+immediate EOF, matching POSIX read() semantics musl's stdio layer
+expects) -- only a genuine std::cin.bad() stream failure is surfaced
+as an error, not EOF.
+
+Needed for the same reason as the matching QEMU-side change
+(DADAO-0628 components/qemu/patches/0022): musl's __stdio_read issues
+a plain SYS_read for the unbuffered/getc-refill case, and this backend
+previously had no SYS_read at all. Verified with a getchar()-based E2E
+probe (dual-backend PASS against QEMU, see
+tests/lit/E2E/musl_stdin_getchar.test in the DADAO-0628 repo) -- reads
+back the correct byte values from real piped stdin.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ src/arch/dadao/decoder.cc | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 2f8191a8fd..08266226b3 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -658,6 +658,39 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     uint64_t arg2  = tc->getReg(intRegId(RD_BASE + 19));
+     uint64_t ret = 0;
+     switch (sysno) {
++    case 63: { /* SYS_read: fd=arg0, buf=arg1, len=arg2 (ML-025a). Symmetric
++                  with case 64/SYS_write below: only fd==0 (stdin) is
++                  backed, any other fd leaves ret at 0 -- same
++                  "unsupported fd -> inert" convention case 64/66 already
++                  use. Reads byte-at-a-time from the real host std::cin and
++                  writes the bytes into guest memory in one shot via
++                  SETranslatingPortProxy::tryWriteBlob (the mirror image of
++                  case 64's tryReadBlob for the write buffer). Stops early
++                  on EOF, returning the actual number of bytes read so far
++                  (0 on immediate EOF) -- matches POSIX read() semantics
++                  musl's stdio layer expects; does not synthesize
++                  -ENOSYS/-EIO for EOF, only a genuine stream failure
++                  (std::cin.bad()) is surfaced as an error, consistent with
++                  "EOF is not an error". */
++      uint64_t len = arg2;
++      uint64_t nread = 0;
++      bool io_error = false;
++      if (arg0 == 0) {
++        std::vector<uint8_t> d(len);
++        for (; nread < len; nread++) {
++          int c = std::cin.get();
++          if (c == std::char_traits<char>::eof())
++            break;
++          d[nread] = (uint8_t)c;
++        }
++        if (nread == 0 && std::cin.bad())
++          io_error = true;
++        else if (nread)
++          SETranslatingPortProxy(tc).tryWriteBlob(arg1, d.data(), nread);
++      }
++      ret = io_error ? (uint64_t)(-(int64_t)5 /* EIO */) : nread;
++      break;
++    }
+     case 64: { uint64_t len=arg2; std::vector<uint8_t> d(len);
+       SETranslatingPortProxy(tc).tryReadBlob(arg1,d.data(),len);
+       for(uint64_t i=0;i<len;i++) std::cout.put(d[i]); ret=len; break; }
+-- 
+2.43.0
+
