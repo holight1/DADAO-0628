@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent
 
-**状态**: 待处理
+**状态**: 已完成
 
 ## 硬约束（务必遵守，违反视为任务失败）
 
@@ -157,3 +157,102 @@ int main(void) {
 - `.work/build/musl/lib/{crt1.o,libc.a}`（`make build-musl` 重新生成）
 - `tests/scripts/dadao.ld`（链接脚本，架构师踩过"不加这个链接失败"的坑，
   必须用它）
+
+## 完成区
+
+**状态**：已完成
+
+**独立复现**（不采信架构师的转述，自己重新编译/链接/跑）：
+
+- 用架构师给出的样例源码，重新 `clang --target=dadao -O2 -nostdinc -ffreestanding
+  -c` → `ld.lld -T tests/scripts/dadao.ld --start-group crt1.o <obj> libc.a
+  --end-group` → `objcopy -O binary`，QEMU 与 gem5 双后端独立跑：均 `exit=42`，
+  stdout 含 `MALLOC_CHAIN_OK`。与架构师转述结果一致，但是本任务独立重跑得出，
+  非采信。
+
+**mmap 真实触发的判别性证据**（不满足"只信程序跑通了"）：
+
+- 写了一个独立探针（非交付物，`/tmp` scratch），在两次 malloc 之间手写十六进制
+  打印函数（不用 `printf %p`/`%s`，规避已知 `varargs-pointer-args-lost-rb-bank
+  -save-area` 缺口）打印返回指针：QEMU 上第一次 `malloc(131052)` 返回
+  `0x100000010`，第二次 `malloc(262144)` 返回 `0x100021030`。两者均落在
+  `ML-007a` 建立的专用 mmap arena（`0x100000000` 起，QEMU `target/dadao/cpu.c`
+  `DADAO_MMAP_ARENA_BASE`）内，且第二个地址严格大于第一个（差 `0x21020` 字节，
+  量级与两次 `mmap(length≈131072/266240)` 页对齐推进吻合），非同一地址、非几
+  字节量级的小差异——排除"总返回同一固定地址"和"落在普通 slab 池/heap 区"两
+  种假阳性。
+- 负控制：单独 `malloc(8)`（远低于 `MMAP_THRESHOLD=131052`）在当前 HEAD 上直接
+  返回 `NULL`（QEMU 与 gem5 独立复测一致；gem5 侧后续访问会 `MALIGN` 硬故障，
+  exit=129）——这是一个**与本任务无关、超出范围的既存缺口**（size-class slab
+  池路径，本里程碑从设计上就只用 `>=MMAP_THRESHOLD` 的分配规避它，原始
+  ML-014a 任务文字本身就是这么定的）。已 grep 确认 `docs/issues.yaml`/
+  `docs/issues-archive.yaml` 均无相关登记条目，如实报告给架构师，**未自行创建
+  issue 登记**（不确定是否要单独立项，交由架构师判断）。
+
+**正式 lit 测试**：新增 `tests/lit/E2E/Inputs/musl_malloc_printf.c` +
+`tests/lit/E2E/musl_malloc_printf.test`（管线范式对齐 `musl_printf_int.test`）。
+
+**全量回归**（落地后）：
+- `llvm-lit tests/lit/E2E/` → **63/63**（基线 62 + 本任务新增 1，零回归）。
+- `python3 tools/run_differential.py` → **AGREE(3-way)=200/AGREE(4-way)=200/
+  DIVERGE=0**，与基线完全一致（本任务不涉及 ISA 语义改动）。
+- `python3 scripts/manifest_check.py` → PASS。
+- `python3 scripts/check_issues.py` → PASS（Open=23/Closed=34）。
+
+**issues.yaml 核查**：grep `docs/issues.yaml`/`docs/issues-archive.yaml` 未
+发现任何登记 `0x90001000`/`exit=13`/`exit=14`/`ML-014m/n/o/p` 的条目——ML-014m
+那次卡点从未被登记成正式 issue（如架构师所料，只记在任务文件完成区/report.md
+里），**无需关闭任何 issue 条目**。
+
+**未改动 LLVM/QEMU/gem5 任何源码**——符合任务预期（当前 HEAD 已含全部前置修
+复，本任务纯粹是验证 + 测试固化）。
+
+**修改文件**：
+- 新增 `tests/lit/E2E/Inputs/musl_malloc_printf.c`
+- 新增 `tests/lit/E2E/musl_malloc_printf.test`
+- 更新 `code-agent/tasks/ML-014a-musl-e2e-malloc-printf.md`（状态改为已完成，
+  见该文件完成区）
+- 本任务文件（`code-agent/tasks/ML-023a-mallocng-e2e-real-completion.md`）
+
+**遗留问题**：
+- **发现但超出本任务范围**：`malloc(8)`（size-class 小分配路径）在当前 HEAD
+  上单独调用即返回 `NULL`（QEMU），gem5 侧后续访问 `MALIGN` 故障 exit=129。与
+  历史 `0x90001000` brk/VMA 问题（地址区间、exit 码、触发机制均不同）是**不同
+  的缺口**，未登记 issue，需架构师判断是否拆分独立任务追查（本任务/
+  ML-014a 里程碑均不依赖这条路径，不阻塞两者验收）。
+
+## 审阅记录（subagent）
+
+**执行方式**：本任务由架构师直接调度的 subagent 执行（非 DS 走 DS.md 常规流
+程），按项目"任何代码改动前必须走独立 subagent review"的硬性要求，另开一个
+独立 subagent 做了不采信本 subagent 转述的复核（该 subagent 自己重新编译/
+链接/跑，未读本 subagent 的任何中间产物结论）。
+
+**独立 review subagent 报告的 10 项核验**（见其完整报告，摘要如下）：
+
+1. 任务文件通读 ✓；2. 新增两文件 RUN 行与 `musl_printf_int.test` 结构一致 ✓；
+3. 独立跑 `musl_malloc_printf.test` → PASS ✓；4. 独立跑全量 E2E → 63/63，零
+回归 ✓；5. 独立跑差分 → AGREE(3-way)=200/AGREE(4-way)=200/DIVERGE=0，与基线
+一致 ✓；6. 独立写探针复现 mmap 地址证据（QEMU 第二次分配 `0x100021030`，
+gem5 侧因 mallocng 内部 metadata-area mmap 触发时机差异得到 `0x100020030`——
+两者均在 arena 内、均单调递增，核心证据在两后端独立成立，仅引用注释里"精确
+差值 0x21020"这句话是 QEMU 专属、非跨后端不变量，判定为文档措辞层面的小
+瑕疵、非缺陷）✓；7. 独立 grep 确认无 `0x90001000`/`exit=13/14`/ML-014m-p 相关
+issue 登记 ✓；8. 逐条核对 ML-014a 原始验收标准 ✓（除下条发现的缺陷外全部
+满足）；9. **发现真实缺陷**：`check_block` 用普通 `char *`，在 `-O2` 下 LLVM
+通过 store-to-load forwarding 证明"同一次调用内读到的值必等于刚写入的值"，
+把几乎全部读回校验（IR 里只剩 1 条真实 `load`，`return 12` 分支在编译产物里
+死代码/不可达）折叠成编译期常量 `true`——如果历史那类"mmap 区间实际未真实
+支持读写"的 bug 复发但只影响 block 1 或边界字节，本测试仍会通过，起不到应有
+的判别作用；10. 归档 ML-014m/n/o/p 的历史叙述与本任务因果推断（4 个后续修复
+共同解锁）无矛盾 ✓。
+
+| finding | 处置 | 改了什么 | 复验证据 |
+|---|---|---|---|
+| #9 `check_block` 在 `-O2` 下几乎全部读回检查被 store-to-load forwarding 折叠成编译期常量，`return 12` 路径死代码/不可达，起不到"验证内容正确性"的判别作用 | ✅已修 | `Inputs/musl_malloc_printf.c` 的 `check_block` 改为通过 `volatile char *vp` 读写（写循环+两个边界字节+读循环+两个边界读全部经 `vp`），并在 `.test` 文件引用注释里记录原因 | 独立重新生成 `-O2` LLVM IR：修复前只有 1 条 `load`（`grep -c "= load"`=1），修复后 37 条 `load`；`return 12` 的 phi 分支在修复后重新出现在 IR 里（`cleanup14` 的 `[ 12, %check_block.exit ]` 等分支），确认可达；负控制（故意把 `p[1]` 期望值改错）独立编译/链接/跑 QEMU，得到 `exit=12`（而非误报 42），证明检查确实起作用而非恒真；修复后重新双后端跑通 `exit=42`+`MALLOC_CHAIN_OK`（QEMU 与 gem5 均确认）；全量回归重新核对：`llvm-lit tests/lit/E2E/`=63/63、`run_differential.py`=AGREE(3-way)=200/AGREE(4-way)=200/DIVERGE=0、`manifest_check.py`/`check_issues.py` 均 PASS |
+| 引用注释里"QEMU/gem5 两后端地址差值均为 0x21020"的表述是 QEMU 专属，gem5 因 metadata mmap 触发时机不同实际得到不同的具体差值 | ✅已修 | `.test` 文件引用注释改为只断言"两后端均单调递增、均落在 arena 内"，不再声称跨后端字节级差值一致 | 复核后的注释文字不再包含该项过度具体化的声称 |
+| `malloc(8)`（size-class 路径）在当前 HEAD 单独调用返回 `NULL`，gem5 后续访问 `MALIGN` 故障 exit=129 | ⏸延后（超出本任务范围） | 本任务/ML-014a 均只要求 `>=MMAP_THRESHOLD` 的直接 mmap 路径，未改动任何代码 | 已如实记入本任务"遗留问题"，交架构师判断是否拆分独立任务；未登记 issues.yaml（不确定分类/scope，避免猜测） |
+
+**判决**：**通过（PASS-WITH-CAVEATS → 按 finding #9 已修复后应为通过）**。
+finding #9 是真实缺陷，已按处置修复并复验；finding #10（引用注释措辞）已修
+正；`malloc(8)` 缺口已如实记入遗留、不阻塞本任务/ML-014a 验收。

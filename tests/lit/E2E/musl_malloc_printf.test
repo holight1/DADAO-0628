@@ -1,0 +1,50 @@
+// ML-023a: formalizes ML-014a, musl's second E2E milestone -- a real
+// mallocng malloc()/write/read-back/free chain (two different sizes, both
+// >= MMAP_THRESHOLD=131052 so both go through the real mmap(222) path, not
+// the size-class slab pool) followed by a real puts() through musl's
+// buffered stdio -> SYS_writev(66) path, on BOTH backends. This is the exact
+// scenario that stayed blocked from 2026-07-18 through ML-014f/j/m/n/o/p
+// (gem5 page-table fault at 0x90001000, QEMU exit 13/14 on the follow-up
+// pointer/read-back probes) until four independently-landed fixes unblocked
+// it: DL-070a (CALL Defs missing RB31), ML-018a (musl -O0 workaround
+// removal), ML-019a (SYS_writev responder), and ML-021a (ISD::CALLSEQ_START/
+// END glue-chain fix -- mallocng's allocator makes several consecutive calls
+// within one basic block, exactly the pattern ML-021a's bug hit).
+//
+// See Inputs/musl_malloc_printf.c for the full history/citation comment and
+// code-agent/tasks/ML-014a-musl-e2e-malloc-printf.md's completion notes for
+// the address-level verification that this really is the mmap path (not the
+// slab pool): the two allocations' returned pointers both land inside the
+// dedicated mmap arena (0x100000000-based, ML-007a) with the second address
+// strictly greater than the first by an amount consistent with the
+// page-aligned bump-allocator cursor advancing (not reused, not identical;
+// the exact byte gap differs slightly between QEMU and gem5 because of an
+// intervening mallocng metadata-area mmap call, but both backends show
+// monotonic, page-scale advancement within the arena).
+//
+// Inputs/musl_malloc_printf.c's check_block reads the block back through a
+// `volatile char *` -- see that file's header comment for why: a plain
+// `char *` lets LLVM's -O2 store-to-load forwarding prove the read-back
+// always matches the just-written value and fold nearly the whole check to
+// a compile-time constant, which an independent subagent review caught
+// (only 1 real `load` in the whole -O2 IR, `return 12` unreachable). The
+// `volatile` fix was independently verified to restore genuine per-check
+// loads (37 in the -O2 IR) and a negative-control build (deliberately wrong
+// expected value) was confirmed to make the test fail rather than pass.
+//
+// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O2 \
+// RUN:   -I%S/../../../.work/source/musl/arch/dadao \
+// RUN:   -I%S/../../../.work/source/musl/arch/generic \
+// RUN:   -I%S/../../../.work/source/musl/include \
+// RUN:   -I%S/../../../.work/build/musl/obj/include \
+// RUN:   -c -o %t.o %S/Inputs/musl_malloc_printf.c
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld \
+// RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \
+// RUN:   -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.out
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.gout
+//
+// MARKER: MALLOC_CHAIN_OK
