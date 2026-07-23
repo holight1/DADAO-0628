@@ -117,3 +117,42 @@ gcc-c-torture/execute/`，含 `builtins/`、`ieee/` 两个子目录），手写 
   其它前端严格性4/no-main companion 32/TIMEOUT 8）作为分类命名参考，但**本项目的
   实际分布大概率不同**（前端支持程度、musl 完整度都不一样），不要假设数字会一致，
   必须实测。
+
+## 完成区
+
+**状态**：已完成
+**修改文件**：
+- 新增 `tests/scripts/gcc_torture_sweep.py`（可重复运行的批量扫描/分类/报告生成脚本，
+  支持 `--retest-timeouts`、`--gem5-crosscheck`、`--report` 子模式）
+- 新增 `docs/reviews/ML-026a-gcc-c-torture-sweep-2026-07-24.md`（分类报告）
+- **未改动任何 backend/musl/LLVM/QEMU/gem5/contracts 源码**（符合硬约束）
+
+**验收结果**：
+- 全量 1708 个 `.c` 文件真实跑通 clang→ld.lld→objcopy→QEMU 管线（~16s，8 并发）；
+  1 个 TIMEOUT 用 60s 复测仍未结束，额外独立跑 gem5 SE 复现同样挂起（两个独立实现
+  一致）；49 个 FAIL_RUN 全部按 D2 决策额外做了 gem5 交叉确认。
+- PASS=1328(77.8%) / FAIL_COMPILE=113(6.6%) / FAIL_LINK=217(12.7%) / FAIL_RUN=49(2.9%)
+  / TIMEOUT=1。
+- 逐一核实：FAIL_COMPILE 113 个里 84 个（74.3%）与 upstream `execute/CMakeLists.txt`
+  自带的分类清单**逐文件精确匹配**（nested_function 29/29、vla_in_struct 8/8、
+  return_type 3/3、gnu89-inline 12/12 等），29 个是真实 DADAO 后端候选缺陷
+  （VLA dynamic_stackalloc 9、无向量类型 legalize 11、`__int128` CallingConv 6、
+  BlockAddress 3）。FAIL_LINK 217 个里 123 个可解释（companion-no-main 105、
+  gnu89-inline 12、GCC 专有 builtin 3、-O0 下 `link_error` 死代码消除失效 2、
+  setjmp/longjmp 1），94 个是候选缺陷（单精度/双精度顺序比较软浮点符号缺失 92
+  个文件——本次最大单一可行动发现；大常量地址计算被错误编码进短范围 relocation
+  2 个文件）。FAIL_RUN 49 个里发现一个高价值方法论问题：`-ffreestanding` 会关闭
+  clang 对"main 隐式 return 0"的插入（C11 hosted-only 保证），实测确认至少 12
+  个 `unexpected_exit_1` 用例纯粹是这个 flag 副作用（去掉 `-ffreestanding` 全部
+  变为真实 PASS），非 DADAO 缺陷；另发现变参传小 struct 实参（12 个文件，与
+  DL-072a 同一 ABI 区域但不同子问题）、`nestfunc-4.c` 深递归触发真实 RASOF
+  硬件异常（架构级发现：当前无 RAS-spill-to-stack 机制）等候选。
+- 报告含完整文件名清单（每个分类）、根因判断、9 条按优先级排序的建议后续任务、
+  §8 回归门禁声明（未跑，因未改动生产代码，不适用）。
+
+**遗留问题**：
+- 本次全程 `-O0`，未做 `-O2` 复扫（见报告 §6 建议 11），gcc-c-torture 里部分
+  用例专门检验优化器正确性，`-O0` 下这类检验的意义有限，是最大的已知覆盖缺口。
+- 报告列出的候选缺陷（软浮点符号缺失/relocation 范围/VLA/`__int128`/向量
+  legalize/RASOF 架构问题/变参 struct 实参）均未修复，按任务定位等待架构师/
+  用户决定下一步立项顺序。
