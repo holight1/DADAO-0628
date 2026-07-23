@@ -46,3 +46,4 @@
 0046-dadao-call-defs-rb31-missing.patch
 0047-DADAO-register-f32-f64-soft-float-RTLIB-libcalls.patch
 0048-DADAO-fix-ISD-CALLSEQ_START-END-glue-linkage-bug-ML-.patch
+0049-dadao-mc-immediate-range-validation.patch

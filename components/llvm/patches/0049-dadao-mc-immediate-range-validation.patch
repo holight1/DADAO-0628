@@ -1,0 +1,349 @@
+From 72cb112b4c1eb4f00cb8e8facc78e5185edb1244 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 23 Jul 2026 15:26:04 +0800
+Subject: [PATCH] DADAO: diagnose out-of-range MC immediates
+
+---
+ .../Target/DADAO/AsmParser/DADAOAsmParser.cpp | 84 ++++++++++++-------
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       | 39 ++++++++-
+ llvm/test/MC/DADAO/immediate-range-invalid.s  | 57 +++++++++++++
+ llvm/test/MC/DADAO/immediate-range-valid.s    | 49 +++++++++++
+ 4 files changed, 196 insertions(+), 33 deletions(-)
+ create mode 100644 llvm/test/MC/DADAO/immediate-range-invalid.s
+ create mode 100644 llvm/test/MC/DADAO/immediate-range-valid.s
+
+diff --git a/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp b/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
+index bd048a66fb31..284a5456dd77 100644
+--- a/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
++++ b/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
+@@ -57,6 +57,13 @@ class DADAOAsmParser : public MCTargetAsmParser {
+ #include "DADAOGenAsmMatcher.inc"
+ 
+ public:
++  enum DADAOMatchResultTy : unsigned {
++    Match_Dummy = FIRST_TARGET_MATCH_RESULT_TY,
++#define GET_OPERAND_DIAGNOSTIC_TYPES
++#include "DADAOGenAsmMatcher.inc"
++#undef GET_OPERAND_DIAGNOSTIC_TYPES
++  };
++
+   DADAOAsmParser(const MCSubtargetInfo &STI, MCAsmParser &Parser,
+                  const MCInstrInfo &MII, const MCTargetOptions &Options)
+       : MCTargetAsmParser(Options, STI, MII), Parser(Parser),
+@@ -120,53 +127,42 @@ public:
+   bool isToken() const override { return Kind == Token; }
+   bool isMem() const override { return false; }
+ 
++  template <unsigned Bits, bool Signed> bool isImmInRange() const {
++    if (!isImm())
++      return false;
++
++    int64_t Value;
++    if (!Imm.Value->evaluateAsAbsolute(Value))
++      return true;
++    return Signed ? isIntN(Bits, Value) : isUIntN(Bits, Value);
++  }
++
+   bool isImms12() const {
+-    if (!isImm()) return false;
+-    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
+-      return isInt<12>(CE->getValue());
+-    return true;
++    return isImmInRange<12, true>();
+   }
+ 
+   bool isImmu12() const {
+-    if (!isImm()) return false;
+-    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
+-      return isUInt<12>(CE->getValue());
+-    return true;
++    return isImmInRange<12, false>();
+   }
+ 
+   bool isImms18() const {
+-    if (!isImm()) return false;
+-    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
+-      return isInt<18>(CE->getValue());
+-    return true;
++    return isImmInRange<18, true>();
+   }
+ 
+   bool isImmu16() const {
+-    if (!isImm()) return false;
+-    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
+-      return isUInt<16>(CE->getValue());
+-    return true;
++    return isImmInRange<16, false>();
+   }
+ 
+   bool isImmu6() const {
+-    if (!isImm()) return false;
+-    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
+-      return isUInt<6>(CE->getValue());
+-    return true;
++    return isImmInRange<6, false>();
+   }
+ 
+   bool isImms24() const {
+-    if (!isImm()) return false;
+-    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
+-      return isInt<24>(CE->getValue());
+-    return true;
++    return isImmInRange<24, true>();
+   }
+ 
+   bool isWydepos() const {
+-    if (!isImm()) return false;
+-    if (const MCConstantExpr *CE = dyn_cast<MCConstantExpr>(Imm.Value))
+-      return isUInt<2>(CE->getValue());
+-    return true;
++    return isImmInRange<2, false>();
+   }
+ 
+   void addExpr(MCInst &Inst, const MCExpr *Expr) const {
+@@ -277,7 +273,9 @@ bool DADAOAsmParser::matchAndEmitInstruction(SMLoc IdLoc, unsigned &Opcode,
+   MCInst Inst;
+   SMLoc ErrorLoc;
+ 
+-  switch (MatchInstructionImpl(Operands, Inst, ErrorInfo, MatchingInlineAsm)) {
++  unsigned Result =
++      MatchInstructionImpl(Operands, Inst, ErrorInfo, MatchingInlineAsm);
++  switch (Result) {
+   case Match_Success:
+     Out.emitInstruction(Inst, getSTI());
+     Opcode = Inst.getOpcode();
+@@ -298,6 +296,34 @@ bool DADAOAsmParser::matchAndEmitInstruction(SMLoc IdLoc, unsigned &Opcode,
+     return Error(ErrorLoc, "Invalid operand for instruction");
+   }
+   }
++
++  if (Result > FIRST_TARGET_MATCH_RESULT_TY && ErrorInfo >= Operands.size())
++    return Error(IdLoc, "Too few operands for instruction");
++
++  SMLoc ImmLoc = Operands[ErrorInfo]->getStartLoc();
++  switch (Result) {
++  case Match_InvalidImms12:
++    return Error(ImmLoc, "immediate must be an integer in the range "
++                         "[-2048, 2047]");
++  case Match_InvalidImmu12:
++    return Error(ImmLoc,
++                 "immediate must be an integer in the range [0, 4095]");
++  case Match_InvalidImms18:
++    return Error(ImmLoc, "immediate must be an integer in the range "
++                         "[-131072, 131071]");
++  case Match_InvalidImmu16:
++    return Error(ImmLoc,
++                 "immediate must be an integer in the range [0, 65535]");
++  case Match_InvalidImmu6:
++    return Error(ImmLoc,
++                 "immediate must be an integer in the range [0, 63]");
++  case Match_InvalidImms24:
++    return Error(ImmLoc, "immediate must be an integer in the range "
++                         "[-8388608, 8388607]");
++  case Match_InvalidWydepos:
++    return Error(ImmLoc,
++                 "immediate must be an integer in the range [0, 3]");
++  }
+   llvm_unreachable("Unknown match type detected!");
+ }
+ 
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 0e241c59c89a..9bdbb59d5d13 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -9,39 +9,70 @@
+ include "DADAOInstrFormats.td"
+ 
+ // Immediate operand types
++class DADAOImmAsmOperand<string name, string predicate>
++    : AsmOperandClass {
++  let Name = name;
++  let PredicateMethod = predicate;
++  let RenderMethod = "addImmOperands";
++  let DiagnosticType = "Invalid" # name;
++}
++
++def Imms12AsmOperand : DADAOImmAsmOperand<"Imms12", "isImms12">;
++def Immu12AsmOperand : DADAOImmAsmOperand<"Immu12", "isImmu12">;
++def Imms18AsmOperand : DADAOImmAsmOperand<"Imms18", "isImms18">;
++def Immu16AsmOperand : DADAOImmAsmOperand<"Immu16", "isImmu16">;
++def Immu6AsmOperand  : DADAOImmAsmOperand<"Immu6", "isImmu6">;
++def Imms24AsmOperand : DADAOImmAsmOperand<"Imms24", "isImms24">;
++def WydeposAsmOperand : DADAOImmAsmOperand<"Wydepos", "isWydepos">;
++
+ def imms12 : Operand<i64> {
+   let DecoderMethod = "decodeS12Imm";
++  let ParserMatchClass = Imms12AsmOperand;
++}
++def immu12 : Operand<i64> {
++  let ParserMatchClass = Immu12AsmOperand;
+ }
+-def immu12 : Operand<i64>;
+ def imms18 : Operand<i64> {
+   let DecoderMethod = "decodeS18Imm";
++  let ParserMatchClass = Imms18AsmOperand;
++}
++def immu16 : Operand<i64> {
++  let ParserMatchClass = Immu16AsmOperand;
++}
++def immu6  : Operand<i64> {
++  let ParserMatchClass = Immu6AsmOperand;
+ }
+-def immu16 : Operand<i64>;
+-def immu6  : Operand<i64>;
+ def imms24 : Operand<i64> {
+   let DecoderMethod = "decodeS24Imm";
+   let EncoderMethod = "getImm24OpValue";
++  let ParserMatchClass = Imms24AsmOperand;
++}
++def wydepos : Operand<i64> {
++  let ParserMatchClass = WydeposAsmOperand;
+ }
+-def wydepos : Operand<i64>;
+ 
+ def cfxcode6 : Operand<i64> {
+   let OperandType = "OPERAND_IMMEDIATE";
++  let ParserMatchClass = Immu6AsmOperand;
+ }
+ 
+ def brtarget24 : Operand<OtherVT> {
+   let EncoderMethod = "getImm24OpValue";
+   let DecoderMethod = "decodeS24Imm";
+   let OperandType = "OPERAND_PCREL";
++  let ParserMatchClass = Imms24AsmOperand;
+ }
+ def brtarget18 : Operand<OtherVT> {
+   let EncoderMethod = "getImm18OpValue";
+   let DecoderMethod = "decodeS18Imm";
+   let OperandType = "OPERAND_PCREL";
++  let ParserMatchClass = Imms18AsmOperand;
+ }
+ def brtarget12 : Operand<OtherVT> {
+   let EncoderMethod = "getImm12OpValue";
+   let DecoderMethod = "decodeS12Imm";
+   let OperandType = "OPERAND_PCREL";
++  let ParserMatchClass = Imms12AsmOperand;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/llvm/test/MC/DADAO/immediate-range-invalid.s b/llvm/test/MC/DADAO/immediate-range-invalid.s
+new file mode 100644
+index 000000000000..0f1985cf396d
+--- /dev/null
++++ b/llvm/test/MC/DADAO/immediate-range-invalid.s
+@@ -0,0 +1,57 @@
++# RUN: not llvm-mc -triple=dadao -filetype=obj %s -o /dev/null 2>&1 \
++# RUN:   | FileCheck %s
++
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [-2048, 2047]
++addi rd8, rd0, -2049
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [-2048, 2047]
++addi rd8, rd0, 2048
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [-2048, 2047]
++addi rd8, rd0, 4096
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [-2048, 2047]
++addi rd8, rd0, (2047 + 1)
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [-2048, 2047]
++jump rb1, rd2, -2049
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [-2048, 2047]
++call rb1, rd2, 2048
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [-2048, 2047]
++breq rd1, rd2, -2049
++
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [0, 4095]
++cmpu rd8, rd0, -1
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [0, 4095]
++cmpu rd8, rd0, 4096
++
++# CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [-131072, 131071]
++swym -131073
++# CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [-131072, 131071]
++swym 131072
++# CHECK: :[[#@LINE+1]]:10: error: immediate must be an integer in the range [-131072, 131071]
++brz rd1, -131073
++
++# CHECK: :[[#@LINE+1]]:13: error: immediate must be an integer in the range [0, 65535]
++orw rd8, 0, -1
++# CHECK: :[[#@LINE+1]]:13: error: immediate must be an integer in the range [0, 65535]
++orw rd8, 0, 65536
++
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [0, 63]
++shlu rd8, rd0, -1
++# CHECK: :[[#@LINE+1]]:16: error: immediate must be an integer in the range [0, 63]
++shlu rd8, rd0, 64
++# CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [0, 63]
++trap -1, 0
++# CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [0, 63]
++trap 64, 0
++
++# CHECK: :[[#@LINE+1]]:10: error: immediate must be an integer in the range [0, 3]
++orw rd8, -1, 0
++# CHECK: :[[#@LINE+1]]:10: error: immediate must be an integer in the range [0, 3]
++orw rd8, 4, 0
++
++# CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [-8388608, 8388607]
++call -8388609
++# CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [-8388608, 8388607]
++call 8388608
++# CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [-8388608, 8388607]
++jump -8388609
++# CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [-8388608, 8388607]
++jump 8388608
+diff --git a/llvm/test/MC/DADAO/immediate-range-valid.s b/llvm/test/MC/DADAO/immediate-range-valid.s
+new file mode 100644
+index 000000000000..5d6582623c78
+--- /dev/null
++++ b/llvm/test/MC/DADAO/immediate-range-valid.s
+@@ -0,0 +1,49 @@
++# RUN: llvm-mc -triple=dadao -filetype=obj %s -o /dev/null
++
++# Signed 12-bit immediates and the branch/call forms that share the field.
++addi rd8, rd0, -2048
++addi rd8, rd0, 2047
++jump rb1, rd2, -2048
++call rb1, rd2, 2047
++breq rd1, rd2, -2048
++brne rd1, rd2, 2047
++
++# Unsigned 12-bit immediate.
++cmpu rd8, rd0, 0
++cmpu rd8, rd0, 4095
++
++# Signed 18-bit immediates and branches.
++swym -131072
++swym 131071
++brz rd1, -131072
++brnz rd1, 131071
++
++# Unsigned 16-bit immediate and two-bit wyde position.
++orw rd8, 0, 0
++orw rd8, 3, 65535
++
++# Unsigned six-bit immediates, including the CFX code field.
++shlu rd8, rd0, 0
++shlu rd8, rd0, 63
++trap 0, 0
++trap 63, 0
++
++# Signed 24-bit immediates and direct branch targets.
++call -8388608
++call 8388607
++jump -8388608
++jump 8388607
++
++# Absolute constant expressions are range-checked after evaluation.
++addi rd8, rd0, (1024 + 1023)
++orw rd8, (1 + 2), (32767 + 32768)
++
++# Symbol expressions continue through the existing fixup paths.
++rela rb8, target
++addi rb8, rb8, target
++breq rd1, rd2, target
++brz rd1, target
++jump target
++call target
++target:
++swym 0
+-- 
+2.43.0
+

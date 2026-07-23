@@ -82,7 +82,7 @@ _start:
     # accidentally resolved to rb16 instead of rb4 cannot coincidentally
     # "pass" by reading the stale argument register (subagent review
     # finding, ML-011a; kept after the ML-013a register-bank restoration).
-    addi rd16, rd0, 0x5A5A
+    setzw rd16, 0, 0x5A5A
     rd2rb rb16, rd16, 1
 
     call get_tp_sub
@@ -100,7 +100,7 @@ check2:
 
     rd2rb rb16, rd2, 1
     call set_tp_sub
-    addi rd16, rd0, 0x5A5A
+    setzw rd16, 0, 0x5A5A
     rd2rb rb16, rd16, 1
     call get_tp_sub
     breq rd31, rd2, pass
