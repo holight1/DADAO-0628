@@ -1,0 +1,398 @@
+From 3aa546d1d0cd516e04edc599e8c32a964acd96b2 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 23 Jul 2026 19:41:48 +0800
+Subject: [PATCH] DADAO: implement caller-populated varargs save area
+
+---
+ clang/lib/CodeGen/CMakeLists.txt              |  1 +
+ clang/lib/CodeGen/CodeGenModule.cpp           |  2 +
+ clang/lib/CodeGen/TargetInfo.h                |  3 +
+ clang/lib/CodeGen/Targets/DADAO.cpp           | 42 +++++++++++
+ clang/test/CodeGen/DADAO/varargs-slot.c       | 23 ++++++
+ llvm/lib/Target/DADAO/DADAOFrameLowering.cpp  | 27 +------
+ llvm/lib/Target/DADAO/DADAOFrameLowering.h    |  9 ++-
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   | 70 +++++++++----------
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       |  5 +-
+ .../Target/DADAO/DADAOMachineFunctionInfo.h   |  3 -
+ llvm/test/CodeGen/DADAO/varargs-save-area.ll  | 38 ++++++++++
+ 11 files changed, 157 insertions(+), 66 deletions(-)
+ create mode 100644 clang/lib/CodeGen/Targets/DADAO.cpp
+ create mode 100644 clang/test/CodeGen/DADAO/varargs-slot.c
+ create mode 100644 llvm/test/CodeGen/DADAO/varargs-save-area.ll
+
+diff --git a/clang/lib/CodeGen/CMakeLists.txt b/clang/lib/CodeGen/CMakeLists.txt
+index dbbc35b372f4..d8a23a74ad7a 100644
+--- a/clang/lib/CodeGen/CMakeLists.txt
++++ b/clang/lib/CodeGen/CMakeLists.txt
+@@ -137,6 +137,7 @@ add_clang_library(clangCodeGen
+   Targets/AVR.cpp
+   Targets/BPF.cpp
+   Targets/CSKY.cpp
++  Targets/DADAO.cpp
+   Targets/DirectX.cpp
+   Targets/Hexagon.cpp
+   Targets/Lanai.cpp
+diff --git a/clang/lib/CodeGen/CodeGenModule.cpp b/clang/lib/CodeGen/CodeGenModule.cpp
+index 85ed38f14462..5c32e4a20b5f 100644
+--- a/clang/lib/CodeGen/CodeGenModule.cpp
++++ b/clang/lib/CodeGen/CodeGenModule.cpp
+@@ -117,6 +117,8 @@ createTargetCodeGenInfo(CodeGenModule &CGM) {
+   default:
+     return createDefaultTargetCodeGenInfo(CGM);
+ 
++  case llvm::Triple::dadao:
++    return createDADAOTargetCodeGenInfo(CGM);
+   case llvm::Triple::m68k:
+     return createM68kTargetCodeGenInfo(CGM);
+   case llvm::Triple::mips:
+diff --git a/clang/lib/CodeGen/TargetInfo.h b/clang/lib/CodeGen/TargetInfo.h
+index db06584d766b..cba3e311224b 100644
+--- a/clang/lib/CodeGen/TargetInfo.h
++++ b/clang/lib/CodeGen/TargetInfo.h
+@@ -488,6 +488,9 @@ protected:
+ std::unique_ptr<TargetCodeGenInfo>
+ createDefaultTargetCodeGenInfo(CodeGenModule &CGM);
+ 
++std::unique_ptr<TargetCodeGenInfo>
++createDADAOTargetCodeGenInfo(CodeGenModule &CGM);
++
+ enum class AArch64ABIKind {
+   AAPCS = 0,
+   DarwinPCS,
+diff --git a/clang/lib/CodeGen/Targets/DADAO.cpp b/clang/lib/CodeGen/Targets/DADAO.cpp
+new file mode 100644
+index 000000000000..da8a6cd103eb
+--- /dev/null
++++ b/clang/lib/CodeGen/Targets/DADAO.cpp
+@@ -0,0 +1,42 @@
++//===- DADAO.cpp ---------------------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "ABIInfoImpl.h"
++#include "TargetInfo.h"
++
++using namespace clang;
++using namespace clang::CodeGen;
++
++namespace {
++
++class DADAOABIInfo : public DefaultABIInfo {
++public:
++  using DefaultABIInfo::DefaultABIInfo;
++
++  RValue EmitVAArg(CodeGenFunction &CGF, Address VAListAddr, QualType Ty,
++                   AggValueSlot Slot) const override {
++    return emitVoidPtrVAArg(CGF, VAListAddr, Ty, /*IsIndirect=*/false,
++                            getContext().getTypeInfoInChars(Ty),
++                            CharUnits::fromQuantity(8),
++                            /*AllowHigherAlign=*/false, Slot,
++                            /*ForceRightAdjust=*/true);
++  }
++};
++
++class DADAOTargetCodeGenInfo : public TargetCodeGenInfo {
++public:
++  explicit DADAOTargetCodeGenInfo(CodeGenTypes &CGT)
++      : TargetCodeGenInfo(std::make_unique<DADAOABIInfo>(CGT)) {}
++};
++
++} // namespace
++
++std::unique_ptr<TargetCodeGenInfo>
++CodeGen::createDADAOTargetCodeGenInfo(CodeGenModule &CGM) {
++  return std::make_unique<DADAOTargetCodeGenInfo>(CGM.getTypes());
++}
+diff --git a/clang/test/CodeGen/DADAO/varargs-slot.c b/clang/test/CodeGen/DADAO/varargs-slot.c
+new file mode 100644
+index 000000000000..6449fe3dde79
+--- /dev/null
++++ b/clang/test/CodeGen/DADAO/varargs-slot.c
+@@ -0,0 +1,23 @@
++// RUN: %clang_cc1 -triple dadao -O0 -emit-llvm -o - %s | FileCheck %s
++
++#include <stdarg.h>
++
++int read_two(int named, ...) {
++  va_list ap;
++  va_start(ap, named);
++  int a = va_arg(ap, int);
++  int b = va_arg(ap, int);
++  va_end(ap);
++  return a + b;
++}
++
++// CHECK: %[[CUR:.*]] = load ptr
++// CHECK-NEXT: %[[NEXT:.*]] = getelementptr inbounds i8, ptr %[[CUR]], i64 8
++// CHECK-NEXT: store ptr %[[NEXT]]
++// CHECK-NEXT: %[[RIGHT:.*]] = getelementptr inbounds i8, ptr %[[CUR]], i64 4
++// CHECK-NEXT: load i32, ptr %[[RIGHT]]
++// CHECK: %[[CUR2:.*]] = load ptr
++// CHECK-NEXT: %[[NEXT2:.*]] = getelementptr inbounds i8, ptr %[[CUR2]], i64 8
++// CHECK-NEXT: store ptr %[[NEXT2]]
++// CHECK-NEXT: %[[RIGHT2:.*]] = getelementptr inbounds i8, ptr %[[CUR2]], i64 4
++// CHECK-NEXT: load i32, ptr %[[RIGHT2]]
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+index 64d3dd098d9f..ef0a01f46570 100644
+--- a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+@@ -21,19 +21,9 @@ namespace {
+ 
+ constexpr uint64_t DADAOFrameAlignment = 8;
+ 
+-// MFI does not include the fixed varargs register-save object in its stack
+-// size.  Keep the allocation and all SP-relative references based on the same
+-// rounded total.  For the varargs object itself, getFrameIndexReference below
+-// places the save area below the local frame so that its final slot cannot
+-// overlap a local or callee-saved object.
+ uint64_t getDADAOFrameSize(const MachineFunction &MF) {
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
+-  uint64_t FrameSize = MFI.getStackSize();
+-  const DADAOMachineFunctionInfo *DFI =
+-      MF.getInfo<DADAOMachineFunctionInfo>();
+-  if (DFI)
+-    FrameSize += DFI->getVarArgsSaveSize();
+-  return alignTo(FrameSize, DADAOFrameAlignment);
++  return alignTo(MFI.getStackSize(), DADAOFrameAlignment);
+ }
+ 
+ } // namespace
+@@ -78,20 +68,5 @@ StackOffset DADAOFrameLowering::getFrameIndexReference(
+   FrameReg = DADAO::RB1;
+ 
+   int64_t FrameSize = static_cast<int64_t>(getDADAOFrameSize(MF));
+-  const DADAOMachineFunctionInfo *DFI =
+-      MF.getInfo<DADAOMachineFunctionInfo>();
+-  if (DFI && FI == DFI->getVarArgsFrameIndex() &&
+-      DFI->getVarArgsSaveSize() != 0) {
+-    // The register-save area occupies the part of the rounded frame below
+-    // the ordinary MFI frame.  Do not apply this adjustment when no registers
+-    // need saving: then this fixed object denotes incoming stack arguments.
+-    uint64_t Padding = static_cast<uint64_t>(FrameSize) -
+-                       DFI->getVarArgsSaveSize() - MFI.getStackSize();
+-    // The save area contains 64-bit stores, so its base must itself remain
+-    // 8-byte aligned.  Rounding down leaves any residual padding above it,
+-    // between the save area and the ordinary local frame.
+-    FrameSize = static_cast<int64_t>(alignDown(Padding, DADAOFrameAlignment));
+-  }
+-
+   return StackOffset::getFixed(MFI.getObjectOffset(FI) + FrameSize);
+ }
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.h b/llvm/lib/Target/DADAO/DADAOFrameLowering.h
+index f3ac73707901..994f70c0cb0f 100644
+--- a/llvm/lib/Target/DADAO/DADAOFrameLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.h
+@@ -16,6 +16,13 @@ public:
+ 
+   bool hasFPImpl(const MachineFunction &MF) const override { return false; }
+ 
++  // Call lowering writes outgoing stack arguments (including the unified
++  // varargs save area) at SP-relative offsets.  Reserve the largest such
++  // frame in the prologue so those stores cannot overlap local objects.
++  bool hasReservedCallFrame(const MachineFunction &MF) const override {
++    return true;
++  }
++
+   StackOffset getFrameIndexReference(const MachineFunction &MF, int FI,
+                                      Register &FrameReg) const override;
+ 
+@@ -27,4 +34,4 @@ public:
+ };
+ 
+ } // namespace llvm
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index ce0f74dd5fa0..b27ce12685ae 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -119,7 +119,20 @@ SDValue DADAOTargetLowering::LowerCall(
+   CCState CCInfo(CallConv, IsVarArg, MF, ArgLocs, *DAG.getContext());
+   CCInfo.AnalyzeCallOperands(Outs, CC_DADAO);
+ 
+-  unsigned NumBytes = CCInfo.getStackSize();
++  // The DADAO varargs ABI uses one caller-populated save area in source
++  // argument order.  Fixed stack arguments remain at their ordinary incoming
++  // offsets.  Put the save area immediately after them, and move any
++  // additional variadic overflow copies above it.
++  unsigned FixedStackBytes = 0;
++  if (IsVarArg) {
++    for (unsigned I = 0; I < ArgLocs.size(); ++I)
++      if (!Outs[I].Flags.isVarArg() && ArgLocs[I].isMemLoc())
++        FixedStackBytes = std::max(
++            FixedStackBytes,
++            static_cast<unsigned>(ArgLocs[I].getLocMemOffset()) + 8);
++  }
++  const unsigned VarArgsSaveSize = IsVarArg ? Outs.size() * 8 : 0;
++  unsigned NumBytes = CCInfo.getStackSize() + VarArgsSaveSize;
+ 
+   Chain = DAG.getCALLSEQ_START(Chain, NumBytes, 0, DL);
+ 
+@@ -135,6 +148,8 @@ SDValue DADAOTargetLowering::LowerCall(
+     } else {
+       assert(VA.isMemLoc() && "Argument must be register or memory");
+       unsigned LocMemOffset = VA.getLocMemOffset();
++      if (IsVarArg && Outs[i].Flags.isVarArg())
++        LocMemOffset += VarArgsSaveSize;
+       SDValue PtrOff = DAG.getIntPtrConstant(
+           LocMemOffset, DL);
+       SDValue DstAddr = DAG.getNode(ISD::ADD, DL, MVT::i64,
+@@ -144,6 +159,19 @@ SDValue DADAOTargetLowering::LowerCall(
+                                     MachinePointerInfo::getStack(MF, LocMemOffset));
+       MemOpChains.push_back(Store);
+     }
++
++    if (IsVarArg) {
++      assert(Arg.getValueType() == MVT::i64 &&
++             "DADAO scalar varargs must be legalized to one 64-bit slot");
++      unsigned SaveOffset = FixedStackBytes + i * 8;
++      SDValue PtrOff = DAG.getIntPtrConstant(SaveOffset, DL);
++      SDValue DstAddr =
++          DAG.getNode(ISD::ADD, DL, MVT::i64,
++                      DAG.getRegister(DADAO::RB1, MVT::i64), PtrOff);
++      MemOpChains.push_back(
++          DAG.getStore(Chain, DL, Arg, DstAddr,
++                       MachinePointerInfo::getStack(MF, SaveOffset)));
++    }
+   }
+ 
+   if (!MemOpChains.empty())
+@@ -257,43 +285,15 @@ SDValue DADAOTargetLowering::LowerFormalArguments(
+   }
+ 
+   if (IsVarArg) {
+-    static const MCPhysReg ArgRegs[] = {
+-        DADAO::RD16, DADAO::RD17, DADAO::RD18,
+-        DADAO::RD19, DADAO::RD20, DADAO::RD21,
+-        DADAO::RD22, DADAO::RD23, DADAO::RD24,
+-        DADAO::RD25, DADAO::RD26, DADAO::RD27,
+-        DADAO::RD28, DADAO::RD29, DADAO::RD30,
+-        DADAO::RD31};
+-    unsigned Idx = CCInfo.getFirstUnallocated(ArgRegs);
+     MachineFrameInfo &MFI = MF.getFrameInfo();
+     DADAOMachineFunctionInfo *DFI = MF.getInfo<DADAOMachineFunctionInfo>();
+-
+-    unsigned XLenInBytes = 8;
+-    unsigned NumArgRegs = sizeof(ArgRegs) / sizeof(ArgRegs[0]);
+-    unsigned VarArgsSaveSize = XLenInBytes * (NumArgRegs - Idx);
+-
+-    int FI;
+-    if (VarArgsSaveSize == 0) {
+-      int VaArgOffset = CCInfo.getStackSize();
+-      FI = MFI.CreateFixedObject(XLenInBytes, VaArgOffset, true);
+-    } else {
+-      int VaArgOffset = CCInfo.getStackSize();
+-      FI = MFI.CreateFixedObject(VarArgsSaveSize, VaArgOffset, true);
+-
+-      for (unsigned I = Idx; I < NumArgRegs; ++I) {
+-        Register VReg = RegInfo.createVirtualRegister(&DADAO::GPRDRegClass);
+-        RegInfo.addLiveIn(ArgRegs[I], VReg);
+-        SDValue ArgValue = DAG.getCopyFromReg(Chain, DL, VReg, MVT::i64);
+-        int Offset = (I - Idx) * XLenInBytes;
+-        SDValue PtrOff = DAG.getIntPtrConstant(Offset, DL);
+-        SDValue Addr = DAG.getNode(ISD::ADD, DL, MVT::i64,
+-                                    DAG.getFrameIndex(FI, MVT::i64), PtrOff);
+-        Chain = DAG.getStore(Chain, DL, ArgValue, Addr,
+-                              MachinePointerInfo::getFixedStack(MF, FI, Offset));
+-      }
+-    }
++    // CCInfo's stack size accounts for fixed named arguments that overflowed
++    // their register bank.  The caller places the unified save area directly
++    // after those fixed slots; va_start skips the named arguments in the save
++    // area and therefore points at its first unnamed slot.
++    int VaArgOffset = CCInfo.getStackSize() + Ins.size() * 8;
++    int FI = MFI.CreateFixedObject(8, VaArgOffset, true);
+     DFI->setVarArgsFrameIndex(FI);
+-    DFI->setVarArgsSaveSize(VarArgsSaveSize);
+   }
+ 
+   return Chain;
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 9bdbb59d5d13..3af69decb94d 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -161,7 +161,10 @@ class DADAOPseudo<dag outs, dag ins, list<dag> pattern> : Instruction {
+ // this task investigates. Selecting through Pat<> means InstrEmitter's
+ // generic multi-result RAUW (via MorphNodeTo) handles both results
+ // automatically; no manual glue bookkeeping is needed here at all.
+-let Size = 0 in {
++// These have no explicit register operands, so mark them side-effecting to
++// keep generic dead-MI elimination from deleting them before PEI has measured
++// the maximum reserved call frame.
++let Size = 0, hasSideEffects = 1 in {
+ def ADJCALLSTACKDOWN : DADAOPseudo<(outs), (ins i64imm:$amt1, i64imm:$amt2),
+                                    [(callseq_start timm:$amt1, timm:$amt2)]>;
+ def ADJCALLSTACKUP   : DADAOPseudo<(outs), (ins i64imm:$amt1, i64imm:$amt2),
+diff --git a/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h b/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
+index 276ded80a846..98d61ee5a330 100644
+--- a/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
++++ b/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
+@@ -11,7 +11,6 @@ class TargetSubtargetInfo;
+ 
+ class DADAOMachineFunctionInfo : public MachineFunctionInfo {
+   int VarArgsFrameIndex = -1;
+-  unsigned VarArgsSaveSize = 0;
+ 
+ public:
+   static char ID;
+@@ -19,8 +18,6 @@ public:
+ 
+   int getVarArgsFrameIndex() const { return VarArgsFrameIndex; }
+   void setVarArgsFrameIndex(int Index) { VarArgsFrameIndex = Index; }
+-  unsigned getVarArgsSaveSize() const { return VarArgsSaveSize; }
+-  void setVarArgsSaveSize(int Size) { VarArgsSaveSize = Size; }
+ };
+ 
+ } // namespace llvm
+diff --git a/llvm/test/CodeGen/DADAO/varargs-save-area.ll b/llvm/test/CodeGen/DADAO/varargs-save-area.ll
+new file mode 100644
+index 000000000000..fab5ce95706c
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/varargs-save-area.ll
+@@ -0,0 +1,38 @@
++; RUN: llc -mtriple=dadao < %s | FileCheck %s
++
++declare i64 @sink(i64, ptr, ...)
++
++define i64 @caller(ptr %p) {
++entry:
++  %r = call i64 (i64, ptr, ...) @sink(i64 1, ptr %p, i64 2, ptr %p)
++  ret i64 %r
++}
++
++; CHECK-LABEL: caller:
++; CHECK: addi rb1, rb1, -32
++; CHECK-DAG: sto {{.*}}, rb1, 0
++; CHECK-DAG: sto {{.*}}, rb1, 8
++; CHECK-DAG: sto {{.*}}, rb1, 16
++; CHECK-DAG: sto {{.*}}, rb1, 24
++; CHECK: call sink
++; CHECK: addi rb1, rb1, 32
++
++define i64 @callee(i64 %a, ptr %p, ...) {
++entry:
++  %ap = alloca ptr, align 8
++  call void @llvm.va_start.p0(ptr %ap)
++  %v = va_arg ptr %ap, i64
++  call void @llvm.va_end.p0(ptr %ap)
++  ret i64 %v
++}
++
++; The callee initializes ap from incoming SP + two named 8-byte slots and
++; performs no RD/RB register-bank reconstruction stores.
++; CHECK-LABEL: callee:
++; CHECK: addi rb1, rb1, -8
++; CHECK: addi [[BASE:rb[0-9]+]], rb1, 24
++; CHECK: rb2rd [[AP:rd[0-9]+]], [[BASE]], 1
++; CHECK: ldo rd31, {{rb[0-9]+}}, 0
++
++declare void @llvm.va_start.p0(ptr)
++declare void @llvm.va_end.p0(ptr)
+-- 
+2.43.0
+

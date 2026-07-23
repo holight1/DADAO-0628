@@ -1,0 +1,8 @@
+// DL-072a: fixed and unnamed RD overflow arguments must not overlap the
+// caller-populated source-order save area.
+//
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -O2 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/varargs_overflow.c -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 42'

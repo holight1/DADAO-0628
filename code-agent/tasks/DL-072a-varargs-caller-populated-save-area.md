@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent
 
-**状态**: 待处理
+**状态**: 已完成（独立 review Accepted）
 
 ## 硬约束（务必遵守，违反视为任务失败）
 
@@ -164,3 +164,101 @@ spill 自己的传入寄存器）：
   保存区是"变参函数专属、涵盖全部实参"，本任务实现时注意区分不要混淆）、第318行
   Varargs 现有措辞（本任务要更新的位置）
 - `docs/open-spec-issues.md` 第11行 Varargs 条目（同步更新）
+
+## 完成区（实现 subagent，2026-07-23）
+
+### 根因与实现
+
+根因由三层组成：
+
+1. `LowerFormalArguments` 在 callee 侧只 spill 尚未分配的 RD16–RD31，RB
+   指针实参从未进入 `va_list`，也无法在 callee 侧恢复原声明顺序。
+2. DADAO 原先沿用通用 `SelectionDAG::expandVAArg`，`int` 按 4 字节递增并
+   从 slot 基址读取，违反 wiki 的统一 8 字节步进和大端 `slot+4` 读取。
+3. 新增 caller save area 后暴露既有 frame 缺口：无操作数的
+   `ADJCALLSTACKDOWN/UP` 在 PEI 前被 dead-MI elimination 删除，
+   `maxCallFrameSize` 变成 0，outgoing save slots 会覆盖 caller locals。
+
+LLVM 普通提交 `3aa546d1d0cd516e04edc599e8c32a964acd96b2`
+（`DADAO: implement caller-populated varargs save area`）完成：
+
+- `LowerCall` 对 `CLI.IsVarArg` 的全部 RD/RB 标量实参按原顺序双写到统一
+  8-byte-slot save area；固定/未命名 overflow 另有不重叠布局。
+- 删除 callee RD-only spill；`va_start` 用 incoming fixed-stack size 加
+  named-slot 偏移直接定位 caller area。
+- 新增 DADAO Clang ABI `EmitVAArg`：slot size 8、每次 `+8`、大端窄值右对齐。
+- 删除 `VarArgsSaveSize` 及 DADAOFrameLowering 旧特判；call-frame pseudos
+  标记 side-effecting，使 PEI 真正预留最大 outgoing frame。
+- 新增 LLVM/Clang 回归和 4 个 E2E：mixed RD/RB、big-endian narrow、
+  fixed/unnamed overflow、real musl `printf("%s %s")`；scanf 原 XFAIL 删除。
+
+已立即导出
+`components/llvm/patches/0050-DADAO-implement-caller-populated-varargs-save-area.patch`
+并追加 `series`。具体 pointer-loss issue 已从 `docs/issues.yaml` 移入
+`docs/issues-archive.yaml`；ABI/open-spec 文档已明确 caller-populated 机制。
+
+### 验收证据
+
+- 改动前 E2E：68 discovered，67 PASS + 1 XFAIL（scanf）。
+- Clang narrow IR：两次 `va_arg(int)` 均为 `argp.next = argp + 8`，读取地址
+  均为 `argp.cur + 4`。
+- LLVM 定向 lit：`varargs-slot.c` + `varargs-save-area.ll` = 2/2 PASS。
+- 核心运行探针：mixed RD/RB（O0/O2）、narrow、overflow、
+  `printf("%s %s")`、`scanf("%d",&x)` = 5/5 PASS；每个运行探针均覆盖
+  QEMU + gem5。printf 输出严格为 `left right`；scanf 输出 `got=42` 且
+  双后端退出 42。
+- frame 证据：修复前 `maxCallFrameSize=0, stackSize=16, local=sp+12`
+  与 save slot `sp+8` 重叠；修复后
+  `maxCallFrameSize=16, stackSize=32, local=sp+28`，不再重叠。
+- 干净 musl object/libc archive 重建：`make -C .work/build/musl clean`
+  后 `make build-musl` PASS（best-effort archive，既有已登记失败仍按项目
+  recipe 处理）。
+- 全量 E2E：72/72 PASS（新增 4，scanf 由 XFAIL 转正常 PASS）。
+- differential：
+  `AGREE(3-way)=200, gem5-SKIP=2, DIVERGE=0, HARNESS=0`；
+  `AGREE(4-way)=200, Sail-SKIP=2, SAIL-DIVERGE=0`。
+- `manifest_check.py` PASS。
+- `check_issues.py` PASS：Open 20 / Closed 37 / Total 57。
+- 干净 manifest pin `ca7933e47d3a...` worktree 依次 `git am`：
+  50/50 PASS；最终 tree
+  `c9f9803b7fb5f35c8199174bfb1ff4a29ff420fe` 与 LLVM 提交 tree 完全一致。
+
+### wiki 歧义与范围
+
+wiki 的标量提升表与字节图不冲突：caller 存完整扩展后的 64 位值；callee
+读取 `int` 时在大端 slot 内从 `+4` 取低 32 位。
+
+但 wiki 另有一处真实文字冲突：`save-area base = incoming SP` 与“地址从低到高
+为 overflow → locals → save area”在存在普通 overflow 副本时无法同时成立，
+因为 callee 不知道调用点的未命名 overflow 总量，也没有第二个 base 参数。
+本实现保留 incoming SP 这一唯一 callee 可得锚点：无 fixed overflow 时
+save area 以 incoming SP 为基址；有 fixed overflow 时，`va_start` 使用
+`incoming SP + fixed_stack_size + named_count*8`，同时将 fixed overflow
+放在 save area 前、未命名 overflow 的普通副本移到 save area 后。
+fixed/unnamed overflow E2E 均通过。该措辞冲突已保留在
+`docs/open-spec-issues.md`，未静默宣称完整 RF/aggregate ABI 已闭合。
+DL-072a 仍严格限定于 RD/RB 标量；RF 与完整 aggregate coverage 未实现。
+
+## 审阅记录（实现者自审）
+
+| Finding | 处置 |
+|---|---|
+| 通用 `expandVAArg` 会 `int +4` 且从 slot 基址读 | 新增 DADAO Clang ABI，IR 回归锁定 `+8/+4` |
+| caller slots 首版覆盖 caller local，scanf 输出正确后 MALIGN | 追到 call-frame pseudo 过早删除；保留 pseudo 至 PEI，MIR/双后端复验 |
+| 只测寄存器内参数会遗漏 overflow 偏移风险 | 新增 17 fixed + 17 unnamed overflow 真实双后端探针 |
+| 增量 musl build 会复用旧编译器产物 | 执行 clean 后完整重建，再运行真实 printf/scanf |
+| wiki overflow 排列文字与 incoming-SP 公式冲突 | 明确记录 open-spec；未改 wiki、未隐瞒 |
+
+**实现者自审判决：PASS，提交独立 subagent review。**
+
+## 独立 subagent review（2026-07-23）
+
+- 审查记录：`docs/reviews/DL-072a-independent-review-20260723.md`
+- 判决：**Accepted**，无 blocking finding。
+- 独立复跑：LLVM/Clang 定向 2/2 PASS；核心 E2E 5/5 PASS；全量 E2E
+  72/72 PASS；四方差分 200 AGREE、0 DIVERGE；manifest/issues PASS。
+- 独立复核：0050 与 LLVM 普通提交逐字节对应；manifest pin 上 50/50
+  full replay clean，最终 tree 与 `3aa546d1d0cd...` 一致。
+- 非阻断边界：wiki 的 overflow/locals/save 地址顺序与 incoming-SP 公式
+  仍存在文字冲突；broader `Varargs` issue 保持 open，RF 与完整 aggregate
+  未纳入本任务完成声明。
