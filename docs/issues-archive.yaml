@@ -4,6 +4,34 @@
 # Schema / field definitions are documented in docs/issues.yaml's header.
 # Search with: grep -r 'keyword' docs/issues-archive.yaml
 
+- id: llvm-patch-series-full-replay-corrupt-at-0005
+  title: "components/llvm/patches/ 全部38条从裸 pin commit 完整 git am 重放，在第5条(0005-dadao-asmparser.patch)报 corrupt patch at line 447——早于本session的既有问题，此前从未被验证过完整从零重放"
+  status: closed
+  scope: [Infra]
+  blocks: null
+  resolved_by: "IN-006a/IN-006b (2026-07-23，独立 worker+review 判决 Accepted)"
+  # DL-069a（2026-07-18）架构师复核时发现：此前每个任务的"patch可重放性"
+  # 验证都只做"新增的最后一条 patch 能否接到当前 .work/llvm 已有状态之
+  # 上"，从未有人真正验证过全部38条从裸 pin commit（ca7933e47d3a）开始
+  # 完整重放。本次首次尝试，`git am`（与 scripts/apply_series.py 同款调
+  # 用）在第5条报 mbox 解析错误"corrupt patch at line 447"，与 DL-069a
+  # 本身无关（该 patch 远早于本 session）。
+  #
+  # IN-006a（2026-07-23）定位 0005 的三处 hunk 计数/序列化缺口（CMake
+  # hunk 声明 11/13、InstPrinter 声明 14/14 实际 8/13、新建 MCCodeEmitter
+  # 文件声明 77 行实际 74 行）并修复，但完整重放在 0006 又撞上独立的
+  # mbox 损坏，5/48 后阻塞。IN-006b 承接，一次性静态扫描 0006～0048，
+  # 定位并修复 4 处独立损坏（0006/0007/0013/0019，均为 hunk 计数/前像
+  # 序列化问题，非源码语义改动），从裸 pin `ca7933e47d3a` plain
+  # `git am` 48/48（当时 series 共 48 条，后续 DL-071a 新增 0049）成功，
+  # 重放 tree 与 `.work/llvm` HEAD 完全一致。
+  #
+  # 架构师独立复核（2026-07-23，非采信 worker/review 报告）：用干净
+  # detached worktree 从 manifest pin 重新执行全部（含 DL-071a 新增后的）
+  # 49 条 patch，`git am` 49/49 成功，最终 tree
+  # `214c454ff1fcf163d95e0d72f5c7743b69374dcf` 与 `.work/llvm` 当前 HEAD
+  # tree 完全一致，确认问题真正解决、非报告夸大。
+
 - id: musl-backend-assert-illegal-result-number
   title: "musl `intscan.c`/`mallocng/donate.c` 编译时撞 SDNode::getValueType 断言 'ResNo < NumValues && \"Illegal result number!\"'"
   status: closed
