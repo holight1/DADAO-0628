@@ -869,3 +869,56 @@ path) to fix the glue-chain defect. Explicitly flagged as a third
 attempt at a related class of bug (after two deferred DL-063b/c rounds)
 with permission to stop and report rather than force a low-confidence
 fix.
+
+### ML-021a complete (2026-07-23): the real root cause, much bigger win than scoped
+
+The actual bug was different from the `Pat<>`-vs-hand-built hypothesis
+this task was dispatched to test (that hypothesis had, in fact, already
+been tried and failed independently before — see the task's own
+completion section). Found via SelectionDAG debug dumps
+(`llc -debug-only=isel`), as the task's hard constraints required
+before any fix attempt: `DADAOISelDAGToDAG.cpp::Select()` hand-special-
+cased `ISD::CALLSEQ_START`/`END` — deleting the node and redirecting
+only its **chain** result (ResNo 0) to the input chain, never its
+**glue** result (ResNo 1). Invisible with one call per block; with a
+second independent call (direct, indirect, or libcall) in the same
+block, the freed node's memory got reused and a dangling glue edge
+corrupted the DAG, tripping the exact assertion `DL-063c` hit in 2026
+(a different, since-independently-resolved cause) and `ML-020a`'s f64
+libcall fix re-exposed at scale.
+
+Fix: converted `callseq_start`/`end` to standard `Pat<>`-based selection
+via new `ADJCALLSTACKDOWN`/`UP` pseudos (mirroring RISC-V's reference
+pattern) instead of hand-rolled node surgery, so `InstrEmitter`'s
+generic multi-result rewrite threads both chain and glue automatically.
+Wired `DADAOInstrInfo`'s `CFSetup`/`CFDestroy` (previously literal `0`)
+to the new pseudos so `PrologEpilogInserter` actually elides them.
+Commit `4b812d2f9930`, patch `0048`.
+
+Impact far exceeded the task's own scope (fixing `vfprintf.o`
+specifically): a **fresh full musl rebuild dropped from ~180 failing
+objects to 10** — 3 existing issues (`illegal-result-number`,
+`node-already-inserted`, `asmprinter-unmapself`) fully resolved and
+archived; 7 objects newly exposed a real, unrelated, pre-existing gap
+(`ISD::DYNAMIC_STACKALLOC` was never implemented — new open issue
+`musl-backend-dynamic-stackalloc-unimplemented`); 2 pre-existing,
+unrelated failures (`unanalyzable-fallthrough`, `instrinfo-unreachable`)
+untouched. `vfprintf.o` now compiles with musl's real `-O2` build flags.
+
+E2E 60→61/61 (new non-float regression test
+`direct_call_multicall_block.test`), differential AGREE=200/DIVERGE=0
+unchanged, manifest/issues PASS — architect-verified independently
+(rebuilt toolchain, reproduced both the crash and the fix on the
+2-line minimal case, reran the full musl fresh-build matrix from
+scratch and confirmed all 10 remaining failures by name match exactly).
+
+**Compile succeeding is not roadmap B's finish line** — the architect
+independently attempted linking a real integer-format `printf` test
+right after this task closed and confirmed exactly 7 missing link-time
+symbols (`__adddf3`/`__subdf3`/`__nedf2`/`__fixdfdi`/`__fixunsdfdi`/
+`__floatsidf`/`__floatunsidf`), matching `ML-020a`'s "option A" (small
+shim) threshold precisely. **Follow-up dispatched**: `ML-022a` — a
+minimal 7-symbol soft-float shim in `musl/arch/dadao/`, algorithm
+reference only from `compiler-rt/lib/builtins` (not a vendored
+component), to actually link and run an integer-format `printf` E2E
+test end to end.
