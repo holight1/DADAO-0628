@@ -922,3 +922,58 @@ minimal 7-symbol soft-float shim in `musl/arch/dadao/`, algorithm
 reference only from `compiler-rt/lib/builtins` (not a vendored
 component), to actually link and run an integer-format `printf` E2E
 test end to end.
+
+### ML-022a complete (2026-07-23): roadmap B closed — printf actually links and runs
+
+Re-running the architect's 7-symbol repro against the current `libc.a`
+turned up **10** undefined symbols, not 7 (`printf_core` references the
+full double-precision family — `%f`/`%g`/`%e` handling code type-
+legalizes alongside `%d`/`%u` regardless of which format string a
+caller actually uses at runtime). Also corrected the task's own wrong
+assumption about where to put the file: `arch/dadao/` is never
+auto-globbed into the musl build (only `src/*/dadao/`, `crt/dadao/`,
+`ldso/dadao/`, and the mallocng `dadao/` subdirectory are) — landed at
+`src/internal/dadao/softfloat_shim.c` instead, following the existing
+`src/internal/i386/` precedent.
+
+Self-contained IEEE-754 binary64 implementation (526 lines, commit
+`fe3f43b6`, patch `0010`) covering `__adddf3`/`__subdf3`/`__muldf3`/
+`__nedf2`/`__eqdf2`/`__unorddf2`/`__fixdfdi`/`__fixunsdfdi`/
+`__floatsidf`/`__floatunsidf` — every operation implemented as pure
+bit-pattern integer arithmetic (deliberately never `+`/`-`/`==`/`!=` on
+a native `double` anywhere in the file, since DADAO has no f64 register
+class and any such operator would itself re-legalize into a recursive
+libcall against the very symbol being defined). `__subdf3`'s
+tail-call into `__adddf3` relies on the tree-wide
+`-fno-optimize-sibling-calls` musl already builds with (ML-012a),
+avoiding the pre-existing, unrelated `codegen-tailcall-lowercall-assert`
+gap. Fuzz-verified against native hardware doubles (~200k random values
++ boundary cases: subnormals, ±inf, NaN, 2^63/2^64 overflow) with zero
+mismatches.
+
+The architect's exact repro (`printf("value=%d\n", 42); return 42;`)
+now **links and runs correctly on both QEMU and gem5**, printing
+`value=42` and exiting 42 — new `tests/lit/E2E/musl_printf_int.test`
+asserts the real output content via FileCheck, not just the exit code.
+E2E 61→62/62, differential AGREE=200/DIVERGE=0 unchanged, manifest/
+issues PASS, musl fresh-build object count 1336→1337 with the same 10
+pre-existing, unrelated failures — architect-verified independently
+(rebuilt musl from scratch, reproduced the link failure→success
+boundary directly with the same command, confirmed the vfscanf gap by
+hand). Commit `f442d1a`.
+
+`vfscanf`/`floatscan.c` needs a different, larger symbol set
+(single-precision f32 family + `__divdf3`/`__gedf2`) not covered here —
+recorded as a new open issue
+(`musl-vfscanf-missing-single-precision-and-divide-softfloat-symbols`),
+deliberately out of scope (a new precision family + division algorithm,
+not "a few more of the same kind").
+
+**Roadmap B is now closed for its stated scope** (integer-format
+`printf` links and runs on both backends with real output verified).
+`scanf` integer format remains open (separate symbol gap above).
+Roadmap C (optional be99→d3bd causal isolation) and E (kernel) remain
+untouched. **Next**: roadmap D — resume `ML-014a` (mallocng e2e) itself,
+starting with reproducing/diagnosing the chained malloc/free/output
+test's last known failure (`ML-014f`, QEMU rc=130 / gem5 rc=0,
+never root-caused) now that the stdout blocker (roadmap A) is fixed.
