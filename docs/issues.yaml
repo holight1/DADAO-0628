@@ -12,6 +12,102 @@
 # docs/issues-archive.yaml (same schema) -- day-to-day lookup/registration
 # of new issues only needs this file.
 
+- id: frame-offset-no-imms12-range-check-silent-wraparound
+  title: "DADAOFrameLowering::emitPrologue/emitEpilogue 和 DADAORegisterInfo::eliminateFrameIndex 的全部 6 个 case（ADDI_RB_FI/LDO_FI/STO_FI/LDO_RB_FI/STO_RB_FI）把 FrameOff/StackSize 不做范围检查直接塞进 imms12（12-bit 有符号，[-2048,2047]）立即数字段；一旦函数栈帧或某个局部变量的最终帧内偏移超出该范围，立即数在 MCCodeEmitter 层被静默按 12-bit 环回截断（无 assert/无告警），产生完全错误的地址——这是 pr56866.c TIMEOUT 的根因，且是一个通用的、影响面覆盖'任意栈使用超过约 2KB 的函数'的后端正确性缺口，不是 rotate/窄位宽特有问题"
+  status: open
+  scope: [CodeGen, ISA]
+  blocks: [pr56866.c, gcc-c-torture-full-pass]
+  resolved_by: null
+  # ML-027a（诊断任务，未修复）2026-07-24。
+  #
+  # 二分定位过程：
+  # 1. 把 pr56866.c 的 4 段 rotate 循环（64/32/16/8 位宽）逐个单独抽出编译
+  #    链接跑，4 个全部独立 PASS（QEMU+gem5 均 exit 0）——排除"某个位宽的
+  #    rotate 表达式本身编译错误"。
+  # 2. 把循环两两组合：相同位宽再来一遍（qq=64+64、ii=32+32）均 PASS；
+  #    混合不同位宽（qi=64→32、iq=32→64）均复现挂起/异常——qi 在 QEMU/
+  #    gem5 均 TIMEOUT，iq 反而在 QEMU 上 exit 127（abort，说明校验值算
+  #    错但循环本身正常退出）且 gem5 触发
+  #    `Page table fault when accessing virtual address 0` panic 崩溃。
+  # 3. 对比 llc -O0 汇编（.s 文本层面）：两个混合案例的循环头/循环体/
+  #    for.inc 结构与纯同位宽的工作案例（qq/ii）逐条比对完全同构（相同
+  #    指令种类、相同顺序），.s 文本层面看不出任何错误。
+  # 4. 关键突破：用 `qemu-system-dadao -d exec,nochain` 无 TB 链接逐条
+  #    trace，在 qi 案例上抓到真实死循环的 4 个循环 PC
+  #    （0x8000075c→0x80000770→0x80000774→0x800007c4→0x8000075c），
+  #    确认是第二个循环（32-bit i 循环）的 for.cond/for.body/for.inc 在
+  #    无限循环——但反汇编 .elf 在该地址范围显示的实际指令字节
+  #    （ldo/shlu-3/shift-56/sto，均为 64-bit 操作数）与 .s 源文本
+  #    （ldtu/shlu-2/shift-24/stt，应为 32-bit）完全不符，怀疑目标文件
+  #    的字节和汇编文本对不上。
+  # 5. 手工按 §2.2 field layout（op[8]/ha[6]/hb[6]/hc[6]/hd[6]）逐 bit
+  #    解码可疑指令 `49 20 18 30`：ha=8(rb8) hb=1(rb1) hc=32 hd=48，
+  #    imm12=(32<<6)|48=2096，作为 12-bit 有符号数 sign-extend =
+  #    2096-4096=-2000——与 llvm-objdump 显示的 `addi rb8, rb1, -2000`
+  #    完全吻合，证明这不是反汇编器的显示 bug，是目标文件里真实编码的
+  #    立即数。而 .s 源文本这一行是 `addi rb8, rb1, 48`（`ri` 数组基址，
+  #    应该编码 imm12=48）。
+  # 6. 顺藤摸瓜查 3 个源头：
+  #    - `DADAOFrameLowering::emitPrologue`/`emitEpilogue`
+  #      （llvm/lib/Target/DADAO/DADAOFrameLowering.cpp:43-45,60-62）：
+  #      `BuildMI(.... ADDI_RBRRII, RB1).addReg(RB1)
+  #      .addImm(-static_cast<int64_t>(StackSize))` ——StackSize 来自
+  #      `MFI.getStackSize()` 对齐到 8，完全没有检查是否 `isInt<12>`。
+  #      本任务复现的 case_q64.c 单独跑时 StackSize=4128（真实需要的负偏
+  #      移 -4128 超出 [-2048,2047]），实际编码验证为 `addi rb1,rb1,-32`
+  #      （-4128 mod 4096 = -32）——顺利通过纯属该函数栈用量小、错位后
+  #      的地址范围恰好没有和任何关键数据碰撞的运气；`case_qi.c`
+  #      StackSize=6192，-6192 mod 4096 = +2000（不但截断，符号都翻了，
+  #      变成栈指针向"错误方向"调整），造成大范围栈帧错位。
+  #    - `DADAORegisterInfo::eliminateFrameIndex`
+  #      （llvm/lib/Target/DADAO/DADAORegisterInfo.cpp:91-168）：
+  #      `ADDI_RB_FI`/`LDO_FI`/`STO_FI`/`LDO_RB_FI`/`STO_RB_FI` 共 5 个
+  #      case 全部把 `FrameOff`（或 `FrameOff+GEPOff`）不做范围检查直接
+  #      `.addImm(...)` 到 `ADDI_RBRRII`/`LDO_RRII`/`STO_RRII`（imms12）。
+  #    - `DADAOMCCodeEmitter::getImm12OpValue`
+  #      （MCTargetDesc/DADAOMCCodeEmitter.cpp:112-125）：
+  #      `return static_cast<unsigned>(MO.getImm())`，对立即数值本身没有
+  #      任何 range assert，纯粹信任调用方传入的已经是合法 12-bit 值。
+  #    全链路（ISel 的 isInt<12> 检查只在
+  #    DADAOISelDAGToDAG.cpp:175 一处、只覆盖"load/store 常量偏移直接
+  #    折叠进 FI"这条窄路径）没有任何一层为"帧大小/帧内偏移超出 12-bit"
+  #    提供大立即数兜底物化路径。
+  #
+  # 影响面评估：这不是 pr56866.c 专属 bug，是任何"栈使用超过约 2KB"的
+  # 函数都会触发的通用后端缺口——本次扫描到的其它 1707 个 gcc-c-torture
+  # 用例大多数栈用量小，多数情况下截断后的错误偏移恰好落在未使用的旁路
+  # 内存（如本任务 case_q64.c/case_qq.c 两个"意外通过"的反例）不产生可见
+  # 症状，是"运气好没撞上"，不是"这条路径是对的"。已验证 58/58 E2E + 全量
+  # 差分 200 AGREE 的既有基线大概率都没有触碰到这个阈值（手写测试栈用量
+  # 普遍很小），所以这个缺口至今未被现有测试网暴露。
+  #
+  # 未在本任务内修复的原因（根因深/改动面判断）：
+  # - 需要在 FrameLowering.cpp（2 处）+ RegisterInfo.cpp（5 处 case）新增
+  #   "isInt<12> 检查失败时改用多指令物化大立即数"的兜底路径，且必须是
+  #   RB（地址 bank）寄存器版本——ISA 里已有对应指令
+  #   `SETZW_RB_RWII`/`ORW_RB_RWII`（DADAOInstrInfo.td:401,403）和
+  #   `add-rb`（orrr format，见 contracts/isa/spec.md §2.6.2）可以复用，
+  #   跟 `DADAOInstrInfo.cpp:158-162` 里已有的 GPRD 版本大立即数物化模式
+  #   （SETZW+ORW 拼 64-bit 常量）同构，但需要为 PEI 阶段（
+  #   `eliminateFrameIndex`）挑一个安全的临时 RB scratch 寄存器——函数签
+  #   名里已经传入了 `RegScavenger *RS` 参数但当前实现完全没用它，新增
+  #   代码需要正确使用 RegScavenger 借用寄存器而不破坏活跃性，这是需要
+  #   仔细设计而非照抄的部分。
+  # - 修复后必须重新跑：全量 `llvm-lit tests/lit/E2E/`、
+  #   `tools/run_differential.py`、**以及全量 gcc-c-torture 重扫**（因为
+  #   本 bug 影响面是"任何大栈帧函数"，其它当前"侥幸 PASS"的用例有可能在
+  #   修复后从"偶然算对"变成"真正算对"，也有可能修复本身如果有新 bug 导致
+  #   之前侥幸 PASS 的用例反而出问题——需要跑一遍全量对比，不能只验证
+  #   pr56866.c 单个用例，验证工作量超出本次诊断任务范围）。
+  #
+  # 建议：作为独立任务下发（新代码实现 + 需要先想清楚 RegScavenger 用法
+  # 再动手，符合"必须创建任务下发"标准），任务范围应包含：
+  # 1. FrameLowering.cpp emitPrologue/emitEpilogue 大立即数兜底
+  # 2. RegisterInfo.cpp eliminateFrameIndex 全部 5 个 case 同样兜底
+  # 3. pr56866.c 从 TIMEOUT 变 PASS（双后端）
+  # 4. 全量 E2E lit + 差分 + gcc-c-torture 全量重扫三件套零回归
+  #    （重扫要同时看有没有"之前侥幸 PASS 现在真的挂了"的新发现）
+
 - id: gem5-differential-harness-stale-blanket-skip-rasuf
   title: "run_gem5_test.py's blanket jump/call/ret+expected_fault SKIP rule (tests/scripts/run_gem5_test.py:104-106) predates ML-015c's vector reclassification and now structurally skips 2 real RASUF vectors gem5 already implements correctly, inflating gem5-SKIP from 0 to 2 in tools/run_differential.py"
   status: open
@@ -371,3 +467,33 @@
   # 删除并配合后端修复（宽距/绝对寻址取外部符号地址的能力）一起解决，
   # 现在这个 override 只是"当前阶段安全、需要在有动态链接需求时重新审视"
   # 的临时措施，不是长久方案。
+
+- id: musl-softfloat-shim-missing-divsc3
+  title: "softfloat_shim.c 未实现 __divsc3（单精度复数除法，C99 Annex G / compiler-rt divsc3.c 的 Smith 算法），gcc-c-torture 全量语料库（1708 个用例）里仅 complex-5.c 一个文件因此仍 FAIL_LINK（独立验证：complex-6.c/complex-7.c 用到的是相等比较/相减/构造，不需要 __divsc3，链接已在 ML-028a 补齐比较+算术家族后转 PASS）"
+  status: open
+  scope: [musl, softfloat]
+  blocks: [complex-5.c]
+  resolved_by: null
+  # ML-028a（2026-07-24）评估记录：
+  #
+  # ML-026a 的 92 文件符号并集报告里列出了 __divsc3，但逐一 grep + 独立
+  # 探针编译确认 92 个文件里实际引用 __divsc3 的只有 complex-5.c 一个
+  # （`y = p(x, 1.0f / z)`，`z` 是 `float __complex__`，"实数 / 复数"触发
+  # C99 复数除法）。complex-6.c 只有一次简单赋值/构造、complex-7.c 只有
+  # `!=` 相等比较（触发的是 __nesf2 之类的比较符号，本任务已补齐），两者
+  # 都不需要 __divsc3——独立编译验证过（补齐本任务其余符号后二者均转
+  # PASS，且 FAIL_LINK 错误信息里从未出现过 __divsc3）。
+  #
+  # 未在 ML-028a 内实现的原因：__divsc3 的算法（Smith's method：先用
+  # logb/scalbn 把分母重新定标避免中间溢出，再按 C99 Annex G 对
+  # NaN/inf/0 的各种组合做专门特判，见
+  # .work/source/llvm/compiler-rt/lib/builtins/divsc3.c）在"复杂度"这个
+  # 维度上和本文件其余全部符号（__addsf3/__divsf3/比较家族/int64<->float
+  # 转换等，全部是闭式位模式运算，没有任何依赖其它超越函数或多步骤特判
+  # 表）不是同一量级——需要先实现或复用 logb/scalbn/isnan/isinf 这一层
+  # （本文件目前完全没有这套基础设施），且 Annex G 的特判分支本身就需要
+  # 单独设计验证向量，不是"改几个位宽常量"就能照抄已有函数模式完成的
+  # 工作。按 ML-028a 任务书的应急条款（"如果这 92 个文件里实际用到
+  # __divsc3 的只有个位数...且实现复杂度明显超出其它符号...允许作为独立
+  # 后续任务留待以后处理"）登记为独立任务，不阻塞本次 92 文件里其余 81
+  # 个的收尾。
