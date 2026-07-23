@@ -8,3 +8,4 @@
 0008-dadao-make-mallocng-public-entry-point-extractable.patch
 0009-dadao-drop-O0-workaround-and-optnone-attributes-ML-0.patch
 0010-dadao-add-IEEE-754-binary64-soft-float-shim-for-vfpr.patch
+0011-dadao-fix-AT_PAGESZ-auxv-immediate-overflow-in-crt_a.patch

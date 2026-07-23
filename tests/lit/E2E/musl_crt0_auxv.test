@@ -115,7 +115,12 @@ aux_loop:
 
 aux_pagesz:
     ldo rd13, rb20, 8
-    addi rd9, rd0, 4096
+    # ML-024a: was `addi rd9, rd0, 4096` -- addi's imms12 is signed 12-bit
+    # (-2048..2047, contracts/isa/spec.md SS3.6/SS1011), so 4096 silently
+    # wrapped to 0 here AND in crt0_auxv.s's own construction of this same
+    # value (compensating error: both sides 0, so this check passed
+    # vacuously despite the real value being wrong). setzw fixes both.
+    setzw rd9, 0, 4096
     breq rd13, rd9, aux_pagesz_ok
     addi rd30, rd0, 6
     jump fail

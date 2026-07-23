@@ -1,0 +1,33 @@
+// ML-024a: mallocng size-class (small-object/slab-pool) path E2E test,
+// covering the gap ML-023a found and left open (that milestone only
+// exercised mallocng's direct-mmap path, >=MMAP_THRESHOLD=131052 bytes).
+// See Inputs/musl_malloc_sizeclass.c's header comment for the full root
+// cause (arch/dadao/crt_arch.h's AT_PAGESZ auxv entry was synthesized with
+// `addi rd8, rd0, 4096`, but addi's imms12 immediate is signed 12-bit
+// (-2048..2047) so 4096 silently wrapped to 0, leaving libc.page_size==0
+// at runtime and cascading into zero-length mmap(0,0,...) calls in both
+// musl's lite_malloc.c fallback allocator and mallocng's alloc_group()).
+//
+// Covers both scenarios the diagnosis found behave differently under the
+// bug: malloc-only (no dereference, silently linked lite_malloc instead of
+// mallocng because nothing referenced a mallocng-specific symbol) and
+// malloc+write+read-back+free (references `free`, forcing real mallocng to
+// link). Both must pass with exit=42 on both backends now that the root
+// cause is fixed.
+//
+// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O2 \
+// RUN:   -I%S/../../../.work/source/musl/arch/dadao \
+// RUN:   -I%S/../../../.work/source/musl/arch/generic \
+// RUN:   -I%S/../../../.work/source/musl/include \
+// RUN:   -I%S/../../../.work/build/musl/obj/include \
+// RUN:   -c -o %t.o %S/Inputs/musl_malloc_sizeclass.c
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld \
+// RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \
+// RUN:   -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.out
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.gout
+//
+// MARKER: SIZECLASS_OK

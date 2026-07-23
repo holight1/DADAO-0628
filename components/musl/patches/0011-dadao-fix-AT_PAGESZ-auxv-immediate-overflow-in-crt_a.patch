@@ -1,0 +1,68 @@
+From b3240b4a76ed143952af45dc4550e749cf08312b Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 23 Jul 2026 11:36:51 +0800
+Subject: [PATCH] dadao: fix AT_PAGESZ auxv immediate overflow in crt_arch.h
+ (ML-024a)
+
+crt_arch.h synthesized the AT_PAGESZ=4096 auxv entry with
+`addi rd8, rd0, 4096`, but addi's immediate field (imms12) is signed
+12-bit (-2048..2047, contracts/isa/spec.md SS3.6/SS1011); 4096 does not
+fit and silently wrapped to 0 instead of erroring. This left
+libc.page_size==0 at runtime instead of 4096, which cascaded into a
+zero-length mmap(0, 0, ...) call from both musl's lite_malloc.c bump
+allocator (via its PAGE_SIZE-based req/brk arithmetic, which
+underflows/zeroes when PAGE_SIZE==0) and mallocng's alloc_group()
+(which reads PGSZ == libc.page_size directly; its sibling alloc_meta()
+only clamps a local copy that never propagates back). QEMU's mmap
+responder correctly rejects a zero-length request (-EINVAL), giving a
+clean NULL from malloc(); gem5's did not, returning a non-NULL but
+unbacked address that only faults (MALIGN) once actually dereferenced.
+
+Diagnosed via targeted debug instrumentation (raw write(2,...) traces
+added temporarily to lite_malloc.c and mallocng/malloc.c, then
+reverted) that traced two minimal repro programs down to the exact
+computed values (req=0, needed=0, mmap length=0) at each layer.
+
+Fix: use `setzw rd8, 0, 4096` (unsigned 16-bit immediate instruction,
+contracts/isa/spec.md SS607/SS617) instead, which materializes 4096
+exactly. Same idiom already used in tp_probe.test/mmap_backing_probe.test
+for constants >2047.
+
+Also fixes the identical bug in tests/scripts/crt0_auxv.s and a
+compensating error in tests/lit/E2E/musl_crt0_auxv.test's own
+expected-value construction (both sides independently wrapped to 0,
+so the AT_PAGESZ check passed vacuously despite the real value being
+wrong) -- tracked in the main DADAO-0628 repo, not part of this patch.
+
+See code-agent/tasks/ML-024a-mallocng-small-sizeclass-diagnosis.md.
+---
+ arch/dadao/crt_arch.h | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/arch/dadao/crt_arch.h b/arch/dadao/crt_arch.h
+index a02551f6..9d1b1f28 100644
+--- a/arch/dadao/crt_arch.h
++++ b/arch/dadao/crt_arch.h
+@@ -80,10 +80,17 @@ START ":\n"
+ "    # [3] envp terminator = NULL (empty environment)\n"
+ "    sto rd8, rb1, 24\n"
+ "\n"
+-"    # [4..5] AT_PAGESZ(6) = 4096\n"
++"    # [4..5] AT_PAGESZ(6) = 4096. NOTE (ML-024a): `addi` takes a signed\n"
++"    # 12-bit immediate (imms12, -2048..2047, contracts/isa/spec.md SS3.6/\n"
++"    # SS1011) -- 4096 does not fit and silently wraps to 0, which was the\n"
++"    # confirmed root cause of the mallocng/lite_malloc size-class-path\n"
++"    # gap (libc.page_size ended up 0 at runtime instead of 4096). `setzw`\n"
++"    # (SS607/SS617) takes an unsigned 16-bit immediate and can materialize\n"
++"    # 4096 exactly; this idiom is already used elsewhere for constants\n"
++"    # >2047 (tests/lit/E2E/tp_probe.test, mmap_backing_probe.test).\n"
+ "    addi rd8, rd0, 6\n"
+ "    sto rd8, rb1, 32\n"
+-"    addi rd8, rd0, 4096\n"
++"    setzw rd8, 0, 4096\n"
+ "    sto rd8, rb1, 40\n"
+ "\n"
+ "    # [6..7] AT_UID(11) = 0\n"
+-- 
+2.43.0
+

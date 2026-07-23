@@ -1,0 +1,28 @@
+// ML-024a: mallocng size-class path, lite_malloc-linked variant. See
+// Inputs/musl_malloc_sizeclass_liteonly.c's header comment: this
+// translation unit references only `malloc()` (never `free()`), which an
+// independent review confirmed resolves to musl's separate
+// src/malloc/lite_malloc.c bump allocator (weak `malloc` symbol) rather
+// than mallocng (strong `malloc`, only pulled in when something else in
+// the link references a mallocng-specific symbol) -- a genuinely distinct
+// code path from musl_malloc_sizeclass.test's malloc+write+free scenario,
+// both of which independently hit variants of the same root cause (see
+// that test's header comment for the full diagnosis) before the
+// crt_arch.h AT_PAGESZ fix.
+//
+// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O2 \
+// RUN:   -I%S/../../../.work/source/musl/arch/dadao \
+// RUN:   -I%S/../../../.work/source/musl/arch/generic \
+// RUN:   -I%S/../../../.work/source/musl/include \
+// RUN:   -I%S/../../../.work/build/musl/obj/include \
+// RUN:   -c -o %t.o %S/Inputs/musl_malloc_sizeclass_liteonly.c
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld \
+// RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \
+// RUN:   -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.out
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.gout
+//
+// MARKER: SIZECLASS_LITE_OK

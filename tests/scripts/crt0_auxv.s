@@ -58,10 +58,15 @@ _start:
     # [3] envp terminator = NULL (empty envp: just the one NULL entry)
     sto rd8, rb1, 24
 
-    # [4..5] AT_PAGESZ = 4096
+    # [4..5] AT_PAGESZ = 4096. NOTE (ML-024a): addi's imms12 is signed
+    # 12-bit (-2048..2047, contracts/isa/spec.md SS3.6/SS1011); 4096
+    # silently wrapped to 0 here, which combined with the identical bug in
+    # musl_crt0_auxv.test's own expected-value construction (compensating
+    # error, both sides 0) masked the real libc.page_size=0 regression
+    # this probe exists to catch. setzw materializes 4096 exactly.
     addi rd8, rd0, 6
     sto rd8, rb1, 32
-    addi rd8, rd0, 4096
+    setzw rd8, 0, 4096
     sto rd8, rb1, 40
 
     # [6..7] AT_UID = 0
