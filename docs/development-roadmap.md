@@ -973,7 +973,61 @@ not "a few more of the same kind").
 `printf` links and runs on both backends with real output verified).
 `scanf` integer format remains open (separate symbol gap above).
 Roadmap C (optional be99→d3bd causal isolation) and E (kernel) remain
-untouched. **Next**: roadmap D — resume `ML-014a` (mallocng e2e) itself,
-starting with reproducing/diagnosing the chained malloc/free/output
-test's last known failure (`ML-014f`, QEMU rc=130 / gem5 rc=0,
-never root-caused) now that the stdout blocker (roadmap A) is fixed.
+untouched.
+
+### ML-014a / roadmap D complete (2026-07-23): mallocng e2e milestone closed for real
+
+Blocked since 2026-07-18 across `ML-014f`/`j`/`m`/`n`/`o`/`p` (archived
+in `code-agent/tasks/archive/2026-07-ml014-malloc-e2e-run/`): a real
+`mallocng` allocation chain hit a gem5 page-table fault at `0x90001000`
+and QEMU follow-up-probe failures (exit 13/14), root cause never found
+("needs a separate investigation"). The architect independently
+reproduced the exact historical repro on current HEAD (post `DL-070a`/
+`ML-018a`/`ML-019a`/`ML-021a`/`ML-022a`) *before dispatching any task*
+and found it now passes cleanly on both backends — strong evidence
+`ML-021a`'s `CALLSEQ_START/END` glue-chain fix was the real root cause
+of the old gem5 fault all along (mallocng's allocator makes several
+consecutive calls within one basic block, exactly that bug's shape).
+
+`ML-023a` independently re-verified this (its own fresh compile/link/
+run, not trusting the architect's numbers) and formalized it as
+`tests/lit/E2E/musl_malloc_printf.test`: two real allocations (131052
+and 262144 bytes, both `>= MMAP_THRESHOLD` so both take the real
+`mmap(222)` path, not the size-class slab pool), page-granularity
+write/read-back verification, `free`, `puts()` output, exit 42 on both
+QEMU and gem5. mmap-triggering verified discriminatively — both
+pointers land inside the dedicated mmap arena with monotonically
+increasing addresses; a `malloc(8)` negative control does not.
+
+An independent review caught a real defect worth remembering: the
+first draft's `check_block` used a plain `char *`, and `-O2`'s
+store-to-load forwarding proved the read-back always matches what was
+just written, folding nearly every check to a compile-time constant
+(only 1 real `load` survived in the whole IR; the failure branch was
+unreachable) — silently defeating the "verify content, not just that
+it ran" requirement this milestone had from day one. Fixed with
+`volatile char *` access; architect-independently-verified (37 real
+loads in the `-O2` IR, and a genuine negative control — one check's
+expected value deliberately wrong — reproducibly fails at exit 12
+rather than passing). This is a durable lesson for any future E2E test
+in this project that verifies memory content at `-O2` or higher: a
+plain-pointer round-trip check inside a single function is exactly the
+shape LLVM's store-forwarding will optimize away.
+
+E2E 62→63/63, differential AGREE=200/DIVERGE=0 unchanged, manifest/
+issues PASS. No LLVM/QEMU/gem5/musl source changes were needed — pure
+verification + test formalization on top of four already-landed
+fixes. `code-agent/tasks/ML-014a-musl-e2e-malloc-printf.md` is marked
+complete for the first time since the milestone was defined. Commit
+`a84348d`.
+
+A new, unrelated, deliberately out-of-scope gap was found and left
+open: `malloc(8)` (the size-class slab-pool path, below
+`MMAP_THRESHOLD`) returns `NULL` and gem5 subsequently `MALIGN`-faults
+— this milestone only ever exercised the `>= MMAP_THRESHOLD` mmap
+path by design; not registered as an issue yet, left for a future
+decision on whether it warrants its own task.
+
+**Status**: roadmap A/B/D are now all closed. Remaining: roadmap C
+(optional, not blocking), roadmap E (kernel bring-up, ADR-0015 charter),
+and the newly-found `malloc(8)` size-class gap (undecided scope).
