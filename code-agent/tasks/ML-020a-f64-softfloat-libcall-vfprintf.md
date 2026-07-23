@@ -2,7 +2,8 @@
 
 **执行环境**: 本地 subagent
 
-**状态**: 待处理
+**状态**: 部分完成（Accepted-with-findings；编译期 libcall 注册完成，后续由
+ML-021a/ML-022a 收口）
 
 ## 硬约束（务必遵守，违反视为任务失败）
 

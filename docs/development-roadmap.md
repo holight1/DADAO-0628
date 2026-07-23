@@ -1031,3 +1031,40 @@ decision on whether it warrants its own task.
 **Status**: roadmap A/B/D are now all closed. Remaining: roadmap C
 (optional, not blocking), roadmap E (kernel bring-up, ADR-0015 charter),
 and the newly-found `malloc(8)` size-class gap (undecided scope).
+
+### Post-ML-024 stabilization complete (2026-07-23)
+
+The small-allocation gap was traced to a real crt0 defect rather than a
+mallocng algorithm bug: `AT_PAGESZ=4096` was materialized with an out-of-range
+signed-12-bit `addi`, silently encoding zero. ML-024a replaced it with
+`setzw`, fixed the compensating error in the auxv probe, and added separate
+mallocng and lite_malloc E2E coverage. ML-024b independently accepted the
+fix; ML-024c strengthened the lite_malloc case with volatile memory
+write/read so gem5 can no longer pass on an unbacked non-NULL pointer.
+
+ML-025a established that the current QEMU and gem5 responders already agree
+on raw zero-length mmap (`-EINVAL` before cursor/VMA side effects) and locked
+that behavior with a direct syscall probe. No duplicate simulator fix or
+empty component commit was created.
+
+Two reproducibility defects found during these reviews were repaired:
+
+- IN-006a/b restored the LLVM component series to plain `git am` **49/49**
+  from the manifest pin, with final tree identity against LLVM HEAD.
+- IN-007a restored the missing QEMU `e7639ea...` history patch; the QEMU
+  series now replays **21/21** with final tree identity.
+
+DL-071a then eliminated the systemic cause of the crt0 bug: DADAO MC now
+rejects out-of-range constants for every explicit encoded immediate field,
+while preserving symbol/fixup expressions. It added positive/negative MC
+tests and corrected two illegal `addi 0x5A5A` instances in `tp_probe.test`
+to use `setzw`. The LLVM series remains 49/49 after this new patch.
+
+Accepted final gate: project MC **14/14**, E2E **66/66** (including the 23
+thin-wrapper llvm-test-suite cases), differential
+`AGREE(3-way)=200`, `AGREE(4-way)=200`, `DIVERGE=0`, manifest/issues PASS.
+This is not a claim that the full upstream LLVM or llvm-test-suite suites
+have run; native LLVM lit still lacks `llvm-config` in the current build
+tree. Follow-up DL-071b records the narrower multi-load/store `count=0`
+instruction-legality gap. Kernel roadmap E remains paused pending the next
+compiler-coverage decision.
