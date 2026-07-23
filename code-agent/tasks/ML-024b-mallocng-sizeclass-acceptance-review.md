@@ -4,7 +4,7 @@
 
 ## 状态
 
-待处理。
+已完成，独立判决 **Accepted-with-findings**，无 blocking finding。
 
 ## 背景
 
@@ -38,3 +38,16 @@ mallocng 与 lite_malloc 两条小分配双后端 E2E。worker 已在 ML-024a �
 
 独立 review 报告必须给出 Accepted、Accepted-with-findings 或 Needs-fix 判决，
 列出实际命令、关键输出、finding 和建议处置。
+
+## 完成区
+
+- 独立报告：
+  `docs/reviews/ML-024b-independent-review-20260723.md`
+- 判决：Accepted-with-findings；ML-024a 核心修复可接受。
+- 已独立确认 musl 0001～0011 裸 pin 重放、allocator 符号分流、目标测试、
+  E2E 65/65、四方 differential、manifest 和 issues 门禁。
+- 三项 non-blocking finding：
+  1. lite_malloc 测试未读写返回内存，在旧 bug 下会在 gem5 假阳性；
+  2. lite-only 测试命名/注释不准确；
+  3. assembler 仍静默接受越界立即数。
+- finding 1/2 下发为 ML-024c；finding 3 已下发为 DL-071a。
