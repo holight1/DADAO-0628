@@ -1,0 +1,584 @@
+From fe3f43b6a1682398128e0f89f4ac273b2da32294 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 23 Jul 2026 09:52:16 +0800
+Subject: [PATCH] dadao: add IEEE-754 binary64 soft-float shim for vfprintf
+ link gap (ML-022a)
+
+DADAO has no floating-point registers/instructions. LLVM's generic
+SelectionDAG type legalizer softens every `double` op musl's
+vfprintf.c/vfscanf.c reference into standard GNU-style libcalls
+(registered for the dadao triple by ML-020a). ML-021a fixed vfprintf.o's
+own CodeGen (a separate glue-chain bug) so it compiles clean, but linking
+a real integer-format `printf("value=%d\n", 42); return 42;` program
+against crt1.o + libc.a still failed at link time.
+
+Independently re-running the architect's original 7-symbol repro against
+the current libc.a found 10 undefined symbols, not 7 (__eqdf2, __muldf3,
+__unorddf2 in addition to __adddf3/__subdf3/__nedf2/__fixdfdi/
+__fixunsdfdi/__floatsidf/__floatunsidf) -- vfprintf.c's printf_core
+references all 10 regardless of which format specifier is used at
+runtime, since the whole translation unit must type-legalize.
+
+Adds src/internal/dadao/softfloat_shim.c implementing exactly those 10
+symbols, self-contained (no int_lib.h/fp_lib.h compiler-rt
+infrastructure, no compiler-rt/Makefile integration -- this was ML-020a's
+pre-evaluated "option A: small gap, hand-write a shim" path). Verified
+with a standalone functional test (exercised through the real compiler
+softening path, not direct calls) that add/sub/mul/eq/ne/unord/fix/float
+all compute correct IEEE-754 results including NaN handling, on both
+QEMU and gem5.
+
+Placed under src/internal/dadao/ (not arch/dadao/, despite the task
+file's assumption) because ARCH_GLOBS only globs src/*/$(ARCH)/*.[csS]
+(and crt/ldso/malloc-mallocng variants) -- arch/dadao/ holds headers only
+and is never auto-compiled into libc.a.
+
+__subdf3's `return __adddf3(...)` tail call relies on arch.mak's existing
+tree-wide -fno-optimize-sibling-calls (ML-012a) to avoid the pre-existing
+DADAO sibling-call-lowering assertion (codegen-tailcall-lowercall-assert);
+verified directly with that flag, matching the real musl build.
+
+vfscanf.o's own path (via floatscan.o) needs a distinct, larger set of
+symbols not covered here (single-precision f32 family + __divdf3/__gedf2)
+-- see docs/issues.yaml musl-vfscanf-missing-single-precision-and-divide-
+softfloat-symbols, follow-up task recommended.
+---
+ src/internal/dadao/softfloat_shim.c | 526 ++++++++++++++++++++++++++++
+ 1 file changed, 526 insertions(+)
+ create mode 100644 src/internal/dadao/softfloat_shim.c
+
+diff --git a/src/internal/dadao/softfloat_shim.c b/src/internal/dadao/softfloat_shim.c
+new file mode 100644
+index 00000000..9436d76e
+--- /dev/null
++++ b/src/internal/dadao/softfloat_shim.c
+@@ -0,0 +1,526 @@
++/* dadao: minimal self-contained IEEE-754 binary64 soft-float shim (ML-022a).
++ *
++ * DADAO has no floating-point registers/instructions (contracts/isa/spec.md).
++ * LLVM's generic SelectionDAG type legalizer softens every `double` op that
++ * musl's vfprintf.c/vfscanf.c reference into a standard GNU-style libcall
++ * (registered for the dadao triple in RuntimeLibcalls.td by ML-020a).
++ *
++ * The ML-022a task file's original architect repro reported exactly 7
++ * undefined symbols at link time (__adddf3, __subdf3, __nedf2, __fixdfdi,
++ * __fixunsdfdi, __floatsidf, __floatunsidf). Independently re-running that
++ * same repro against the current `.work/build/musl/lib/libc.a` (rebuilt
++ * since) turned up **10**, not 7: the same 7 plus __eqdf2, __muldf3,
++ * __unorddf2 (`llvm-nm -u obj/src/stdio/vfprintf.o` confirms all 10 are
++ * referenced directly by `vfprintf.c`'s `printf_core`, independent of which
++ * format specifier is used at runtime -- the whole translation unit must
++ * type-legalize, and it contains %f/%g/%e handling code alongside %d/%u).
++ * Per this task's own contingency instructions ("如果验证中发现这 7 个符号
++ * 不够...可以在本任务范围内继续补，只要总数仍然是个位数/十几个以内的小
++ * 集合"), 10 is still a small, single-shim-file scope, so all 10 are
++ * implemented here rather than stopping at 7 or escalating back to the
++ * architect. See the ML-022a task completion notes for the full discrepancy
++ * writeup.
++ *
++ * This file implements exactly those 10 symbols and nothing else -- it is
++ * not a general libgcc/compiler-rt replacement, just the minimal set that
++ * closes the observed vfprintf.o link gap for integer-format printf.
++ * vfscanf.o's own path (via src/internal/floatscan.c) needs a different,
++ * larger set of symbols not implemented here (single-precision f32 family:
++ * __extendsfdf2/__floatsisf/__mulsf3/__truncdfsf2, plus __divdf3/__gedf2)
++ * -- see docs/issues.yaml
++ * musl-vfscanf-missing-single-precision-and-divide-softfloat-symbols.
++ *
++ * Lives under src/internal/dadao/ rather than arch/dadao/: musl's
++ * Makefile only auto-globs C/S source files found in an ARCH-named
++ * subdirectory directly beneath src's per-category directories (also
++ * crt, ldso, and the mallocng directory) into the build, via the
++ * ARCH_GLOBS/ARCH_SRCS Makefile variables. arch/dadao/ itself holds only
++ * headers (syscall_arch.h, atomic_arch.h, etc.) and is never
++ * auto-compiled. src/internal/ already has arch-specific precedent
++ * (src/internal/i386/), so this dadao-only compiler-support file follows
++ * that existing convention.
++ *
++ * Algorithms are adapted from LLVM compiler-rt's
++ * lib/builtins/{adddf3,subdf3,muldf3,fixdfdi,fixunsdfdi,floatsidf,
++ * floatunsidf,comparedf2}.c, but reimplemented standalone: compiler-rt's
++ * originals pull in int_lib.h/fp_lib.h's cross-target configuration/macro
++ * infrastructure, which this port does not need (DADAO only ever needs the
++ * binary64 case). The 64x64->128-bit wide multiply muldf3 needs is done
++ * with the compiler's native `unsigned __int128` support rather than
++ * compiler-rt's manual 4-way 32x32 partial-product decomposition
++ * (`wideMultiply` in fp_lib.h) -- verified this does not itself introduce
++ * any new undefined-symbol dependency (checked with `llvm-nm -u` on a
++ * standalone probe object: DADAO's backend expands 128-bit multiply
++ * in-line, no `__multi3`-style libcall).
++ *
++ * IMPORTANT (self-recursion trap, see ML-022a task file): every operation in
++ * this file must be implemented using only integer/bitwise operations on the
++ * `rep_t` (uint64_t) bit representation of `double` -- never the native C
++ * `+`, `-`, `==`, `!=`, `<` etc. operators applied directly to `double`
++ * values. DADAO has no f64 register class, so any such native FP operator
++ * used *inside* these definitions would itself be legalized by LLVM into a
++ * libcall against one of these very symbols (e.g. writing `a != b` inside
++ * __nedf2 would legalize to a recursive call to __nedf2 itself, and `a + b`
++ * inside __adddf3 would legalize to a recursive call to __adddf3). All 10
++ * functions below only ever compare/shift/mask the uint64_t bit patterns.
++ *
++ * Rounding mode: DADAO has no floating-point control register, so this shim
++ * hardcodes IEEE-754 default round-to-nearest, ties-to-even (unlike
++ * compiler-rt's fp_add_impl.inc, which supports switching modes via a
++ * hosted fenv shim DADAO does not have and does not need).
++ */
++
++typedef unsigned long long rep_t;
++typedef unsigned int half_rep_t;
++
++#define REP_C(x) (x##ULL)
++#define significandBits 52
++#define typeWidth 64
++#define exponentBits (typeWidth - significandBits - 1) /* 11 */
++#define maxExponent ((1 << exponentBits) - 1)           /* 2047 */
++#define exponentBias (maxExponent >> 1)                 /* 1023 */
++
++#define implicitBit (REP_C(1) << significandBits)
++#define significandMask (implicitBit - 1U)
++#define signBit (REP_C(1) << (significandBits + exponentBits))
++#define absMask (signBit - 1U)
++#define exponentMask (absMask ^ significandMask)
++#define infRep exponentMask
++#define quietBit (implicitBit >> 1)
++#define qnanRep (exponentMask | quietBit)
++
++static __inline rep_t toRep(double x) {
++  union {
++    double f;
++    rep_t i;
++  } u;
++  u.f = x;
++  return u.i;
++}
++
++static __inline double fromRep(rep_t x) {
++  union {
++    double f;
++    rep_t i;
++  } u;
++  u.i = x;
++  return u.f;
++}
++
++static __inline int rep_clz(rep_t a) {
++  /* a is always nonzero at every call site below (guarded by the implicit
++   * bit or by an explicit zero-check first), so no need to special-case 0. */
++  return __builtin_clzll(a);
++}
++
++/* Normalizes a subnormal significand in place; returns the resulting biased
++ * exponent (mirrors compiler-rt's fp_lib.h normalize()). */
++static __inline int normalize(rep_t *significand) {
++  const int shift = rep_clz(*significand) - rep_clz(implicitBit);
++  *significand <<= shift;
++  return 1 - shift;
++}
++
++/* 64x64 -> 128-bit wide multiply, used only by __muldf3. Uses the
++ * compiler's native `unsigned __int128` support (see file header: verified
++ * standalone to compile with no new undefined-symbol dependency) rather
++ * than compiler-rt's manual 4-way 32x32 partial-product decomposition. */
++static __inline void wideMultiply(rep_t a, rep_t b, rep_t *hi, rep_t *lo) {
++  unsigned __int128 product = (unsigned __int128)a * (unsigned __int128)b;
++  *hi = (rep_t)(product >> 64);
++  *lo = (rep_t)product;
++}
++
++/* Left-shifts the 128-bit {*hi, *lo} pair (hi is the more-significant half)
++ * in place by `count` bits. Only ever called with count == 1 below. */
++static __inline void wideLeftShift(rep_t *hi, rep_t *lo, unsigned int count) {
++  *hi = (*hi << count) | (*lo >> (typeWidth - count));
++  *lo = *lo << count;
++}
++
++/* Right-shifts the 128-bit {*hi, *lo} pair by `count` bits, ORing a sticky
++ * bit into the result's LSB if any shifted-out bit was set (needed for
++ * correct round-to-nearest-even on values that would otherwise silently
++ * drop precision). Mirrors fp_lib.h's wideRightShiftWithSticky. */
++static __inline void wideRightShiftWithSticky(rep_t *hi, rep_t *lo,
++                                               unsigned int count) {
++  if (count < typeWidth) {
++    const int sticky = (*lo << (typeWidth - count)) != 0;
++    *lo = (*hi << (typeWidth - count)) | (*lo >> count) | (rep_t)sticky;
++    *hi = *hi >> count;
++  } else if (count < 2 * typeWidth) {
++    const int sticky = ((*hi << (2 * typeWidth - count)) | *lo) != 0;
++    *lo = (*hi >> (count - typeWidth)) | (rep_t)sticky;
++    *hi = 0;
++  } else {
++    const int sticky = (*hi | *lo) != 0;
++    *lo = (rep_t)sticky;
++    *hi = 0;
++  }
++}
++
++/* ---- __adddf3 / __subdf3 ---- */
++
++double __adddf3(double a, double b) {
++  rep_t aRep = toRep(a);
++  rep_t bRep = toRep(b);
++  const rep_t aAbs = aRep & absMask;
++  const rep_t bAbs = bRep & absMask;
++
++  /* Detect if a or b is zero, infinity, or NaN. */
++  if (aAbs - REP_C(1) >= infRep - REP_C(1) ||
++      bAbs - REP_C(1) >= infRep - REP_C(1)) {
++    if (aAbs > infRep)
++      return fromRep(aRep | quietBit); /* NaN + anything = qNaN */
++    if (bAbs > infRep)
++      return fromRep(bRep | quietBit); /* anything + NaN = qNaN */
++
++    if (aAbs == infRep) {
++      /* +/-infinity + -/+infinity = qNaN; else +/-infinity. */
++      if ((aRep ^ bRep) == signBit)
++        return fromRep(qnanRep);
++      else
++        return a;
++    }
++    if (bAbs == infRep)
++      return b; /* anything remaining + +/-infinity = +/-infinity */
++
++    if (!aAbs) {
++      if (!bAbs)
++        return fromRep(aRep & bRep); /* zero + zero: get the sign right */
++      else
++        return b;
++    }
++    if (!bAbs)
++      return a;
++  }
++
++  /* Swap so that a has the larger absolute value. */
++  if (bAbs > aAbs) {
++    const rep_t temp = aRep;
++    aRep = bRep;
++    bRep = temp;
++  }
++
++  int aExponent = (int)((aRep >> significandBits) & maxExponent);
++  int bExponent = (int)((bRep >> significandBits) & maxExponent);
++  rep_t aSignificand = aRep & significandMask;
++  rep_t bSignificand = bRep & significandMask;
++
++  if (aExponent == 0)
++    aExponent = normalize(&aSignificand);
++  if (bExponent == 0)
++    bExponent = normalize(&bSignificand);
++
++  const rep_t resultSign = aRep & signBit;
++  const int subtraction = (aRep ^ bRep) & signBit ? 1 : 0;
++
++  aSignificand = (aSignificand | implicitBit) << 3;
++  bSignificand = (bSignificand | implicitBit) << 3;
++
++  const unsigned int align = (unsigned int)(aExponent - bExponent);
++  if (align) {
++    if (align < typeWidth) {
++      const int sticky = (bSignificand << (typeWidth - align)) != 0;
++      bSignificand = (bSignificand >> align) | (rep_t)sticky;
++    } else {
++      bSignificand = 1; /* b is known to be non-zero: set the sticky bit. */
++    }
++  }
++
++  if (subtraction) {
++    aSignificand -= bSignificand;
++    if (aSignificand == 0)
++      return fromRep(0); /* a == -b: +zero */
++    if (aSignificand < (implicitBit << 3)) {
++      const int shift = rep_clz(aSignificand) - rep_clz(implicitBit << 3);
++      aSignificand <<= shift;
++      aExponent -= shift;
++    }
++  } else {
++    aSignificand += bSignificand;
++    if (aSignificand & (implicitBit << 4)) {
++      const int sticky = aSignificand & 1;
++      aSignificand = (aSignificand >> 1) | (rep_t)sticky;
++      aExponent += 1;
++    }
++  }
++
++  if (aExponent >= maxExponent)
++    return fromRep(infRep | resultSign);
++
++  if (aExponent <= 0) {
++    const int shift = 1 - aExponent;
++    const int sticky = (aSignificand << (typeWidth - shift)) != 0;
++    aSignificand = (aSignificand >> shift) | (rep_t)sticky;
++    aExponent = 0;
++  }
++
++  const int roundGuardSticky = (int)(aSignificand & 0x7);
++
++  rep_t result = (aSignificand >> 3) & significandMask;
++  result |= (rep_t)aExponent << significandBits;
++  result |= resultSign;
++
++  /* Round to nearest, ties to even (DADAO has no other rounding mode). */
++  if (roundGuardSticky > 0x4)
++    result++;
++  if (roundGuardSticky == 0x4)
++    result += result & 1;
++
++  return fromRep(result);
++}
++
++double __subdf3(double a, double b) {
++  /* a - b == a + (-b): flip b's sign bit and add.
++   *
++   * NOTE: this `return __adddf3(...)` is a literal tail call, which on its
++   * own crashes the DADAO backend at -O2 (pre-existing, already-tracked
++   * `codegen-tailcall-lowercall-assert`: `LowerCallTo: LowerCall emitted a
++   * return value for a tail call!`, since DADAO's TargetLowering never
++   * opts out of sibling-call codegen). This file relies on
++   * `arch/dadao/arch.mak`'s existing, already-landed (ML-012a)
++   * `CFLAGS_AUTO += -fno-optimize-sibling-calls` -- applied tree-wide to
++   * every musl object being built for dadao, not just this one -- to keep
++   * this call out of tail position; verified directly (see ML-022a task completion
++   * notes) that compiling this exact file with that flag, matching the
++   * real musl build, does not hit the assertion. Not re-solved with an
++   * in-file inline-asm barrier here because that pattern has its own
++   * separate tracked DADAO backend gap
++   * (`musl-inline-asm-empty-clobber-reg-alloc`). If this file is ever
++   * compiled standalone outside the musl build tree, pass
++   * `-fno-optimize-sibling-calls` explicitly. */
++  return __adddf3(a, fromRep(toRep(b) ^ signBit));
++}
++
++/* ---- __muldf3 ---- */
++
++double __muldf3(double a, double b) {
++  rep_t aRep = toRep(a);
++  rep_t bRep = toRep(b);
++  const unsigned int aExponent = (unsigned int)((aRep >> significandBits) & maxExponent);
++  const unsigned int bExponent = (unsigned int)((bRep >> significandBits) & maxExponent);
++  const rep_t productSign = (aRep ^ bRep) & signBit;
++
++  rep_t aSignificand = aRep & significandMask;
++  rep_t bSignificand = bRep & significandMask;
++  int scale = 0;
++
++  /* Detect if a or b is zero, denormal, infinity, or NaN. */
++  if (aExponent - 1U >= (unsigned int)maxExponent - 1U ||
++      bExponent - 1U >= (unsigned int)maxExponent - 1U) {
++    const rep_t aAbs = aRep & absMask;
++    const rep_t bAbs = bRep & absMask;
++
++    if (aAbs > infRep)
++      return fromRep(aRep | quietBit); /* NaN * anything = qNaN */
++    if (bAbs > infRep)
++      return fromRep(bRep | quietBit); /* anything * NaN = qNaN */
++
++    if (aAbs == infRep) {
++      if (bAbs)
++        return fromRep(aAbs | productSign); /* infinity * non-zero */
++      else
++        return fromRep(qnanRep); /* infinity * zero = NaN */
++    }
++    if (bAbs == infRep) {
++      if (aAbs)
++        return fromRep(bAbs | productSign); /* non-zero * infinity */
++      else
++        return fromRep(qnanRep); /* zero * infinity = NaN */
++    }
++
++    if (!aAbs || !bAbs)
++      return fromRep(productSign); /* zero * anything = +/- zero */
++
++    /* One or both of a, b is denormal; the other (if applicable) is
++     * normal. Renormalize and fold the adjustment into scale. */
++    if (aAbs < implicitBit)
++      scale += normalize(&aSignificand);
++    if (bAbs < implicitBit)
++      scale += normalize(&bSignificand);
++  }
++
++  aSignificand |= implicitBit;
++  bSignificand |= implicitBit;
++
++  rep_t productHi, productLo;
++  wideMultiply(aSignificand, bSignificand << exponentBits, &productHi, &productLo);
++
++  int productExponent = (int)aExponent + (int)bExponent - exponentBias + scale;
++
++  if (productHi & implicitBit)
++    productExponent++;
++  else
++    wideLeftShift(&productHi, &productLo, 1);
++
++  if (productExponent >= maxExponent)
++    return fromRep(infRep | productSign); /* overflow */
++
++  if (productExponent <= 0) {
++    /* Denormal result before rounding. wideRightShiftWithSticky's own
++     * three-way branch already handles arbitrarily large shift counts
++     * (collapsing to hi=0, lo=sticky-bit), so there is no need for a
++     * separate "shift too large, flush to zero" early return -- letting
++     * the shared rounding step below run uniformly also correctly allows
++     * an extremely tiny nonzero product to round up to the smallest
++     * denormal instead of unconditionally flushing to zero. */
++    const unsigned int shift = (unsigned int)(1 - productExponent);
++    wideRightShiftWithSticky(&productHi, &productLo, shift);
++  } else {
++    productHi &= significandMask;
++    productHi |= (rep_t)productExponent << significandBits;
++  }
++
++  productHi |= productSign;
++
++  /* Round to nearest, ties to even. */
++  if (productLo > signBit)
++    productHi++;
++  if (productLo == signBit)
++    productHi += productHi & 1;
++
++  return fromRep(productHi);
++}
++
++/* ---- __nedf2 / __eqdf2 / __unorddf2 ---- */
++
++/* GNU/libgcc soft-float comparison convention: returns 0 if a and b
++ * compare equal, nonzero otherwise -- callers only ever test the result
++ * against zero (they do not depend on sign/magnitude). Per IEEE-754, a
++ * comparison against NaN is always "unordered", which counts as "not equal"
++ * for the purposes of the != operator, so NaN must yield nonzero here too.
++ *
++ * Deliberately does NOT use `a != b`/`a == b` on the `double` operands --
++ * see the file-header self-recursion note. Only integer ops on the bit
++ * patterns are used.
++ */
++static __inline int cmp_nonequal(double a, double b) {
++  rep_t aRep = toRep(a);
++  rep_t bRep = toRep(b);
++  rep_t aAbs = aRep & absMask;
++  rep_t bAbs = bRep & absMask;
++
++  /* NaN (exponent all-ones, nonzero mantissa) on either side: unordered. */
++  if (aAbs > infRep || bAbs > infRep)
++    return 1;
++
++  /* +0.0 and -0.0 compare equal despite differing bit patterns. */
++  if (aAbs == 0 && bAbs == 0)
++    return 0;
++
++  return aRep != bRep;
++}
++
++int __nedf2(double a, double b) { return cmp_nonequal(a, b); }
++
++/* __eqdf2 and __nedf2 are the exact same comparison in the GNU/libgcc
++ * convention -- compiler-rt's comparedf2.c literally implements both as
++ * ELF weak aliases of the same __ledf2 function body. LLVM's softening
++ * pass (TargetLowering::softenSetCCOperands) picks which libcall to call
++ * (OEQ_F64 -> __eqdf2 for `==`, UNE_F64 -> __nedf2 for `!=`) and always
++ * tests the shared numeric result the same way (0 means "equal", nonzero
++ * means "not equal", including for NaN/unordered) -- see the file header's
++ * self-recursion note for why this is written as an integer-bit-pattern
++ * comparison rather than `a == b`/`a != b`. */
++int __eqdf2(double a, double b) { return cmp_nonequal(a, b); }
++
++/* __unorddf2 returns nonzero iff either operand is NaN ("unordered"),
++ * 0 otherwise -- per compiler-rt's comparedf2.c/fp_compare_impl.inc
++ * __unordXf2__. */
++int __unorddf2(double a, double b) {
++  rep_t aAbs = toRep(a) & absMask;
++  rep_t bAbs = toRep(b) & absMask;
++  return (aAbs > infRep) || (bAbs > infRep);
++}
++
++/* ---- __fixdfdi / __fixunsdfdi ---- */
++
++unsigned long long __fixunsdfdi(double a) {
++  rep_t aRep = toRep(a);
++  rep_t aAbs = aRep & absMask;
++
++  /* Negative (including -0.0 -- signBit set but that already returns 0 via
++   * the exponent/significand path below too) or NaN-with-sign: unsigned
++   * fix-to-zero-or-negative-value is 0, matching compiler-rt's __fixuint. */
++  if (aRep & signBit)
++    return 0;
++
++  int exponent = (int)((aAbs >> significandBits) & maxExponent) - exponentBias;
++  if (exponent < 0)
++    return 0; /* |a| < 1.0 truncates to 0 (covers +0.0 too) */
++
++  /* Saturate if the magnitude doesn't fit in 64 bits (also covers +inf/NaN,
++   * whose biased exponent is maxExponent-exponentBias = 1024). */
++  if ((unsigned)exponent >= 64)
++    return ~0ULL;
++
++  rep_t significand = (aAbs & significandMask) | implicitBit; /* 53 bits */
++
++  /* significand represents 1.xxx * 2^exponent; shift so the binary point
++   * lands at bit `exponent`, truncating any fractional bits (matches C's
++   * truncate-toward-zero double-to-integer conversion semantics). */
++  if (exponent < significandBits)
++    return (unsigned long long)(significand >> (significandBits - exponent));
++  return (unsigned long long)significand << (exponent - significandBits);
++}
++
++long long __fixdfdi(double a) {
++  rep_t aRep = toRep(a);
++  rep_t aAbs = aRep & absMask;
++  int negative = (aRep & signBit) != 0;
++
++  int exponent = (int)((aAbs >> significandBits) & maxExponent) - exponentBias;
++  if (exponent < 0)
++    return 0; /* |a| < 1.0 truncates to 0 */
++
++  const long long fixint_max = (long long)(~0ULL / 2);
++  const long long fixint_min = -fixint_max - 1;
++  if ((unsigned)exponent >= 64)
++    return negative ? fixint_min : fixint_max; /* saturate (incl. +/-inf/NaN) */
++
++  rep_t significand = (aAbs & significandMask) | implicitBit;
++  unsigned long long mag = (exponent < significandBits)
++                                ? (unsigned long long)(significand >> (significandBits - exponent))
++                                : (unsigned long long)significand << (exponent - significandBits);
++  /* Negate on the integer/bit side only -- never apply unary `-` to a
++   * `double` here (see file-header self-recursion note). */
++  return negative ? -(long long)mag : (long long)mag;
++}
++
++/* ---- __floatsidf / __floatunsidf ---- */
++
++/* Note: a 32-bit input's exponent is always in [0, 31], so
++ * `significandBits(52) - exponent` is always in [21, 52] -- strictly
++ * positive -- meaning the shift into the 52-bit significand field is always
++ * a left shift. (Unlike the 64-bit __fixdfdi/__fixunsdfdi conversions above,
++ * there is no corresponding right-shift case here.) */
++
++double __floatunsidf(unsigned int a) {
++  if (a == 0)
++    return fromRep(0);
++
++  const int exponent = 31 - __builtin_clz(a);
++  const int shift = significandBits - exponent;
++  rep_t result = ((rep_t)a << shift) ^ implicitBit;
++  result += (rep_t)(exponent + exponentBias) << significandBits;
++  return fromRep(result);
++}
++
++double __floatsidf(int a) {
++  if (a == 0)
++    return fromRep(0);
++
++  rep_t sign = 0;
++  unsigned int aAbs = (unsigned int)a;
++  if (a < 0) {
++    sign = signBit;
++    aAbs = -aAbs; /* unsigned negation: correct even for INT_MIN */
++  }
++
++  const int exponent = 31 - __builtin_clz(aAbs);
++  const int shift = significandBits - exponent;
++  rep_t result = ((rep_t)aAbs << shift) ^ implicitBit;
++  result += (rep_t)(exponent + exponentBias) << significandBits;
++  return fromRep(result | sign);
++}
+-- 
+2.43.0
+

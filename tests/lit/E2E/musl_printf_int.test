@@ -1,0 +1,38 @@
+// ML-022a: roadmap B collapse -- real, integer-format printf() E2E,
+// link + run on BOTH backends (not just "compiles"). Closes the
+// remaining gap ML-021a left open: vfprintf.o compiled clean, but
+// linking a real `printf("value=%d\n", 42); return 42;` program against
+// crt1.o + libc.a still failed at link time on 10 undefined
+// double-precision soft-float symbols (__adddf3, __subdf3, __muldf3,
+// __nedf2, __eqdf2, __unorddf2, __fixdfdi, __fixunsdfdi, __floatsidf,
+// __floatunsidf) that vfprintf.c's printf_core references regardless of
+// which format specifier is actually used at runtime. This task adds a
+// minimal, self-contained IEEE-754 binary64 soft-float shim
+// (arch/dadao/... -- see src/internal/dadao/softfloat_shim.c comments for
+// why it lives there and not literal `arch/dadao/`, and for the ML-020a
+// architect repro's "7 symbols" vs. this task's independently
+// re-confirmed "10 symbols" discrepancy) implementing exactly those 10
+// symbols, closing the link gap.
+//
+// Note: the vfscanf.o/floatscan.o path needs a DIFFERENT, larger set of
+// symbols not covered by this task (single-precision f32 family:
+// __extendsfdf2/__floatsisf/__mulsf3/__truncdfsf2, plus __divdf3/__gedf2)
+// -- see ML-022a task completion notes; not implemented here, follow-up
+// task recommended.
+//
+// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O2 \
+// RUN:   -I%S/../../../.work/source/musl/arch/dadao \
+// RUN:   -I%S/../../../.work/source/musl/arch/generic \
+// RUN:   -I%S/../../../.work/source/musl/include \
+// RUN:   -I%S/../../../.work/build/musl/obj/include \
+// RUN:   -c -o %t.o %S/Inputs/musl_printf_int.c
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld \
+// RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \
+// RUN:   -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.out
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: %FileCheck %s --check-prefix=MARKER < %t.gout
+//
+// MARKER: value=42
