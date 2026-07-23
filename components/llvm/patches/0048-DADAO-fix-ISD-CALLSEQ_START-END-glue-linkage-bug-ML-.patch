@@ -1,0 +1,146 @@
+From 4b812d2f99305a259a3d37a827d67c6c1ae14546 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 22 Jul 2026 16:23:38 +0800
+Subject: [PATCH] DADAO: fix ISD::CALLSEQ_START/END glue-linkage bug (ML-021a)
+
+DADAOISelDAGToDAG.cpp::Select() special-cased ISD::CALLSEQ_START/END by
+deleting the node and redirecting only its chain result (ResNo 0) to the
+input chain -- it never redirected the *glue* result (ResNo 1) that
+callseq_end produces for downstream consumers (e.g. the CopyFromReg
+reading a call's return register). This is harmless with a single call
+per basic block, but once a second independent direct/indirect/libcall
+CALL appears in the same block, the freed node's memory gets reused and
+the dangling glue use-edge corrupts the SelectionDAG, tripping
+ScheduleDAGSDNodes::BuildSchedUnits's "Node already inserted!" /
+SDNode::getValueType's "Illegal result number!" assertions.
+
+Fix: convert callseq_start/end to standard tablegen Pat<>-based selection
+(new ADJCALLSTACKDOWN/ADJCALLSTACKUP DADAOPseudo instructions, matching
+RISCVInstrInfo.td's reference pattern), so InstrEmitter's generic
+multi-result RAUW (via MorphNodeTo) threads both chain and glue correctly
+with no manual bookkeeping. Also wire DADAOInstrInfo's CFSetup/CFDestroy
+opcodes (previously hardcoded to literal 0, which coincidentally aliased
+HALT_RIII's opcode) to the new pseudo opcodes so PrologEpilogInserter's
+eliminateCallFramePseudoInstr actually fires on them.
+
+Verified via SelectionDAG debug dumps (llc -debug-only=isel): before the
+fix, the "Selected selection DAG" printout shows the same CALL_IIII node
+printed twice and a CopyFromReg glue operand as "<<Deleted Node!>>";
+after the fix, every glue chain threads through its own call's own
+ADJCALLSTACKUP with no duplication.
+
+- llvm-lit tests/lit/E2E: 61/61 (60 baseline + new
+  direct_call_multicall_block.test, a non-float regression test for
+  this exact bug shape, run on both QEMU and gem5 backends)
+- tools/run_differential.py: AGREE(4-way)=200, DIVERGE=0 (unchanged)
+- musl/src/stdio/vfprintf.o: now compiles with real musl -O2 build flags
+- Fresh full musl rebuild: failing objects dropped from ~180 to 10.
+  docs/issues.yaml musl-backend-assert-illegal-result-number (15),
+  -node-already-inserted (88), and -asmprinter-unmapself (1) all
+  resolved -> moved to docs/issues-archive.yaml. Remaining 10 failures
+  are 2 pre-existing unrelated issues (unanalyzable-fallthrough,
+  instrinfo-unreachable) plus 7 newly-exposed (not newly-caused)
+  ISD::DYNAMIC_STACKALLOC selection gaps, tracked as a new open issue
+  musl-backend-dynamic-stackalloc-unimplemented.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp | 13 +++++---
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp    |  3 +-
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td     | 35 +++++++++++++++++++++
+ 3 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+index 340d1c07029c..1a51e27648f4 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp
+@@ -35,11 +35,14 @@ void DADAODAGToDAGISel::Select(SDNode *Node) {
+   }
+ 
+   unsigned Opc = Node->getOpcode();
+-  if (Opc == ISD::CALLSEQ_START || Opc == ISD::CALLSEQ_END) {
+-    ReplaceUses(SDValue(Node, 0), Node->getOperand(0));
+-    CurDAG->RemoveDeadNode(Node);
+-    return;
+-  }
++  // ISD::CALLSEQ_START/END are matched by SelectCode() below via the
++  // ADJCALLSTACKDOWN/UP Pat<> patterns (ML-021a) — no special-casing here
++  // anymore. The former hand-rolled short-circuit (redirect ResNo 0 to the
++  // input chain, then RemoveDeadNode) never propagated the *glue* result
++  // (ResNo 1) of callseq_end, corrupting the glue chain of any CopyFromReg
++  // reading a call's return value once a second independent call appeared
++  // in the same block. See the comment on ADJCALLSTACKDOWN/UP in
++  // DADAOInstrInfo.td for the full root-cause writeup.
+ 
+   if (Opc == ISD::Constant) {
+     ConstantSDNode *C = cast<ConstantSDNode>(Node);
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index 72791aff740c..0f01f4ac651b 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -13,7 +13,8 @@ using namespace llvm;
+ #include "DADAOGenInstrInfo.inc"
+ 
+ DADAOInstrInfo::DADAOInstrInfo(const DADAOSubtarget &STI)
+-    : DADAOGenInstrInfo(STI, RI, /*CFSetup=*/0, /*CFDestroy=*/0,
++    : DADAOGenInstrInfo(STI, RI, /*CFSetup=*/DADAO::ADJCALLSTACKDOWN,
++                        /*CFDestroy=*/DADAO::ADJCALLSTACKUP,
+                         /*CatchRet=*/0, /*ReturnOpcode=*/0) {}
+ 
+ void DADAOInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index eddb6d332557..0e241c59c89a 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -59,6 +59,18 @@ def HALT_RIII : F_RIII_RD<(outs), (ins GPRD:$rdha), "halt", []> {
+ def DADAORetGlue : SDNode<"DADAOISD::RET_GLUE", SDTNone,
+                            [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
+ 
++// Target-specific re-declarations of the generic ISD::CALLSEQ_START/END
++// nodes (ML-021a). DADAO's call-frame accounting immediates are i64 (see
++// the `TargetConstant:i64<0>` operands on callseq_start/end in SelectionDAG
++// dumps), so the generic default profile doesn't apply directly — every
++// target instantiates its own width, same as RISCVInstrInfo.td.
++def SDT_DADAOCallSeqStart : SDCallSeqStart<[SDTCisVT<0, i64>, SDTCisVT<1, i64>]>;
++def SDT_DADAOCallSeqEnd   : SDCallSeqEnd<[SDTCisVT<0, i64>, SDTCisVT<1, i64>]>;
++def callseq_start : SDNode<"ISD::CALLSEQ_START", SDT_DADAOCallSeqStart,
++                           [SDNPHasChain, SDNPOutGlue]>;
++def callseq_end   : SDNode<"ISD::CALLSEQ_END", SDT_DADAOCallSeqEnd,
++                           [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue]>;
++
+ def SDT_DADAOBr1 : SDTypeProfile<0, 2,
+     [SDTCisVT<0, i64>, SDTCisVT<1, OtherVT>]>;
+ def SDT_DADAOBr2 : SDTypeProfile<0, 3,
+@@ -102,6 +114,29 @@ class DADAOPseudo<dag outs, dag ins, list<dag> pattern> : Instruction {
+   let Size = 4;
+ }
+ 
++// Call-frame adjustment pseudos (ML-021a). DADAO's frame lowering always
++// reserves the worst-case outgoing-args area in the prologue
++// (eliminateCallFramePseudoInstr just erases these, DADAOFrameLowering.h)
++// so, like most targets with a reserved call frame, these carry no real
++// register-adjustment semantics — they exist purely so ISD::CALLSEQ_START/
++// END get selected through the *standard* tablegen pattern-matching path
++// (MorphNodeTo, in place) instead of the ad hoc "delete node, manually
++// splice ResNo 0 only" special-case this replaces in DADAOISelDAGToDAG.cpp.
++// That hand-rolled special-case never redirected the *glue* result
++// (ResNo 1) of callseq_end when the node was removed, leaving any
++// CopyFromReg reading a call's return register with a dangling glue
++// operand once a second, independent call/callseq appeared later in the
++// same block — the SelectionDAG scheduler's `BuildSchedUnits` assertion
++// this task investigates. Selecting through Pat<> means InstrEmitter's
++// generic multi-result RAUW (via MorphNodeTo) handles both results
++// automatically; no manual glue bookkeeping is needed here at all.
++let Size = 0 in {
++def ADJCALLSTACKDOWN : DADAOPseudo<(outs), (ins i64imm:$amt1, i64imm:$amt2),
++                                   [(callseq_start timm:$amt1, timm:$amt2)]>;
++def ADJCALLSTACKUP   : DADAOPseudo<(outs), (ins i64imm:$amt1, i64imm:$amt2),
++                                   [(callseq_end timm:$amt1, timm:$amt2)]>;
++}
++
+ def ADD_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
+                              [(set GPRD:$dst, (add GPRD:$a, GPRD:$b))]>;
+ def SUB_PSEUDO : DADAOPseudo<(outs GPRD:$dst), (ins GPRD:$a, GPRD:$b),
+-- 
+2.43.0
+

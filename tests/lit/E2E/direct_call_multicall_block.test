@@ -1,0 +1,13 @@
+// ML-021a: same-basic-block, ≥2 independent direct CALLs (no libcall/float
+// involved). g() returns 10, h() returns 32; main returns g()+h()=42. Before
+// the ML-021a fix this crashed llc's scheduler with
+// "Node already inserted!" (ScheduleDAGSDNodes::BuildSchedUnits) — see
+// docs/issues.yaml musl-backend-assert-node-already-inserted /
+// -illegal-result-number.
+// RUN: %llc -march=dadao -o %t.ll.s %S/Inputs/direct_call_multicall_block.ll
+// RUN: cat %S/Inputs/crt0.s %t.ll.s > %t.full.s
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %t.full.s
+// RUN: %llvm-objcopy -O binary --only-section=.text %t.o %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: %gen_min_elf %t.bin %t.elf
+// RUN: bash -c '%gem5 %gem5_se %t.elf >/dev/null 2>&1; test $? -eq 42'

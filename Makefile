@@ -116,7 +116,7 @@ build-musl: manifest-check
 	  $$(find $(MUSL_BUILD)/obj/src $(MUSL_BUILD)/obj/compat -name '*.o' 2>/dev/null)
 	.work/build/llvm/bin/llvm-ranlib $(MUSL_BUILD)/lib/libc.a
 	@test -f $(MUSL_BUILD)/lib/crt1.o
-	@echo "build-musl: PASS (crt1.o + best-effort libc.a subset at $(MUSL_BUILD)/lib/; ~180 known-failing files excluded, see docs/issues.yaml)"
+	@echo "build-musl: PASS (crt1.o + best-effort libc.a subset at $(MUSL_BUILD)/lib/; ~10 known-failing files excluded as of ML-021a, see docs/issues.yaml)"
 
 check-wiki-drift:
 	@$(PYTHON) scripts/check_wiki_drift.py

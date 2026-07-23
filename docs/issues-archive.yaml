@@ -4,6 +4,124 @@
 # Schema / field definitions are documented in docs/issues.yaml's header.
 # Search with: grep -r 'keyword' docs/issues-archive.yaml
 
+- id: musl-backend-assert-illegal-result-number
+  title: "musl `intscan.c`/`mallocng/donate.c` 编译时撞 SDNode::getValueType 断言 'ResNo < NumValues && \"Illegal result number!\"'"
+  status: closed
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: "ML-021a (llvm 待提交, components/llvm/patches/0048-...patch)"
+  # ML-010a（2026-07-17）atomic_arch.h 落地后这两个文件首次真正编译到这
+  # 一步（此前被 atomic_arch.h 缺失挡住）才曝光。未做根因定位，只记录触
+  # 发文件和断言文本，留给独立后端任务排查。
+  # ML-018a（2026-07-22）去掉 ML-014f 引入的全项目 `-O0` workaround 后，
+  # 全树 `make -k lib/libc.a`（干净 `-j1` 串行重建，逐对象独立复测）确认
+  # 本类别多一个新触发文件 `src/multibyte/btowc.o`（此前一直被 `-O0` 掩盖，
+  # 同一断言点，非新类别）。当前本类别共 3 个触发对象：intscan.c、
+  # mallocng/donate.c、multibyte/btowc.c。
+  #
+  # ML-020a（2026-07-22，f64 soft-float libcall 注册任务）：给 DADAO 补上
+  # `RTLIB::LibcallImpl` 注册（`components/llvm/patches/0047-...patch`，
+  # `llvm/include/llvm/IR/RuntimeLibcalls.td` 新增 `DADAOSystemLibrary`）
+  # 后，`report_fatal_error: unsupported library call operation` 这个更早
+  # 的编译期错误被消除，大量此前卡在那一步的浮点相关 musl 源文件第一次真
+  # 正走到指令选择/调度阶段，本类别触发对象从 3 个暴涨到 **15 个**（新增
+  # 12 个，全部是浮点相关：`complex/__cexpf.c`、`math/atanf.c`、
+  # `math/fdimf.c`、`math/log2f.c`、`math/logf.c`、`math/sincosf.c`、
+  # `math/sincos.c`、`math/sinf.c`、`math/sin.c`、`math/tanf.c`、
+  # `math/tan.c`、**`stdio/vfprintf.c`**——即 ML-020a 的直接目标文件）。
+  #
+  # **根因定位（ML-020a 首次给出，非猜测）**：最小 2 行复现（无 musl 依赖）：
+  # `double cmp(double a,double b){ return (a>=b)+(a==0); }`
+  # 用 `clang --target=dadao -O1`（-O0 不复现，-O1/-O2/-O3 都复现）编译，
+  # 100% 复现同一断言。gdb 定位到 `ScheduleDAGSDNodes.cpp:372`
+  # （`BuildSchedUnits` "scan up to find glued preds" 循环）：某个
+  # `CopyFromReg`（读回 libcall 返回值 `$rd31`）节点的 Glue 操作数指向了
+  # 一个只有 1 个结果值的 `ADDI_RRII`（materialize-constant）节点的 ResNo=1
+  # ——即"同一基本块出现 2 个独立的 CALL"时，产出的 glue 链拓扑不满足
+  # SelectionDAG "每个节点至多一个 glue 输入/输出、glue 链必须是单一线性
+  # 链"的不变量。三次独立触发路径（DL-063c 间接调用单个 call / ML-010a
+  # 直接调用两个 call / ML-020a libcall 合成两个 call）曾被怀疑指向同一个
+  # 更底层缺陷。
+  #
+  # **ML-021a 真根因（与 ML-020a 猜测的方向不同）**：不是"CALL_IIII 手工
+  # getMachineNode vs Pat<>"（这个方向此前已被独立试过、同样撞同一断言，
+  # 见 `DADAOInstrInfo.td` CALL_PSEUDO_INDIRECT 注释），而是
+  # `DADAOISelDAGToDAG.cpp::Select()` 对 `ISD::CALLSEQ_START`/`CALLSEQ_END`
+  # 的手写特判：`ReplaceUses(SDValue(Node,0), Node->getOperand(0));
+  # CurDAG->RemoveDeadNode(Node);` 只重定向了 ResNo=0（chain），从未处理
+  # `callseq_end` 的 ResNo=1（glue）结果——一旦同一基本块出现第二个独立
+  # 调用序列，前一个 callseq_end 被删除后其 glue 结果的悬空引用会与新分配
+  # 节点的内存产生错误关联，被调度器 BuildSchedUnits 的"已插入"检测到。
+  # 用 `llc -debug-only=isel` 转储证实：修复前 "Selected selection DAG" 里
+  # 同一 `CALL_IIII` 节点被打印两次（图结构损坏），且另一个 CopyFromReg 的
+  # glue 操作数显示为 `<<Deleted Node!>>`。修复方案：仿照 RISC-V
+  # `ADJCALLSTACKDOWN`/`ADJCALLSTACKUP` 的标准做法，把 callseq_start/end
+  # 转成 tablegen `Pat<>` 选择（`DADAOInstrInfo.td` 新增两个 `DADAOPseudo`
+  # + 目标专属 `callseq_start`/`callseq_end` SDNode 重声明），并在
+  # `DADAOInstrInfo.cpp` 的 `DADAOGenInstrInfo` 构造里把 CFSetup/CFDestroy
+  # 从误传的字面量 `0` 改成真实的
+  # `DADAO::ADJCALLSTACKDOWN`/`DADAO::ADJCALLSTACKUP`。**订正**（subagent
+  # review 发现）：`0` 实际是生成枚举里的 `PHI`（target-independent 伪指
+  # 令，`Target.td:1200`）而非 HALT_RIII——此前完成区/commit message 误记
+  # 为"碰巧等于 HALT_RIII 的 opcode"。这不影响修复本身的正确性：
+  # `PHIElimination` 在 PEI 之前已把所有 PHI 节点消除，所以无论 opcode 0
+  # 对应哪条真实指令，"PEI 从未真正识别出任何 call-frame 伪指令"这个结论
+  # 依然成立，只是原因是"函数体里此时已不存在 opcode 0 的 MI"而非"opcode 0
+  # 恰好被其它指令占用"。
+  #
+  # 验证：全量 lit E2E 61/61（新增 direct_call_multicall_block.test 覆盖
+  # 非浮点场景）、差分 AGREE(4-way)=200/DIVERGE=0、`vfprintf.o` 用真实
+  # musl 构建标志编译通过、干净 fresh 全量 musl 重建后本类别（连同
+  # musl-backend-assert-node-already-inserted、
+  # musl-backend-assert-asmprinter-unmapself）触发对象清零；musl 总失败
+  # 对象数从 ~180 降到 10（剩余 10 个分属两个既有不相关问题——
+  # musl-backend-assert-unanalyzable-fallthrough /
+  # -instrinfo-unreachable——及一个新发现的独立缺口
+  # musl-backend-dynamic-stackalloc-unimplemented）。
+
+- id: musl-backend-assert-node-already-inserted
+  title: "musl `setrlimit.c`/`res_query.c`/`vfwprintf.c` 编译时撞 ScheduleDAGSDNodes::BuildSchedUnits 断言 'N->getNodeId() == -1 && \"Node already inserted!\"'"
+  status: closed
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: "ML-021a (同 musl-backend-assert-illegal-result-number 条目根因，一次性修复)"
+  # ML-010a（2026-07-17）同上，atomic_arch.h 解锁后新曝光，未做根因定位。
+  # ML-018a（2026-07-22）去掉 ML-014f 引入的全项目 `-O0` workaround 后，
+  # 全树 `make -k lib/libc.a`（干净 `-j1` 串行重建，逐对象独立复测）确认
+  # 本类别原 3 个触发文件（setrlimit.c/res_query.c/vfwprintf.c）确实是被
+  # `-O0` 掩盖、非被修复；另新发现 3 个同断言点触发文件：`locale/iconv.c`、
+  # `thread/pthread_mutex_consistent.c`、`thread/pthread_mutex_timedlock.c`
+  # （同一断言，非新类别）。当前本类别共 6 个触发对象。
+  #
+  # ML-020a（2026-07-22）：同 `musl-backend-assert-illegal-result-number`
+  # 条目所述的 DADAO f64 libcall 注册修复（`components/llvm/patches/
+  # 0047-...patch`）之后，本类别触发对象从 6 个暴涨到 **88 个**——几乎
+  # 全部是 `src/math/*`、`src/complex/*` 浮点函数（`acos`/`asin`/`atan`/
+  # `exp`/`log`/`pow`/`sinh`/`cosh`/`hypot`/`j0`/`j1`/`jn`/`lgamma_r`/
+  # `tgamma`/`__rem_pio2`/`__expo2` 等及其 f 后缀变体），外加
+  # `internal/floatscan.c`（vfscanf 依赖的浮点扫描辅助）。
+  #
+  # 根因与 `musl-backend-assert-illegal-result-number` 条目是同一个缺陷的
+  # 两种断言表现（同一 `ScheduleDAGSDNodes::BuildSchedUnits` 的
+  # "scan up to find glued preds" 循环，372/374 两行相邻断言），ML-021a
+  # 已一次性修复（CALLSEQ_START/END glue RAUW 缺陷，见该条目的完整写
+  # 法），不重复展开。
+
+- id: musl-backend-assert-asmprinter-unmapself
+  title: "musl `thread/__unmapself.o` 编译时撞 UNREACHABLE executed at DADAOAsmPrinter.cpp:82（与 legacy/daemon.c 的 TargetInstrInfo.h:786 断言点不同，独立立项）"
+  status: closed
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: "ML-021a（同一 CALLSEQ_START/END glue 修复的副带收益，非独立诊断——该文件同样含同一基本块多个独立调用序列）"
+  # ML-011a（2026-07-17）pthread_arch.h 落地解锁 183 处编译后，全树
+  # make -k lib/libc.a 首次编译到 src/thread/__unmapself.c 这一步才曝光
+  # （此前被 pthread_arch.h 缺失挡住）。未做根因定位，只记录触发文件和
+  # 断言文本/位置，留给独立后端任务排查。
+  # ML-021a（2026-07-22）：fresh 全量 musl 重建后确认本文件已能干净编译
+  # （单独 rm+重建复核），未做进一步逐行诊断（不是本任务目标文件），但
+  # 根因大概率同属 CALLSEQ_START/END glue 缺陷（该文件同样在同一基本块
+  # 调用多个独立函数：mmap/madvise/munmap 等）。
+
 - id: mmap-arena-unbacked-real-memory-qemu-gem5
   title: "Phase A cfx_smon mmap(222) responder returns addresses in a region with no real memory backing on either backend -- QEMU silently drops writes/reads-as-zero, gem5 SE hard-panics the whole simulator process on first real access -- discovered by ML-014a while trying to build a real malloc()-triggers-mmap E2E milestone"
   status: closed
