@@ -5,7 +5,8 @@ Subject: [PATCH] target/dadao: select -> cs* conditional assign (DL-063a)
 
 ---
  llvm/lib/Target/DADAO/DADAOISelLowering.h | 1 +
- 1 file changed, 1 insertion(+)
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td   | 9 +++++++++
+ 2 files changed, 10 insertions(+)
 
 diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
 index fc7b0885bcb2..e5b58b639739 100644
@@ -19,6 +20,23 @@ index fc7b0885bcb2..e5b58b639739 100644
    FI_ADDR, // (TargetFrameIndex) → i64  frame address in GPRB
    PCREL_HI, // (GlobalAddress) → i64  page-aligned PC-relative address in RB
  };
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 2d50e93902e4..2a226f7f2820 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -355,3 +355,12 @@ def : Pat<(sext_inreg GPRD:$src, i16),
+           (EXTS_ORRI GPRD:$src, 48)>;
+ def : Pat<(sext_inreg GPRD:$src, i32),
+           (EXTS_ORRI GPRD:$src, 32)>;
++
++//===----------------------------------------------------------------------===//
++// CodeGen patterns — conditional select (§3.12)
++//===----------------------------------------------------------------------===//
++
++// plain select: csz(cond, dst, false_val, true_val)
++// csz: rdha==0 ? rdhc : rdhd.  cond==0 → take b (false), else a (true)
++def : Pat<(select GPRD:$cond, GPRD:$a, GPRD:$b),
++          (CSZ_RRRR GPRD:$cond, GPRD:$b, GPRD:$a)>;
 -- 
 2.43.0
 

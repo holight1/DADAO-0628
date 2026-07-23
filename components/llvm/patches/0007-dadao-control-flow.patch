@@ -614,29 +614,26 @@ index 000000000000..9ded0d0cb3df
 +}
 \ No newline at end of file
 diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
-index db600d7a70d9..6ea5e385cb0a 100644
+index 974043071d07..6ea5e385cb0a 100644
 --- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
 +++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
-@@ -9,21 +9,105 @@
+@@ -9,27 +9,105 @@
  include "DADAOInstrFormats.td"
  
  // Immediate operand types
--def imms12 : Operand<i64>;
-+def imms12 : Operand<i64> {
-+  let DecoderMethod = "decodeS12Imm";
-+}
+ def imms12 : Operand<i64> {
+   let DecoderMethod = "decodeS12Imm";
+ }
  def immu12 : Operand<i64>;
--def imms18 : Operand<i64>;
-+def imms18 : Operand<i64> {
-+  let DecoderMethod = "decodeS18Imm";
-+}
+ def imms18 : Operand<i64> {
+   let DecoderMethod = "decodeS18Imm";
+ }
  def immu16 : Operand<i64>;
  def immu6  : Operand<i64>;
--def imms24 : Operand<i64>;
-+def imms24 : Operand<i64> {
-+  let DecoderMethod = "decodeS24Imm";
+ def imms24 : Operand<i64> {
+   let DecoderMethod = "decodeS24Imm";
 +  let EncoderMethod = "getImm24OpValue";
-+}
+ }
  def wydepos : Operand<i64>;
  
 +def brtarget24 : Operand<OtherVT> {
@@ -1322,4 +1319,3 @@ index cc7e3a73ff4e..c57b26420b01 100644
  
 -- 
 2.43.0
-

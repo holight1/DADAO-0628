@@ -1,12 +1,12 @@
 From bb5415abcd13577585e3aec0437ad42be60aa9bc Mon Sep 17 00:00:00 2001
 From: suiyan <suiyan@sunmmio.com>
 Date: Sat, 11 Jul 2026 20:08:04 +0800
-Subject: [PATCH 13/15] target/dadao: GlobalAddress lowering via rela
- PC-relative (DL-061b)
+Subject: [PATCH] target/dadao: GlobalAddress lowering via rela PC-relative
+ (DL-061b)
 
 ---
  .../Target/DADAO/AsmParser/DADAOAsmParser.cpp |  18 +-
- llvm/lib/Target/DADAO/CMakeLists.txt          |  14 +-
+ llvm/lib/Target/DADAO/CMakeLists.txt          |  10 +
  llvm/lib/Target/DADAO/DADAO.h                 |  20 +-
  llvm/lib/Target/DADAO/DADAO.td                |  24 +-
  llvm/lib/Target/DADAO/DADAOCallingConv.td     |  13 +
@@ -15,7 +15,7 @@ Subject: [PATCH 13/15] target/dadao: GlobalAddress lowering via rela
  llvm/lib/Target/DADAO/DADAOISelDAGToDAG.cpp   |  27 ++
  llvm/lib/Target/DADAO/DADAOISelLowering.cpp   |  13 +-
  llvm/lib/Target/DADAO/DADAOISelLowering.h     |   2 +
- llvm/lib/Target/DADAO/DADAOInstrFormats.td    | 254 ++++++++++++++----
+ llvm/lib/Target/DADAO/DADAOInstrFormats.td    | 253 ++++++++++++++----
  llvm/lib/Target/DADAO/DADAOInstrInfo.h        |  46 ++++
  llvm/lib/Target/DADAO/DADAOInstrInfo.td       |   1 +
  llvm/lib/Target/DADAO/DADAORegisterInfo.h     |   4 +
@@ -24,8 +24,6 @@ Subject: [PATCH 13/15] target/dadao: GlobalAddress lowering via rela
  llvm/lib/Target/DADAO/DADAOSubtarget.h        |  52 ++++
  llvm/lib/Target/DADAO/DADAOTargetMachine.cpp  |  81 ++++--
  llvm/lib/Target/DADAO/DADAOTargetMachine.h    |  32 ++-
- .../Target/DADAO/Disassembler/CMakeLists.txt  |  10 +
- .../DADAO/Disassembler/DADAODisassembler.cpp  | 106 ++++++++
  .../Target/DADAO/MCTargetDesc/CMakeLists.txt  |   1 +
  .../DADAO/MCTargetDesc/DADAOAsmBackend.cpp    |  27 ++
  .../DADAO/MCTargetDesc/DADAOAsmInfo.cpp       |   1 +
@@ -34,15 +32,13 @@ Subject: [PATCH 13/15] target/dadao: GlobalAddress lowering via rela
  .../DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp |   2 +
  .../DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp  |  14 +
  .../DADAO/MCTargetDesc/DADAOMCTargetDesc.h    |   3 +
- 29 files changed, 763 insertions(+), 131 deletions(-)
+ 27 files changed, 643 insertions(+), 130 deletions(-)
  create mode 100644 llvm/lib/Target/DADAO/DADAOCallingConv.td
  create mode 100644 llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
  create mode 100644 llvm/lib/Target/DADAO/DADAOFrameLowering.h
  create mode 100644 llvm/lib/Target/DADAO/DADAOInstrInfo.h
  create mode 100644 llvm/lib/Target/DADAO/DADAOSubtarget.cpp
  create mode 100644 llvm/lib/Target/DADAO/DADAOSubtarget.h
- create mode 100644 llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
- create mode 100644 llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
  create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCAsmInfo.cpp
 
 diff --git a/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp b/llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
@@ -113,17 +109,13 @@ index 74540f99fd3c..bd048a66fb31 100644
      return false;
    case Match_MissingFeature:
 diff --git a/llvm/lib/Target/DADAO/CMakeLists.txt b/llvm/lib/Target/DADAO/CMakeLists.txt
-index 08db6fd37cd6..202c4aad984f 100644
+index 728f8ffb5fcb..202c4aad984f 100644
 --- a/llvm/lib/Target/DADAO/CMakeLists.txt
 +++ b/llvm/lib/Target/DADAO/CMakeLists.txt
-@@ -5,19 +5,30 @@ set(LLVM_TARGET_DEFINITIONS DADAO.td)
- tablegen(LLVM DADAOGenRegisterInfo.inc -gen-register-info)
- tablegen(LLVM DADAOGenInstrInfo.inc -gen-instr-info)
- tablegen(LLVM DADAOGenAsmMatcher.inc -gen-asm-matcher)
--tablegen(LLVM DADAOGenMCCodeEmitter.inc -gen-emitter)
+@@ -8,17 +8,27 @@ tablegen(LLVM DADAOGenAsmMatcher.inc -gen-asm-matcher)
  tablegen(LLVM DADAOGenAsmWriter.inc -gen-asm-writer)
-+tablegen(LLVM DADAOGenMCCodeEmitter.inc -gen-emitter)
-+tablegen(LLVM DADAOGenDisassemblerTables.inc -gen-disassembler)
+ tablegen(LLVM DADAOGenMCCodeEmitter.inc -gen-emitter)
+ tablegen(LLVM DADAOGenDisassemblerTables.inc -gen-disassembler)
 +tablegen(LLVM DADAOGenDAGISel.inc -gen-dag-isel)
 +tablegen(LLVM DADAOGenSubtargetInfo.inc -gen-subtarget)
 +tablegen(LLVM DADAOGenCallingConv.inc -gen-callingconv)
@@ -148,13 +140,6 @@ index 08db6fd37cd6..202c4aad984f 100644
    Support
    Target
    TargetParser
-@@ -27,5 +38,6 @@ add_llvm_target(DADAOCodeGen
-   )
- 
- add_subdirectory(AsmParser)
-+add_subdirectory(Disassembler)
- add_subdirectory(MCTargetDesc)
- add_subdirectory(TargetInfo)
 diff --git a/llvm/lib/Target/DADAO/DADAO.h b/llvm/lib/Target/DADAO/DADAO.h
 index a5d4263f2624..a05e71b89ffc 100644
 --- a/llvm/lib/Target/DADAO/DADAO.h
@@ -466,18 +451,10 @@ index 892f12890be2..fc7b0885bcb2 100644
  
  } // namespace llvm
 diff --git a/llvm/lib/Target/DADAO/DADAOInstrFormats.td b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
-index 10ebcdd254b0..7bceb8a9f5c4 100644
+index 360e8c188f28..7bceb8a9f5c4 100644
 --- a/llvm/lib/Target/DADAO/DADAOInstrFormats.td
 +++ b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
-@@ -11,6 +11,7 @@ class InstDADAO<dag outs, dag ins, string asmstr, list<dag> pattern>
-   field bits<32> Inst;
-   let Size = 4;
-   let Namespace = "DADAO";
-+  let DecoderNamespace = "DADAO";
- 
-   bits<8> op;
-   bits<6> ha;
-@@ -30,7 +31,7 @@ class InstDADAO<dag outs, dag ins, string asmstr, list<dag> pattern>
+@@ -31,7 +31,7 @@ class InstDADAO<dag outs, dag ins, string asmstr, list<dag> pattern>
    let Pattern = pattern;
  }
  
@@ -486,7 +463,7 @@ index 10ebcdd254b0..7bceb8a9f5c4 100644
  class F_IIII<dag outs, dag ins, string asmstr, list<dag> pattern>
      : InstDADAO<outs, ins, asmstr, pattern> {
    bits<24> imm24;
-@@ -50,99 +51,246 @@ class F_OIII<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> patte
+@@ -51,99 +51,246 @@ class F_OIII<bits<6> minor_op, dag outs, dag ins, string asmstr, list<dag> patte
    let hd = imm18{5-0};
  }
  
@@ -1176,134 +1153,6 @@ index 3b63f61cae98..fc81d35763cd 100644
 -
 -#endif // LLVM_LIB_TARGET_DADAO_DADAOTARGETMACHINE_H
 +#endif
-diff --git a/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt b/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
-new file mode 100644
-index 000000000000..8bb9b25edd23
---- /dev/null
-+++ b/llvm/lib/Target/DADAO/Disassembler/CMakeLists.txt
-@@ -0,0 +1,10 @@
-+add_llvm_component_library(LLVMDADAODisassembler
-+  DADAODisassembler.cpp
-+
-+  LINK_COMPONENTS
-+  MCDisassembler
-+  Support
-+
-+  ADD_TO_COMPONENT
-+  DADAO
-+)
-diff --git a/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp b/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
-new file mode 100644
-index 000000000000..3220fd99d201
---- /dev/null
-+++ b/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
-@@ -0,0 +1,106 @@
-+//===- DADAODisassembler.cpp - Disassembler for DADAO -----------*- C++ -*-===//
-+//
-+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-+// See https://llvm.org/LICENSE.txt for license information.
-+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+//
-+//===----------------------------------------------------------------------===//
-+//
-+// This file is part of the DADAO Disassembler.
-+//
-+//===----------------------------------------------------------------------===//
-+
-+#include "MCTargetDesc/DADAOMCTargetDesc.h"
-+#include "TargetInfo/DADAOTargetInfo.h"
-+#include "llvm/MC/MCDecoder.h"
-+#include "llvm/MC/MCDecoderOps.h"
-+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
-+#include "llvm/MC/MCInst.h"
-+#include "llvm/MC/MCSubtargetInfo.h"
-+#include "llvm/MC/TargetRegistry.h"
-+#include "llvm/Support/Compiler.h"
-+#include "llvm/Support/Debug.h"
-+#include "llvm/Support/Endian.h"
-+#include "llvm/Support/MathExtras.h"
-+
-+#define DEBUG_TYPE "dadao-disassembler"
-+
-+using namespace llvm;
-+using namespace llvm::MCD;
-+
-+typedef MCDisassembler::DecodeStatus DecodeStatus;
-+
-+class DADAODisassembler : public MCDisassembler {
-+public:
-+  DADAODisassembler(const MCSubtargetInfo &STI, MCContext &Ctx)
-+      : MCDisassembler(STI, Ctx) {}
-+
-+  DecodeStatus getInstruction(MCInst &Instr, uint64_t &Size,
-+                              ArrayRef<uint8_t> Bytes, uint64_t Address,
-+                              raw_ostream &CStream) const override;
-+};
-+
-+static DecodeStatus DecodeGPRDRegisterClass(MCInst &Inst, unsigned RegNo,
-+                                             uint64_t /*Address*/,
-+                                             const MCDisassembler * /*Decoder*/) {
-+  if (RegNo > 63)
-+    return MCDisassembler::Fail;
-+  Inst.addOperand(MCOperand::createReg(DADAO::RD0 + RegNo));
-+  return MCDisassembler::Success;
-+}
-+
-+static DecodeStatus DecodeGPRBRegisterClass(MCInst &Inst, unsigned RegNo,
-+                                             uint64_t /*Address*/,
-+                                             const MCDisassembler * /*Decoder*/) {
-+  if (RegNo > 63)
-+    return MCDisassembler::Fail;
-+  Inst.addOperand(MCOperand::createReg(DADAO::RB0 + RegNo));
-+  return MCDisassembler::Success;
-+}
-+
-+static DecodeStatus decodeS12Imm(MCInst &Inst, unsigned Imm,
-+                                  uint64_t /*Address*/,
-+                                  const MCDisassembler * /*Decoder*/) {
-+  Inst.addOperand(MCOperand::createImm(SignExtend64<12>(Imm)));
-+  return MCDisassembler::Success;
-+}
-+
-+static DecodeStatus decodeS18Imm(MCInst &Inst, unsigned Imm,
-+                                  uint64_t /*Address*/,
-+                                  const MCDisassembler * /*Decoder*/) {
-+  Inst.addOperand(MCOperand::createImm(SignExtend64<18>(Imm)));
-+  return MCDisassembler::Success;
-+}
-+
-+static DecodeStatus decodeS24Imm(MCInst &Inst, unsigned Imm,
-+                                  uint64_t /*Address*/,
-+                                  const MCDisassembler * /*Decoder*/) {
-+  Inst.addOperand(MCOperand::createImm(SignExtend64<24>(Imm)));
-+  return MCDisassembler::Success;
-+}
-+
-+#include "DADAOGenDisassemblerTables.inc"
-+
-+DecodeStatus DADAODisassembler::getInstruction(
-+    MCInst &Instr, uint64_t &Size, ArrayRef<uint8_t> Bytes,
-+    uint64_t Address, raw_ostream &CStream) const {
-+  if (Bytes.size() < 4) {
-+    Size = 0;
-+    return MCDisassembler::Fail;
-+  }
-+  uint32_t Insn = support::endian::read32be(Bytes.data());
-+  Size = 4;
-+
-+  return decodeInstruction(DecoderTableDADAO32, Instr, Insn, Address, this, STI);
-+}
-+
-+static MCDisassembler *createDADAODisassembler(const Target &T,
-+                                                const MCSubtargetInfo &STI,
-+                                                MCContext &Ctx) {
-+  return new DADAODisassembler(STI, Ctx);
-+}
-+
-+extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeDADAODisassembler() {
-+  TargetRegistry::RegisterMCDisassembler(getTheDADAOTarget(),
-+                                          createDADAODisassembler);
-+}
 diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt b/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
 index 7d73a99b2c75..07c4d6a06237 100644
 --- a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
