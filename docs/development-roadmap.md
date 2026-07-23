@@ -1124,3 +1124,57 @@ scoped, highest-confirmed-impact open item (blocks all `scanf`/`vscanf`,
 and historically also blocked `printf("%s", ptr)`-style calls) — a
 candidate for the next dispatch alongside the previously-recommended
 gcc-c-torture/llvm-test-suite scan, pending user direction.
+
+### DL-072a complete (2026-07-23): varargs-pointer-args-lost-rb-bank-save-area closed per wiki, exactly per ADR-0012 D5's ordering
+
+Per the user's explicit direction to follow ADR-0012 D5's original sequencing
+(fix this before the torture-suite sweep, not after) and to follow the wiki
+literally rather than the architect's own two candidate designs (an x86-64-
+style split-counter `va_list`, or a RISC-V-style "force all variadic args
+through one bank"): the architect located the actual authoritative mechanism
+in `~/DADAO-wiki/DADAO-21-ABI-应用程序二进制接口.md` §可变参数, which specifies
+a third, different design neither candidate matched — **the caller**, not the
+callee, writes every named and unnamed argument (in original call-site order,
+one per 8-byte slot, dual-written alongside normal register passing) into a
+single unified save area; `va_start` just offsets past the named-argument
+slot count into that caller-populated area, and `va_arg` advances 8 bytes at
+a time with big-endian narrow values right-adjusted in each slot.
+
+Implemented (LLVM commit `3aa546d1d0cd`, patch `0050`): `LowerCall` now emits
+the caller-side save-area stores for `IsVarArg` calls; the old callee-side
+RD-only register-spill in `LowerFormalArguments` is deleted entirely; a new
+`clang/lib/CodeGen/Targets/DADAO.cpp` gives DADAO a custom `EmitVAArg` via
+Clang's existing `emitVoidPtrVAArg` helper (slot size 8, `ForceRightAdjust`)
+matching the wiki's big-endian rule exactly. Along the way, found and fixed
+a real, subtle frame-corruption bug: the side-effect-free `ADJCALLSTACKDOWN/
+UP` pseudos were being deleted by generic dead-MI elimination before PEI
+could measure the maximum outgoing call frame, undersizing it so save-area
+stores clobbered caller locals — fixed by marking them `hasSideEffects=1`
+and giving `DADAOFrameLowering` `hasReservedCallFrame() = true`.
+
+Honestly flagged, not silently resolved: the wiki text itself has an
+internal contradiction (one passage places the save area at the *highest*
+frame address, after locals; another defines `va_start`'s base as the
+incoming stack pointer, which cannot be reconciled with the first without
+inventing a second base the callee doesn't have). DL-072a kept incoming-SP
+as the implementable anchor and recorded the conflict in
+`docs/wiki-questions.md` (§5) for the wiki team, rather than picking a
+resolution unilaterally and calling the ABI settled.
+
+Architect-verified independently, including scenarios beyond what the task
+asked for: a self-constructed mixed int/pointer variadic probe (interleaved
+`int, void*, int` variadic tail — the exact shape that exposes bank
+confusion), real musl `printf("%s %s\n", "left", "right")` (correct order,
+not swapped), real musl `scanf("%d", &x)` end to end, and the 17-fixed-arg /
+17-unnamed-variadic-arg overflow edge cases the task's own test suite
+added (`varargs_overflow.test`) — all pass on both QEMU and gem5. Full E2E
+68→72/72, differential AGREE=200/DIVERGE=0 unchanged, manifest/issues PASS.
+Independently replayed the full 50-patch LLVM series from a bare manifest-
+pin checkout (`git am` 50/50) and confirmed the final tree hash matches
+live `.work/llvm` HEAD exactly. `musl_scanf_int.test`'s `XFAIL` marker was
+removed (the task it tracked no longer fails); `varargs-pointer-args-lost-
+rb-bank-save-area` closed and archived.
+
+**Status**: roadmap A/B/D and the varargs pointer-loss bug are all closed.
+Per ADR-0012 D5's own sequencing, the gcc-c-torture/llvm-test-suite sweep
+is now unblocked and is the user-directed next step.
