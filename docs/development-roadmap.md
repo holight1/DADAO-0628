@@ -1178,3 +1178,37 @@ rb-bank-save-area` closed and archived.
 **Status**: roadmap A/B/D and the varargs pointer-loss bug are all closed.
 Per ADR-0012 D5's own sequencing, the gcc-c-torture/llvm-test-suite sweep
 is now unblocked and is the user-directed next step.
+
+### ML-026a complete (2026-07-24): first full gcc-c-torture sweep (scan only)
+
+All 1708 `execute/` corpus files run through the real clang→ld.lld→QEMU
+pipeline (pure recon, no source changes, per ADR-0012 D5): **PASS 1328
+(77.8%)**, FAIL_COMPILE 113 (84 match known upstream-denylist causes —
+nested functions, VLA-in-struct, gnu89-inline, etc. — 29 real backend
+candidates), FAIL_LINK 217 (123 explainable, mostly companion-no-main;
+94 real candidates, dominated by one missing-softfloat-symbol cluster —
+92 files), FAIL_RUN 49 (includes a real methodology finding:
+`-ffreestanding` suppresses C11's implicit `return 0` in `main`,
+producing ~12 false failures unrelated to DADAO), TIMEOUT 1
+(`pr56866.c`, hangs identically and independently on both QEMU and gem5
+— the highest-confidence real bug candidate in the whole sweep).
+
+Deliverables: `tests/scripts/gcc_torture_sweep.py` (reusable scan tool)
+and `docs/reviews/ML-026a-gcc-c-torture-sweep-2026-07-24.md` (full
+classification + an 11-item prioritized follow-up list). Architect-
+verified independently: re-ran the entire sweep from scratch
+(identical counts), confirmed the `abort()`→127/`exit(0)`→0 convention,
+the `-ffreestanding` finding, the `pr56866.c` dual-backend hang, the
+softfloat symbol-miss counts, and the `nestfunc-4.c` RASOF exception
+with direct probes — commit `020b24b`.
+
+Top of the follow-up list (see the report for the full ranked list):
+P0 `pr56866.c` infinite-loop root cause; P0 finish the softfloat
+symbol family (single-precision + the remaining ordered-comparison
+symbols `__gtdf2`/`__ltdf2`/`__ledf2`) — highest-leverage single fix,
+~90+ files; P1 verify DL-072a's varargs fix covers struct-by-value
+variadic args (12 `FAIL_RUN` files cluster here); P1 a relocation/
+large-constant-addressing bug (2 concrete repros, likely wider blast
+radius); P1 re-evaluate whether `-ffreestanding` is still the right
+default now that a real musl libc exists. This scan did not attempt
+any fixes; prioritization and dispatch order is pending user direction.
