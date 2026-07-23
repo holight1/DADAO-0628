@@ -1,0 +1,115 @@
+// ML-025a: raw cfx_smon SYS_mmap(222) zero-length consistency probe.
+//
+// This test is deliberately independent of libc and malloc.  It verifies:
+//   1. length=0 returns the raw Linux/asm-generic ABI value -EINVAL (-22);
+//   2. a failed zero-length request before the first successful mapping does
+//      not consume the arena base or create a conflicting VMA;
+//   3. a failed zero-length request between two successful mappings does not
+//      advance the cursor or create a conflicting VMA;
+//   4. the non-zero control mapping has real writable backing.
+//
+// Exact returned addresses make the side-effect checks discriminating:
+// the first successful mapping must be 0x100000000 and the second must be
+// exactly one 4096-byte page later.
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.o %s
+// RUN: %ld.lld -T %S/../../scripts/dadao.ld %t.o -o %t.elf
+// RUN: %llvm-objcopy -O binary %t.elf %t.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.bin > %t.out 2>&1; test $? -eq 42'
+// RUN: grep -c "mmap-zero-ok" %t.out | xargs test 1 -eq
+// RUN: bash -c '%gem5 %gem5_se %t.elf > %t.gout 2>&1; test $? -eq 42'
+// RUN: grep -c "mmap-zero-ok" %t.gout | xargs test 1 -eq
+
+.text
+.globl _start
+_start:
+    setzw rd2, 0, 4096       # page size
+    setzw rd9, 2, 1          # fixed mmap arena base = 0x100000000
+    addi rd10, rd0, -22      # raw -EINVAL
+
+    # mmap(NULL, 0, RW, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd0, 0
+    addi rd19, rd0, 3
+    addi rd20, rd0, 34
+    setow rd21, 0, 65535
+    addi rd22, rd0, 0
+    trap 2, 0
+    breq rd31, rd10, first_control
+    addi rd17, rd0, 1
+    jump fail
+
+first_control:
+    # A length-one request rounds to one page.  Returning the exact arena
+    # base proves that the preceding zero-length request consumed no cursor
+    # and established no conflicting VMA.
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd0, 1
+    addi rd19, rd0, 3
+    addi rd20, rd0, 34
+    setow rd21, 0, 65535
+    addi rd22, rd0, 0
+    trap 2, 0
+    breq rd31, rd9, backing_control
+    addi rd17, rd0, 2
+    jump fail
+
+backing_control:
+    # Prove the successful control is backed, not just a plausible address.
+    rd2rb rb20, rd31, 1
+    addi rd24, rd0, 85
+    sto rd24, rb20, 0
+    ldo rd25, rb20, 0
+    breq rd25, rd24, second_zero
+    addi rd17, rd0, 3
+    jump fail
+
+second_zero:
+    # Repeat the rejected call after a real mapping, then require the next
+    # successful return to be arena_base + one page.
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    addi rd18, rd0, 0
+    addi rd19, rd0, 3
+    addi rd20, rd0, 34
+    setow rd21, 0, 65535
+    addi rd22, rd0, 0
+    trap 2, 0
+    breq rd31, rd10, second_control
+    addi rd17, rd0, 4
+    jump fail
+
+second_control:
+    add rd0, rd11, rd9, rd2 # expected = arena base + 4096
+    addi rd16, rd0, 222
+    addi rd17, rd0, 0
+    setzw rd18, 0, 4096
+    addi rd19, rd0, 3
+    addi rd20, rd0, 34
+    setow rd21, 0, 65535
+    addi rd22, rd0, 0
+    trap 2, 0
+    breq rd31, rd11, pass
+    addi rd17, rd0, 5
+    jump fail
+
+pass:
+    addi rd16, rd0, 64
+    addi rd17, rd0, 1
+    rela rb8, msg_data
+    addi rb8, rb8, msg_data
+    rb2rd rd18, rb8, 1
+    addi rd19, rd0, 13
+    trap 2, 0
+    addi rd16, rd0, 93
+    addi rd17, rd0, 42
+    trap 2, 0
+
+fail:
+    addi rd16, rd0, 93
+    trap 2, 0
+
+.align 8, 0
+msg_data:
+    .asciz "mmap-zero-ok\n"
