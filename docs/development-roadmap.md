@@ -1068,3 +1068,59 @@ have run; native LLVM lit still lacks `llvm-config` in the current build
 tree. Follow-up DL-071b records the narrower multi-load/store `count=0`
 instruction-legality gap. Kernel roadmap E remains paused pending the next
 compiler-coverage decision.
+
+**Architect note (2026-07-23)**: the above six items (ML-024b/c, IN-006a/b,
+IN-007a, DL-071a) were dispatched and committed directly by an independently
+running Codex session, bypassing the project's normal "Claude reviews then
+commits" flow. The architect independently re-verified all six after the
+fact (fresh full rebuild, behavioral MC-immediate tests, full E2E/
+differential/manifest/issues, and a clean full bare-pin `git am` replay of
+both the 49-patch LLVM series and the 21-patch QEMU series with tree-hash
+comparison against live HEAD) and confirmed everything is correct. The user
+has since confirmed this was a one-off exception, not a new default
+workflow — see `feedback_codex_direct_commit_special_case_only.md`.
+
+### ML-025a complete (2026-07-23): scanf softfloat gap closed; a real, unconditional scanf blocker isolated
+
+Closes `musl-vfscanf-missing-single-precision-and-divide-softfloat-symbols`
+(ML-022a's remaining 6-symbol gap: `__extendsfdf2`/`__truncdfsf2`/
+`__floatsisf`/`__mulsf3`/`__divdf3`/`__gedf2` — the single-precision family,
+division, and one ordered comparison) in the same self-contained shim,
+fuzz-verified against native hardware arithmetic (2.1M cases, 0 mismatches)
+with disassembly-confirmed zero self-recursion. `scanf`'s link gap is fully
+closed (commit `0b28784a`, patch `0012`).
+
+Along the way, discovered neither QEMU nor gem5 had ever implemented
+`SYS_read` — no DADAO program could read real host stdin through any
+buffered stdio path. Added a symmetric `case 63` responder to both
+backends (commits `79ee086`/`62c1264698`, patches `0022`/`0016`), verified
+with a `getchar()`-based dual-backend probe.
+
+`scanf`'s actual runtime correctness remains blocked by a **separate,
+pre-existing, already-tracked issue**: `varargs-pointer-args-lost-rb-bank-
+save-area`. `scanf`'s output pointer argument is corrupted because LLVM's
+varargs save-area prologue only spills the RD register bank, never the RB
+bank a pointer argument lives in. Isolated via negative control
+(`sscanf` with zero pointer varargs runs clean on both backends, proving
+`vfscanf`/`intscan` parsing itself is sound). Unlike `printf`'s `%d`
+(pass-by-value, no pointer vararg — how `musl_printf_int.test` dodged this
+same gap), `scanf` has no format specifier that avoids a pointer vararg, so
+**this blocks every real `scanf`/`vscanf` call unconditionally, not just
+some format specifiers** — a materially larger blast radius for this
+long-known bug than previously documented. `musl_scanf_int.test` is kept,
+`XFAIL`-marked asserting the *intended* fixed behavior, so it flips to an
+unexpected pass the day this lands.
+
+E2E 66→68 (67 PASS + 1 honest XFAIL), differential AGREE=200/DIVERGE=0
+unchanged, manifest/issues PASS — architect-verified independently
+(rebuilt musl/QEMU/gem5 from scratch, reproduced the link success and the
+`getchar` E2E pass directly, independently `git am`'d all three patches on
+clean pin checkouts, commit `e048f96`).
+
+**Status**: both small musl loose ends from the 2026-07-23 sequence
+(`malloc(8)` size-class, scanf softfloat symbols) are now closed. The
+`varargs-pointer-args-lost-rb-bank-save-area` bug is the most concretely
+scoped, highest-confirmed-impact open item (blocks all `scanf`/`vscanf`,
+and historically also blocked `printf("%s", ptr)`-style calls) — a
+candidate for the next dispatch alongside the previously-recommended
+gcc-c-torture/llvm-test-suite scan, pending user direction.
