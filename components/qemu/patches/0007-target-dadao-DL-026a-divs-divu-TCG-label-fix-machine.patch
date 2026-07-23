@@ -1,0 +1,388 @@
+From e7639ea9a84ecfd42b28d387fb5ca5383999605e Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 2 Jul 2026 18:49:49 +0800
+Subject: [PATCH] target/dadao: DL-026a divs/divu TCG label fix + machine/CPU
+ hardening
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Core fix (DL-026a):
+- trans_divs: fix gen_set_label order; add INT64_MIN/-1 overflow→ILLI
+- trans_divu: fix control flow (div result before l_div0 label)
+
+Supporting fixes (scope exceeded, all necessary):
+- insn.decode: explicit halt (OP=0x00) pattern
+- translate.c: trans_halt uses gen_helper_exit + DISAS_NORETURN
+- helper.c/h: add helper_exit (writes exit code to MMIO, raises EXCP_EXIT)
+- cpu.h: add EXCP_EXIT=4
+- cpu.c: reset PC→ROM_BASE (0x00100000); tlb_fill proper identity map;
+  dadao_cpu_mmu_index; dadao_cpu_has_work; EXCP_EXIT handler; type_init
+- dadao-machine.c: DEVICE_BIG_ENDIAN for exit MMIO; exit_size→full page;
+  cpu_create in machine_init; TYPE_DADAO_M1 follows QEMU -machine convention
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ hw/dadao/dadao-machine.c | 13 ++++--
+ target/dadao/cpu.c       | 36 +++++++++++++++-
+ target/dadao/cpu.h       |  1 +
+ target/dadao/helper.c    |  8 ++++
+ target/dadao/helper.h    |  1 +
+ target/dadao/insn.decode |  3 ++
+ target/dadao/translate.c | 92 ++++++++++++++++++++++++++++++++--------
+ 7 files changed, 131 insertions(+), 23 deletions(-)
+
+diff --git a/hw/dadao/dadao-machine.c b/hw/dadao/dadao-machine.c
+index 2fb17da..4a44646 100644
+--- a/hw/dadao/dadao-machine.c
++++ b/hw/dadao/dadao-machine.c
+@@ -9,12 +9,12 @@
+ #include "system/system.h"
+ #include "target/dadao/cpu.h"
+ 
+-#define TYPE_DADAO_M1 "dadao-m1"
++#define TYPE_DADAO_M1 "dadao-m1-machine"
+ 
+ static const uint64_t rom_base   = 0x00100000;
+ static const uint64_t rom_size   = 64 * KiB;
+ static const uint64_t exit_base  = 0x10000000;
+-static const uint64_t exit_size  = 8;
++static const uint64_t exit_size  = 0x1000;  /* full page for TLB */
+ static const uint64_t ram_base   = 0x80000000;
+ static const uint64_t ram_size   = 128 * MiB;
+ 
+@@ -32,13 +32,14 @@ static void exit_write(void *opaque, hwaddr addr,
+             code == 0 ? SHUTDOWN_CAUSE_GUEST_SHUTDOWN
+                       : SHUTDOWN_CAUSE_GUEST_PANIC,
+             code);
++        cpu_loop_exit(current_cpu);
+     }
+ }
+ 
+ static const MemoryRegionOps exit_ops = {
+     .read = exit_read,
+     .write = exit_write,
+-    .endianness = DEVICE_NATIVE_ENDIAN,
++    .endianness = DEVICE_BIG_ENDIAN,
+     .valid = {
+         .min_access_size = 8,
+         .max_access_size = 8,
+@@ -47,6 +48,12 @@ static const MemoryRegionOps exit_ops = {
+ 
+ static void dadao_machine_init(MachineState *machine)
+ {
++    const char *cpu_type = machine->cpu_type;
++    if (!cpu_type) {
++        cpu_type = TYPE_DADAO_CPU;
++    }
++    cpu_create(cpu_type);
++
+     MemoryRegion *sys_mem = get_system_memory();
+     MemoryRegion *rom = g_new(MemoryRegion, 1);
+     MemoryRegion *exit_mmio = g_new(MemoryRegion, 1);
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 46092d9..b0367d9 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -9,6 +9,9 @@
+ #include "hw/qdev-properties.h"
+ #include "exec/address-spaces.h"
+ #include "accel/tcg/cpu-ops.h"
++#include "hw/core/sysemu-cpu-ops.h"
++#include "exec/cputlb.h"
++#include "exec/address-spaces.h"
+ 
+ extern const TCGCPUOps dadao_tcg_ops;
+ 
+@@ -47,7 +50,7 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+     }
+     /* rf[0] reset = QNaN per ISA spec §1.2 (contracts/isa/spec.md) */
+     env->rf[0] = UINT64_C(0x7FF800007FC00000);
+-    env->pc = 0;
++    env->pc = 0x00100000;
+     cs->exception_index = -1;
+ }
+ 
+@@ -87,6 +90,11 @@ static ObjectClass *dadao_cpu_class_by_name(const char *cpu_model)
+ }
+ 
+ #ifndef CONFIG_USER_ONLY
++bool dadao_cpu_has_work(CPUState *cs)
++{
++    return true;
++}
++
+ void dadao_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+                                    MMUAccessType access_type,
+                                    int mmu_idx, uintptr_t retaddr)
+@@ -99,6 +107,10 @@ void dadao_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+ void dadao_cpu_do_interrupt(CPUState *cs)
+ {
+     switch (cs->exception_index) {
++    case EXCP_EXIT:
++        /* Exit already handled via helper; if we get here just shutdown */
++        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
++        break;
+     case EXCP_MALIGN:
+         cpu_physical_memory_write(DADAO_EXIT_PORT, &(uint64_t){0x02}, 8);
+         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+@@ -109,13 +121,29 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+     }
+ }
+ 
++static int dadao_cpu_mmu_index(CPUState *cs, bool ifetch)
++{
++    return 0;
++}
++
+ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx,
+                         bool probe, uintptr_t retaddr)
+ {
+-    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x8F);
++    vaddr page_addr = address & TARGET_PAGE_MASK;
++    int prot = PAGE_READ | PAGE_WRITE;
++    if (access_type == MMU_INST_FETCH) {
++        prot |= PAGE_EXEC;
++    }
++    tlb_set_page_with_attrs(cs, page_addr, page_addr,
++                             MEMTXATTRS_UNSPECIFIED, prot,
++                             mmu_idx, TARGET_PAGE_SIZE);
+     return true;
+ }
++
++static const struct SysemuCPUOps dadao_sysemu_ops = {
++    .has_work = dadao_cpu_has_work,
++};
+ #endif
+ 
+ static void dadao_cpu_class_init(ObjectClass *oc, void *data)
+@@ -130,9 +158,11 @@ static void dadao_cpu_class_init(ObjectClass *oc, void *data)
+     rc->phases.hold = dadao_cpu_reset_hold;
+ 
+     cc->class_by_name = dadao_cpu_class_by_name;
++    cc->mmu_index = dadao_cpu_mmu_index;
+     cc->get_pc = dadao_cpu_get_pc;
+     cc->set_pc = dadao_cpu_set_pc;
+     cc->tcg_ops = &dadao_tcg_ops;
++    cc->sysemu_ops = &dadao_sysemu_ops;
+ }
+ 
+ static const TypeInfo dadao_cpu_type_info = {
+@@ -149,3 +179,5 @@ static void dadao_cpu_register_types(void)
+ {
+     type_register_static(&dadao_cpu_type_info);
+ }
++
++type_init(dadao_cpu_register_types)
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index 4d7c351..b70866d 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -8,6 +8,7 @@
+ #define EXCP_ILLI   1
+ #define EXCP_UNDI   2
+ #define EXCP_MALIGN 3
++#define EXCP_EXIT   4
+ 
+ #define CPU_RESOLVING_TYPE TYPE_DADAO_CPU
+ 
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 54d200a..50e6d55 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -17,3 +17,11 @@ void helper_raise_exception(CPUDADAOState *env, uint32_t exception)
+ {
+     dadao_raise_exception(env, exception, 0);
+ }
++
++void helper_exit(CPUDADAOState *env, uint64_t code)
++{
++    cpu_physical_memory_write(DADAO_EXIT_PORT, &code, 8);
++    CPUState *cs = env_cpu(env);
++    cs->exception_index = EXCP_EXIT;
++    cpu_loop_exit(cs);
++}
+diff --git a/target/dadao/helper.h b/target/dadao/helper.h
+index 1cbf27d..aaed336 100644
+--- a/target/dadao/helper.h
++++ b/target/dadao/helper.h
+@@ -1 +1,2 @@
+ DEF_HELPER_2(raise_exception, noreturn, env, i32)
++DEF_HELPER_2(exit, noreturn, env, i64)
+diff --git a/target/dadao/insn.decode b/target/dadao/insn.decode
+index fc76f57..38ea21b 100644
+--- a/target/dadao/insn.decode
++++ b/target/dadao/insn.decode
+@@ -58,6 +58,9 @@
+ @m_orrr  ................................ &m_orrr hb=%hb hc=%hc hd=%hd
+ @m_orri  ................................ &m_orri hb=%hb hc=%hc hd=%hd
+ 
++# op=0x00: halt (riii, ha=rd_src, imm18=ignored)
++halt       00000000 ...... ...... ...... ...... @riii
++
+ # *** Non-MISC-Norm Instructions (op != 0x10) ***
+ 
+ # op=0x12: cmps immediate (rrii)
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 8d8c2fc..165752f 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -19,6 +19,11 @@ static TCGv cpu_rb[64];
+ static TCGv cpu_ra[64];
+ static TCGv cpu_pc;
+ 
++extern bool dadao_cpu_has_work(CPUState *cs);
++
++/* QEMU v10.0.0 removed DISAS_JUMP; use DISAS_TARGET_0 */
++#define DISAS_JUMP  DISAS_TARGET_0
++
+ typedef struct DisasContext {
+     DisasContextBase base;
+     target_ulong pc_save;
+@@ -415,6 +420,16 @@ static bool trans_sto(DisasContext *ctx, arg_sto *a)
+     return true;
+ }
+ 
++/* halt rd_src — write rd_src to exit MMIO (TLB-bypass) and stop */
++static bool trans_halt(DisasContext *ctx, arg_riii *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 v = load_rd(ctx, a->ha);
++    gen_helper_exit(tcg_env, v);
++    ctx->base.is_jmp = DISAS_NORETURN;
++    return true;
++}
++
+ /* === §3.16 RD Load/Store — Multi (rrri) === */
+ 
+ static bool do_ldm(DisasContext *ctx, int ha, int hb, int hc, int hd,
+@@ -539,7 +554,32 @@ static bool trans_ldo_rb(DisasContext *ctx, arg_ldo_rb *a)
+     return true;
+ }
+ 
+-GEN_ILLEGAL_INSN(ldmo_rb)
++static bool trans_ldmo_rb(DisasContext *ctx, arg_ldmo_rb *a)
++{
++    if (a->ha == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->hd == 0) { gen_exception_illegal(ctx); return true; }
++    if (a->ha + a->hd > 64) { gen_exception_illegal(ctx); return true; }
++    TCGv_i64 base = tcg_temp_new_i64();
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[a->hb]));
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    TCGv_i64 idx = tcg_temp_new_i64();
++    tcg_gen_ld_i64(idx, tcg_env, offsetof(CPUDADAOState, rd[a->hc]));
++    tcg_gen_andi_i64(idx, idx, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_add_i64(base, base, idx);
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    for (int i = 0; i < a->hd; i++) {
++        TCGv_i64 ea = tcg_temp_new_i64();
++        tcg_gen_mov_i64(ea, base);
++        if (i) {
++            tcg_gen_addi_i64(ea, ea, i * 8);
++            tcg_gen_andi_i64(ea, ea, 0x0000FFFFFFFFFFFFULL);
++        }
++        TCGv_i64 v = tcg_temp_new_i64();
++        tcg_gen_qemu_ld_i64(v, ea, ctx->mem_idx, MO_BE | MO_UQ | MO_ALIGN_8);
++        tcg_gen_st_i64(v, tcg_env, offsetof(CPUDADAOState, rb[a->ha + i]));
++    }
++    return true;
++}
+ 
+ /* === §4.8 RB Relative Address (riii) === */
+ 
+@@ -1106,19 +1146,22 @@ static bool trans_divs(DisasContext *ctx, arg_divs *a)
+     TCGv_i64 zero = tcg_constant_i64(0);
+     TCGv_i64 min64 = tcg_constant_i64(INT64_MIN);
+     TCGv_i64 mone = tcg_constant_i64(-1);
++
++    TCGLabel *l_div0 = gen_new_label();
++    TCGLabel *l_overflow = gen_new_label();
++    TCGLabel *l_ok = gen_new_label();
++
+     /* divisor == 0 → ILLI */
+-    TCGLabel *l1 = gen_new_label();
+-    tcg_gen_brcond_i64(TCG_COND_NE, divisor, zero, l1);
+-    gen_exception_illegal(ctx);
+-    return true;
+-    gen_set_label(l1);
++    tcg_gen_brcond_i64(TCG_COND_EQ, divisor, zero, l_div0);
+     /* INT64_MIN / -1 → ILLI */
+-    TCGLabel *l2 = gen_new_label();
+-    tcg_gen_brcond_i64(TCG_COND_NE, dividend, min64, l2);
+-    tcg_gen_brcond_i64(TCG_COND_NE, divisor, mone, l2);
+-    gen_exception_illegal(ctx);
+-    return true;
+-    gen_set_label(l2);
++    tcg_gen_brcond_i64(TCG_COND_NE, dividend, min64, l_ok);
++    tcg_gen_brcond_i64(TCG_COND_NE, divisor, mone, l_ok);
++
++    gen_set_label(l_overflow);
++    gen_set_label(l_div0);
++    gen_helper_raise_exception(tcg_env, tcg_constant_i32(EXCP_ILLI));
++    gen_set_label(l_ok);
++
+     TCGv_i64 quot = tcg_temp_new_i64();
+     TCGv_i64 rem = tcg_temp_new_i64();
+     tcg_gen_div_i64(quot, dividend, divisor);
+@@ -1135,18 +1178,24 @@ static bool trans_divu(DisasContext *ctx, arg_divu *a)
+     TCGv_i64 dividend = load_rd(ctx, a->hc);
+     TCGv_i64 divisor = load_rd(ctx, a->hd);
+     TCGv_i64 zero = tcg_constant_i64(0);
++
++    TCGLabel *l_div0 = gen_new_label();
++    TCGLabel *l_ok = gen_new_label();
++
+     /* divisor == 0 → ILLI */
+-    TCGLabel *l1 = gen_new_label();
+-    tcg_gen_brcond_i64(TCG_COND_NE, divisor, zero, l1);
+-    gen_exception_illegal(ctx);
+-    return true;
+-    gen_set_label(l1);
++    tcg_gen_brcond_i64(TCG_COND_EQ, divisor, zero, l_div0);
++
+     TCGv_i64 quot = tcg_temp_new_i64();
+     TCGv_i64 rem = tcg_temp_new_i64();
+     tcg_gen_divu_i64(quot, dividend, divisor);
+     tcg_gen_remu_i64(rem, dividend, divisor);
+     store_rd(ctx, a->ha, rem);
+     store_rd(ctx, a->hb, quot);
++    tcg_gen_br(l_ok);
++
++    gen_set_label(l_div0);
++    gen_helper_raise_exception(tcg_env, tcg_constant_i32(EXCP_ILLI));
++    gen_set_label(l_ok);
+     return true;
+ }
+ 
+@@ -1219,7 +1268,7 @@ static bool trans_csne(DisasContext *ctx, arg_csne *a)
+ 
+ static void decode_opc(CPUDADAOState *env, DisasContext *ctx)
+ {
+-    ctx->opcode = translator_ldl_swap(env, &ctx->base, ctx->base.pc_next, true);
++    ctx->opcode = translator_ldl_swap(env, &ctx->base, ctx->base.pc_next, false);
+     if (!decode(ctx, ctx->opcode)) {
+         gen_exception_undi(ctx);
+     }
+@@ -1305,11 +1354,18 @@ static void dadao_restore_state_to_opc(CPUState *cs,
+     cpu->env.pc = data[0];
+ }
+ 
++static bool dadao_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
++{
++    return false;
++}
++
+ const TCGCPUOps dadao_tcg_ops = {
+     .initialize = dadao_tcg_init,
+     .translate_code = dadao_translate_code,
+     .restore_state_to_opc = dadao_restore_state_to_opc,
+ #ifndef CONFIG_USER_ONLY
++    .cpu_exec_interrupt = dadao_cpu_exec_interrupt,
++    .cpu_exec_halt = dadao_cpu_has_work,
+     .tlb_fill = dadao_cpu_tlb_fill,
+     .do_interrupt = dadao_cpu_do_interrupt,
+     .do_unaligned_access = dadao_cpu_do_unaligned_access,
+-- 
+2.43.0
+
