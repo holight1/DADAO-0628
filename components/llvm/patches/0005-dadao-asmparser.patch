@@ -7,14 +7,14 @@ Subject: [PATCH 3/3] DADAO AsmParser, MCCodeEmitter, MCInstPrinter
  .../lib/Target/DADAO/AsmParser/CMakeLists.txt |  16 +
  .../Target/DADAO/AsmParser/DADAOAsmParser.cpp | 383 ++++++++++++++++++
  llvm/lib/Target/DADAO/CMakeLists.txt          |   7 +-
- llvm/lib/Target/DADAO/DADAO.td                |   1 +
+ llvm/lib/Target/DADAO/DADAO.td                |   3 ++-
  .../Target/DADAO/MCTargetDesc/CMakeLists.txt  |   1 +
  .../DADAO/MCTargetDesc/DADAOInstPrinter.cpp   |  31 +-
  .../DADAO/MCTargetDesc/DADAOInstPrinter.h     |  11 +-
  .../DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp |  77 ++++
  .../DADAO/MCTargetDesc/DADAOMCTargetDesc.cpp  |   3 +
  .../DADAO/MCTargetDesc/DADAOMCTargetDesc.h    |   8 +
- 10 files changed, 528 insertions(+), 10 deletions(-)
+ 10 files changed, 529 insertions(+), 11 deletions(-)
  create mode 100644 llvm/lib/Target/DADAO/AsmParser/CMakeLists.txt
  create mode 100644 llvm/lib/Target/DADAO/AsmParser/DADAOAsmParser.cpp
  create mode 100644 llvm/lib/Target/DADAO/MCTargetDesc/DADAOMCCodeEmitter.cpp
@@ -440,6 +440,7 @@ index 22b4303be235..08db6fd37cd6 100644
  tablegen(LLVM DADAOGenRegisterInfo.inc -gen-register-info)
 +tablegen(LLVM DADAOGenInstrInfo.inc -gen-instr-info)
 +tablegen(LLVM DADAOGenAsmMatcher.inc -gen-asm-matcher)
++tablegen(LLVM DADAOGenMCCodeEmitter.inc -gen-emitter)
 +tablegen(LLVM DADAOGenAsmWriter.inc -gen-asm-writer)
  
  add_public_tablegen_target(DADAOCommonTableGen)
@@ -460,14 +461,20 @@ diff --git a/llvm/lib/Target/DADAO/DADAO.td b/llvm/lib/Target/DADAO/DADAO.td
 index 0bbe4f8174d2..86f36095cdb9 100644
 --- a/llvm/lib/Target/DADAO/DADAO.td
 +++ b/llvm/lib/Target/DADAO/DADAO.td
-@@ -19,6 +19,7 @@ include "llvm/Target/Target.td"
+@@ -19,7 +19,7 @@ include "llvm/Target/Target.td"
  include "DADAORegisterInfo.td"
+-include "DADAOInstrInfo.td"
  
  def DADAOInstrInfo : InstrInfo;
 +defm : RemapAllTargetPseudoPointerOperands<GPRD>;
  
  //===----------------------------------------------------------------------===//
  // DADAO processors supported.
+@@ -39,3 +39,4 @@ def DADAOInstPrinter : AsmWriter {
+ def DADAO : Target {
+   let InstructionSet = DADAOInstrInfo;
+   let AssemblyWriters = [DADAOInstPrinter];
++}
 diff --git a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt b/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
 index a63416eaed67..7d73a99b2c75 100644
 --- a/llvm/lib/Target/DADAO/MCTargetDesc/CMakeLists.txt
@@ -518,12 +525,10 @@ index 84e9f3f99b07..b64a1b737afc 100644
    printAnnotation(O, Annot);
  }
  
-@@ -28,14 +36,14 @@
+@@ -28,6 +36,15 @@ DADAOInstPrinter::getMnemonic(const MCInst &MI) const {
+   return {"<unknown>", 0};
+ }
  
--void DADAOInstPrinter::getMnemonic(const MCInst &MI) const {
--  return {"<unknown>", 0};
--}
--
 -void DADAOInstPrinter::printRegName(raw_ostream &OS, MCRegister Reg) {
 -  OS << "<unknown>";
 +void DADAOInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
@@ -608,6 +613,10 @@ index 000000000000..8c62185573ba
 +                         SmallVectorImpl<MCFixup> &Fixups,
 +                         const MCSubtargetInfo &STI) const override;
 +
++  uint64_t getBinaryCodeForInstr(const MCInst &MI,
++                                 SmallVectorImpl<MCFixup> &Fixups,
++                                 const MCSubtargetInfo &STI) const;
++
 +  uint64_t getMachineOpValue(const MCInst &MI, const MCOperand &MO,
 +                             SmallVectorImpl<MCFixup> &Fixups,
 +                             const MCSubtargetInfo &STI) const;
@@ -619,11 +628,8 @@ index 000000000000..8c62185573ba
 +                                           SmallVectorImpl<char> &CB,
 +                                           SmallVectorImpl<MCFixup> &Fixups,
 +                                           const MCSubtargetInfo &STI) const {
-+  // FIXME: Implement once instruction encoding is properly defined
-+  (void)Fixups;
-+  (void)STI;
-+  (void)Ctx;
-+  support::endian::write<uint32_t>(CB, 0, llvm::endianness::big);
++  uint64_t Bits = getBinaryCodeForInstr(MI, Fixups, STI);
++  support::endian::write<uint32_t>(CB, Bits, llvm::endianness::big);
 +}
 +
 +uint64_t
@@ -637,6 +643,8 @@ index 000000000000..8c62185573ba
 +  llvm_unreachable("Unhandled expression!");
 +  return 0;
 +}
++
++#include "DADAOGenMCCodeEmitter.inc"
 +
 +MCCodeEmitter *llvm::createDADAOMCCodeEmitter(const MCInstrInfo &,
 +                                              MCContext &Ctx) {
@@ -680,4 +688,3 @@ index 4fb8a7715650..cc7e3a73ff4e 100644
  #endif // LLVM_LIB_TARGET_DADAO_MCTARGETDESC_DADAOMCTARGETDESC_H
 -- 
 2.43.0
-
