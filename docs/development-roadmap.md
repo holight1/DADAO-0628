@@ -1620,3 +1620,10 @@ untouched). gcc-c-torture: 1465→1471/1708 (86.1%), zero regressions.
 `check_codegen_abi.py` caught a real ABI-doc/schema drift, fixed in the
 same commit. Full E2E (79/79), CodeGen+MC lit (13/13) pass; 62-patch
 LLVM series replays clean with matching tree hash.
+
+## ML-039a: implement `__fixsfti`/`__udivti3` (2026-07-25) — see `code-agent/tasks/ML-039a-implement-int128-arith-libcalls.md` 完成区
+
+Gap audit confirmed these were the only 2 missing 128-bit compiler-rt
+libcalls across all FAIL_LINK files. Closes `pr49218.c`/`pr84748.c`.
+gcc-c-torture: 1471→1473/1708 (86.3%), zero regressions. Full E2E
+unchanged; 15-patch musl series replays clean with matching tree hash.
