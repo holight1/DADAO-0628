@@ -1,0 +1,21 @@
+// ML-038a: `__int128` return value + call-result consumption, dual backend
+// (QEMU + gem5). Positive control expects exit 42 (both halves round-trip
+// correctly through the rd31/rd30 return split and back through the call
+// site's AnalyzeCallResult path, plus a genuine sign-extended negative
+// __int128). A negative-control build (-DNEGATIVE_CONTROL) deliberately
+// mis-states the expected high half so the test is not vacuously true;
+// it must fail with exit 1, not 42.
+//
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -O0 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/i128_return_call.c -o %t.o0.elf
+// RUN: %llvm-objcopy -O binary %t.o0.elf %t.o0.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O2 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/i128_return_call.c -o %t.o2.elf
+// RUN: %llvm-objcopy -O binary %t.o2.elf %t.o2.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O0 -DNEGATIVE_CONTROL=1 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/i128_return_call.c -o %t.negative.elf
+// RUN: %llvm-objcopy -O binary %t.negative.elf %t.negative.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.negative.bin >/dev/null 2>&1; test $? -eq 1'
+// RUN: bash -c '%gem5 %gem5_se %t.negative.elf >/dev/null 2>&1; test $? -eq 1'

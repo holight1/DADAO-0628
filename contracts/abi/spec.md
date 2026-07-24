@@ -200,6 +200,37 @@ assume rd31 / rb31 holds a canonical 64-bit value.
 because any other policy produces undefined behavior at call boundaries.
 Wiki gap tracked in docs/open-spec-issues.md.]
 
+**128-bit scalar return (`__int128`/`unsigned __int128`)**: returned in
+**rd31:rd30** — the high 64 bits in rd31, the low 64 bits in rd30.
+[M1 architecture decision, ML-038a: 128-bit scalar types have no wiki ABI
+contract at all (not even alignment — see `docs/issues.yaml`
+`dadao-frame-lowering-8byte-align-insufficient-for-16byte-locals`, a
+separate, permanently-excluded gap about *local-variable spill-slot*
+alignment, unrelated to this return-*register* decision), so this is a
+self-contained backend extension, not a wiki-derived rule. It is deliberately **not** an
+implementation of §3.2's "multiple return values" (that section covers
+genuinely separate return values and has its own open, unresolved
+declaration-order ambiguity that keeps it Excluded from M1 — see below);
+this instead splits a *single* 128-bit value across two registers under a
+mechanical rule with no such ambiguity. High-first register order was
+chosen so the pre-existing single-register scalar-return convention
+(rd31, above) is preserved unchanged for every ordinary ≤64-bit return —
+only a genuinely 128-bit-wide value ever touches rd30. High/low-to-rd31/
+rd30 assignment follows from two independent, unambiguous facts, not a
+judgment call: DADAO's data layout is big-endian, under which
+target-independent SelectionDAG legalization (`getCopyToParts`/
+`getCopyFromParts`) always presents the high 64 bits before the low 64
+bits; and `CCAssignToReg`'s allocator always tries its register list
+head-first, so listing rd31 ahead of rd30 gives the first (high) part
+rd31 and leaves the second (low) part rd30. Argument passing needs no
+equivalent decision: `CC_DADAO`'s existing ascending rd16..rd31 list
+already assigns two consecutive registers to a split i128 argument
+without modification, high half in the lower-numbered register (e.g.
+rd16/rd17 for the first parameter) — this is asymmetric with the
+high-in-rd31 return convention only in which physical register happens
+to be tried first, not in which half is "high"; both sides agree
+low64|high64 is split in that same big-endian part order.]
+
 ### 3.2 Multiple Return Values (Post-M1 / Informative)
 
 **Excluded from M1 BasicCodeGen.** Provided here for reference only; not

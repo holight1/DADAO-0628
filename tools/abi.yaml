@@ -33,7 +33,14 @@ arguments:
 # ---- §3.1 Return values: scalar return registers ----
 returns:
   integer:
-    register: rd31
+    # ML-038a: a 128-bit scalar (__int128/unsigned __int128) splits across
+    # two registers (high in rd31, low in rd30); every <=64-bit integer
+    # return still uses rd31 alone (rd31 listed first == tried first by
+    # CCAssignToReg's allocator, so a single value never reaches rd30).
+    # See contracts/abi/spec.md §3.1 "128-bit scalar return" for the full
+    # derivation (not a wiki-defined rule -- 128-bit types have no wiki ABI
+    # contract at all).
+    registers: [rd31, rd30]
     abi_cite: "abi §3.1"
   pointer:
     register: rb31

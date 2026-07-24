@@ -7,7 +7,7 @@ parses backend source and reports agreement.
 
 Compared surfaces:
   1. DADAOCallingConv.td   CC_DADAO   -> abi.yaml arguments.integer.registers
-                           RetCC_DADAO-> abi.yaml returns.integer.register
+                           RetCC_DADAO-> abi.yaml returns.integer.registers
   2. DADAORegisterInfo.cpp getReservedRegs -> abi.yaml reserved set
      DADAORegisterInfo.td  allocatable order (cross-check with reserved)
   3. TargetDataLayout.cpp  case Triple::dadao string -> abi.yaml datalayout
@@ -144,13 +144,17 @@ def check_calling_conv(abi):
         record("MISMATCH", "CallingConv",
                f"integer params: backend={cc} contract={want} [{cite}]")
 
-    # integer return
-    rwant = [abi["returns"]["integer"]["register"].lower()]
+    # integer return (ML-038a: contract is now a register LIST -- rd31 then
+    # rd30 -- to cover the 128-bit-scalar two-register split; expand_range
+    # already accepts a plain list here the same way it does for
+    # arguments.integer.registers, so no separate wrapping logic is needed)
+    rwant = expand_range(abi["returns"]["integer"]["registers"])
     rcite = abi["returns"]["integer"]["abi_cite"]
     if retcc is None:
         record("MISMATCH", "CallingConv", f"RetCC_DADAO not found (contract {rcite})")
     elif retcc == rwant:
-        record("MATCH", "CallingConv", f"integer return rd31 [{rcite}]")
+        record("MATCH", "CallingConv",
+               f"integer return {'/'.join(rwant)} [{rcite}]")
     else:
         record("MISMATCH", "CallingConv",
                f"integer return: backend={retcc} contract={rwant} [{rcite}]")

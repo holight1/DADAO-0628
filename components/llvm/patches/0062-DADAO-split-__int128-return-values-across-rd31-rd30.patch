@@ -1,0 +1,297 @@
+From be30d543202be42b52081dc8adea0528e2f8d443 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 06:55:51 +0800
+Subject: [PATCH] DADAO: split __int128 return values across rd31/rd30
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RetCC_DADAO's i64 rule only had a single register (rd31), so any i128
+return value -- expanded by target-independent type legalization into
+two i64 SelectionDAG values, since i64 is DADAO's only legal integer
+type -- crashed as soon as the second value needed somewhere to go:
+CCState::AnalyzeReturn hit "unable to allocate function return #1"
+(LowerReturn, a `return` statement) or CCState::AnalyzeCallResult hit
+the CallingConvLower.cpp:174 UNREACHABLE (LowerCall, a call site
+consuming an i128 result). Reproduced and confirmed via the exact
+crash sites/backtraces before making any change (ML-038a).
+
+Fix: give the i64 return rule a second register, listed as
+[RD31, RD30] (rd31 first) rather than the naive [RD30, RD31] -- the
+latter was tried first and silently reassigns every ordinary
+single-i64 return from rd31 to rd30 (CCAssignToReg's underlying
+CCState::AllocateReg has no notion of "reserve the last slot for a
+solo value", it just walks the list start-to-end), caught by two
+pre-existing lit regressions (dynamic-stackalloc.ll,
+varargs-save-area.ll) after rebuilding, not by inspection. With
+[RD31, RD30], a lone i64 return still allocates rd31 (unchanged ABI,
+contracts/abi/spec.md §3.1) and an i128's two split values fall on
+rd31 (first, i.e. the high 64 bits given DADAO's big-endian data
+layout and SelectionDAGBuilder's getCopyToParts/getCopyFromParts
+part-ordering) and rd30 (second, the low 64 bits).
+
+This also exposed a second, independent latent bug in LowerCall's
+AnalyzeCallResult loop: it reused the same Glue SDValue across every
+CopyFromReg instead of chaining Glue = Copy.getValue(2) between them
+(reference pattern: LanaiISelLowering.cpp's LowerCallResult), which is
+invalid once more than one CopyFromReg needs to glue-chain -- it
+crashed the post-ISel scheduler ("Node already inserted!" in
+ScheduleDAGSDNodes::BuildSchedUnits) as soon as RVLocs.size() > 1
+became reachable at all. Fixed alongside the CC change since neither
+is exercisable without the other.
+
+Scope: __int128 only, not vector types (which hit the same "unable to
+allocate function return #1" site via a different Outs-splitting path
+and have an additional, independent SetCC-legalization gap -- out of
+scope for this task per ML-038a).
+
+New CodeGen lit test (i128-return-value.ll) covers: all-zero, all-one,
+high-only, low-only, and negative (sign-extended) i128 return
+constants; an identity round trip through the argument split (rd16
+hi/rd17 lo, unaffected -- CC_DADAO's argument list order was already
+correct) into the return split; a narrower-to-i128 sign extension; and
+the AnalyzeCallResult call-result-consumption path.
+
+Full CodeGen/DADAO and MC/DADAO lit suites: 11/11 and 2/2, zero
+regressions. Full gcc-c-torture sweep (1708 files), diffed per-file
+against a freshly rebuilt pre-fix baseline (not just aggregate
+counts): 8 files changed status, 0 regressions -- 6 are the ML-038a
+target files (4 now PASS: pr54471.c, pr85582-2.c, pr85582-3.c,
+pr84169.c; 2 now FAIL_LINK on missing __int128 runtime libcalls
+__fixsfti/__udivti3 -- a separate, pre-existing arithmetic-libcall gap
+unrelated to calling convention, out of scope here), and 2
+(20050316-1.c, 20050316-3.c) are vector-return files that incidentally
+share this same RetCC_DADAO register-starvation crash site and started
+passing as a side effect, not a deliberate vector fix.
+---
+ llvm/lib/Target/DADAO/DADAOCallingConv.td    |  54 +++++++-
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp  |  13 ++
+ llvm/test/CodeGen/DADAO/i128-return-value.ll | 129 +++++++++++++++++++
+ 3 files changed, 195 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/test/CodeGen/DADAO/i128-return-value.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOCallingConv.td b/llvm/lib/Target/DADAO/DADAOCallingConv.td
+index 36199b8c5563..008623a4b7c8 100644
+--- a/llvm/lib/Target/DADAO/DADAOCallingConv.td
++++ b/llvm/lib/Target/DADAO/DADAOCallingConv.td
+@@ -37,5 +37,57 @@ def CC_DADAO : CallingConv<[
+ 
+ def RetCC_DADAO : CallingConv<[
+   CCIfPtr<CCAssignToReg<[RB31]>>,
+-  CCIfType<[i64], CCAssignToReg<[RD31]>>
++
++  // A 128-bit scalar (`__int128`/`unsigned __int128`) is wider than
++  // DADAO's only legal integer type (i64), so target-independent type
++  // legalization (no DADAO-specific opt-in needed: it falls out of
++  // TargetLoweringBase::computeRegisterProperties once i64 is the sole
++  // type given a register class -- see DADAOISelLowering.cpp's single
++  // `addRegisterClass(MVT::i64, ...)` call) expands it into exactly two
++  // i64 SelectionDAG values before DADAOTargetLowering ever sees it. Only
++  // then does CCState::AnalyzeReturn/AnalyzeCallResult walk the Outs/Ins
++  // list -- so this rule needs a second register purely to have somewhere
++  // to put that second i64.
++  //
++  // Split order: SelectionDAGBuilder's getCopyToParts/getCopyFromParts
++  // (llvm/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp) place the
++  // *high* 64 bits first and the *low* 64 bits second whenever
++  // DataLayout::isBigEndian() is true, which DADAO's "E-..." data layout
++  // (clang/lib/Basic/Targets/DADAO.h) is -- independently confirmed by
++  // reading both getCopyToParts (~line 636: `if (BigEndian)
++  // std::reverse(Parts, ...)`, undoing the little-endian-first
++  // EXTRACT_ELEMENT order) and getCopyFromParts (~line 209: `if
++  // (BigEndian) std::swap(Lo, Hi)`) directly, not inferred from the
++  // unrelated "DADAO instruction fetch is big-endian" precedent.
++  //
++  // Register order: CCAssignToReg's underlying CCState::AllocateReg walks
++  // its register list start-to-end and picks the first entry not yet
++  // allocated *in this CCState* -- it does not know in advance whether a
++  // second Outs/Ins entry is coming. Listing rd30 before rd31 was tried
++  // first and is WRONG: it silently reassigns rd31 -> rd30 for every
++  // ordinary single-i64 return (Outs.size() == 1 always takes the first
++  // list entry), breaking the pre-existing rd31 scalar-return convention
++  // (contracts/abi/spec.md §3.1) for the overwhelming majority of
++  // functions -- caught by two pre-existing lit regressions
++  // (dynamic-stackalloc.ll, varargs-save-area.ll) after rebuilding and
++  // rerunning the full CodeGen/DADAO suite, not by inspection. Listing
++  // **rd31 before rd30** fixes this: the sole value of an ordinary return
++  // still allocates rd31 first (unchanged ABI), and for the two-value
++  // i128 case the first (high) part takes rd31 and the second (low) part
++  // falls through to rd30. rd30 is caller-saved and unreserved
++  // (DADAORegisterInfo::getReservedRegs/getCalleeSavedRegs). This also
++  // reads consistently with wiki §DADAO-21-ABI §多返回值's own framing
++  // ("primary return value in rd31; additional values in rd30, rd29, …
++  // toward rd16") if the high (first) part is read as "primary" -- but
++  // this rule is NOT an implementation of that wiki section: §多返回值
++  // covers genuinely separate return values and has its own open,
++  // unresolved declaration-order ambiguity (contracts/abi/spec.md §3.2,
++  // tracked in docs/open-spec-issues.md "Multiple returns") that keeps it
++  // Excluded from M1. This rule instead splits a *single* 128-bit value
++  // across two registers under a mechanical rule with no such ambiguity
++  // (the high/low order is dictated entirely by DataLayout::isBigEndian(),
++  // not by any wiki declaration-order convention), so the two are
++  // independent and this change neither resolves nor depends on resolving
++  // that open issue.
++  CCIfType<[i64], CCAssignToReg<[RD31, RD30]>>
+ ]>;
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 24795d240b06..8fbded022136 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -296,6 +296,19 @@ SDValue DADAOTargetLowering::LowerCall(
+     SDValue Copy = DAG.getCopyFromReg(Chain, DL, VA.getLocReg(),
+                                        VA.getLocVT(), Glue);
+     Chain = Copy.getValue(1);
++    // A Glue-typed SDValue may only be consumed once: each CopyFromReg
++    // both takes the previous glue as input and produces a *new* one
++    // (result #2) that the next CopyFromReg must chain onto. Reusing the
++    // same Glue value for every result (as this loop did before -- latent
++    // and unobserved while RVLocs.size() was always 1, i.e. before this
++    // target had any multi-register return value) makes two distinct
++    // CopyFromReg nodes glue-consumers of the same producer, which
++    // desugars into the same SDNode being inserted into the scheduler's
++    // graph twice ("Node already inserted!" in
++    // ScheduleDAGSDNodes::BuildSchedUnits) -- reproduced independently
++    // while diagnosing the __int128 return-value fix (ML-038a), see
++    // reference pattern in e.g. LanaiISelLowering.cpp's LowerCallResult.
++    Glue = Copy.getValue(2);
+     InVals.push_back(Copy.getValue(0));
+   }
+ 
+diff --git a/llvm/test/CodeGen/DADAO/i128-return-value.ll b/llvm/test/CodeGen/DADAO/i128-return-value.ll
+new file mode 100644
+index 000000000000..1a8941aa2736
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/i128-return-value.ll
+@@ -0,0 +1,129 @@
++; ML-038a: `__int128` is wider than DADAO's only legal integer type (i64), so
++; the target-independent type legalizer expands every i128 value into two
++; i64 SelectionDAG values before DADAOTargetLowering ever runs -- this needs
++; RetCC_DADAO to have a second return register (rd30) to receive that second
++; i64 alongside the pre-existing single-register rd31 return.
++;
++; Two independent facts fix the register assignment:
++;  - DADAO's data layout is big-endian (clang/lib/Basic/Targets/DADAO.h), so
++;    the *first* of the two split i64 values is the high 64 bits and the
++;    second is the low 64 bits (SelectionDAGBuilder's
++;    getCopyToParts/getCopyFromParts).
++;  - CCAssignToReg's underlying CCState::AllocateReg tries its register list
++;    start-to-end and has no notion of "reserve the last slot for a lone
++;    value" -- listing rd30 before rd31 silently reassigns the pre-existing
++;    single-i64 scalar return convention (contracts/abi/spec.md §3.1) from
++;    rd31 to rd30 (caught via the pre-existing dynamic-stackalloc.ll /
++;    varargs-save-area.ll lit regressions, not by inspection). Listing rd31
++;    first preserves that convention: the lone value of an ordinary return
++;    still gets rd31, and for the two-value i128 case the high half falls on
++;    rd31 (tried first) and the low half on rd30 (tried second).
++;
++; RUN: llc -mtriple=dadao < %s | FileCheck %s
++
++; All-zero: both halves are zero.
++define i128 @ret_zero() {
++; CHECK-LABEL: ret_zero:
++; CHECK: addi rd30, rd0, 0
++; CHECK: addi rd31, rd30, 0
++; CHECK: ret rd0, 0
++entry:
++  ret i128 0
++}
++
++; All-one bit pattern: both halves are all-ones (-1 sign-extended to i128).
++define i128 @ret_all_ones() {
++; CHECK-LABEL: ret_all_ones:
++; CHECK: addi rd30, rd0, -1
++; CHECK: addi rd31, rd30, 0
++; CHECK: ret rd0, 0
++entry:
++  ret i128 -1
++}
++
++; Only the high 64 bits are non-zero (2^64): rd31 (high) = 1, rd30 (low) = 0.
++define i128 @ret_hi_only() {
++; CHECK-LABEL: ret_hi_only:
++; CHECK: addi rd31, rd0, 1
++; CHECK: addi rd30, rd0, 0
++; CHECK: ret rd0, 0
++entry:
++  ret i128 18446744073709551616
++}
++
++; Only the low 64 bits are non-zero (0x12345678): rd31 (high) = 0, rd30
++; (low) materializes the constant.
++define i128 @ret_lo_only() {
++; CHECK-LABEL: ret_lo_only:
++; CHECK: addi rd31, rd0, 0
++; CHECK: setzw rd30, 0, 22136
++; CHECK: orw rd30, 1, 4660
++; CHECK: ret rd0, 0
++entry:
++  ret i128 305419896
++}
++
++; Negative i128 constant (-0x12345678): the high half must be materialized
++; as all-ones (true 128-bit two's complement sign extension), not left as
++; zero or truncated -- this is the case that would silently produce a wrong
++; positive-looking value if the two halves were not independently correct.
++define i128 @ret_negative() {
++; CHECK-LABEL: ret_negative:
++; CHECK: addi rd31, rd0, -1
++; CHECK: setzw rd30, 0, 43400
++; CHECK: orw rd30, 1, 60875
++; CHECK: orw rd30, 2, 65535
++; CHECK: orw rd30, 3, 65535
++; CHECK: ret rd0, 0
++entry:
++  ret i128 -305419896
++}
++
++; Round trip through the RD-bank argument split (rd16 = high, rd17 = low --
++; CC_DADAO's argument list is ascending from rd16, unaffected by this fix)
++; straight back out via the return split (rd31 = high, rd30 = low) with no
++; other computation -- confirms parameter and return splitting agree on
++; which half is which even though the two CC tables assign opposite
++; register-number order.
++define i128 @identity(i128 %x) {
++; CHECK-LABEL: identity:
++; CHECK: addi rd31, rd16, 0
++; CHECK: addi rd30, rd17, 0
++; CHECK: ret rd0, 0
++entry:
++  ret i128 %x
++}
++
++; Sign extension from a narrower type: the low half carries the sign-
++; extended 32-bit value and the high half is derived from the low half's
++; sign bit (all-0 or all-1), not from the caller's (non-existent) high
++; 32 bits of the i32 argument.
++define i128 @ret_sext_from_i32(i32 %x) {
++; CHECK-LABEL: ret_sext_from_i32:
++; CHECK: exts rd30, rd16, 32
++; CHECK: addi [[SHAMT:rd[0-9]+]], rd0, 63
++; CHECK: shrs rd31, rd30, [[SHAMT]]
++; CHECK: ret rd0, 0
++entry:
++  %s = sext i32 %x to i128
++  ret i128 %s
++}
++
++; The `AnalyzeCallResult` path (CallingConvLower.cpp:174 UNREACHABLE before
++; this fix): the caller must read the callee's i128 result back out of the
++; same rd31/rd30 pair the return convention assigns, with the two
++; CopyFromReg nodes correctly glue-chained (a second, independently found
++; bug -- see the Glue-reuse fix in DADAOISelLowering.cpp's LowerCall, which
++; previously fed the same Glue value to both CopyFromReg nodes and crashed
++; the post-ISel scheduler with "Node already inserted!" as soon as
++; RVLocs.size() > 1 was reachable at all).
++declare i128 @produce()
++
++define i128 @consume_call_result() {
++; CHECK-LABEL: consume_call_result:
++; CHECK: call produce
++; CHECK: ret rd0, 0
++entry:
++  %r = call i128 @produce()
++  ret i128 %r
++}
+-- 
+2.43.0
+

@@ -59,3 +59,4 @@
 0059-DADAO-preserve-sret-and-disable-unsupported-tail-cal.patch
 0060-DADAO-implement-dynamic-stack-allocation-and-restore.patch
 0061-DADAO-declare-ZeroOrOneBooleanContent-to-stop-O0-mas.patch
+0062-DADAO-split-__int128-return-values-across-rd31-rd30.patch
