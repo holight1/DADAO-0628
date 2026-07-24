@@ -1212,3 +1212,80 @@ large-constant-addressing bug (2 concrete repros, likely wider blast
 radius); P1 re-evaluate whether `-ffreestanding` is still the right
 default now that a real musl libc exists. This scan did not attempt
 any fixes; prioritization and dispatch order is pending user direction.
+
+**User direction (2026-07-24)**: fix in priority order; the goal is every
+test in the suite either passing or having a documented, reasonable reason
+it doesn't (echoing ADR-0012 D5 verbatim). Both P0 items are now closed.
+
+### ML-027a/ML-028a/ML-029a complete (2026-07-24): both P0 items closed, gcc-c-torture 1328→1412/1708 (+84)
+
+**ML-027a** (diagnosis only) found `pr56866.c`'s hang was not a rotate/
+narrow-width bug at all: bisection showed every rotate width passes alone,
+only mixed-width combinations (which push the stack frame past ~2KB) fail.
+QEMU execution tracing (TB-chaining disabled) pinpointed the exact looping
+PC; hand-decoding the instruction bytes bit-by-bit against the ISA's field
+layout proved the *encoded* immediate was wrong, not a disassembler
+artifact. Root cause: `DADAOFrameLowering::emitPrologue/emitEpilogue` and
+all of `DADAORegisterInfo::eliminateFrameIndex`'s frame-index pseudo cases
+baked `StackSize`/`FrameOff` straight into 12-bit signed `imms12` operands
+with **no range check anywhere in the pipeline** — not in frame lowering,
+not in the register-info fixup sites, not in `DADAOMCCodeEmitter::
+getImm12OpValue` itself. Any function with a stack frame or offset outside
+`[-2048,2047]` got silently wrapped mod 4096 at encode time, sometimes
+flipping the sign of the stack-pointer adjustment entirely (confirmed: a
+real `StackSize=6192` encoded as `+2000` instead of `-6192`). Not specific
+to gcc-c-torture — a general correctness gap for any function using more
+than ~2KB of stack, with some then-"passing" tests (e.g. a large frame
+alone) only passing because the wraparound happened to land somewhere
+inert. Registered as `frame-offset-no-imms12-range-check-silent-
+wraparound`; diagnosis-only per the ML-020a/021a precedent given the scope.
+
+**ML-028a** closed the 92-file softfloat symbol gap: added the full
+single-precision arithmetic/compare/conversion family plus the remaining
+double ordered-comparison symbols (`__gtdf2`/`__ltdf2`/`__ledf2`) to the
+same self-contained shim (commit `f6ba5f43`, patch `0013`). Found and
+added two symbols beyond the original file list (`__unordsf2`,
+`__floatdisf`) discovered during verification rather than stopping short.
+Deferred `__divsc3` (complex division) as a new, separate open issue —
+only 1 of 92 files needs it and its algorithm (Smith's method + full C99
+Annex G special-casing) is qualitatively harder than everything else here.
+~4.87M fuzz checks against native hardware arithmetic (0 mismatches) plus
+5 confirmed negative controls; disassembly confirms exactly 2 `call`
+instructions in the whole file (both pre-existing/expected tail-call
+patterns), zero self-recursion.
+
+**ML-029a** implemented the actual fix for ML-027a's finding: `LowerCall`-
+adjacent frame code now checks `isInt<12>` before encoding any frame
+offset, falling back to materializing the value into an ABI-reserved
+scratch register (reusing the existing GPRD constant-materialization
+pattern from `CONST_WYDE`) and computing the final address via the
+existing cross-bank `ADDRB_ORRR` add instruction — no new instructions
+needed. A same-day follow-up commit (`032fab81c9bf`) fixed a subtler
+bug the first pass missed: the naive `estimateStackSize() > 2047` check
+for reserving an emergency register-scavenger spill slot didn't account
+for large fixed-object offsets or large GEP offsets on an otherwise-small
+frame, so `processFunctionBeforeFrameFinalized` now scans every frame-
+index pseudo's actual worst-case total offset. New MIR/IR regression
+tests lock the exact `2047`/`2048` boundary behavior, and a new E2E test
+(`frame_offset_large.test`) with a genuine negative control confirms the
+check isn't vacuous.
+
+Architect-verified independently (not just trusting the implementer's or
+Codex's own review): rebuilt the toolchain from scratch, reproduced
+`pr56866.c` flipping from `TIMEOUT` to `PASS` directly, reran the full
+1708-file gcc-c-torture sweep myself and got the exact same breakdown
+(`1412/113/133/50/0`) as both the implementer and the independent
+reviewer reported, replayed the full 52-patch LLVM series from a bare
+manifest-pin checkout with tree-hash identity confirmed, and independently
+verified the musl patch and self-recursion claims. E2E 72→73/73,
+differential AGREE=200/DIVERGE=0 unchanged, manifest/issues PASS.
+
+**gcc-c-torture running total: 1328→1412/1708 (82.7%)**, zero regressions
+across all three tasks (confirmed via full-corpus before/after file-level
+diffing, not just aggregate counts). Both `frame-offset-no-imms12-range-
+check-silent-wraparound` and the original 92-file softfloat gap are closed
+and archived. Remaining open items from ML-026a's original list: P1
+verify DL-072a's varargs fix covers struct-by-value args, P1 the
+relocation/large-constant-addressing bug, P1 re-evaluate `-ffreestanding`,
+P2 VLA/`__int128`/vector-legalize/`alloca`/`BlockAddress`, plus the new
+`musl-softfloat-shim-missing-divsc3` issue from ML-028a.
