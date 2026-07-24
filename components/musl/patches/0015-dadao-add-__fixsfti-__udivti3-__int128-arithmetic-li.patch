@@ -1,0 +1,201 @@
+From 0b1e006c7370a0b919283b9f64eb8e089636508c Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 07:28:57 +0800
+Subject: [PATCH] dadao: add __fixsfti / __udivti3 __int128 arithmetic libcalls
+ (ML-039a)
+
+Closes docs/issues.yaml musl-softfloat-shim-missing-int128-arith-libcalls,
+found as a side effect of ML-038a's __int128 return-value CallingConv
+fix: pr49218.c (float->__int128 conversion) and pr84748.c (unsigned
+128-bit division) both compile cleanly but fail at link with
+undefined symbol __fixsfti / __udivti3 respectively.
+
+Scope check (full gcc-c-torture FAIL_LINK re-scan, 126 files, grepped
+for *ti/*ti2/*ti3/*ti4 compiler-rt 128-bit-libcall naming): these are
+the only two such symbols anywhere in the current FAIL_LINK set, each
+referenced by exactly one file -- no wider gap in this corpus today.
+
+__udivti3: 128-iteration shift-and-subtract restoring long division.
+Division is exactly the operation this libcall replaces, so a native
+`/` on unsigned __int128 inside its own body would legalize back into
+a recursive call to itself (verified directly: a standalone probe
+`u128 div128(u128 a, u128 b) { return a / b; }` does emit `undefined
+symbol: __udivti3` on this target) -- never uses `/` or `%` on a
+128-bit operand.
+
+__fixsfti: direct widening of this file's existing __fixsfdi (float
+-> long long) to __int128, same compiler-rt fp_fixint_impl.inc
+algorithm, reusing the existing F32_* bit-pattern macros.
+
+Unlike the f64/f32 functions elsewhere in this file (restricted to
+raw uint64_t/uint32_t bit patterns because DADAO has no float
+registers), both functions here freely use native unsigned
+__int128/__int128 add/sub/compare/shift -- independently probed and
+confirmed to compile to fully inline instruction sequences with no
+new undefined-symbol dependency on this target (unlike `/`).
+
+Verified: llvm-nm -u on the compiled object shows zero undefined
+symbols; llvm-objdump -d confirms no `call` instruction anywhere in
+either function body (no self-recursion). Host-side fuzz harness
+(gcc -O2 and -O0 -fsanitize=undefined,address) cross-checks
+~600k cases against native host __int128 division and (in-range)
+float->__int128 conversion, plus explicit boundary values (0, ~0,
+self-division, MSB-only, subnormals, etc.) -- zero mismatches, with
+two negative-control buggy variants confirmed caught by the same
+harness. pr49218.c/pr84748.c now PASS end-to-end through the real
+clang->ld.lld->QEMU pipeline; full 1708-file gcc-c-torture re-scan
+shows exactly these 2 files changed (FAIL_LINK -> PASS), zero other
+regressions.
+---
+ src/internal/dadao/softfloat_shim.c | 138 ++++++++++++++++++++++++++++
+ 1 file changed, 138 insertions(+)
+
+diff --git a/src/internal/dadao/softfloat_shim.c b/src/internal/dadao/softfloat_shim.c
+index 84f2f4a9..259be418 100644
+--- a/src/internal/dadao/softfloat_shim.c
++++ b/src/internal/dadao/softfloat_shim.c
+@@ -1957,3 +1957,141 @@ float _Complex __divsc3(float a, float b, float c, float d) {
+   __imag__ result = imagPart;
+   return result;
+ }
++
++/* ============================================================================
++ * ML-039a: __int128 arithmetic libcalls (__fixsfti, __udivti3).
++ *
++ * docs/issues.yaml musl-softfloat-shim-missing-int128-arith-libcalls: ML-038a
++ * fixed the __int128 return-value CallingConv crash that previously masked
++ * this gap, exposing exactly 2 undefined symbols at gcc-c-torture link time:
++ *   __fixsfti  (float -> __int128 conversion, referenced by pr49218.c:main)
++ *   __udivti3  (unsigned 128-bit division, referenced by pr84748.c:foo)
++ *
++ * Scope check (this task's own hard requirement -- not just implementing the
++ * 2 already-known symbols and stopping): every FAIL_LINK entry in a full
++ * gcc-c-torture sweep (126 files, baseline 1471/96/126/15) was grepped for
++ * undefined symbols matching compiler-rt's *ti/*ti2/*ti3/*ti4 128-bit-libcall
++ * naming convention (matching lib/builtins/*ti*.c file names). Result:
++ * __fixsfti and __udivti3 are the *only* two such symbols anywhere in the
++ * current FAIL_LINK set, each referenced by exactly one file (pr49218.c,
++ * pr84748.c respectively) -- no wider gap exists in this corpus today. Every
++ * compiler-rt 128-bit libcall this scan did NOT find a reference to
++ * (__divti3/__modti3/__umodti3/__fixdfti/__fixunssfti/__fixunsdfti/
++ * __floattisf/__floattidf/__floatuntisf/__floatuntidf/__muloti4/etc.) is
++ * left unimplemented -- see this task's completion notes for the full
++ * symbol/file-count table and an explicit list of what's covered vs. not.
++ *
++ * Self-recursion trap (same rule as every other symbol in this file, see the
++ * very first header comment above): division is exactly the operation these
++ * two compiler-rt libcalls exist to replace, so `a / b` on `unsigned
++ * __int128` operands inside __udivti3's own body would legalize right back
++ * into a recursive call to __udivti3 itself. Verified directly with a
++ * standalone probe object (clang --target=dadao -c, llvm-nm -u): a bare
++ * `u128 div128(u128 a, u128 b) { return a / b; }` does emit `undefined
++ * symbol: __udivti3` (confirms the trap is real for this target, not just a
++ * theoretical concern carried over from other targets' compiler-rt). This
++ * file's __udivti3 below therefore implements division from scratch as a
++ * 128-iteration shift-and-subtract restoring long division -- the "no
++ * bit-pattern tricks needed" algorithm this task's own instructions
++ * explicitly allow for this symbol -- and never uses `/` or `%` on a
++ * 128-bit operand anywhere.
++ *
++ * Unlike `/`, native `unsigned __int128`/`__int128` add, subtract, compare,
++ * bitwise, and shift (both constant- and variable-amount) operations were
++ * independently probed the same way and confirmed to compile to fully
++ * inline instruction sequences with *no* new undefined-symbol dependency (no
++ * compiler-rt __addti3/__subti3/__cmpti2/__ucmpti2/__ashlti3/__lshrti3 call
++ * is ever emitted by this target's backend for those). So, unlike the
++ * f64/f32 functions earlier in this file (restricted to raw uint64_t/
++ * uint32_t bit-pattern operations because DADAO has no float registers at
++ * all), the two functions below freely use native `unsigned __int128`/
++ * `__int128` arithmetic for everything except the division/modulo operators
++ * themselves -- this both matches how compiler-rt's own reference
++ * implementations are written (udivmodti4.c uses `tu_int`/`ti_int`, i.e.
++ * native 128-bit ints, throughout) and keeps this port a closer,
++ * easier-to-audit line-for-line translation.
++ *
++ * __udivti3 below deliberately does not implement compiler-rt's Knuth
++ * Algorithm D 64-bit-divisor fast path (udivmodti4.c's
++ * udiv128by64to64/udiv128by64to64default optimized branch) -- that fast
++ * path's `__builtin_clzll(divisor.s.high)` is undefined behavior whenever
++ * divisor.s.high == 0, which is exactly the case that branch exists to
++ * special-case, and correctly reproducing that guard is unnecessary
++ * complexity this corpus's actual usage (a single division in pr84748.c, by
++ * a value that is always 0 or 1) does not need. The uniform 128-iteration
++ * loop below is correct for every divisor, including divisor == 0 (see its
++ * own comment), just not the fastest possible implementation.
++ *
++ * __fixsfti is a direct widening of this file's own existing __fixsfdi
++ * (float -> long long, see above) to __int128 -- same algorithm
++ * (compiler-rt's fp_fixint_impl.inc __fixint, specialized to
++ * SINGLE_PRECISION/ti_int), reusing the F32_* bit-pattern macros already
++ * defined above. Faithfully porting compiler-rt's own saturation boundary
++ * (`(unsigned)exponent >= sizeof(fixint_t) * CHAR_BIT`, i.e. >= 128 here)
++ * means -- exactly as in upstream compiler-rt, and exactly as in this
++ * file's own existing __fixsfdi at the 64-bit width -- values whose
++ * magnitude lands in the half-open range [2^127, 2^128) (biased exponent
++ * 127 with a large mantissa, e.g. anything near FLT_MAX) do not cleanly
++ * saturate to INT128_MAX/INT128_MIN; the intermediate unsigned bit pattern
++ * can have its top bit set before the sign is folded in. This is a known
++ * compiler-rt quirk at that exact boundary, not something introduced by
++ * this port, and both a real float->__int128 conversion in that overflow
++ * range *and* this shim's bit-pattern reproduction of it are undefined
++ * behavior territory per ISO C (6.3.1.4p1: converting a floating value that
++ * does not fit the destination integer type is undefined) -- there is no
++ * "more correct" defined answer to match, upstream or otherwise, and no
++ * gcc-c-torture file in this corpus exercises that range (pr49218.c only
++ * ever converts 0.0f). Left exactly as compiler-rt defines it rather than
++ * inventing a stricter saturation rule compiler-rt itself doesn't have.
++ */
++
++/* Returns a / b (unsigned 128-bit). Division by zero is undefined behavior
++ * in C and not specially guarded here (compiler-rt's own udivmodti4.c does
++ * not guard it either); this loop's specific behavior for b == 0 is that
++ * every iteration's `remainder >= b` test is trivially true (b == 0), so
++ * every quotient bit gets set and the result saturates to all-ones
++ * (~(unsigned __int128)0) rather than crashing or looping forever -- still
++ * well-defined C (no `/` or `%` ever executes), just not a meaningful
++ * quotient. */
++unsigned __int128 __udivti3(unsigned __int128 a, unsigned __int128 b) {
++  unsigned __int128 quotient = 0;
++  unsigned __int128 remainder = 0;
++  for (int i = 127; i >= 0; i--) {
++    remainder = (remainder << 1) | ((a >> i) & 1);
++    if (remainder >= b) {
++      remainder -= b;
++      quotient |= ((unsigned __int128)1 << i);
++    }
++  }
++  return quotient;
++}
++
++__int128 __fixsfti(float a) {
++  unsigned int aRep = toRepF32(a);
++  unsigned int aAbs = aRep & F32_ABS_MASK;
++  int negative = (aRep & F32_SIGN_BIT) != 0;
++
++  int exponent = (int)((aAbs >> F32_SIG_BITS) & (unsigned int)F32_MAX_EXP) - F32_EXP_BIAS;
++  if (exponent < 0)
++    return 0; /* |a| < 1.0 truncates to 0 */
++
++  /* INT128_MAX / INT128_MIN, computed with `~`/`>>1` (not `/2`) purely to
++   * keep this function free of any `/` on a 128-bit operand at all -- unlike
++   * __udivti3 above, __fixsfti has no self-recursion risk through `/`
++   * (nothing here calls back into a division libcall), this is just staying
++   * consistent with this file's house style. */
++  const __int128 fixint_max = (__int128)(~(unsigned __int128)0 >> 1);
++  const __int128 fixint_min = -fixint_max - 1;
++  if ((unsigned)exponent >= 128)
++    return negative ? fixint_min : fixint_max; /* saturate (incl. +/-inf/NaN) */
++
++  unsigned int significand = (aAbs & (unsigned int)F32_SIG_MASK) |
++                              (unsigned int)F32_IMPLICIT_BIT; /* 24 bits */
++  unsigned __int128 mag = (exponent < F32_SIG_BITS)
++      ? (unsigned __int128)(significand >> (F32_SIG_BITS - exponent))
++      : (unsigned __int128)significand << (exponent - F32_SIG_BITS);
++  /* Negate on the integer side only -- mag is already an integer bit
++   * pattern here, never a `float`, so this is not the float-self-recursion
++   * trap __fixsfdi's own comment above warns about. */
++  return negative ? -(__int128)mag : (__int128)mag;
++}
+-- 
+2.43.0
+

@@ -12,31 +12,6 @@
 # docs/issues-archive.yaml (same schema) -- day-to-day lookup/registration
 # of new issues only needs this file.
 
-- id: musl-softfloat-shim-missing-int128-arith-libcalls
-  title: "softfloat_shim.c has no __int128 arithmetic compiler-rt libcalls (__fixsfti confirmed missing for pr49218.c: float->__int128 conversion; __udivti3 confirmed missing for pr84748.c: unsigned 128-bit division) -- both files compile cleanly (ML-038a fixed the CallingConv crash that previously masked this) but fail at link with undefined symbol"
-  status: open
-  scope: [musl, softfloat, int128]
-  blocks: [pr49218.c, pr84748.c]
-  resolved_by: null
-  # Found during ML-038a (2026-07-24) as a side effect of fixing __int128
-  # return-value CallingConv: pr49218.c/pr84748.c previously crashed the
-  # compiler before ever reaching link, so this libcall gap was invisible.
-  # Architect independently reproduced both link errors directly (ld.lld
-  # --start-group crt1.o <obj> libc.a --end-group):
-  #   ld.lld: error: undefined symbol: __fixsfti
-  #   >>> referenced by pr49218.c:(main)
-  #   ld.lld: error: undefined symbol: __udivti3
-  #   >>> referenced by pr84748.c:(foo)
-  # Not yet scoped how many total __int128 arithmetic libcalls compiler-rt
-  # defines (divti3/modti3/udivti3/umodti3/fixsfti/fixdfti/fixunssfti/
-  # fixunsdfti/floattisf/floattidf/floatuntisf/floatuntidf/muloti4/etc. --
-  # full inventory not yet audited) vs. how many the gcc-c-torture corpus
-  # actually exercises (only these 2 files confirmed so far, out of the
-  # 1708-file corpus). Likely comparable in shape to the ML-022a/025a/028a
-  # softfloat_shim.c symbol-gap pattern (bit-pattern-only implementations,
-  # fuzz-verified against native 128-bit arithmetic) but not yet attempted
-  # -- registering as a tracked gap per the standing "either PASS or a
-  # documented reason" bar rather than leaving it silently unaccounted for.
 - id: dadao-frame-lowering-8byte-align-insufficient-for-16byte-locals
   title: "128-bit-aligned locals (SIMD vector alloca, __int128 spill slot) are not supported by the DADAO ABI and are permanently excluded, like HFA -- the wiki's ABI type table (DADAO-21-ABI §Fundamental Types, the sizeof/Alignment table) never defines a type wider than 8 bytes (long/pointer/double top out at Alignment=8; aggregates are 'at least 8-byte aligned'), so __int128/vector are GNU extensions with no DADAO ABI alignment contract at all -- DADAOFrameLowering.h's declared Align(8) is therefore CORRECT per spec, not a bug to fix; the 2 gcc-c-torture files exercising these types are expected to remain non-PASS"
   status: open

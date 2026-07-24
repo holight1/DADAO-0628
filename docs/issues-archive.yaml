@@ -1488,3 +1488,91 @@
   # inputs + accumulating, non-short-circuiting negative control) both
   # independently verified to FAIL against the pre-fix compiler and PASS
   # against the post-fix compiler.
+
+- id: musl-softfloat-shim-missing-int128-arith-libcalls
+  title: "softfloat_shim.c has no __int128 arithmetic compiler-rt libcalls (__fixsfti confirmed missing for pr49218.c: float->__int128 conversion; __udivti3 confirmed missing for pr84748.c: unsigned 128-bit division) -- both files compile cleanly (ML-038a fixed the CallingConv crash that previously masked this) but fail at link with undefined symbol"
+  status: closed
+  scope: [musl, softfloat, int128]
+  blocks: [pr49218.c, pr84748.c]
+  resolved_by: "ML-039a; musl patch 0015-dadao-add-__fixsfti-__udivti3-__int128-arithmetic-li.patch"
+  # Found during ML-038a (2026-07-24) as a side effect of fixing __int128
+  # return-value CallingConv: pr49218.c/pr84748.c previously crashed the
+  # compiler before ever reaching link, so this libcall gap was invisible.
+  # Architect independently reproduced both link errors directly (ld.lld
+  # --start-group crt1.o <obj> libc.a --end-group):
+  #   ld.lld: error: undefined symbol: __fixsfti
+  #   >>> referenced by pr49218.c:(main)
+  #   ld.lld: error: undefined symbol: __udivti3
+  #   >>> referenced by pr84748.c:(foo)
+  # Not yet scoped how many total __int128 arithmetic libcalls compiler-rt
+  # defines (divti3/modti3/udivti3/umodti3/fixsfti/fixdfti/fixunssfti/
+  # fixunsdfti/floattisf/floattidf/floatuntisf/floatuntidf/muloti4/etc. --
+  # full inventory not yet audited) vs. how many the gcc-c-torture corpus
+  # actually exercises (only these 2 files confirmed so far, out of the
+  # 1708-file corpus). Likely comparable in shape to the ML-022a/025a/028a
+  # softfloat_shim.c symbol-gap pattern (bit-pattern-only implementations,
+  # fuzz-verified against native 128-bit arithmetic) but not yet attempted
+  # -- registering as a tracked gap per the standing "either PASS or a
+  # documented reason" bar rather than leaving it silently unaccounted for.
+  #
+  # ML-039a resolution (2026-07-25):
+  #
+  # Scope check (this task's own hard requirement, done before any
+  # implementation): grepped all undefined symbols across the current 126
+  # FAIL_LINK entries (full gcc-c-torture re-scan) for compiler-rt's
+  # *ti/*ti2/*ti3/*ti4 128-bit-libcall naming convention. Result:
+  # __fixsfti and __udivti3 are the *only* two such symbols anywhere in the
+  # FAIL_LINK set, each referenced by exactly one file -- confirms this
+  # corpus does not need the rest of compiler-rt's 128-bit libcall family
+  # (divti3/modti3/umodti3/fixdfti/fixunssfti/fixunsdfti/floattisf/
+  # floattidf/floatuntisf/floatuntidf/muloti4/etc. remain unimplemented,
+  # left for a future task if/when a corpus file ever needs one).
+  #
+  # __udivti3: 128-iteration shift-and-subtract restoring long division.
+  # Division is exactly the operation this libcall replaces, so `a / b` on
+  # `unsigned __int128` inside its own body would legalize back into a
+  # recursive call to itself -- verified directly with a standalone probe
+  # object (`u128 div128(u128 a, u128 b) { return a / b; }` does emit
+  # `undefined symbol: __udivti3` on this target, confirming the trap is
+  # real here, not just a theoretical concern carried over from other
+  # compiler-rt targets). Never uses `/` or `%` on a 128-bit operand.
+  # Deliberately skips compiler-rt's udivmodti4.c Knuth Algorithm D
+  # 64-bit-divisor fast path (its `__builtin_clzll(divisor.s.high)` is UB
+  # whenever divisor.s.high == 0, exactly the case that branch special-
+  # cases) -- unnecessary complexity for this corpus's actual usage (one
+  # division in pr84748.c, by a value always 0 or 1).
+  #
+  # __fixsfti: direct widening of softfloat_shim.c's existing __fixsfdi
+  # (float -> long long) to __int128, same compiler-rt fp_fixint_impl.inc
+  # algorithm/saturation boundary, reusing the existing F32_* macros.
+  #
+  # Unlike the f64/f32 functions elsewhere in the file (restricted to raw
+  # uint64_t/uint32_t bit patterns because DADAO has no float registers),
+  # both new functions freely use native unsigned __int128/__int128
+  # add/sub/compare/shift -- independently probed (clang --target=dadao -c,
+  # llvm-nm -u) and confirmed to compile to fully inline instruction
+  # sequences with no new undefined-symbol dependency on this target
+  # (unlike `/`).
+  #
+  # Verification: llvm-nm -u on the compiled softfloat_shim.o shows zero
+  # undefined symbols; llvm-objdump -d --triple=dadao confirms no `call`
+  # instruction anywhere in either function's body (no self-recursion).
+  # Host-side fuzz harness (gcc -O2, and -O0 -fsanitize=undefined,address)
+  # cross-checks ~600k cases -- 400k+ random unsigned-128 divisions against
+  # the host's native `/`, 200k random in-range float->__int128
+  # conversions against the host's native `(__int128)` cast, plus explicit
+  # boundary values (0, ~0, self-division, MSB-only operands, subnormals,
+  # 0.5/0.999/exact powers of two, etc.) -- zero mismatches. Two
+  # deliberately-wrong variants (buggy_udivti3 truncated to a 64-bit loop
+  # bound; buggy_fixsfti with an off-by-one exponent bias) were both
+  # confirmed caught by the same harness, as a negative control that the
+  # comparison methodology is sound and not vacuously passing.
+  #
+  # End-to-end: pr49218.c/pr84748.c re-run through the real
+  # clang->ld.lld->QEMU pipeline both now PASS. Full 1708-file
+  # gcc-c-torture re-scan, diffed file-by-file against the pre-task
+  # baseline (1471/96/126/15): exactly these 2 files changed (FAIL_LINK ->
+  # PASS), 0 other regressions (1473/96/124/15). llvm-lit
+  # tests/lit/E2E/: 79/79, unchanged. tools/run_differential.py:
+  # AGREE(4-way)=200/DIVERGE=0, unchanged (spec-vector harness, does not
+  # exercise this musl-runtime-only change but confirmed unaffected).

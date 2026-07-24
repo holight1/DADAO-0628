@@ -12,3 +12,4 @@
 0012-dadao-add-6-more-softfloat_shim.c-symbols-closing-th.patch
 0013-dadao-add-single-precision-softfloat-family-double-o.patch
 0014-dadao-add-divsc3-single-precision-complex-division.patch
+0015-dadao-add-__fixsfti-__udivti3-__int128-arithmetic-li.patch
