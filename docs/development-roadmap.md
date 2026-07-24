@@ -1608,3 +1608,15 @@ Closes the last known FAIL_LINK gap (`complex-5.c`, single-precision
 complex division per C99 Annex G). gcc-c-torture: 1464→1465/1708
 (85.8%), zero regressions. Full E2E/differential/manifest/issues pass;
 musl 14-patch series replays clean with matching tree hash.
+
+## ML-038a: fix `__int128` return-value CallingConv crash (2026-07-24) — see `code-agent/tasks/ML-038a-fix-int128-calling-convention.md` 完成区
+
+Splits `__int128` returns across `rd31`/`rd30`. 4/6 target files PASS;
+the other 2 hit a newly-registered, separate gap (missing
+`__fixsfti`/`__udivti3` libcalls,
+`musl-softfloat-shim-missing-int128-arith-libcalls`). 2 vector-return
+files flip to PASS as a side effect (vector legalization itself
+untouched). gcc-c-torture: 1465→1471/1708 (86.1%), zero regressions.
+`check_codegen_abi.py` caught a real ABI-doc/schema drift, fixed in the
+same commit. Full E2E (79/79), CodeGen+MC lit (13/13) pass; 62-patch
+LLVM series replays clean with matching tree hash.
