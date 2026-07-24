@@ -1,0 +1,46 @@
+From 25e4e8a5f03578ff46832788cf5feae0dc180cc7 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 15:10:52 +0800
+Subject: [PATCH] md5sum: decode message words as little endian
+
+---
+ src/md5sum/md5.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/md5sum/md5.c b/src/md5sum/md5.c
+index 092e183..bfbd3ac 100644
+--- a/src/md5sum/md5.c
++++ b/src/md5sum/md5.c
+@@ -90,7 +90,10 @@ void md5(uint8_t *initial_msg, size_t initial_len) {
+     msg[initial_len] = 128; // write the "1" bit
+ 
+     uint32_t bits_len = 8*initial_len; // note, we append the len
+-    memcpy(msg + new_len, &bits_len, 4);           // in bits at the end of the buffer
++    msg[new_len] = (uint8_t) bits_len;
++    msg[new_len + 1] = (uint8_t) (bits_len >> 8);
++    msg[new_len + 2] = (uint8_t) (bits_len >> 16);
++    msg[new_len + 3] = (uint8_t) (bits_len >> 24);
+ 
+     // Process the message in successive 512-bit chunks:
+     //for each 512-bit chunk of message:
+@@ -98,7 +101,16 @@ void md5(uint8_t *initial_msg, size_t initial_len) {
+     for(offset=0; offset<new_len; offset += (512/8)) {
+ 
+         // break chunk into sixteen 32-bit words w[j], 0 ≤ j ≤ 15
+-        uint32_t *w = (uint32_t *) (msg + offset);
++        uint32_t w[16];
++        int word;
++        for (word = 0; word < 16; word++)
++          {
++            int byte = offset + word * 4;
++            w[word] = (uint32_t) msg[byte]
++              | ((uint32_t) msg[byte + 1] << 8)
++              | ((uint32_t) msg[byte + 2] << 16)
++              | ((uint32_t) msg[byte + 3] << 24);
++          }
+ 
+ #ifdef DEBUG
+         printf("offset: %d %x\n", offset, offset);
+-- 
+2.43.0
+

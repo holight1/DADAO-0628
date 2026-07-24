@@ -37,6 +37,14 @@ patch_series = "components/llvm-test-suite/patches/series"
 role = "SingleSource pure-compute regression source (ADR-0012 D4, thin lit wrapper, not upstream CMake/lit harness)"
 
 [[component]]
+name = "embench"
+enabled = true
+repository = "https://github.com/embench/embench-iot.git"
+commit = "09c2ed8c3b7008c95d08b038de4a3f6dc103ed70"
+patch_series = "components/embench/patches/series"
+role = "Embench-IoT 19-benchmark functional correctness corpus (ML-032a)"
+
+[[component]]
 name = "musl"
 enabled = true
 repository = "https://git.musl-libc.org/git/musl"
