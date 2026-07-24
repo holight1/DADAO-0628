@@ -1,0 +1,722 @@
+From f6ba5f43b337ae9df767417086eed59711551f23 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 07:01:16 +0800
+Subject: [PATCH] dadao: add single-precision softfloat family + double
+ ordered-compare remainder closing 92-file gcc-c-torture FAIL_LINK cluster
+ (ML-028a)
+
+ML-026a's full-corpus gcc-c-torture sweep found 92 FAIL_LINK files (42%
+of all FAIL_LINK) sharing one undefined-symbol cluster: the
+single-precision (float) soft-float family was almost entirely missing
+(only __mulsf3/__extendsfdf2/__truncdfsf2/__floatsisf existed, from
+ML-025a), and the double-precision ordered-comparison family was
+missing 3 of its 4 members (only __gedf2 existed).
+
+Adds, appended to the same softfloat_shim.c ML-022a/ML-025a already
+established (same self-contained bit-pattern-arithmetic style, no
+compiler-rt int_lib.h/fp_lib.h infrastructure):
+
+  __addsf3 __subsf3 __divsf3                     (float arithmetic)
+  __eqsf2 __nesf2 __gesf2 __gtsf2 __lesf2 __ltsf2 (float compare family)
+  __unordsf2                                      (float unordered compare)
+  __fixsfdi __fixunssfdi                          (float -> int64_t/uint64_t)
+  __floatdidf __floatundidf           (int64_t/uint64_t -> double)
+  __floatundisf __floatunsisf __floatdisf         (uint64_t/uint32_t/int64_t -> float)
+  __gtdf2 __ltdf2 __ledf2             (double ordered-compare remainder)
+
+__unordsf2 and __floatdisf were not in ML-026a's original 92-file
+symbol union (discovered independently via this task's own link-gap
+verification: 6 files need __unordsf2 via isunordered()/islessgreater()
+macros, 1 file needs __floatdisf for a (long long)->float conversion);
+added since they are trivial, same-pattern extensions of the family
+already being completed.
+
+__divsc3 (single-precision complex division) is deliberately deferred:
+independent verification found only 1 of the 92 files (complex-5.c)
+actually needs it, and its algorithm (Smith's method, C99 Annex G) is
+qualitatively more involved than every other symbol here. Registered as
+docs/issues.yaml musl-softfloat-shim-missing-divsc3.
+
+Verified: standalone cross-compile clean (0 undefined symbols, 36 T
+symbols), llvm-objdump -dr disassembly of the whole file shows exactly
+2 call instructions (the pre-existing __subdf3->__adddf3 and the new
+__subsf3->__addsf3 tail-call workaround), zero self-recursion. Native
+fuzz harness (renamed symbols, linked against real libc) ran ~4.87M
+checks across boundary values + 300k-400k random vectors per function
+against native x86-64 float/double arithmetic: 0 mismatches; 5
+independent negative controls (deliberately broken unordered-sign
+convention, division iteration count, denormal-window constant,
+floatdisf zero case, unordsf2 comparison operator) were all caught by
+the harness, proving it is not a rubber stamp.
+
+Result: fresh `make build-musl` still packages exactly 1337 objects
+into libc.a (same as the ML-022a/ML-025a baseline -- only appended to
+an existing file, no new source file) with the same 10 known-failing
+objects (docs/issues.yaml codegen-tailcall-lowercall-assert /
+musl-backend-dynamic-stackalloc-unimplemented families), zero
+regression. gcc-c-torture full sweep: 74 of the 92 originally FAIL_LINK
+files now PASS outright (81 of 92 once accounting for __unordsf2/
+__floatdisf), 3 move to FAIL_RUN against already-catalogued unrelated
+categories (ML-026a's abort_127/unexpected_exit_1), 6 remain FAIL_LINK
+on the known, out-of-scope __alloca gap, 1 on the deferred __divsc3,
+and 1 (builtins/lib/main.c) is llvm-test-suite harness infrastructure,
+not a standalone test. Zero regressions across the full 1708-file
+corpus (PASS 1328 -> 1409, FAIL_LINK 217 -> 133, FAIL_RUN 49 -> 52,
+FAIL_COMPILE/TIMEOUT unchanged).
+---
+ src/internal/dadao/softfloat_shim.c | 642 ++++++++++++++++++++++++++++
+ 1 file changed, 642 insertions(+)
+
+diff --git a/src/internal/dadao/softfloat_shim.c b/src/internal/dadao/softfloat_shim.c
+index 026594a5..a56fce89 100644
+--- a/src/internal/dadao/softfloat_shim.c
++++ b/src/internal/dadao/softfloat_shim.c
+@@ -1040,3 +1040,645 @@ float __mulsf3(float a, float b) {
+ 
+   return fromRepF32(result);
+ }
++
++/* ============================================================================
++ * ML-028a: complete the single-precision (f32) soft-float family + the
++ * double-precision ordered-comparison family this file was still missing --
++ * closing the link gap ML-026a's gcc-c-torture full-corpus sweep found in
++ * 92 files (docs/reviews/ML-026a-gcc-c-torture-sweep-2026-07-24.md §4.2(a)):
++ * a whole 92-file cluster of FAIL_LINK failures (42% of all FAIL_LINK in the
++ * 1708-file corpus) that all reduce to this exact symbol set:
++ *
++ *   __addsf3 __subsf3 __divsf3                     (float arithmetic)
++ *   __eqsf2 __nesf2 __gesf2 __gtsf2 __lesf2 __ltsf2 (float compare family)
++ *   __fixsfdi __fixunssfdi                          (float -> int64_t/uint64_t)
++ *   __floatdidf __floatundidf           (int64_t/uint64_t -> double -- NOT
++ *                                         the same as ML-022a's already-done
++ *                                         __floatsidf/__floatunsidf, which
++ *                                         are 32-bit-int -> double and never
++ *                                         need rounding; these 64-bit-int
++ *                                         versions can lose precision and do)
++ *   __floatundisf __floatunsisf         (uint64_t/uint32_t -> float)
++ *   __gtdf2 __ltdf2 __ledf2             (double ordered-compare family;
++ *                                        __gedf2, from ML-025a right above,
++ *                                        is the 4th member and is left
++ *                                        completely untouched here)
++ *
++ * Same rules as the rest of this file (see the very first header comment
++ * at the top): every operation below only ever touches the raw
++ * uint32_t/uint64_t bit pattern of a float/double operand -- never the
++ * native `+ - * / == != < >` C operators applied directly to a float/double
++ * value, since DADAO has no hardware float support and LLVM's type
++ * legalizer would turn any such native op right back into a libcall against
++ * one of these very symbols (self-recursion). Re-verified for every
++ * function below by disassembling a standalone cross-compile
++ * (`llvm-objdump -dr --triple=dadao`), not just by grepping the source --
++ * see the task completion notes for the actual output.
++ *
++ * __divsc3 (single-precision complex division, C99 Annex G / compiler-rt's
++ * divsc3.c) is deliberately NOT implemented here: independent grep + probe
++ * compile of the 92-file list found only ONE file (complex-5.c, via
++ * `y = p(x, 1.0f / z)` where `z` is `float __complex__`) that actually needs
++ * it, and its algorithm (Smith's method: logb/scalbn to rescale, then
++ * special-case NaN/inf combinations per Annex G) is qualitatively more
++ * involved than every other symbol in this file -- all of which are
++ * closed-form bit-pattern arithmetic with no transcendental-adjacent
++ * scaling step or IEEE Annex G edge-case table. Per this task's own
++ * contingency instructions, registered as a separate, deferred
++ * docs/issues.yaml entry instead of blocking on it here.
++ */
++
++/* ---- __gtdf2 / __ltdf2 / __ledf2 (double ordered-compare family) ----
++ *
++ * __gedf2 above (ML-025a) already documents the shared algorithm (signed-
++ * integer reinterpretation of the bit pattern) and the GNU/libgcc ordered-
++ * relation convention (-1/0/+1 for </==/>; caller only tests the *sign* of
++ * the result). The only thing that differs between the 4 members of this
++ * family is which sign they report for "unordered" (either operand NaN):
++ * __gedf2/__gtdf2 report -1 (so `>=`/`>` are correctly false against NaN),
++ * __ledf2/__ltdf2/__eqdf2/__nedf2 report +1 (so `<=`/`<` are correctly false
++ * against NaN too) -- see compiler-rt's comparedf2.c file header for the
++ * same GE_UNORDERED=-1 vs. LE_UNORDERED=+1 split this mirrors. __gedf2's own
++ * body (already independently fuzz-verified in ML-025a) is left completely
++ * unmodified; the 3 new functions below share a new, separate static helper
++ * that is behaviorally identical to (but not shared code with) __gedf2's
++ * body, to keep this change strictly additive.
++ */
++static __inline int cmp_ordered_df(double a, double b, int unorderedResult) {
++  const srep_t aInt = (srep_t)toRep(a);
++  const srep_t bInt = (srep_t)toRep(b);
++  const rep_t aAbs = (rep_t)aInt & absMask;
++  const rep_t bAbs = (rep_t)bInt & absMask;
++
++  if (aAbs > infRep || bAbs > infRep)
++    return unorderedResult; /* unordered */
++  if ((aAbs | bAbs) == 0)
++    return 0; /* +/-0 == +/-0 */
++
++  if ((aInt & bInt) >= 0) {
++    if (aInt < bInt)
++      return -1;
++    else if (aInt == bInt)
++      return 0;
++    else
++      return 1;
++  } else {
++    if (aInt > bInt)
++      return -1;
++    else if (aInt == bInt)
++      return 0;
++    else
++      return 1;
++  }
++}
++
++int __gtdf2(double a, double b) { return cmp_ordered_df(a, b, -1); }
++int __ledf2(double a, double b) { return cmp_ordered_df(a, b, 1); }
++int __ltdf2(double a, double b) { return cmp_ordered_df(a, b, 1); }
++
++/* ---- __floatdidf / __floatundidf (int64_t / uint64_t -> double) ----
++ *
++ * Unlike __floatsidf/__floatunsidf above (32-bit integer inputs, which
++ * always fit exactly in the 52-bit double mantissa -- see that section's
++ * own comment on why no right-shift/rounding case exists there), a 64-bit
++ * integer can have up to 64 significant bits, more than the mantissa holds,
++ * so these two must round. Both extract a 56-bit window (implicit bit +
++ * 52 fraction bits + 3 guard/round/sticky bits, exactly the same "shift so
++ * the window's top bit lands at bit 55" convention __adddf3/__muldf3/
++ * __divdf3 all use above, just approached by shifting the raw integer
++ * itself rather than a pre-normalized significand) via the same
++ * rightShiftWithStickyRep() helper __divdf3/__mulsf3/__truncdfsf2 already
++ * use, so the sticky-bit accumulation logic is shared, not reimplemented.
++ * A 64-bit integer's value is always finite and always fits in double's
++ * exponent range (max unbiased exponent 63, vs. double's max 1023), so
++ * neither function has (or needs) an overflow-to-infinity path.
++ */
++
++double __floatundidf(unsigned long long a) {
++  if (a == 0)
++    return fromRep(0);
++
++  const int exponent = 63 - rep_clz(a);
++  const int totalShift = exponent - (significandBits + 3); /* exponent - 55 */
++
++  const rep_t shifted = (totalShift >= 0)
++                             ? rightShiftWithStickyRep(a, (unsigned int)totalShift)
++                             : (a << (unsigned int)(-totalShift));
++
++  const int roundGuardSticky = (int)(shifted & 0x7);
++  rep_t result = (shifted >> 3) & significandMask;
++  result |= (rep_t)(exponent + exponentBias) << significandBits;
++
++  if (roundGuardSticky > 0x4)
++    result++;
++  if (roundGuardSticky == 0x4)
++    result += result & 1;
++
++  return fromRep(result);
++}
++
++double __floatdidf(long long a) {
++  if (a == 0)
++    return fromRep(0);
++
++  rep_t sign = 0;
++  unsigned long long aAbs = (unsigned long long)a;
++  if (a < 0) {
++    sign = signBit;
++    aAbs = -aAbs; /* unsigned negation: correct even for INT64_MIN */
++  }
++
++  const int exponent = 63 - rep_clz(aAbs);
++  const int totalShift = exponent - (significandBits + 3); /* exponent - 55 */
++
++  const rep_t shifted = (totalShift >= 0)
++                             ? rightShiftWithStickyRep(aAbs, (unsigned int)totalShift)
++                             : (aAbs << (unsigned int)(-totalShift));
++
++  const int roundGuardSticky = (int)(shifted & 0x7);
++  rep_t result = (shifted >> 3) & significandMask;
++  result |= (rep_t)(exponent + exponentBias) << significandBits;
++  result |= sign;
++
++  if (roundGuardSticky > 0x4)
++    result++;
++  if (roundGuardSticky == 0x4)
++    result += result & 1;
++
++  return fromRep(result);
++}
++
++/* ---- __floatunsisf / __floatundisf (uint32_t / uint64_t -> float) ----
++ *
++ * __floatunsisf mirrors __floatsidf's structure above (compiler-rt's
++ * floatunsisf.c algorithm, literally ported: clz-based exponent, left-shift
++ * into the field when it fits, right-shift-with-manual-round-bit when it
++ * doesn't -- a 32-bit input can need rounding for f32's narrower 23-bit
++ * mantissa, unlike the 32-bit-input -> *double* case above which never
++ * does). __floatundisf mirrors __floatundidf just above (same "shift so the
++ * window's top bit lands at the implicit-bit position, using
++ * rightShiftWithStickyRep for the sticky bit" technique), just with the f32
++ * window width (implicit + 23 fraction + 3 guard/round/sticky = 27 bits,
++ * i.e. implicit bit at position 26) instead of the f64 window width (56
++ * bits, implicit bit at position 55) __floatundidf uses.
++ */
++
++float __floatunsisf(unsigned int a) {
++  if (a == 0)
++    return fromRepF32(0);
++
++  const int exponent = 31 - __builtin_clz(a);
++  unsigned int result;
++  if (exponent <= F32_SIG_BITS) {
++    const int shift = F32_SIG_BITS - exponent;
++    result = (a << shift) ^ F32_IMPLICIT_BIT;
++  } else {
++    const int shift = exponent - F32_SIG_BITS;
++    result = (a >> shift) ^ F32_IMPLICIT_BIT;
++    const unsigned int round = a << (32 - shift);
++    if (round > F32_SIGN_BIT)
++      result++;
++    else if (round == F32_SIGN_BIT)
++      result += result & 1;
++  }
++  result += (unsigned int)(exponent + F32_EXP_BIAS) << F32_SIG_BITS;
++  return fromRepF32(result);
++}
++
++float __floatundisf(unsigned long long a) {
++  if (a == 0)
++    return fromRepF32(0);
++
++  const int exponent = 63 - rep_clz(a);
++  const int totalShift = exponent - (F32_SIG_BITS + 3); /* exponent - 26 */
++
++  const rep_t shifted = (totalShift >= 0)
++                             ? rightShiftWithStickyRep(a, (unsigned int)totalShift)
++                             : (a << (unsigned int)(-totalShift));
++
++  const int roundGuardSticky = (int)(shifted & 0x7);
++  unsigned int result = (unsigned int)(shifted >> 3) & (unsigned int)F32_SIG_MASK;
++  result |= (unsigned int)(exponent + F32_EXP_BIAS) << F32_SIG_BITS;
++
++  if (roundGuardSticky > 0x4)
++    result++;
++  if (roundGuardSticky == 0x4)
++    result += result & 1;
++
++  return fromRepF32(result);
++}
++
++/* ---- __floatdisf (int64_t -> float) ----
++ *
++ * NOT in ML-026a's original 92-file symbol union (a genuine gap in that
++ * scan, discovered independently during this task's own link-gap
++ * verification -- gcc-c-torture's conversion.c needs it: `sll2f` converts a
++ * `long long` to `float`). Same "shift so the window's top bit lands at the
++ * f32 implicit-bit position" technique as __floatundisf just above, plus
++ * the same unsigned-negation-handles-INT64_MIN trick __floatdidf/
++ * __floatsisf use for the sign. */
++float __floatdisf(long long a) {
++  if (a == 0)
++    return fromRepF32(0);
++
++  unsigned int sign = 0;
++  unsigned long long aAbs = (unsigned long long)a;
++  if (a < 0) {
++    sign = F32_SIGN_BIT;
++    aAbs = -aAbs; /* unsigned negation: correct even for INT64_MIN */
++  }
++
++  const int exponent = 63 - rep_clz(aAbs);
++  const int totalShift = exponent - (F32_SIG_BITS + 3); /* exponent - 26 */
++
++  const rep_t shifted = (totalShift >= 0)
++                             ? rightShiftWithStickyRep(aAbs, (unsigned int)totalShift)
++                             : (aAbs << (unsigned int)(-totalShift));
++
++  const int roundGuardSticky = (int)(shifted & 0x7);
++  unsigned int result = (unsigned int)(shifted >> 3) & (unsigned int)F32_SIG_MASK;
++  result |= (unsigned int)(exponent + F32_EXP_BIAS) << F32_SIG_BITS;
++  result |= sign;
++
++  if (roundGuardSticky > 0x4)
++    result++;
++  if (roundGuardSticky == 0x4)
++    result += result & 1;
++
++  return fromRepF32(result);
++}
++
++/* ---- __addsf3 / __subsf3 (float +/-) ----
++ *
++ * Exact f32 analogue of __adddf3/__subdf3 above -- compiler-rt's own
++ * addsf3.c/subsf3.c are literally the same width-parameterized
++ * fp_add_impl.inc/fp_lib.h template __adddf3/__subdf3 use, just compiled
++ * with SINGLE_PRECISION instead of DOUBLE_PRECISION, so this is the same
++ * algorithm with s/rep_t/unsigned int/, s/typeWidth(64)/F32_WIDTH(32)/, and
++ * s/<double-precision constant>/F32_<same constant>/ throughout -- not a
++ * different algorithm.
++ */
++
++float __addsf3(float a, float b) {
++  unsigned int aRep = toRepF32(a);
++  unsigned int bRep = toRepF32(b);
++  const unsigned int aAbs = aRep & F32_ABS_MASK;
++  const unsigned int bAbs = bRep & F32_ABS_MASK;
++
++  /* Detect if a or b is zero, infinity, or NaN. */
++  if (aAbs - 1U >= (unsigned int)F32_INF_REP - 1U ||
++      bAbs - 1U >= (unsigned int)F32_INF_REP - 1U) {
++    if (aAbs > (unsigned int)F32_INF_REP)
++      return fromRepF32(aRep | F32_QUIET_BIT); /* NaN + anything = qNaN */
++    if (bAbs > (unsigned int)F32_INF_REP)
++      return fromRepF32(bRep | F32_QUIET_BIT); /* anything + NaN = qNaN */
++
++    if (aAbs == (unsigned int)F32_INF_REP) {
++      /* +/-infinity + -/+infinity = qNaN; else +/-infinity. */
++      if ((aRep ^ bRep) == F32_SIGN_BIT)
++        return fromRepF32((unsigned int)F32_QNAN_REP);
++      else
++        return a;
++    }
++    if (bAbs == (unsigned int)F32_INF_REP)
++      return b; /* anything remaining + +/-infinity = +/-infinity */
++
++    if (!aAbs) {
++      if (!bAbs)
++        return fromRepF32(aRep & bRep); /* zero + zero: get the sign right */
++      else
++        return b;
++    }
++    if (!bAbs)
++      return a;
++  }
++
++  /* Swap so that a has the larger absolute value. */
++  if (bAbs > aAbs) {
++    const unsigned int temp = aRep;
++    aRep = bRep;
++    bRep = temp;
++  }
++
++  int aExponent = (int)((aRep >> F32_SIG_BITS) & (unsigned int)F32_MAX_EXP);
++  int bExponent = (int)((bRep >> F32_SIG_BITS) & (unsigned int)F32_MAX_EXP);
++  unsigned int aSignificand = aRep & (unsigned int)F32_SIG_MASK;
++  unsigned int bSignificand = bRep & (unsigned int)F32_SIG_MASK;
++
++  if (aExponent == 0)
++    aExponent = normalizeF32(&aSignificand);
++  if (bExponent == 0)
++    bExponent = normalizeF32(&bSignificand);
++
++  const unsigned int resultSign = aRep & F32_SIGN_BIT;
++  const int subtraction = (aRep ^ bRep) & F32_SIGN_BIT ? 1 : 0;
++
++  aSignificand = (aSignificand | (unsigned int)F32_IMPLICIT_BIT) << 3;
++  bSignificand = (bSignificand | (unsigned int)F32_IMPLICIT_BIT) << 3;
++
++  const unsigned int align = (unsigned int)(aExponent - bExponent);
++  if (align) {
++    if (align < F32_WIDTH) {
++      const int sticky = (bSignificand << (F32_WIDTH - align)) != 0;
++      bSignificand = (bSignificand >> align) | (unsigned int)sticky;
++    } else {
++      bSignificand = 1; /* b is known to be non-zero: set the sticky bit. */
++    }
++  }
++
++  if (subtraction) {
++    aSignificand -= bSignificand;
++    if (aSignificand == 0)
++      return fromRepF32(0); /* a == -b: +zero */
++    if (aSignificand < ((unsigned int)F32_IMPLICIT_BIT << 3)) {
++      const int shift = __builtin_clz(aSignificand) -
++                         __builtin_clz((unsigned int)F32_IMPLICIT_BIT << 3);
++      aSignificand <<= shift;
++      aExponent -= shift;
++    }
++  } else {
++    aSignificand += bSignificand;
++    if (aSignificand & ((unsigned int)F32_IMPLICIT_BIT << 4)) {
++      const int sticky = aSignificand & 1;
++      aSignificand = (aSignificand >> 1) | (unsigned int)sticky;
++      aExponent += 1;
++    }
++  }
++
++  if (aExponent >= F32_MAX_EXP)
++    return fromRepF32((unsigned int)F32_INF_REP | resultSign);
++
++  if (aExponent <= 0) {
++    const int shift = 1 - aExponent;
++    const int sticky = (aSignificand << (F32_WIDTH - shift)) != 0;
++    aSignificand = (aSignificand >> shift) | (unsigned int)sticky;
++    aExponent = 0;
++  }
++
++  const int roundGuardSticky = (int)(aSignificand & 0x7);
++
++  unsigned int result = (aSignificand >> 3) & (unsigned int)F32_SIG_MASK;
++  result |= (unsigned int)aExponent << F32_SIG_BITS;
++  result |= resultSign;
++
++  /* Round to nearest, ties to even (DADAO has no other rounding mode). */
++  if (roundGuardSticky > 0x4)
++    result++;
++  if (roundGuardSticky == 0x4)
++    result += result & 1;
++
++  return fromRepF32(result);
++}
++
++float __subsf3(float a, float b) {
++  /* a - b == a + (-b): flip b's sign bit and add. Same literal-tail-call
++   * caveat as __subdf3 above -- relies on the same tree-wide
++   * -fno-optimize-sibling-calls (arch/dadao/arch.mak, ML-012a); re-verified
++   * for this file (see task completion notes). */
++  return __addsf3(a, fromRepF32(toRepF32(b) ^ F32_SIGN_BIT));
++}
++
++/* ---- __divsf3 (float / float) ----
++ *
++ * Exact f32 analogue of __divdf3 above: same restoring (shift-subtract)
++ * long division on the significands -- deliberately not compiler-rt's
++ * Newton-Raphson-based fp_div_impl.inc, for the same reason __divdf3 avoids
++ * compiler-rt's approach: this file's convention throughout is "closed-form
++ * bit-pattern arithmetic, no wide (__int128) division, no hidden libcall
++ * dependency" (see __divdf3's own header comment). The significands are
++ * widened into `rep_t` (64-bit) for the division loop purely so the same
++ * "rem/den/quotient" shift-subtract shape as __divdf3 can be reused
++ * directly (a 24x24-bit significand division fits trivially in 64 bits;
++ * this is NOT a wide/128-bit division).
++ */
++
++float __divsf3(float a, float b) {
++  unsigned int aRep = toRepF32(a);
++  unsigned int bRep = toRepF32(b);
++  const unsigned int aExponent = (aRep >> F32_SIG_BITS) & (unsigned int)F32_MAX_EXP;
++  const unsigned int bExponent = (bRep >> F32_SIG_BITS) & (unsigned int)F32_MAX_EXP;
++  const unsigned int quotientSign = (aRep ^ bRep) & F32_SIGN_BIT;
++
++  unsigned int aSignificand = aRep & (unsigned int)F32_SIG_MASK;
++  unsigned int bSignificand = bRep & (unsigned int)F32_SIG_MASK;
++  int scale = 0;
++
++  /* Detect if a or b is zero, denormal, infinity, or NaN (same shape as
++   * __muldf3/__mulsf3/__divdf3's special-case block above). */
++  if (aExponent - 1U >= (unsigned int)F32_MAX_EXP - 1U ||
++      bExponent - 1U >= (unsigned int)F32_MAX_EXP - 1U) {
++    const unsigned int aAbs = aRep & (unsigned int)F32_ABS_MASK;
++    const unsigned int bAbs = bRep & (unsigned int)F32_ABS_MASK;
++
++    if (aAbs > (unsigned int)F32_INF_REP)
++      return fromRepF32(aRep | F32_QUIET_BIT); /* NaN / anything = qNaN */
++    if (bAbs > (unsigned int)F32_INF_REP)
++      return fromRepF32(bRep | F32_QUIET_BIT); /* anything / NaN = qNaN */
++
++    if (aAbs == (unsigned int)F32_INF_REP) {
++      if (bAbs == (unsigned int)F32_INF_REP)
++        return fromRepF32((unsigned int)F32_QNAN_REP); /* inf / inf = NaN */
++      else
++        return fromRepF32(aAbs | quotientSign); /* infinity / anything else */
++    }
++    if (bAbs == (unsigned int)F32_INF_REP)
++      return fromRepF32(quotientSign); /* anything else / infinity = +/- zero */
++
++    if (!aAbs) {
++      if (!bAbs)
++        return fromRepF32((unsigned int)F32_QNAN_REP); /* zero / zero = NaN */
++      else
++        return fromRepF32(quotientSign); /* zero / anything else = +/- zero */
++    }
++    if (!bAbs)
++      return fromRepF32((unsigned int)F32_INF_REP | quotientSign); /* x/0 = +/-inf */
++
++    if (aAbs < (unsigned int)F32_IMPLICIT_BIT)
++      scale += normalizeF32(&aSignificand);
++    if (bAbs < (unsigned int)F32_IMPLICIT_BIT)
++      scale -= normalizeF32(&bSignificand);
++  }
++
++  aSignificand |= (unsigned int)F32_IMPLICIT_BIT;
++  bSignificand |= (unsigned int)F32_IMPLICIT_BIT;
++
++  int quotientExponent = (int)aExponent - (int)bExponent + scale + F32_EXP_BIAS;
++
++  /* Restoring binary long division of the two 24-bit (implicit-bit-
++   * included) significands, widened into rep_t purely so the same
++   * rem/den/quotient shape as __divdf3 above can be reused -- see this
++   * function's own header comment. Produces a 27-bit result shaped exactly
++   * like __divdf3's pre-round "significand << 3" convention: bit 26 is the
++   * implicit bit, bits 25..3 are the 23 significand fraction bits, bits
++   * 2..0 are guard/round/sticky. */
++  rep_t rem = (rep_t)aSignificand;
++  const rep_t den = (rep_t)bSignificand;
++  if (rem < den) {
++    rem <<= 1;
++    quotientExponent -= 1;
++  }
++  rep_t quotient = 0;
++  int i;
++  for (i = 0; i < F32_SIG_BITS + 4; i++) {
++    const rep_t bit = (rem >= den) ? 1 : 0;
++    if (bit)
++      rem -= den;
++    quotient = (quotient << 1) | bit;
++    rem <<= 1;
++  }
++  quotient |= (rem != 0); /* fold the true (infinite-precision) sticky bit into bit 0 */
++
++  if (quotientExponent >= F32_MAX_EXP)
++    return fromRepF32((unsigned int)F32_INF_REP | quotientSign);
++
++  if (quotientExponent <= 0) {
++    const unsigned int shift = (unsigned int)(1 - quotientExponent);
++    quotient = rightShiftWithStickyRep(quotient, shift);
++    quotientExponent = 0;
++  }
++
++  const int roundGuardSticky = (int)(quotient & 0x7);
++  unsigned int result = (unsigned int)(quotient >> 3) & (unsigned int)F32_SIG_MASK;
++  result |= (unsigned int)quotientExponent << F32_SIG_BITS;
++  result |= quotientSign;
++
++  if (roundGuardSticky > 0x4)
++    result++;
++  if (roundGuardSticky == 0x4)
++    result += result & 1;
++
++  return fromRepF32(result);
++}
++
++/* ---- __eqsf2 / __nesf2 (float equal/not-equal, "0 means equal" convention)
++ * ---- f32 analogue of __eqdf2/__nedf2's shared cmp_nonequal above -- same
++ * GNU/libgcc convention (0 == equal, nonzero == not-equal-or-unordered). */
++static __inline int cmp_nonequal_f32(float a, float b) {
++  unsigned int aRep = toRepF32(a);
++  unsigned int bRep = toRepF32(b);
++  unsigned int aAbs = aRep & F32_ABS_MASK;
++  unsigned int bAbs = bRep & F32_ABS_MASK;
++
++  if (aAbs > (unsigned int)F32_INF_REP || bAbs > (unsigned int)F32_INF_REP)
++    return 1; /* NaN on either side: unordered, counts as "not equal" */
++  if (aAbs == 0 && bAbs == 0)
++    return 0; /* +0.0 == -0.0 despite differing bit patterns */
++
++  return aRep != bRep;
++}
++
++int __eqsf2(float a, float b) { return cmp_nonequal_f32(a, b); }
++int __nesf2(float a, float b) { return cmp_nonequal_f32(a, b); }
++
++/* ---- __unordsf2 ---- f32 analogue of __unorddf2 above (NOT in ML-026a's
++ * original 92-file symbol union -- a genuine gap in that scan, discovered
++ * independently during this task's own link-gap verification: 6 of the 92
++ * files' `isunordered`/`islessgreater`-family macros expand to a direct
++ * `__builtin_isunordered` -> __unordsf2 call for float operands, distinct
++ * from the __eqsf2/__nesf2/__gesf2/etc. calls the type legalizer emits for
++ * plain `==`/`!=`/`<`/etc.). Returns nonzero iff either operand is NaN
++ * ("unordered"), 0 otherwise -- per compiler-rt's comparesf2.c/
++ * fp_compare_impl.inc __unordXf2__. */
++int __unordsf2(float a, float b) {
++  unsigned int aAbs = toRepF32(a) & F32_ABS_MASK;
++  unsigned int bAbs = toRepF32(b) & F32_ABS_MASK;
++  return (aAbs > (unsigned int)F32_INF_REP) || (bAbs > (unsigned int)F32_INF_REP);
++}
++
++/* ---- __gesf2 / __gtsf2 / __lesf2 / __ltsf2 (float ordered-compare family)
++ * ---- f32 analogue of cmp_ordered_df above (and, by the same token, of
++ * __gedf2): same signed-integer-reinterpretation trick and the same
++ * GE_UNORDERED=-1 / LE_UNORDERED=+1 split. `int` is DADAO's standard 32-bit
++ * signed type, so no separate `srep_t`-style typedef is needed here -- the
++ * bit pattern from toRepF32() (already `unsigned int`) is reinterpreted
++ * directly via a plain `(int)` cast. */
++static __inline int cmp_ordered_sf(float a, float b, int unorderedResult) {
++  const int aInt = (int)toRepF32(a);
++  const int bInt = (int)toRepF32(b);
++  const unsigned int aAbs = (unsigned int)aInt & F32_ABS_MASK;
++  const unsigned int bAbs = (unsigned int)bInt & F32_ABS_MASK;
++
++  if (aAbs > (unsigned int)F32_INF_REP || bAbs > (unsigned int)F32_INF_REP)
++    return unorderedResult; /* unordered */
++  if ((aAbs | bAbs) == 0)
++    return 0; /* +/-0 == +/-0 */
++
++  if ((aInt & bInt) >= 0) {
++    if (aInt < bInt)
++      return -1;
++    else if (aInt == bInt)
++      return 0;
++    else
++      return 1;
++  } else {
++    if (aInt > bInt)
++      return -1;
++    else if (aInt == bInt)
++      return 0;
++    else
++      return 1;
++  }
++}
++
++int __gesf2(float a, float b) { return cmp_ordered_sf(a, b, -1); }
++int __gtsf2(float a, float b) { return cmp_ordered_sf(a, b, -1); }
++int __lesf2(float a, float b) { return cmp_ordered_sf(a, b, 1); }
++int __ltsf2(float a, float b) { return cmp_ordered_sf(a, b, 1); }
++
++/* ---- __fixsfdi / __fixunssfdi (float -> int64_t / uint64_t) ----
++ *
++ * f32 analogue of __fixdfdi/__fixunsdfdi above -- same structure (biased
++ * exponent decides truncate-to-0 / normal shift / saturate), just with
++ * F32's 24-bit (implicit + 23 fraction) significand and F32_EXP_BIAS
++ * instead of f64's 53-bit significand and exponentBias.
++ */
++
++unsigned long long __fixunssfdi(float a) {
++  unsigned int aRep = toRepF32(a);
++  unsigned int aAbs = aRep & F32_ABS_MASK;
++
++  /* Negative (including -0.0) or NaN-with-sign: unsigned fix-to-zero-or-
++   * negative-value is 0, matching compiler-rt's __fixuint. */
++  if (aRep & F32_SIGN_BIT)
++    return 0;
++
++  int exponent = (int)((aAbs >> F32_SIG_BITS) & (unsigned int)F32_MAX_EXP) - F32_EXP_BIAS;
++  if (exponent < 0)
++    return 0; /* |a| < 1.0 truncates to 0 (covers +0.0 too) */
++
++  /* Saturate if the magnitude doesn't fit in 64 bits (also covers +inf/NaN,
++   * whose biased exponent is F32_MAX_EXP-F32_EXP_BIAS = 128). */
++  if ((unsigned)exponent >= 64)
++    return ~0ULL;
++
++  rep_t significand = (rep_t)((aAbs & (unsigned int)F32_SIG_MASK) |
++                               (unsigned int)F32_IMPLICIT_BIT); /* 24 bits */
++
++  if (exponent < F32_SIG_BITS)
++    return (unsigned long long)(significand >> (F32_SIG_BITS - exponent));
++  return (unsigned long long)significand << (exponent - F32_SIG_BITS);
++}
++
++long long __fixsfdi(float a) {
++  unsigned int aRep = toRepF32(a);
++  unsigned int aAbs = aRep & F32_ABS_MASK;
++  int negative = (aRep & F32_SIGN_BIT) != 0;
++
++  int exponent = (int)((aAbs >> F32_SIG_BITS) & (unsigned int)F32_MAX_EXP) - F32_EXP_BIAS;
++  if (exponent < 0)
++    return 0; /* |a| < 1.0 truncates to 0 */
++
++  const long long fixint_max = (long long)(~0ULL / 2);
++  const long long fixint_min = -fixint_max - 1;
++  if ((unsigned)exponent >= 64)
++    return negative ? fixint_min : fixint_max; /* saturate (incl. +/-inf/NaN) */
++
++  rep_t significand = (rep_t)((aAbs & (unsigned int)F32_SIG_MASK) |
++                               (unsigned int)F32_IMPLICIT_BIT);
++  unsigned long long mag = (exponent < F32_SIG_BITS)
++                                ? (unsigned long long)(significand >> (F32_SIG_BITS - exponent))
++                                : (unsigned long long)significand << (exponent - F32_SIG_BITS);
++  /* Negate on the integer/bit side only -- never apply unary `-` to a
++   * `float` here (see file-header self-recursion note). */
++  return negative ? -(long long)mag : (long long)mag;
++}
+-- 
+2.43.0
+

@@ -10,3 +10,4 @@
 0010-dadao-add-IEEE-754-binary64-soft-float-shim-for-vfpr.patch
 0011-dadao-fix-AT_PAGESZ-auxv-immediate-overflow-in-crt_a.patch
 0012-dadao-add-6-more-softfloat_shim.c-symbols-closing-th.patch
+0013-dadao-add-single-precision-softfloat-family-double-o.patch
