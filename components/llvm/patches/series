@@ -50,3 +50,5 @@
 0050-DADAO-implement-caller-populated-varargs-save-area.patch
 0051-DADAO-materialize-large-frame-offsets.patch
 0052-DADAO-make-frame-offset-scavenging-spill-safe.patch
+0053-DADAO-reject-GlobalAddress-Constant-offset-folding.patch
+0054-DADAO-clarify-isOffsetFoldingLegal-perf-tradeoff-sco.patch

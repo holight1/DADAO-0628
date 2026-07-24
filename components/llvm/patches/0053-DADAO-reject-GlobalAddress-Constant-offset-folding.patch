@@ -1,0 +1,147 @@
+From d10e7bfa25cd983226916863e02ec9928c9160bd Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 12:16:06 +0800
+Subject: [PATCH] DADAO: reject GlobalAddress+Constant offset folding
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RELA_RIII/ADDI_RBRRII encode a GlobalAddress into an 18-bit-range
+relocation (imms18, contracts/isa/spec.md §2.2). SelectionDAG's generic
+ADD(GlobalAddress, Constant) -> GlobalAddress(offset) constant folding
+(SelectionDAG::FoldSymbolOffset) is gated purely by
+TargetLowering::isOffsetFoldingLegal, which DADAO never overrode, so it
+defaulted to always-legal with no visibility into the resulting offset's
+magnitude.
+
+This let source patterns like `a[i - 2000000000L]` (gcc-c-torture
+960321-1.c/pr79286.c) fold the huge constant straight into the
+GlobalAddress node, producing the un-encodable symbol expression
+`a-2000000000` baked into both RELA_RIII and ADDI_RBRRII's imm18
+operands -- ld.lld then rejected the resulting relocation as out of
+range ([-131072, 131071]).
+
+Override isOffsetFoldingLegal to unconditionally return false, matching
+the same choice made by AArch64/RISC-V/MIPS/Sparc for their own HI/LO-
+style address materialization. Any nonzero addend now stays a real DAG
+ADD node, so ordinary instruction selection materializes large constants
+via the existing CONST_WYDE/materializeImm64 path (established by
+ML-029a) and adds them in a register instead. Small in-range offsets
+remain cheap: they still fold into the load/store instruction's own
+immediate displacement, a separate, unaffected combine.
+
+Adds llvm/test/CodeGen/DADAO/large-global-offsets.ll (FileCheck,
+large + small offset) covering the fix directly at the CodeGen level.
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   | 10 ++++
+ llvm/lib/Target/DADAO/DADAOISelLowering.h     | 16 ++++++
+ .../CodeGen/DADAO/large-global-offsets.ll     | 49 +++++++++++++++++++
+ 3 files changed, 75 insertions(+)
+ create mode 100644 llvm/test/CodeGen/DADAO/large-global-offsets.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index b27ce12685ae..73ebf3979a12 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -516,6 +516,16 @@ SDValue DADAOTargetLowering::lowerGlobalAddress(SDValue Op,
+   return DAG.getNode(DADAOISD::PCREL_HI, DL, MVT::i64, GA);
+ }
+ 
++bool DADAOTargetLowering::isOffsetFoldingLegal(
++    const GlobalAddressSDNode *GA) const {
++  // See the declaration comment in DADAOISelLowering.h (ML-030a): folding a
++  // constant addend into a GlobalAddress node here would let an arbitrarily
++  // large offset get encoded straight into the 18-bit-range RELA_RIII/
++  // ADDI_RBRRII immediate operands with no range check, producing an
++  // out-of-range link-time relocation instead of register arithmetic.
++  return false;
++}
++
+ SDValue DADAOTargetLowering::lowerBRCOND(SDValue Op,
+                                           SelectionDAG &DAG) const {
+   SDLoc DL(Op);
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index 148e75c2209e..5e300978afc2 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -60,6 +60,22 @@ public:
+ 
+   SDValue PerformDAGCombine(SDNode *N, DAGCombinerInfo &DCI) const override;
+ 
++  // RELA_RIII/ADDI_RBRRII (see lowerGlobalAddress/PCREL_HI selection) encode
++  // a GlobalAddress into an 18-bit-range relocation (imms18, contracts/isa/
++  // spec.md §2.2). SelectionDAG::FoldSymbolOffset performs generic
++  // ADD(GlobalAddress, Constant) -> GlobalAddress(offset) constant folding
++  // purely based on this hook, with no visibility into the resulting
++  // offset's magnitude (ML-030a ground truth: this is how `a[i-2000000000L]`
++  // ended up as the un-encodable symbol expression `a-2000000000` baked
++  // directly into both instructions' imm18 operands, producing an
++  // out-of-range link-time relocation instead of a register add). Disable
++  // the fold unconditionally so any nonzero addend stays a real DAG ADD,
++  // which lets normal instruction selection materialize large constants via
++  // the existing CONST_WYDE/materializeImm64 path and add them in a
++  // register. Matches the same choice made by AArch64/RISC-V/MIPS/Sparc for
++  // their own HI/LO-style address materialization.
++  bool isOffsetFoldingLegal(const GlobalAddressSDNode *GA) const override;
++
+ private:
+   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerFrameIndex(SDValue Op, SelectionDAG &DAG) const;
+diff --git a/llvm/test/CodeGen/DADAO/large-global-offsets.ll b/llvm/test/CodeGen/DADAO/large-global-offsets.ll
+new file mode 100644
+index 000000000000..18bddac6de22
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/large-global-offsets.ll
+@@ -0,0 +1,49 @@
++; RUN: llc -mtriple=dadao-unknown-elf -O0 < %s | FileCheck %s
++
++; ML-030a: a compile-time constant added to a global address must not be
++; folded into the 18-bit-range RELA_RIII/ADDI_RBRRII relocation operand pair
++; when the constant is too large to encode (this is exactly what happened to
++; gcc-c-torture 960321-1.c/pr79286.c: `a[i - 2000000000L]` produced the
++; un-encodable symbol expression `a-2000000000` baked directly into both
++; instructions' imms18 operands, which ld.lld then rejected as an
++; out-of-range relocation). Large offsets must instead materialize the
++; constant into a register (reusing the existing CONST_WYDE/materializeImm64
++; large-immediate path) and add it with a register-register instruction.
++
++@a = dso_local global [10 x i8] zeroinitializer, align 1
++
++define dso_local signext i8 @large_offset(i64 noundef %i) {
++; CHECK-LABEL: large_offset:
++; The base address of `a` must be materialized with a *bare* symbol
++; reference (no folded addend) ...
++; CHECK:       rela {{rb[0-9]+}}, a{{$}}
++; CHECK:       addi {{rb[0-9]+}}, {{rb[0-9]+}}, a{{$}}
++; ... and the large constant must show up as an independently materialized
++; wyde sequence added in a register, not as part of the symbol expression.
++; CHECK:       setzw
++; CHECK:       orw
++entry:
++  %sub = sub nsw i64 %i, 2000000000
++  %arrayidx = getelementptr inbounds [10 x i8], ptr @a, i64 0, i64 %sub
++  %0 = load i8, ptr %arrayidx, align 1
++  ret i8 %0
++}
++
++; A genuinely small, in-range offset must remain cheap: disabling the
++; GlobalAddress+Constant fold does not force an extra register
++; materialization here, because the +3 addend still folds into the load
++; instruction's own immediate displacement (a separate, unrelated
++; addressing-mode combine on ISD::LOAD/STORE, not on the GlobalAddress
++; node) instead of into the symbol expression.
++define dso_local signext i8 @small_offset_unchanged(i64 noundef %i) {
++; CHECK-LABEL: small_offset_unchanged:
++; CHECK:       rela {{rb[0-9]+}}, a{{$}}
++; CHECK:       addi {{rb[0-9]+}}, {{rb[0-9]+}}, a{{$}}
++; CHECK-NOT:   setzw
++; CHECK:       ldbs {{rd[0-9]+}}, {{rb[0-9]+}}, 3
++entry:
++  %add = add nsw i64 %i, 3
++  %arrayidx = getelementptr inbounds [10 x i8], ptr @a, i64 0, i64 %add
++  %0 = load i8, ptr %arrayidx, align 1
++  ret i8 %0
++}
+-- 
+2.43.0
+

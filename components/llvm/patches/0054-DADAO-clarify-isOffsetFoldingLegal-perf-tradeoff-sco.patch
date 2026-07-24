@@ -1,0 +1,49 @@
+From fada3562a00e77a4e0a61bd3e1b1942530451244 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 12:30:05 +0800
+Subject: [PATCH] DADAO: clarify isOffsetFoldingLegal perf-tradeoff scope
+ (ML-030a review)
+
+Self-review of d10e7bfa25cd flagged that the commit message's 'small
+in-range offsets remain cheap' claim only covers offsets that fit the
+load/store's own imm12 displacement (roughly [-2048,2047]); mid-range
+offsets that would have fit the 18-bit relocation directly (e.g. +5000)
+now cost two extra materialization instructions instead of folding for
+free, and that scope wasn't disclosed. No behavior change -- comment
+only, expanding the isOffsetFoldingLegal doc comment to state the actual
+tradeoff boundary explicitly.
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.h | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index 5e300978afc2..63d848f06e45 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -74,6 +74,23 @@ public:
+   // the existing CONST_WYDE/materializeImm64 path and add them in a
+   // register. Matches the same choice made by AArch64/RISC-V/MIPS/Sparc for
+   // their own HI/LO-style address materialization.
++  //
++  // Trade-off (ML-030a self-review): this is unconditional, not magnitude-
++  // gated, because the hook itself is never told the prospective post-fold
++  // offset (SelectionDAG::FoldSymbolOffset only passes the pre-fold GA).
++  // Offsets that fit the load/store's own imm12 displacement (roughly
++  // [-2048,2047], see the ADDI_RRII threshold in DADAOISelDAGToDAG.cpp's
++  // ISD::Constant handling) still end up folded there for free by an
++  // unrelated addressing-mode combine, and offsets requiring real 18-bit-
++  // or-larger magnitude are correctness-required to take this path. But
++  // *mid-range* offsets that would have fit the 18-bit relocation directly
++  // (e.g. +5000) now cost two extra materialization instructions
++  // (setzw/orw + add) instead of folding for free into RELA_RIII/
++  // ADDI_RBRRII's imm18 operand as they did before this fix. This is the
++  // same correctness-over-code-size choice RISC-V/MIPS/Sparc/AArch64 make
++  // (none of them re-fold a magnitude-safe offset back in either); a
++  // PerformDAGCombine peephole that re-folds when the total is provably
++  // in range would recover it but does not exist yet.
+   bool isOffsetFoldingLegal(const GlobalAddressSDNode *GA) const override;
+ 
+ private:
+-- 
+2.43.0
+
