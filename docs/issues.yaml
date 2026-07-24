@@ -12,6 +12,74 @@
 # docs/issues-archive.yaml (same schema) -- day-to-day lookup/registration
 # of new issues only needs this file.
 
+- id: dadao-frame-lowering-8byte-align-insufficient-for-16byte-locals
+  title: "128-bit-aligned locals (SIMD vector alloca, __int128 spill slot) are not supported by the DADAO ABI and are permanently excluded, like HFA -- the wiki's ABI type table (DADAO-21-ABI §Fundamental Types, the sizeof/Alignment table) never defines a type wider than 8 bytes (long/pointer/double top out at Alignment=8; aggregates are 'at least 8-byte aligned'), so __int128/vector are GNU extensions with no DADAO ABI alignment contract at all -- DADAOFrameLowering.h's declared Align(8) is therefore CORRECT per spec, not a bug to fix; the 2 gcc-c-torture files exercising these types are expected to remain non-PASS"
+  status: open
+  scope: [abi, out-of-scope]
+  blocks: "would require an ABI extension (wiki does not define 128-bit type alignment at all) plus dynamic stack realignment support in DADAOFrameLowering, not a codegen bug fix -- same category as HFA (dadao-hfa-argument-not-implemented)"
+  resolved_by: null
+  # User decision 2026-07-24 (AskUserQuestion, after ML-034a's diagnosis):
+  # register as a permanent ABI-scope exclusion (like HFA) rather than plan
+  # a fix. Rationale: 128-bit types have zero defined alignment contract in
+  # the wiki -- extending the ABI to add one, then implementing dynamic
+  # stack realignment (DADAO has no confirmed bitwise-AND-immediate address-
+  # masking instruction, and no target currently declares
+  # canRealignStack()/needsStackRealignment()) would be new ABI-design +
+  # backend engineering, not a bug fix, for the sake of exactly 2/1708
+  # gcc-c-torture files. This is the standing "either PASS or a clearly
+  # documented reason" bar the user set for the corpus (2026-07-24), same
+  # bar HFA and the M1-Excluded RF-bank items already satisfy.
+  #
+  # Found during ML-034a (removing -ffreestanding from the gcc-c-torture
+  # sweep/lit test compile flags). Full gcc-c-torture re-sweep (1708/1708,
+  # PASS 1438->1461) found exactly 2 files regress PASS->FAIL_RUN(abort,
+  # exit 127): 20050604-1.c (MMX/SSE-style vector_size(8)/vector_size(16)
+  # union arithmetic) and pr63302.c (__int128 bit-masking via a
+  # noinline/noclone helper). Root-caused with a standalone repro (compiled
+  # both files with the old -ffreestanding and new hosted CFLAGS, diffed
+  # the .ll then llc -march=dadao .s output):
+  #   - The ONLY IR difference hosted mode introduces in main() is clang's
+  #     standard C11 hosted-main idiom: an `%retval = alloca i32` + `store
+  #     i32 0, ptr %retval` (dead -- main always has an explicit `return`
+  #     in both files -- but still costs one real stack slot) plus marking
+  #     `abort` noreturn (which only elides a redundant fallthrough jump
+  #     to the very next physical label, itself a no-op).
+  #   - That dead %retval slot is real at the asm level: main()'s prologue
+  #     changes from "no stack frame at all" to `addi rb1, rb1, -8` /
+  #     epilogue `addi rb1, rb1, 8` -- an 8-byte (not 16-byte-multiple)
+  #     adjustment.
+  #   - foo()/bar() (the helper called from main, holding the actual
+  #     vector-add / __int128-mask computation) themselves are BYTE-
+  #     IDENTICAL between the hosted and freestanding compiles (confirmed
+  #     via .ll and .s diff) -- their own prologues subtract a 16-byte-
+  #     multiple frame size and place the 128-bit-wide local at a
+  #     compiler-computed constant offset that is only actually 16-byte
+  #     aligned in memory if the stack pointer THEY WERE ENTERED WITH was
+  #     already 16-byte aligned. Before this task, every existing
+  #     tested call chain happened to keep cumulative frame sizes at
+  #     16-byte multiples (pure luck, not an enforced invariant); main()'s
+  #     new 8-byte-only frame is the first odd-parity frame in a call
+  #     chain leading to a 128-bit-aligned callee local, and misaligns it
+  #     by 8 bytes -- not a hardware MALIGN trap (exit 0x81), just a
+  #     silently wrong value, which is why the torture file's own
+  #     correctness check calls abort() (exit 127) instead of any fault
+  #     code.
+  #   - Confirmed the declared insufficiency directly:
+  #     DADAOFrameLowering.h's TargetFrameLowering base-class constructor
+  #     is called with Align(8), not Align(16) -- so LLVM's own frame-
+  #     lowering machinery never pads/rounds a function's frame size (or a
+  #     caller's outgoing stack pointer at a call site) to preserve 16-byte
+  #     alignment through nested calls, even though 128-bit vector/
+  #     __int128 locals require it.
+  # Not fixed as part of ML-034a (out of that task's flag-only scope), and
+  # per the 2026-07-24 user decision above, not planned to be fixed at all
+  # -- this is latent, pre-existing ABI-scope territory that predates
+  # ML-034a (never exercised by an odd-parity frame before -ffreestanding
+  # removal), NOT a "test depends on freestanding semantics" false
+  # failure, and NOT something -ffreestanding removal should be reverted
+  # to paper over. `20050604-1.c`/`pr63302.c` remain permanently non-PASS
+  # in the gcc-c-torture corpus for this documented reason.
+
 - id: dadao-hfa-argument-not-implemented
   title: "HFA (homogeneous floating-point aggregate) argument passing is not implemented -- DADAOABIInfo::classifyArgumentType falls back to the pre-ML-031a indirect (byval) DefaultABIInfo behavior, unchanged, because the DADAO LLVM backend has no RF register class / floating-point CodeGen support at all"
   status: open

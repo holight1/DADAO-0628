@@ -1,7 +1,7 @@
 // DL-072a: real musl printf pointer-vararg reproducer from the tracked issue.
 // The two strings assert both values and their original argument order.
 //
-// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O2 \
+// RUN: %clang --target=dadao -std=c99 -nostdinc -O2 \
 // RUN:   -I%S/../../../.work/source/musl/arch/dadao \
 // RUN:   -I%S/../../../.work/source/musl/arch/generic \
 // RUN:   -I%S/../../../.work/source/musl/include \

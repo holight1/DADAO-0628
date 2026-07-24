@@ -447,7 +447,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "compile": {
             "target": "dadao",
             "standard": "c99",
-            "flags": ["-nostdinc", "-ffreestanding"],
+            "flags": ["-nostdinc"],
             "optimizations": list(OPTIMIZATIONS),
             "defines": ["WARMUP_HEAT=0", "GLOBAL_SCALE_FACTOR=1"],
             "separate_translation_units": True,
@@ -555,7 +555,6 @@ def compile_benchmark(
             "--target=dadao",
             "-std=c99",
             "-nostdinc",
-            "-ffreestanding",
             f"-{optimization}",
             "-DWARMUP_HEAT=0",
             "-DGLOBAL_SCALE_FACTOR=1",
@@ -1100,7 +1099,7 @@ def render_report(payload: dict[str, Any], path: Path) -> None:
     lines.extend(
         [
             "",
-            "编译契约：`clang --target=dadao -std=c99 -nostdinc -ffreestanding "
+            "编译契约：`clang --target=dadao -std=c99 -nostdinc "
             "-O{0,2} -DWARMUP_HEAT=0 -DGLOBAL_SCALE_FACTOR=1` 加 musl/support/"
             "benchmark include；链接契约：`ld.lld -T tests/scripts/dadao.ld "
             "--start-group crt1.o <objects> libc.a --end-group`。",

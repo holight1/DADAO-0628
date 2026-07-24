@@ -7,12 +7,12 @@
 //
 // RUN: %llvm-mc -triple=dadao -filetype=obj %S/../../scripts/crt0.s -o %t.crt0.o
 // RUN: %llvm-mc -triple=dadao -filetype=obj %S/../../scripts/pico_stubs.s -o %t.stubs.o
-// RUN: %clang --target=dadao -nostdlib -nostdinc -ffreestanding -O0 -c \
+// RUN: %clang --target=dadao -nostdlib -nostdinc -O0 -c \
 // RUN:   -I%pico_include -I%pico_stdio -I%pico_locale -I%pico_root \
 // RUN:   -I%pico_build -I%{clanginc} \
 // RUN:   -D_LIBC -DNEWLIB_NANO_MALLOC \
 // RUN:   %S/../../scripts/stdout_min.c -o %t.stdout.o
-// RUN: %clang --target=dadao -nostdlib -nostdinc -ffreestanding -O0 -c \
+// RUN: %clang --target=dadao -nostdlib -nostdinc -O0 -c \
 // RUN:   -I%pico_include -I%pico_stdio -I%pico_locale -I%pico_root \
 // RUN:   -I%pico_build -I%{clanginc} \
 // RUN:   -D_LIBC -DNEWLIB_NANO_MALLOC \

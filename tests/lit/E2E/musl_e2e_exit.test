@@ -64,7 +64,7 @@
 // musl startup chain and its return value really propagated through
 // exit()/_Exit()/SYS_exit_group all the way to process exit code, on
 // BOTH backends.
-// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O0 \
+// RUN: %clang --target=dadao -std=c99 -nostdinc -O0 \
 // RUN:   -c -o %t.o %S/Inputs/musl_e2e_exit.c
 // RUN: %ld.lld -T %S/../../scripts/dadao.ld \
 // RUN:   --start-group %S/../../../.work/build/musl/lib/crt1.o %t.o %S/../../../.work/build/musl/lib/libc.a --end-group \

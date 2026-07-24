@@ -13,7 +13,7 @@
 // pointer now remains in declaration order and is consumed correctly by
 // scanf/vfscanf on both backends.
 //
-// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O2 \
+// RUN: %clang --target=dadao -std=c99 -nostdinc -O2 \
 // RUN:   -I%S/../../../.work/source/musl/arch/dadao \
 // RUN:   -I%S/../../../.work/source/musl/arch/generic \
 // RUN:   -I%S/../../../.work/source/musl/include \

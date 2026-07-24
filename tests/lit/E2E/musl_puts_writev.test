@@ -14,7 +14,7 @@
 // roadmap route A (ML-019a: cfx_smon SYS_writev(66) responder, both
 // backends).
 //
-// RUN: %clang --target=dadao -std=c99 -nostdinc -ffreestanding -O0 \
+// RUN: %clang --target=dadao -std=c99 -nostdinc -O0 \
 // RUN:   -I%S/../../../.work/source/musl/arch/dadao \
 // RUN:   -I%S/../../../.work/source/musl/arch/generic \
 // RUN:   -I%S/../../../.work/source/musl/include \

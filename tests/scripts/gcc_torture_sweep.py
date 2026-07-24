@@ -10,7 +10,7 @@ gcc-c-torture/execute/CMakeLists.txt uses to keep old-style K&R C accepted
 as warnings instead of hard errors -- see that CMakeLists' top-of-file
 comment "GCC C Torture Suite is conventionally run without warnings"):
 
-  1. compile (clang --target=dadao, freestanding, musl include paths)
+  1. compile (clang --target=dadao, hosted mode, musl include paths)
   2. link (ld.lld -T tests/scripts/dadao.ld against crt1.o + libc.a)
   3. objcopy -O binary
   4. run under QEMU (dadao-m1, -nographic -bios trampoline -kernel <bin>)
@@ -82,13 +82,24 @@ WORKDIR = REPO_ROOT / '.work/gcc-torture-sweep'
 
 # CFLAGS matching llvm-test-suite's own gcc-c-torture/execute/CMakeLists.txt
 # base CFLAGS ("GCC C Torture Suite is conventionally run without
-# warnings"), plus this project's standard freestanding/musl-include recipe
+# warnings"), plus this project's standard hosted/musl-include recipe
 # (tests/lit/E2E/musl_printf_int.test etc.). Deliberately uniform across all
 # 1708 files -- no per-file special CFLAGS (that would be a workaround, out
 # of scope for a pure scan task; upstream's own per-file extras -fwrapv /
 # -lm / -Wno-return-type are intentionally NOT reproduced here, see report).
+#
+# ML-034a: -ffreestanding deliberately removed (hosted mode). The project
+# now has a real, statically-linked musl providing _start/__libc_start_main
+# (ML-007a..012a), so clang's hosted-mode assumptions (C11 implicit
+# `return 0` from a falling-off-the-end main(), recognizing standard
+# library builtins) are both correct and desired -- freestanding's
+# rejection of the implicit-return-0 special case was silently turning
+# ~12-15 logically-correct torture-suite files into false FAIL_RUN
+# (ML-026a report, "method notes" section). -nostdinc is independent of
+# hosted/freestanding (it only affects header search path defaults) and is
+# kept unchanged.
 CFLAGS = [
-    '--target=dadao', '-nostdinc', '-ffreestanding',
+    '--target=dadao', '-nostdinc',
     '-Wno-implicit-int', '-Wno-int-conversion',
     '-Wno-implicit-function-declaration', '-w',
     '-I', str(MUSL_SRC / 'arch/dadao'),
