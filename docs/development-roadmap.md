@@ -1339,3 +1339,95 @@ original list: **P1 aggregate/struct-by-value ABI parameter passing
 2026-07-24 to remove it and switch to hosted mode — not yet started),
 P2 VLA/`__int128`/vector-legalize/`BlockAddress`, plus the open
 `musl-softfloat-shim-missing-divsc3` issue from ML-028a.
+
+## ML-031a/ML-032a/ML-033a: aggregate ABI, Embench corpus, dynamic stack alloc (2026-07-24)
+
+Three tasks landed via a parallel Codex session (Codex both implemented
+and ran an independent review/re-review cycle on each before committing
+directly — outside the normal "architect reviews before commit" flow;
+the architect performed full ground-truth re-verification after the
+fact for all three, described below).
+
+**ML-031a — aggregate/struct-by-value ABI parameter passing** (LLVM
+commits `9079603c93f3`/`ac7c52aa6cd4`/`53e5e16e829a`/`36abcbd6369d`/
+`86656a445241`, patches `0055`-`0059`): implements the wiki's full
+aggregate ABI — HPA (homogeneous-pointer aggregates) via RB bank, ≤32B
+RD-bank splitting, >32B indirect-pointer passing, hidden-sret returns,
+and multi-slot variadic aggregate save-area extension. HFA (RF bank)
+correctly refused and registered as its own issue rather than faked,
+per the task's hard constraint (DADAO has no float register class at
+all). A first independent review round found and required fixing 4
+blocking issues (padded/nested HPA losing non-contiguous fields, >32B
+variadic misclassification, sret pointer not restored to RB16 after an
+internal call, and an incomplete-tail-call assertion at -O2); all four
+were fixed and the final re-review accepted. A genuine mid-task
+regression (`pr28982b.c`, a 256KB by-value struct) was caught and
+traced to a *pre-existing*, unrelated defect this work newly exercised:
+`MaxStoresPerMemcpy/Memset/Memmove` had been left at `UINT_MAX` since
+the earliest DADAO patches (a workaround for a call-selection bug that
+no longer exists), so a real `llvm.memcpy` lowering blew up trying to
+expand 32768+ inline stores; bounding it to 16 (matching Lanai) fixed
+it. Also flagged, not fixed: `pr38151.c`'s `_Complex int` variadic
+struct corruption (orthogonal to this task, new issue registered).
+Result: 15 of the original 15 target torture files now PASS plus one
+bonus file (`20040703-1.c`) the general implementation happened to
+cover — architect-reproduced exactly.
+
+**ML-032a — Embench-IoT functional corpus** (new component, pinned at
+`09c2ed8c3b7008c95d08b038de4a3f6dc103ed70`, one upstream patch for
+MD5's little-endian word decode): brings the project's own fresh,
+version-locked 19-benchmark functional sweep (`tests/scripts/
+embench_sweep.py`), run at both -O0 and -O2 through the real
+clang→lld→musl→QEMU/gem5 pipeline — explicitly a correctness corpus,
+not a performance benchmark. An independent review round found and
+required fixing 4 issues in the sweep tool itself (a `--resume` that
+didn't check whether the query identity had actually changed before
+reusing stale results being the most serious), all closed with a
+fingerprint-based cache-invalidation scheme. Final, fully independent
+result: O0 19/19 PASS, O2 18/19 PASS with a single known, undisguised
+failure (`qrduino` at -O2, diagnosed to a specific buffer-content
+mismatch, kept red rather than "fixed" by disabling optimization on
+the file). Architect independently reran the entire 38-build sweep
+from scratch and reproduced this exact O0/O2 split, including the
+qrduino failure on both backends.
+
+**ML-033a — dynamic stack allocation (VLA)** (LLVM commit
+`dd80ef109bbb`, patch `0060`): implements `DYNAMIC_STACKALLOC`/
+`STACKSAVE`/`STACKRESTORE` lowering plus a new `rb2`-based frame-pointer
+convention for functions with a variable-length stack allocation or a
+`__builtin_frame_address` use, following `contracts/abi/spec.md` §4
+exactly. An independent review round caught a real High-severity bug
+the work's own tests hadn't reached: with a >2047-byte outgoing
+call-frame *and* a live VLA at the same time, the physical `rb1`
+(stack pointer) was fed into a generic RD-bank `ADD` as if it were an
+ordinary integer, losing its RB-bank tag and silently reading the
+wrong register — verified with a 300-argument-call probe that faulted
+on real hardware paths (QEMU exit 1 / gem5 page-table fault). Fixed by
+routing both ordinary large stack-argument addresses and the vararg
+save-area through a shared `getOutgoingStackAddress` helper that
+explicitly emits a bank-correct `DADAOISD::ADDRB` for out-of-imms12-range
+offsets. Closes the 9-file VLA gap from ML-026a's original P2 list.
+
+**Architect independent verification (all three, after the fact)**:
+rebuilt the toolchain from the final HEAD; ran the 11 directed
+`CodeGen/DADAO` + Clang DADAO lit tests (11/11 PASS); ran the full E2E
+suite (77/77 PASS, up from 74/74, including the 3 new aggregate/VLA
+tests); reran the full 1708-file gcc-c-torture sweep from scratch and
+got the exact reported `PASS=1438 FAIL_COMPILE=104 FAIL_LINK=131
+FAIL_RUN=35` (1414→1438, +24, matching +15 from ML-031a and +9 from
+ML-033a exactly); reran `run_differential.py` (AGREE 3-way=200,
+4-way=200, DIVERGE=0, unchanged) and `manifest_check.py`/
+`check_issues.py` (both PASS); replayed the full 60-patch LLVM series
+from a bare manifest-pin checkout in a clean worktree and confirmed the
+tree hash matches `.work/llvm` HEAD exactly; independently re-ran the
+entire Embench sweep from scratch (not just read the report) and
+reproduced the exact same 19/19 O0 / 18/19 O2 split with the same
+`qrduino` failure on both backends.
+
+**gcc-c-torture running total: 1328→1438/1708 (84.2%)**. Remaining open
+items: P1 re-evaluate `-ffreestanding` (user decided 2026-07-24 to
+remove it, switch to hosted mode — not yet started), P2 `__int128`/
+vector-legalize/`BlockAddress`, `qrduino`-O2 and the `_Complex` variadic
+corruption as new, explicitly-documented-not-fixed defects, plus the
+still-open `musl-softfloat-shim-missing-divsc3` (`__divsc3`) and
+`dadao-hfa-argument-not-implemented` issues.
