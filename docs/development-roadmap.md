@@ -1488,3 +1488,49 @@ and freestanding); reran the full E2E suite (77/77) and
 unchanged/PASS).
 
 **gcc-c-torture running total: 1328→1461/1708 (85.6%)**.
+
+## ML-035a: refresh gcc-c-torture gap classification (2026-07-24)
+
+A pure scan/classification task (no source changes) to re-derive the
+current FAIL_COMPILE(104)/FAIL_LINK(125)/FAIL_RUN(18) breakdown, since
+ML-026a's original categorization was done at PASS=1328 and is now
+stale after seven fix rounds moved PASS to 1461. Result: FAIL_COMPILE's
+84 known/explainable + 20 real-candidate split is byte-for-byte
+unchanged from ML-026a (nothing in `ML-027a`-`ML-034a` touched that
+path); FAIL_LINK is now 100% accounted for by known causes (no new
+leads — `ML-028a`/`ML-030a` already mined that vein dry).
+
+The significant find is in FAIL_RUN: a correction to ML-026a's original
+report. `931102-1.c`/`931102-2.c` had been lumped into the 12-file
+"struct-by-value vararg" cluster, but neither file actually uses
+`va_arg` at all (direct source inspection) — they're K&R-style
+union/bitfield "count trailing zero bit" tests. The other 10 files in
+that original cluster are confirmed genuinely PASS now (via `ML-031a`'s
+aggregate ABI + `ML-034a`'s hosted-mode fixes), including `pr38151.c`.
+
+`931102-1.c`/`931102-2.c` are a previously-unrecorded, genuine
+correctness bug: at **-O0 only**, a single-bit AND test written in
+*negative* polarity (`if ((x & 1) == 0)` / `if (!(x & 1))`) silently
+drops the `and rd,rd,1` masking instruction and branches on the raw,
+unmasked byte instead — for x=2 (bit 0 clear, byte value nonzero) this
+produces the wrong branch outcome with no compile/link/fault error at
+all, just a silently wrong answer. `960608-1.c` (a bitfield read) is
+suspected to be the same root-cause family but wasn't isolated to a
+single minimal trigger. Architect independently reproduced with a
+from-scratch 3-line repro run end-to-end through QEMU: an -O0 build
+exits 0 (wrong, expected 1), an -O2 build of the identical source exits
+1 (correct) — confirming both the bug and its -O0-only scope.
+
+Registered as `dadao-o0-negative-polarity-bitand-mask-dropped` and
+immediately escalated to P0 ahead of the rest of ML-035a's priority
+list, despite only hitting 2-3/1708 torture files: this is a *silent*
+wrong-answer defect for extremely common real C idioms (parity checks,
+find-lowest-set-bit loops, single-bit flag tests), not a torture-corpus
+edge case — the low hit count in this specific corpus is likely luck,
+not evidence the real-world risk is small.
+
+Updated priority list (P1 downward): `__divsc3` (1 file, already
+tracked), vector-legalizer + `__int128` calling-convention failures
+(17 files combined, possibly one shared "128-bit return value CC
+allocation" crash site), `BlockAddress`/computed-goto (3 files), plus
+two low-priority singletons not worth their own task.
