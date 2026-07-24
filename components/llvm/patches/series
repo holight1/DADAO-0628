@@ -58,3 +58,4 @@
 0058-DADAO-preserve-aggregate-ABI-layout-and-vararg-slots.patch
 0059-DADAO-preserve-sret-and-disable-unsupported-tail-cal.patch
 0060-DADAO-implement-dynamic-stack-allocation-and-restore.patch
+0061-DADAO-declare-ZeroOrOneBooleanContent-to-stop-O0-mas.patch

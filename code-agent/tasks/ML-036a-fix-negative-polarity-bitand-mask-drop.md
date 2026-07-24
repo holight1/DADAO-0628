@@ -131,3 +131,127 @@ exit=1。语义等价的**正极性**写法（`if (l & 1)` / `if ((l&1) != 0)`�
   写读回校验要用 volatile + 负控制）
 - `feedback_dadao_add_semantics_and_grep_trap`（DADAO 后端历史上出现过的
   类似"寄存器/bank 语义想当然"的踩坑记录，诊断时可参考避免同类误判）
+
+## 完成区（2026-07-24）
+
+### 根因
+
+`DADAOTargetLowering` 构造函数从未调用 `setBooleanContents()`，落到
+`TargetLowering` 默认值 `UndefinedBooleanContent`。这个默认值对本后端是
+错的：`lowerSETCC` 每个 `case` 分支（`cmps`/`cmpu` + `shru`-63/`sub`/`orr`
+链）都在整个 64 位寄存器宽度上物化一个真正的 0-or-1 值，且实际的分支指令
+（`BRNZ`/`BRZ`，`BRCOND`/`BR_CC` 选中的目标）测试的是**整个寄存器**是否
+非零——它们自己不做 bit-0 掩码。本后端真正的不变量是
+`ZeroOrOneBooleanContent`。
+
+在错误的默认值下，`TargetLowering::promoteTargetBoolean`（被
+`DAGTypeLegalizer::PromoteIntOp_BRCOND` 调用）把一个较窄的 i1 布尔值为
+`BRCOND` 消费而加宽时用的是 `ANY_EXTEND` 而非 `ZERO_EXTEND`。在 `-O0`
+（clang 给函数打 `optnone`，无论 `llc` 自身的 `-O` 标志是什么，都强制整个
+`SelectionDAG` 流水线为 `CodeGenOptLevel::None`——直接验证：对同一份带
+`optnone` 的 `.ll`，`llc -O0` 和 `llc -O2` 产生逐字节相同、同样错误的汇编），
+`DAGCombiner.cpp` 的 `visitXOR` 里一条通用 combine
+（`fold not (setcc x, y, cc) -> setcc x y !cc`）先把负极性写法
+（`if ((x&1)==0)`/`if (!(x&1))`，真值分支落在 `else` 臂）里的
+`xor(seteq(and,0),true)` 折成 `setne(and,0)`；随后另一条通用 combine
+在这个特定 DAG 形状下把整条 `and`+`setcc` 链进一步折叠成裸的
+`truncate(loadedByte, i1)`（等价，因为 truncate 到 i1 恰好取最低位）；
+为 `BRCOND` 重新加宽这个 i1 时因为 `ANY_EXTEND` 被调用，
+`ANY_EXTEND(TRUNCATE(X))` 直接代数化简成不带掩码的 anyext 装载——因为
+`ANY_EXTEND` 允许"垃圾"高位——于是 `BRNZ` 变成测试"整个装载字节是否非零"
+而不是"bit 0 是否为 1"。正极性写法（`if (l&1)`）没有走到这条 combine
+（`and`+`setcc` 显式保留到指令选择），所以从未受影响。
+
+声明 `ZeroOrOneBooleanContent` 让同一处加宽改走 `ZERO_EXTEND`，此时
+`ZERO_EXTEND(TRUNCATE(X))` 无法免费抵消——必须物化一次真正的掩码——
+从而恢复被丢弃的 `and rd,rd,<mask>`。
+
+### 修复
+
+`llvm/lib/Target/DADAO/DADAOISelLowering.cpp` 构造函数中加一行
+`setBooleanContents(ZeroOrOneBooleanContent);`（含 25 行注释说明上述机制）。
+
+### 960608-1.c 二分结论
+
+**确认为同一根因**（非"巧合变绿"）：直接比对修复前后的 `.s`，函数内
+`||` 链的**第一个**子条件（`flags->c != 0`，位域读取，编译成
+`shru`+`and`+`brnz`）修复前恰好缺失 `shru` 之后的 `and rd16,rd16,1`，
+修复后在完全相同位置恢复；同一 `||` 链里的其它子条件修复前就已经带
+`and`（走了不同的 DAG 路径），修复前后逐字节不变。
+
+### 通用性验证（ground truth，非手算期望值）
+
+用 4 宽度（int/long/char/short）× 4 掩码（1/2/4/0xff）× 4 比较
+（eq0/ne0/eq1/not）× 2 极性 = 128 个函数、每函数 9 个输入 = 1152 个
+向量的矩阵，同一份源码分别在**宿主机原生编译执行**（ground truth）和
+DADAO QEMU 流水线下跑，两边逐行 diff：
+- 修复前：45/1152 向量分叉，精确对应 9/128 个函数形状，**全部 mask=1**、
+  全部语义等价于"masked-result-is-zero"，覆盖 int/char/short 但不覆盖
+  long（与诊断的 combine 触发条件一致）。
+- 修复后：**0/1152 分叉**。
+
+### 交付物
+
+- `llvm/lib/Target/DADAO/DADAOISelLowering.cpp`：+25 行（1 行是fix，24行注释）
+- `llvm/test/CodeGen/DADAO/negative-polarity-bitand-mask.ll`（新增，13
+  个函数，覆盖正负极性×掩码 1/2/4/0xff×eq0/ne0/eq1/not×i8/i16/i32/i64）——
+  独立验证：对修复前编译器跑该 lit 测试 FAIL，修复后 PASS
+- `tests/lit/E2E/Inputs/negative_polarity_bitand_mask.c` +
+  `tests/lit/E2E/negative_polarity_bitand_mask.test`（新增，volatile 输入
+  + 不短路累加的正负控制，QEMU+gem5 双后端×O0+O2）——独立验证：修复前
+  O0 阶段即 FAIL，修复后 PASS
+- LLVM commit `42a9070dce2a`（`.work/llvm`，普通 commit，HEAD 前进）
+- patch `components/llvm/patches/0061-DADAO-declare-ZeroOrOneBooleanContent-to-stop-O0-mas.patch`，已追加进 `series`
+- `docs/issues.yaml` 的 `dadao-o0-negative-polarity-bitand-mask-dropped`
+  条目已移除，完整迁移到 `docs/issues-archive.yaml` 并置
+  `status: closed`、`resolved_by: "ML-036a; ..."`，附完整根因/修复/验证记录
+
+### 验收结果
+
+| 项 | 修复前基线 | 修复后 |
+|---|---|---|
+| gcc-c-torture 1708 全量 | 1461/104/125/18 | **1464/104/125/15**（逐文件 diff：仅 931102-1.c/931102-2.c/960608-1.c 从 FAIL_RUN→PASS，其余 1705 个文件零变化） |
+| llvm-lit `tests/lit/E2E/` | 77/77 | **78/78**（77 基线 + 1 个新增测试，零回归） |
+| llvm-lit `CodeGen/DADAO/` | 9/9 | **10/10**（9 基线 + 1 个新增测试，零回归） |
+| `tools/run_differential.py` | AGREE(4-way)=200/DIVERGE=0 | **不变**（spec 向量层harness，不经过 codegen，确认未受影响） |
+| `scripts/manifest_check.py` | PASS | **PASS** |
+| `scripts/check_issues.py` | PASS（open 23/closed 40） | **PASS**（open 22/closed 41） |
+| patch 裸 pin 重放 | — | `git worktree` 到 pin commit `ca7933e47d3a` + `git am` 全部 61 个 patch 成功，replay tree hash `f52e7a386ff53103fe829323f705787317e4de3d` 与开发树 `HEAD^{tree}` 完全一致 |
+
+## 审阅记录（自审，2026-07-24）
+
+- Finding 1：矩阵测试脚本第一版（`gen.py`）用"return 累加 fails 计数"
+  作为退出码——发现 `fails` 可能 ≥256 导致 exit code mod 256 环绕回 0，
+  险些把"256/512 向量分叉"误判为"0 fails"。判决：**真实缺陷（自己的测试
+  方法论），已发现并改正**——弃用累加退出码，改用 printf 输出 + 宿主机
+  ground truth 逐行 diff（`gen3.py`/`matrix3.c`），此后所有分叉计数结论
+  均基于这条更严谨的路径。
+- Finding 2：第二版按 width 拆分的测试文件（`gen2.py`）显示 int/long/char/
+  short 各自 64-66 fails，与 combined 矩阵的 6 fails 严重不一致——排查后
+  发现是**测试生成脚本自己的 python "expected" 手算逻辑有 bug**（正极性
+  分支的期望值推导对 `not`/`eq1` 比较符号弄反了），不是 DADAO 编译器的
+  问题。判决：**已发现并绕过**——放弃手算 expected，全部改成宿主机原生
+  执行取 ground truth。
+- Finding 3：diff/grep 命令在 bash 工具里出现过一次诡异的假阴性
+  （`diff` 打印 `[ok] Files are identical` 而两文件 md5 明显不同）。用
+  `/usr/bin/diff`/`/usr/bin/cmp` 直接调用复现出真实差异，怀疑是执行环境
+  里某层命令封装/缓存的瞬时问题，非本任务逻辑错误。判决：**已用绝对路径
+  规避，不影响最终结论**（所有关键 diff 结论都用 `/usr/bin/diff` 或
+  python 直接读文件比对复核过）。
+- Finding 4：`ninja`（不带具体 target）在构建 `libclang-cpp.so` 链接阶段
+  被 OOM kill（`ld terminated with signal 9`）。判决：**环境资源限制，非
+  本任务改动引入**——`ninja clang llc` 精确构建所需目标每次都干净成功，
+  不需要构建 `bugpoint` 等无关工具；未追查/未修复这个无关的资源问题。
+- Finding 5：`960608-1.c` 的确认方式——任务书要求"如果没能孤立出确定
+  结论，如实报告不要强行下结论"。本次**没有依赖"变绿了"这一间接证据**，
+  而是直接对比了修复前后的 `.s`，在 `||` 链第一个子条件里逐指令确认了
+  同一 `shru`+缺失`and`+`brnz`-测试未掩码值 的特征，因此这里是**确定
+  结论**（同一根因），不是"强嫌疑"。
+- Finding 6：mask=0xff 的情况下 CodeGen lit 测试**不要求**出现显式
+  `and` 指令，理由是 `ldbu`（无符号字节装载）本身已经等价于 `& 0xff`
+  掩码。判决：这是正确的、经查验的行为（`ldbu` 零扩展，不会引入本类
+  bug），故该测试用例断言的是 `ldbu` 存在而非 `and`——已在测试文件注释
+  中说明，不是宽松放过。
+- 结论：所有 finding 均已在本次任务内自行发现、自行修正或明确判定为
+  环境噪声，不影响修复本身与验收结果的正确性；未发现需要转交/升级的
+  阻断性问题。

@@ -1,0 +1,31 @@
+// ML-036a: runtime E2E regression guard for
+// docs/issues.yaml `dadao-o0-negative-polarity-bitand-mask-dropped` -- at
+// -O0 only, a single-bit AND-and-compare-to-zero test written in NEGATIVE
+// polarity (`(x & mask) == 0` / `!(x & mask)`, true/if.then branch taken
+// when the masked bits are ZERO) silently dropped the masking instruction
+// and branched on the raw unmasked value instead. The volatile inputs
+// (value 2: bit 0 clear but byte/word non-zero; value 4 for the mask=2
+// check: bit 1 clear but non-zero) are exactly the discriminating shape
+// that a dropped mask gets backwards. Every check in the input C
+// accumulates into one `bad` flag (no short-circuit) so the negative
+// control -- which flips every input to have the tested bit SET -- proves
+// each individual check is a real, non-tautological, input-sensitive
+// assertion, not just the first one reached.
+//
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -O0 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/negative_polarity_bitand_mask.c -o %t.o0.elf
+// RUN: %llvm-objcopy -O binary %t.o0.elf %t.o0.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O2 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/negative_polarity_bitand_mask.c -o %t.o2.elf
+// RUN: %llvm-objcopy -O binary %t.o2.elf %t.o2.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O0 -DNEGATIVE_CONTROL -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/negative_polarity_bitand_mask.c -o %t.o0.neg.elf
+// RUN: %llvm-objcopy -O binary %t.o0.neg.elf %t.o0.neg.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.neg.bin >/dev/null 2>&1; test $? -eq 1'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.neg.elf >/dev/null 2>&1; test $? -eq 1'
+// RUN: %clang --target=dadao-unknown-elf -O2 -DNEGATIVE_CONTROL -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/negative_polarity_bitand_mask.c -o %t.o2.neg.elf
+// RUN: %llvm-objcopy -O binary %t.o2.neg.elf %t.o2.neg.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.neg.bin >/dev/null 2>&1; test $? -eq 1'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.neg.elf >/dev/null 2>&1; test $? -eq 1'

@@ -1,0 +1,477 @@
+From 42a9070dce2a9875947ebd4c49bda90459fe4be2 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 20:37:24 +0800
+Subject: [PATCH] DADAO: declare ZeroOrOneBooleanContent to stop -O0 mask drop
+
+DADAOTargetLowering never called setBooleanContents(), leaving the
+TargetLowering default of UndefinedBooleanContent. That default is wrong
+for this target: every lowerSETCC arm materializes a genuine 0-or-1 value
+across the full register (cmps/cmpu + shru-by-63/sub/or chains), and the
+actual branch instructions (BRNZ/BRZ, selected for BRCOND/BR_CC) test the
+full register for non-zero-ness -- they do not mask to bit 0 themselves.
+This target's real invariant is ZeroOrOneBooleanContent.
+
+Under the wrong default, TargetLowering::promoteTargetBoolean widens a
+narrower i1 boolean for BRCOND consumption via ANY_EXTEND instead of
+ZERO_EXTEND. At -O0 (clang marks the function `optnone`, forcing
+CodeGenOptLevel::None for the whole SelectionDAG pipeline regardless of
+llc's own -O flag), a generic DAGCombiner fold collapses the "AND(x,mask)
+compared to zero, NOT'd for the else-arm branch" shape (i.e. a negative-
+polarity single-bit-and-test, `if ((x & 1) == 0)` / `if (!(x & 1))`) down
+to a bare `truncate(loadedByte, i1)`; re-widening that i1 for BRCOND via
+ANY_EXTEND then collapses `ANY_EXTEND(TRUNCATE(X))` straight through to an
+unmasked load, since ANY_EXTEND licenses "rubbish" upper bits -- so BRNZ
+ends up testing whether the whole loaded byte is non-zero instead of
+whether bit 0 is set. The positive-polarity form never hit this fold
+(kept an explicit AND+SETCC through to instruction selection), which is
+why only the negative-polarity shape was affected.
+
+Declaring ZeroOrOneBooleanContent forces the same widening through
+ZERO_EXTEND, under which `ZERO_EXTEND(TRUNCATE(X))` cannot cancel for
+free -- it must materialize an explicit mask, restoring the dropped
+`and rd,rd,<mask>`.
+
+Adds llvm/test/CodeGen/DADAO/negative-polarity-bitand-mask.ll covering
+both polarities, masks 1/2/4/0xff, comparisons eq0/ne0/eq1/not, and
+widths i8/i16/i32/i64.
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   |  25 ++
+ .../DADAO/negative-polarity-bitand-mask.ll    | 390 ++++++++++++++++++
+ 2 files changed, 415 insertions(+)
+ create mode 100644 llvm/test/CodeGen/DADAO/negative-polarity-bitand-mask.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 6717840c889e..24795d240b06 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -41,6 +41,31 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+     : TargetLowering(TM, STI) {
+   addRegisterClass(MVT::i64, &DADAO::GPRDRegClass);
+ 
++  // DADAO's boolean values are ALWAYS a genuine zero-or-one value across the
++  // full register width, never "any bits above bit 0 may be garbage":
++  // lowerSETCC (below) materializes every condition code via cmps/cmpu +
++  // shru-by-63/sub/or chains that produce exactly 0 or 1 in all 64 bits, and
++  // the actual branch instructions (BRNZ/BRZ, selected for BRCOND/BR_CC)
++  // test the FULL register for non-zero-ness -- they do not mask to bit 0
++  // themselves. The TargetLowering default is UndefinedBooleanContent, which
++  // tells generic SelectionDAG legalization it is free to widen a narrower
++  // i1 boolean into this target's legal type via ANY_EXTEND (leaving upper
++  // bits as "rubbish") instead of ZERO_EXTEND. That default is wrong for
++  // this target and is silently unsound: when the DAGCombiner collapses a
++  // single-bit AND-and-compare-to-zero pattern into a bare
++  // `truncate(loadedByte, i1)` (as it does for the negative-polarity shape
++  // `(x & 1) == 0` at -O0, see docs/issues.yaml
++  // dadao-o0-negative-polarity-bitand-mask-dropped), promoting that i1 for
++  // BRCOND consumption under UndefinedBooleanContent uses ANY_EXTEND, and
++  // `ANY_EXTEND(TRUNCATE(X))` algebraically collapses straight through to a
++  // bare any-extending load of X with NO masking at all -- so BRNZ ends up
++  // testing whether the whole loaded byte is non-zero instead of whether
++  // bit 0 is set. Declaring ZeroOrOneBooleanContent forces that same
++  // widening to use ZERO_EXTEND instead, under which
++  // `ZERO_EXTEND(TRUNCATE(X))` cannot cancel away for free -- it must
++  // materialize an explicit mask -- restoring the dropped `and rd,rd,1`.
++  setBooleanContents(ZeroOrOneBooleanContent);
++
+   setOperationAction(ISD::ADD, MVT::i64, Legal);
+   setOperationAction(ISD::SUB, MVT::i64, Legal);
+ 
+diff --git a/llvm/test/CodeGen/DADAO/negative-polarity-bitand-mask.ll b/llvm/test/CodeGen/DADAO/negative-polarity-bitand-mask.ll
+new file mode 100644
+index 000000000000..d50ffad3fd56
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/negative-polarity-bitand-mask.ll
+@@ -0,0 +1,390 @@
++; RUN: llc -O0 -mtriple=dadao < %s | FileCheck %s
++
++; ML-036a: regression guard for
++; docs/issues.yaml `dadao-o0-negative-polarity-bitand-mask-dropped`.
++;
++; Root cause: DADAOTargetLowering never declared its boolean-content
++; invariant, leaving the TargetLowering default of UndefinedBooleanContent.
++; This target's actual invariant is ZeroOrOneBooleanContent (every
++; DADAOTargetLowering::lowerSETCC arm materializes a genuine 0-or-1 value
++; across the full register, and BRNZ/BRZ test the full register for
++; non-zero-ness, they do not mask to bit 0 themselves). Under the wrong
++; default, generic SelectionDAG legalization is permitted to widen a
++; narrower i1 boolean for BRCOND consumption via ANY_EXTEND instead of
++; ZERO_EXTEND (TargetLowering::promoteTargetBoolean). At -O0 (clang always
++; marks the function `optnone`, forcing CodeGenOptLevel::None for the whole
++; SelectionDAG pipeline regardless of llc's own -O flag), a DAGCombine
++; collapses the "AND(x,1) then compare-to-zero, take the ELSE arm on true"
++; shape directly into a bare `truncate(loadedByte, i1)`; re-widening that i1
++; for BRCOND via ANY_EXTEND then collapses `ANY_EXTEND(TRUNCATE(X))`
++; straight through to an unmasked load, because ANY_EXTEND licenses
++; "rubbish" upper bits -- so BRNZ ends up testing whether the whole loaded
++; byte is non-zero instead of whether bit 0 is set. Declaring
++; ZeroOrOneBooleanContent forces the same widening through ZERO_EXTEND,
++; under which `ZERO_EXTEND(TRUNCATE(X))` cannot cancel for free -- it must
++; materialize an explicit `and rd,rd,<mask>` -- restoring the dropped mask.
++;
++; Every function below must retain (or, for the mask=0xff case, does not
++; need, see below) an explicit AND mask before the branch that decides the
++; return value; ground-truth (native-host-execution) differential testing
++; independently confirmed 0/1152 runtime divergences post-fix across the
++; full width x mask x comparison x polarity cross product (see
++; docs/reviews/ML-036a-*.md).
++
++; ---- Original repro: negative polarity, mask=1, `(l & 1) == 0` ----
++; CHECK-LABEL: negEq0Mask1_i32:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negEq0Mask1_i32(i32 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i32, align 4
++  store i32 %l, ptr %l.addr, align 4
++  %0 = load i32, ptr %l.addr, align 4
++  %and = and i32 %0, 1
++  %cmp = icmp eq i32 %and, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; ---- Same shape, positive polarity: this already worked pre-fix and must
++; ---- keep working (regression guard against over-correcting) ----
++; CHECK-LABEL: posNe0Mask1_i32:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brz [[R]],
++define dso_local i32 @posNe0Mask1_i32(i32 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i32, align 4
++  store i32 %l, ptr %l.addr, align 4
++  %0 = load i32, ptr %l.addr, align 4
++  %and = and i32 %0, 1
++  %cmp = icmp ne i32 %and, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; ---- `!(l & 1)` idiom, negative polarity ----
++; CHECK-LABEL: negNotMask1_i32:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negNotMask1_i32(i32 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i32, align 4
++  store i32 %l, ptr %l.addr, align 4
++  %0 = load i32, ptr %l.addr, align 4
++  %and = and i32 %0, 1
++  %tobool = icmp ne i32 %and, 0
++  br i1 %tobool, label %if.else, label %if.then
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; ---- Width sweep at mask=1, `== 0`, negative polarity ----
++; CHECK-LABEL: negEq0Mask1_i64:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negEq0Mask1_i64(i64 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i64, align 8
++  store i64 %l, ptr %l.addr, align 8
++  %0 = load i64, ptr %l.addr, align 8
++  %and = and i64 %0, 1
++  %cmp = icmp eq i64 %and, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; CHECK-LABEL: negEq0Mask1_i8:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negEq0Mask1_i8(i8 noundef signext %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i8, align 1
++  store i8 %l, ptr %l.addr, align 1
++  %0 = load i8, ptr %l.addr, align 1
++  %conv = sext i8 %0 to i32
++  %and = and i32 %conv, 1
++  %cmp = icmp eq i32 %and, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; CHECK-LABEL: negEq0Mask1_i16:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negEq0Mask1_i16(i16 noundef signext %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i16, align 2
++  store i16 %l, ptr %l.addr, align 2
++  %0 = load i16, ptr %l.addr, align 2
++  %conv = sext i16 %0 to i32
++  %and = and i32 %conv, 1
++  %cmp = icmp eq i32 %and, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; ---- Width sweep, `!(l & 1)` idiom, negative polarity ----
++; CHECK-LABEL: negNotMask1_i64:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negNotMask1_i64(i64 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i64, align 8
++  store i64 %l, ptr %l.addr, align 8
++  %0 = load i64, ptr %l.addr, align 8
++  %and = and i64 %0, 1
++  %tobool = icmp ne i64 %and, 0
++  br i1 %tobool, label %if.else, label %if.then
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; CHECK-LABEL: negNotMask1_i8:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negNotMask1_i8(i8 noundef signext %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i8, align 1
++  store i8 %l, ptr %l.addr, align 1
++  %0 = load i8, ptr %l.addr, align 1
++  %conv = sext i8 %0 to i32
++  %and = and i32 %conv, 1
++  %tobool = icmp ne i32 %and, 0
++  br i1 %tobool, label %if.else, label %if.then
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; CHECK-LABEL: negNotMask1_i16:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negNotMask1_i16(i16 noundef signext %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i16, align 2
++  store i16 %l, ptr %l.addr, align 2
++  %0 = load i16, ptr %l.addr, align 2
++  %conv = sext i16 %0 to i32
++  %and = and i32 %conv, 1
++  %tobool = icmp ne i32 %and, 0
++  br i1 %tobool, label %if.else, label %if.then
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; ---- Mask sweep at i32, `== 0`, negative polarity: proves the fix is not
++; ---- special-cased to bit 0 / mask=1 ----
++; CHECK-LABEL: negEq0Mask2_i32:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negEq0Mask2_i32(i32 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i32, align 4
++  store i32 %l, ptr %l.addr, align 4
++  %0 = load i32, ptr %l.addr, align 4
++  %and = and i32 %0, 2
++  %cmp = icmp eq i32 %and, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; CHECK-LABEL: negEq0Mask4_i32:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negEq0Mask4_i32(i32 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i32, align 4
++  store i32 %l, ptr %l.addr, align 4
++  %0 = load i32, ptr %l.addr, align 4
++  %and = and i32 %0, 4
++  %cmp = icmp eq i32 %and, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; mask=0xff is the one case that legitimately does NOT need an explicit AND:
++; `ldbu` (load byte, zero-extending) already clears every bit above bit 7,
++; which is exactly what "& 0xff" does -- the load itself IS the mask, and
++; requiring a redundant `and` here would be asserting the wrong invariant.
++; CHECK-LABEL: negEq0MaskFF_i32:
++; CHECK: ldbu [[R:rd[0-9]+]],
++; CHECK-NEXT: brnz [[R]],
++define dso_local i32 @negEq0MaskFF_i32(i32 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i32, align 4
++  store i32 %l, ptr %l.addr, align 4
++  %0 = load i32, ptr %l.addr, align 4
++  %and = and i32 %0, 255
++  %cmp = icmp eq i32 %and, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++; ---- Comparison variety: `== 1` instead of `== 0`, still negative polarity
++; ---- (true/if.then arm is NOT taken when the tested bit is set) ----
++; CHECK-LABEL: negEq1Mask1_i32:
++; CHECK: and [[R:rd[0-9]+]], [[R]], {{rd[0-9]+}}
++; CHECK-NEXT: brz [[R]],
++define dso_local i32 @negEq1Mask1_i32(i32 noundef %l) #0 {
++entry:
++  %retval = alloca i32, align 4
++  %l.addr = alloca i32, align 4
++  store i32 %l, ptr %l.addr, align 4
++  %0 = load i32, ptr %l.addr, align 4
++  %and = and i32 %0, 1
++  %cmp = icmp eq i32 %and, 1
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i32 0, ptr %retval, align 4
++  br label %return
++
++if.else:
++  store i32 1, ptr %retval, align 4
++  br label %return
++
++return:
++  %1 = load i32, ptr %retval, align 4
++  ret i32 %1
++}
++
++attributes #0 = { noinline nounwind optnone "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
+-- 
+2.43.0
+

@@ -1308,3 +1308,125 @@
   # differential DIVERGE=0；1708 sweep 仍为 1438/104/131/35，和修复前
   # JSON 逐文件 STATUS_MISMATCH=0。最终 patch 0060 为 816 行，commit 与
   # patch stable patch-id 均为 0fc8ec3758064b86133aa6c8d0a396fdbaec576b。
+
+- id: dadao-o0-negative-polarity-bitand-mask-dropped
+  title: "At -O0 only, a single-bit AND-and-compare-to-zero test written in NEGATIVE polarity (`if ((x & 1) == 0)` / `if (!(x & 1))`, i.e. the true branch is the ELSE arm) silently drops the `and rd,rd,1` masking instruction entirely and branches on the raw unmasked byte instead -- for an input like x=2 (0b010: bit 0 clear, byte nonzero), this returns the WRONG branch result with no compile/link/fault error, just a silently wrong answer. Architect-reproduced independently with a 3-line minimal repro (testMask1(2) returns 0 at -O0, expected 1; returns 1 correctly at -O2)"
+  status: closed
+  scope: [codegen, correctness, isel]
+  blocks: "gcc-c-torture 931102-1.c/931102-2.c (confirmed), 960608-1.c (strongly suspected same root-cause family, not yet isolated to one minimal trigger)"
+  resolved_by: "ML-036a; LLVM DADAOISelLowering.cpp setBooleanContents(ZeroOrOneBooleanContent)"
+  # Found during ML-035a's gcc-c-torture gap re-scan (2026-07-24), correcting
+  # a mis-classification in ML-026a's original report (931102-1.c/931102-2.c
+  # had been lumped into a 12-file "struct-by-value vararg" cluster -- direct
+  # source inspection shows neither file uses va_arg/va_list/stdarg.h at all;
+  # they are K&R-style union/bitfield "count trailing zero bit" tests). The
+  # other 10 files in that original cluster are confirmed genuinely PASS now
+  # (ML-031a aggregate ABI + ML-034a hosted-mode fixes), including
+  # pr38151.c (tracked separately as
+  # dadao-complex-vararg-padded-struct-field-corruption).
+  #
+  # Architect independently reproduced with a minimal, from-scratch repro
+  # (not just trusting the subagent report):
+  #   __attribute__((noinline)) int testMask1(int l) {
+  #     if ((l & 1) == 0) { return 1; } else { return 0; }
+  #   }
+  #   int main() { return testMask1(2); }
+  # -O0 generates NO `and` instruction at all for the masking: instead it
+  # stores the parameter to a stack slot, computes address (stack_slot + 3)
+  # (the low byte of the big-endian-stored 4-byte value), loads that single
+  # byte with `ldbu`, and branches on whether that BYTE is nonzero --
+  # equivalent to testing "is x nonzero" instead of "is bit 0 of x set".
+  # For x=2 (byte value 2, nonzero, but bit 0 clear), this produces the
+  # opposite of the correct branch. Confirmed via full source->QEMU
+  # execution: -O0 build exits 0 (wrong, expected 1); an -O2 build of the
+  # IDENTICAL source exits 1 (correct) -- the bug is specific to whatever
+  # -O0's (lack of) DAGCombine/isel path takes for this exact IR shape.
+  # The POSITIVE-polarity equivalent (`if (l & 1)` / `if ((l&1) != 0)`)
+  # compiles correctly at -O0 (real `and rd,rd,1` emitted, then
+  # brz/brnz on the masked result) -- only the negated/negative-polarity
+  # form loses the mask.
+  #
+  # ML-035a additionally found a suspected second instance in 960608-1.c
+  # (bitfield read, `flags->c != 0` sub-condition inside a `||` chain) with
+  # the same "and instruction missing" signature in the generated .s, but
+  # could not isolate it to a single minimal trigger independent of the
+  # bitfield-through-pointer / adjacent-short-circuit-subexpression context
+  # -- left as "strongly suspected same family, not confirmed identical
+  # root cause" pending a dedicated MIR-level diagnosis
+  # (-print-after-all/-debug-only=isel).
+  #
+  # Severity note (why this is P0 despite only 2-3/1708 files hit): this is
+  # a SILENT wrong-answer miscompile, not a compile/link/runtime-fault
+  # failure -- `if (!(x & 1))` (parity/flag-clear tests),
+  # `while ((x & mask) == 0)` (find-lowest-set-bit loops), and single-bit
+  # bitfield reads are all extremely common real C idioms. The low torture-
+  # corpus hit count is likely luck (most exercised inputs don't happen to
+  # land in the "byte nonzero but target bit clear" trap), not evidence the
+  # real-world risk surface is small. This is scoped as -O0-only currently;
+  # not yet checked whether other optimization levels or other bit
+  # positions/widths (not just bit 0) can trigger a related shape.
+  #
+  # ML-036a resolution (2026-07-24): root cause is that DADAOTargetLowering
+  # never called setBooleanContents(), leaving the TargetLowering default of
+  # UndefinedBooleanContent -- wrong for this target, whose actual invariant
+  # is ZeroOrOneBooleanContent (every lowerSETCC arm materializes a genuine
+  # 0-or-1 value across the full register via cmps/cmpu + shru-by-63/sub/or
+  # chains, and BRNZ/BRZ test the FULL register for non-zero-ness, they do
+  # not mask to bit 0 themselves). Under the wrong default,
+  # TargetLowering::promoteTargetBoolean widens a narrower i1 boolean for
+  # BRCOND consumption via ANY_EXTEND instead of ZERO_EXTEND. At -O0 (clang
+  # always marks the function `optnone`, forcing CodeGenOptLevel::None for
+  # SelectionDAG regardless of llc's own -O flag -- confirmed directly:
+  # `llc -O0` and `llc -O2` on the SAME optnone .ll produce byte-for-byte
+  # identical, both-buggy assembly), a generic DAGCombiner fold ("fold not
+  # (setcc x, y, cc) -> setcc x y !cc" in visitXOR, DAGCombiner.cpp)
+  # collapses the "AND(x,1) compared to 0, NOT'd for the else-arm branch"
+  # shape down to a bare `truncate(loadedByte, i1)` for this exact IR
+  # ordering; re-widening that i1 for BRCOND via ANY_EXTEND then collapses
+  # `ANY_EXTEND(TRUNCATE(X))` straight through to an unmasked load, because
+  # ANY_EXTEND licenses "rubbish" upper bits -- so BRNZ ends up testing
+  # whether the whole loaded byte is non-zero instead of whether bit 0 is
+  # set. The positive-polarity sibling did NOT hit this fold (kept an
+  # explicit AND+SETCC through to instruction selection) which is why it
+  # was never affected. Declaring ZeroOrOneBooleanContent forces the same
+  # widening through ZERO_EXTEND, under which `ZERO_EXTEND(TRUNCATE(X))`
+  # cannot cancel for free -- it must materialize an explicit mask,
+  # restoring the dropped `and rd,rd,<mask>`.
+  #
+  # Fix: one line, `setBooleanContents(ZeroOrOneBooleanContent);` added to
+  # the DADAOTargetLowering constructor (llvm/lib/Target/DADAO/
+  # DADAOISelLowering.cpp).
+  #
+  # 960608-1.c CONFIRMED same root cause (not just "turned green
+  # coincidentally"): direct .s comparison of the pre-fix vs post-fix build
+  # shows the function's FIRST `||` sub-condition (`flags->c != 0`, a
+  # bitfield read compiled to shru+and+brnz) is missing exactly the same
+  # `and rd16,rd16,1` after the `shru` pre-fix, with the fix restoring it in
+  # exactly the same position -- the other sub-conditions in the same `||`
+  # chain already had their `and` pre-fix (they take a different DAG path)
+  # and are byte-identical before/after the fix.
+  #
+  # Generality verification (ground-truth, not hand-derived expected
+  # values): a 128-function x 9-input (1152-vector) matrix crossing 4
+  # widths (int/long/char/short) x 4 masks (1/2/4/0xff) x 4 comparisons
+  # (eq0/ne0/eq1/not) x 2 polarities was compiled and run BOTH natively on
+  # the host (ground truth) and via the DADAO QEMU pipeline; post-fix, 0/1152
+  # vectors diverge from host ground truth (pre-fix: 45/1152 diverged,
+  # spanning exactly 9/128 function shapes, ALL mask=1, ALL semantically
+  # "masked-result-is-zero", spanning int/char/short but NOT long -- the
+  # positive-polarity and mask!=1 shapes were never affected, consistent
+  # with the diagnosed mechanism).
+  #
+  # Full regression: gcc-c-torture 1708-file sweep re-run file-by-file
+  # against the pre-fix baseline shows exactly 3 files changed
+  # (931102-1.c/931102-2.c/960608-1.c, all FAIL_RUN -> PASS) and 0
+  # regressions among the other 1705 (1461/104/125/18 -> 1464/104/125/15).
+  # llvm-lit tests/lit/E2E 78/78 (77 baseline + 1 new regression test), 0
+  # regressions. tools/run_differential.py AGREE(4-way)=200/DIVERGE=0,
+  # unchanged from baseline (spec-vector harness, does not exercise codegen
+  # but confirmed unaffected). New CodeGen lit test
+  # llvm/test/CodeGen/DADAO/negative-polarity-bitand-mask.ll (13 functions)
+  # and E2E test tests/lit/E2E/negative_polarity_bitand_mask.test (volatile
+  # inputs + accumulating, non-short-circuiting negative control) both
+  # independently verified to FAIL against the pre-fix compiler and PASS
+  # against the post-fix compiler.
