@@ -1601,3 +1601,10 @@ bare manifest-pin checkout and confirmed the tree hash matches
 the single highest-priority item on ML-035a's list; remaining: `__divsc3`
 (1 file), the vector-legalizer/`__int128` calling-convention cluster (17
 files), `BlockAddress` (3 files), and two low-priority singletons.
+
+## ML-037a: implement `__divsc3` (2026-07-24) — see `code-agent/tasks/ML-037a-implement-divsc3-softfloat-shim.md` 完成区
+
+Closes the last known FAIL_LINK gap (`complex-5.c`, single-precision
+complex division per C99 Annex G). gcc-c-torture: 1464→1465/1708
+(85.8%), zero regressions. Full E2E/differential/manifest/issues pass;
+musl 14-patch series replays clean with matching tree hash.
