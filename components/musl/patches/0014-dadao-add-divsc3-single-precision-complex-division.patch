@@ -1,0 +1,330 @@
+From 69cadae0aa190d6ed250d6646061bc8aba3950b7 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 21:12:46 +0800
+Subject: [PATCH] dadao: add __divsc3 single-precision complex division
+ (ML-037a)
+
+Closes the last softfloat_shim.c symbol gap ML-028a deferred
+(docs/issues.yaml musl-softfloat-shim-missing-divsc3): gcc-c-torture's
+complex-5.c is the only corpus file needing it (`y = p(x, 1.0f / z)`,
+a real-divided-by-complex-float expression).
+
+Ports compiler-rt's divsc3.c (Smith's method + full C99 Annex G
+NaN/Inf/zero recovery) using this file's established bit-pattern-only
+methodology: new logbf/scalbnf/isnan/isinf/fabs/copysign helpers
+(ilogbAbsF32/scalbnF32/isnanF32/isinfF32/isfiniteF32/fabsF32Rep/
+copysignF32Rep/fmaxAbsF32), reusing the existing __addsf3/__subsf3/
+__mulsf3/__divsf3 for arithmetic instead of native float operators.
+
+Verified: standalone dadao-target compile with the real musl build
+flags is clean (0 undefined symbols); ELF relocation records for
+.text.__divsc3 show every call resolves to __mulsf3/__addsf3/__divsf3/
+__eqsf2/__nesf2/__unordsf2 (already-verified, non-recursive) -- zero
+self-recursive calls. Host fuzz harness (renamed symbols, direct
+#include of this file, oracle is a literal statement-by-statement
+transcription of divsc3.c compiled with -ffp-contract=off to avoid
+FMA-fusion false mismatches) found 0 mismatches across ~8.28M checks
+(279,841 explicit NaN/Inf/0/subnormal boundary cross-product vectors +
+named per-Annex-G-branch cases + random fuzz), and 7 independent
+negative controls (breaking fmaxAbsF32's NaN handling, ilogbAbsF32's
+exponent bias, scalbnF32's overflow saturation and tie-rounding, and
+each of __divsc3's three Annex G recovery branch conditions) were all
+caught immediately.
+
+complex-5.c: FAIL_LINK -> PASS. Full gcc-c-torture corpus: 1465/104/
+124/15 (was 1464/104/125/15) -- exactly the expected +1 PASS/-1
+FAIL_LINK delta, zero other file changed status. E2E lit 78/78,
+run_differential AGREE(4-way)=200/DIVERGE=0, both unchanged (this
+task does not touch instruction semantics).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ src/internal/dadao/softfloat_shim.c | 275 ++++++++++++++++++++++++++++
+ 1 file changed, 275 insertions(+)
+
+diff --git a/src/internal/dadao/softfloat_shim.c b/src/internal/dadao/softfloat_shim.c
+index a56fce89..84f2f4a9 100644
+--- a/src/internal/dadao/softfloat_shim.c
++++ b/src/internal/dadao/softfloat_shim.c
+@@ -1682,3 +1682,278 @@ long long __fixsfdi(float a) {
+    * `float` here (see file-header self-recursion note). */
+   return negative ? -(long long)mag : (long long)mag;
+ }
++
++/* ============================================================================
++ * ML-037a: __divsc3 (single-precision complex division), the one symbol
++ * ML-028a's own file-header comment above deferred as a separate task
++ * (docs/issues.yaml musl-softfloat-shim-missing-divsc3) -- the only
++ * gcc-c-torture file that needs it is complex-5.c (`y = p(x, 1.0f / z)`,
++ * a real-divided-by-complex-float expression; complex-6.c/complex-7.c only
++ * need construction/equality, already covered by the compare family above).
++ *
++ * Algorithm: Smith's method with the full C99 Annex G NaN/Inf/zero edge-case
++ * recovery, ported line-for-line from compiler-rt's authoritative reference
++ * (lib/builtins/divsc3.c, using its fp_lib.h helpers
++ * __compiler_rt_logbf/__compiler_rt_scalbnf/__compiler_rt_fmaxX and
++ * int_math.h's crt_isnan/crt_isinf/crt_isfinite/crt_copysignf). Same rules
++ * as the rest of this file (see the very first header comment at the top):
++ * every operation below only touches the raw uint32_t bit pattern of a
++ * float operand and reuses this file's own __addsf3/__subsf3/__mulsf3/
++ * __divsf3 for the actual arithmetic -- never a native `+ - * /` applied
++ * directly to a float value (self-recursion), and no new libcall dependency
++ * is introduced (in particular, no `__fixsfsi`: DADAO's float->int32
++ * truncation libcall was never exercised by anything in this file before
++ * this task and is not otherwise known to exist for this target).
++ *
++ * logb/scalbn shape: compiler-rt's __compiler_rt_logbf returns a `float`
++ * (the unbiased exponent, converted to a float) that divsc3.c then round-
++ * trips back through a native `(int)` cast. This port instead keeps that
++ * exponent as a plain `int` end-to-end (ilogbAbsF32 below) rather than
++ * round-tripping it through a float bit pattern and back -- behaviorally
++ * identical for every input divsc3.c can ever pass it (a finite float's
++ * unbiased exponent is always in [-149, 127], comfortably exactly
++ * representable as a float, so compiler-rt's own float round-trip is
++ * itself lossless) and it sidesteps needing a float->int32 conversion
++ * helper this file has no other use for. __compiler_rt_scalbnf's semantics
++ * (including its saturating exponent add and its rounding on
++ * overflow/underflow) are reproduced in full by scalbnF32 below, which
++ * reuses rightShiftWithStickyRep for the denormal/underflow rounding step
++ * -- the same helper __truncdfsf2/__mulsf3/__divsf3 already use above --
++ * instead of compiler-rt's "construct a power-of-two float and multiply"
++ * trick (which would itself be a native float multiply).
++ */
++
++/* ---- isnan / isinf / isfinite / fabs / copysign, f32 bit-pattern only ----
++ *
++ * Not previously in this file (every earlier comparison function above
++ * open-codes its own NaN/inf test inline); factored out here as named,
++ * reusable helpers because __divsc3's Annex G recovery logic below needs
++ * many of them, matching this task's own required infrastructure list.
++ */
++
++static __inline int isnanF32(unsigned int rep) {
++  return (rep & (unsigned int)F32_ABS_MASK) > (unsigned int)F32_INF_REP;
++}
++
++static __inline int isinfF32(unsigned int rep) {
++  return (rep & (unsigned int)F32_ABS_MASK) == (unsigned int)F32_INF_REP;
++}
++
++static __inline int isfiniteF32(unsigned int rep) {
++  return (rep & (unsigned int)F32_ABS_MASK) < (unsigned int)F32_INF_REP;
++}
++
++static __inline int iszeroF32(unsigned int rep) {
++  return (rep & (unsigned int)F32_ABS_MASK) == 0;
++}
++
++/* fabsf, bit-pattern only: clear the sign bit. */
++static __inline unsigned int fabsF32Rep(unsigned int rep) {
++  return rep & (unsigned int)F32_ABS_MASK;
++}
++
++/* copysignf, bit-pattern only: magnitude of `magRep`, sign of `signRep`. */
++static __inline unsigned int copysignF32Rep(unsigned int magRep, unsigned int signRep) {
++  return (magRep & (unsigned int)F32_ABS_MASK) | (signRep & (unsigned int)F32_SIGN_BIT);
++}
++
++/* ---- fmaxAbsF32 ----
++ *
++ * __compiler_rt_fmaxX(fabsf(c), fabsf(d)) specialized to two bit patterns
++ * that are already nonnegative-or-NaN (fabsF32Rep's result: fabs clears the
++ * sign bit even on a NaN payload) -- exactly compiler-rt's
++ * `(crt_isnan(x) || x < y) ? y : x`, using native `<` on IEEE floats where
++ * an unordered (NaN-involving) comparison is always false. Both inputs
++ * being nonnegative-or-NaN with sign bit 0 means, once NaN is handled
++ * explicitly, a plain unsigned integer compare of the two bit patterns is
++ * exactly equivalent to the IEEE ordered `<` (bit pattern increases
++ * monotonically with magnitude for nonnegative floats).
++ */
++static __inline unsigned int fmaxAbsF32(unsigned int xAbs, unsigned int yAbs) {
++  if (isnanF32(xAbs))
++    return yAbs; /* x is NaN: unconditionally return y */
++  if (isnanF32(yAbs))
++    return xAbs; /* y is NaN (x isn't): x < y is unordered -> false, return x */
++  return (xAbs < yAbs) ? yAbs : xAbs;
++}
++
++/* ---- ilogbAbsF32 ----
++ *
++ * __compiler_rt_logbX (fp_lib.h), specialized: the input is always a
++ * nonnegative-or-NaN bit pattern (fmaxAbsF32's result above, sign bit
++ * always 0), so the general algorithm's "negative sign, -inf" branch
++ * (`return -x` for -infinity input) can never trigger here and is omitted.
++ *
++ * *isSpecial is set to 1 exactly when logb(x) would not be a genuine finite
++ * value (x is NaN, +inf, or +/-0 -- logb(0) = -inf), matching divsc3.c's
++ * `crt_isfinite(__logbw)` guard around the rescale step; the returned int
++ * is meaningless when *isSpecial is set (mirrors the reference leaving
++ * __ilogbw at its initial 0 in that case). Otherwise *isSpecial is set to 0
++ * and the return value is the finite unbiased exponent.
++ */
++static __inline int ilogbAbsF32(unsigned int xAbs, int *isSpecial) {
++  int exp = (int)(xAbs >> F32_SIG_BITS);
++
++  if (exp == F32_MAX_EXP) { /* NaN or +inf (sign already known 0) */
++    *isSpecial = 1;
++    return 0;
++  }
++  if (xAbs == 0) {
++    *isSpecial = 1; /* logb(0) = -inf: also "not finite" */
++    return 0;
++  }
++
++  *isSpecial = 0;
++  if (exp != 0)
++    return exp - F32_EXP_BIAS; /* normal */
++
++  /* Subnormal, nonzero: normalize and repeat, exactly like normalize()/
++   * normalizeF32() are used elsewhere in this file. */
++  unsigned int sig = xAbs;
++  const int shift = 1 - normalizeF32(&sig);
++  exp = (int)(sig >> F32_SIG_BITS);
++  return exp - F32_EXP_BIAS - shift;
++}
++
++/* ---- scalbnF32 ----
++ *
++ * __compiler_rt_scalbnX (fp_lib.h), ported to operate directly on the bit
++ * pattern. Unlike ilogbAbsF32 above, scalbnF32 is called on __c/__d (and,
++ * for the final rescale, on the raw division results) themselves, which
++ * can carry either sign -- so, unlike ilogbAbsF32, the sign is tracked
++ * generically rather than assumed 0.
++ */
++static __inline unsigned int scalbnF32(unsigned int xRep, int y) {
++  const unsigned int sign = xRep & (unsigned int)F32_SIGN_BIT;
++  const unsigned int xAbs = xRep & (unsigned int)F32_ABS_MASK;
++  int exp = (int)(xAbs >> F32_SIG_BITS);
++
++  if (xAbs == 0 || exp == F32_MAX_EXP)
++    return xRep; /* +/-0, NaN, or +/-inf: unchanged (matches __compiler_rt_scalbnX) */
++
++  unsigned int sig = xAbs & (unsigned int)F32_SIG_MASK;
++  if (exp == 0) {
++    /* Subnormal input: normalize first (matches __compiler_rt_scalbnX). */
++    exp += normalizeF32(&sig);
++    sig &= (unsigned int)F32_SIG_MASK; /* strip the implicit bit normalizeF32 just set */
++  }
++
++  /* Saturating exp+y add, done in a wider integer type rather than
++   * compiler-rt's `__builtin_sadd_overflow` -- exp is bounded to roughly
++   * [-149, 254] and y is a caller-supplied int, so a 64-bit intermediate
++   * can never itself overflow; saturating far enough out just guarantees
++   * the overflow/underflow path below fires (the exact saturated value is
++   * otherwise irrelevant, same as compiler-rt's own comment). */
++  long long wideExp = (long long)exp + (long long)y;
++  if (wideExp > (long long)F32_MAX_EXP)
++    wideExp = (long long)F32_MAX_EXP;
++  else if (wideExp < -(long long)(F32_SIG_BITS + 4 + F32_EXP_BIAS))
++    wideExp = -(long long)(F32_SIG_BITS + 4 + F32_EXP_BIAS);
++  exp = (int)wideExp;
++
++  if (exp >= F32_MAX_EXP)
++    return sign | ((unsigned int)F32_MAX_EXP << F32_SIG_BITS); /* overflow -> +/-inf */
++
++  if (exp <= 0) {
++    /* Underflow to a subnormal or exact zero. Widen the 24-bit (implicit-
++     * bit-included) significand into a rep_t and reuse
++     * rightShiftWithStickyRep + the same "3 guard/round/sticky bits,
++     * round-to-nearest-even" convention __truncdfsf2's/__mulsf3's own
++     * denormal paths use above -- not compiler-rt's "construct a
++     * power-of-two float and multiply" trick, which would itself be a
++     * native float multiply (self-recursion). */
++    const rep_t fullSig = (rep_t)((unsigned int)F32_IMPLICIT_BIT | sig) << 3;
++    const unsigned int shift = (unsigned int)(1 - exp);
++    const rep_t shifted = rightShiftWithStickyRep(fullSig, shift);
++    const int roundGuardSticky = (int)(shifted & 0x7);
++
++    unsigned int result = sign;
++    result |= (unsigned int)(shifted >> 3) & (unsigned int)F32_SIG_MASK;
++    /* exponent field is 0 (denormal-or-zero) -- nothing to OR in. */
++
++    if (roundGuardSticky > 0x4)
++      result++;
++    else if (roundGuardSticky == 0x4)
++      result += result & 1;
++    return result;
++  }
++
++  return sign | ((unsigned int)exp << F32_SIG_BITS) | sig;
++}
++
++/* ---- __divsc3 ----
++ *
++ * Returns (a+ib) / (c+id). Ported line-for-line from compiler-rt's
++ * divsc3.c (see this section's header comment above): ilogbAbsF32/
++ * scalbnF32 stand in for __compiler_rt_logbf/__compiler_rt_scalbnf, and
++ * __addsf3/__subsf3/__mulsf3/__divsf3 stand in for native `+ - * /`.
++ *
++ * `float _Complex` is used directly (matching compiler-rt's own Fcomplex,
++ * which on any C99 compiler -- see compiler-rt's int_types.h -- is simply
++ * `typedef float _Complex Fcomplex`, with COMPLEX_REAL/COMPLEX_IMAGINARY
++ * defined as __real__/__imag__): this is a compile-time struct-field-style
++ * accessor, not an arithmetic operation, so using it here does not risk
++ * the self-recursion this file's other functions guard against. Clang's
++ * DADAO ABI classification (clang/lib/CodeGen/Targets/DADAO.cpp) applies
++ * identically to this function's return type and to the call site Clang
++ * itself generates for a complex division expression
++ * (CGExprComplex.cpp's EmitComplexBinOpLibCall), so no manual register-
++ * packing is needed here -- both sides are classified the same way by the
++ * same compiler.
++ */
++float _Complex __divsc3(float a, float b, float c, float d) {
++  const unsigned int aRep = toRepF32(a);
++  const unsigned int bRep = toRepF32(b);
++
++  const unsigned int maxCDAbs = fmaxAbsF32(fabsF32Rep(toRepF32(c)), fabsF32Rep(toRepF32(d)));
++  int isSpecialLogbw;
++  const int ilogbw = ilogbAbsF32(maxCDAbs, &isSpecialLogbw);
++
++  if (!isSpecialLogbw) {
++    c = fromRepF32(scalbnF32(toRepF32(c), -ilogbw));
++    d = fromRepF32(scalbnF32(toRepF32(d), -ilogbw));
++  }
++
++  const float denom = __addsf3(__mulsf3(c, c), __mulsf3(d, d));
++  float realPart = fromRepF32(scalbnF32(
++      toRepF32(__divsf3(__addsf3(__mulsf3(a, c), __mulsf3(b, d)), denom)), -ilogbw));
++  float imagPart = fromRepF32(scalbnF32(
++      toRepF32(__divsf3(__subsf3(__mulsf3(b, c), __mulsf3(a, d)), denom)), -ilogbw));
++
++  if (isnanF32(toRepF32(realPart)) && isnanF32(toRepF32(imagPart))) {
++    if (iszeroF32(toRepF32(denom)) && (!isnanF32(aRep) || !isnanF32(bRep))) {
++      const float infC = fromRepF32(copysignF32Rep((unsigned int)F32_INF_REP, toRepF32(c)));
++      realPart = __mulsf3(infC, a);
++      imagPart = __mulsf3(infC, b);
++    } else if ((isinfF32(aRep) || isinfF32(bRep)) && isfiniteF32(toRepF32(c)) &&
++               isfiniteF32(toRepF32(d))) {
++      const float aSign = fromRepF32(copysignF32Rep(
++          toRepF32(isinfF32(aRep) ? 1.0f : 0.0f), aRep));
++      const float bSign = fromRepF32(copysignF32Rep(
++          toRepF32(isinfF32(bRep) ? 1.0f : 0.0f), bRep));
++      const float infConst = fromRepF32((unsigned int)F32_INF_REP);
++      realPart = __mulsf3(infConst, __addsf3(__mulsf3(aSign, c), __mulsf3(bSign, d)));
++      imagPart = __mulsf3(infConst, __subsf3(__mulsf3(bSign, c), __mulsf3(aSign, d)));
++    } else if (isinfF32(maxCDAbs) && isfiniteF32(aRep) && isfiniteF32(bRep)) {
++      /* maxCDAbs == +inf here is exactly compiler-rt's `crt_isinf(__logbw)
++       * && __logbw > 0`: logbw can only ever be +inf (from an infinite c or
++       * d) or -inf (from logb(0), i.e. both c and d zero) -- maxCDAbs, being
++       * itself always a nonnegative-or-NaN magnitude, can only match the
++       * +inf bit pattern in the former case, never signal the latter. */
++      const unsigned int cRep = toRepF32(c);
++      const unsigned int dRep = toRepF32(d);
++      const float cSign = fromRepF32(copysignF32Rep(
++          toRepF32(isinfF32(cRep) ? 1.0f : 0.0f), cRep));
++      const float dSign = fromRepF32(copysignF32Rep(
++          toRepF32(isinfF32(dRep) ? 1.0f : 0.0f), dRep));
++      const float zero = fromRepF32(0);
++      realPart = __mulsf3(zero, __addsf3(__mulsf3(a, cSign), __mulsf3(b, dSign)));
++      imagPart = __mulsf3(zero, __subsf3(__mulsf3(b, cSign), __mulsf3(a, dSign)));
++    }
++  }
++
++  float _Complex result;
++  __real__ result = realPart;
++  __imag__ result = imagPart;
++  return result;
++}
+-- 
+2.43.0
+

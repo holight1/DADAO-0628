@@ -4,6 +4,64 @@
 # Schema / field definitions are documented in docs/issues.yaml's header.
 # Search with: grep -r 'keyword' docs/issues-archive.yaml
 
+- id: musl-softfloat-shim-missing-divsc3
+  title: "softfloat_shim.c 未实现 __divsc3（单精度复数除法，C99 Annex G / compiler-rt divsc3.c 的 Smith 算法），gcc-c-torture 全量语料库（1708 个用例）里仅 complex-5.c 一个文件因此仍 FAIL_LINK（独立验证：complex-6.c/complex-7.c 用到的是相等比较/相减/构造，不需要 __divsc3，链接已在 ML-028a 补齐比较+算术家族后转 PASS）"
+  status: closed
+  scope: [musl, softfloat]
+  blocks: [complex-5.c]
+  resolved_by: "ML-037a; musl patch 0014-dadao-add-divsc3-single-precision-complex-division.patch"
+  # ML-028a（2026-07-24）评估记录（登记为独立任务时的原始记录，保留）：
+  #
+  # ML-026a 的 92 文件符号并集报告里列出了 __divsc3，但逐一 grep + 独立
+  # 探针编译确认 92 个文件里实际引用 __divsc3 的只有 complex-5.c 一个
+  # （`y = p(x, 1.0f / z)`，`z` 是 `float __complex__`，"实数 / 复数"触发
+  # C99 复数除法）。complex-6.c 只有一次简单赋值/构造、complex-7.c 只有
+  # `!=` 相等比较（触发的是 __nesf2 之类的比较符号，本任务已补齐），两者
+  # 都不需要 __divsc3——独立编译验证过（补齐本任务其余符号后二者均转
+  # PASS，且 FAIL_LINK 错误信息里从未出现过 __divsc3）。
+  #
+  # 未在 ML-028a 内实现的原因：__divsc3 的算法（Smith's method：先用
+  # logb/scalbn 把分母重新定标避免中间溢出，再按 C99 Annex G 对
+  # NaN/inf/0 的各种组合做专门特判，见
+  # .work/source/llvm/compiler-rt/lib/builtins/divsc3.c）在"复杂度"这个
+  # 维度上和本文件其余全部符号（__addsf3/__divsf3/比较家族/int64<->float
+  # 转换等，全部是闭式位模式运算，没有任何依赖其它超越函数或多步骤特判
+  # 表）不是同一量级——需要先实现或复用 logb/scalbn/isnan/isinf 这一层
+  # （本文件目前完全没有这套基础设施），且 Annex G 的特判分支本身就需要
+  # 单独设计验证向量，不是"改几个位宽常量"就能照抄已有函数模式完成的
+  # 工作。按 ML-028a 任务书的应急条款（"如果这 92 个文件里实际用到
+  # __divsc3 的只有个位数...且实现复杂度明显超出其它符号...允许作为独立
+  # 后续任务留待以后处理"）登记为独立任务，不阻塞本次 92 文件里其余 81
+  # 个的收尾。
+  #
+  # ML-037a（2026-07-24）收口记录：
+  #
+  # 在 softfloat_shim.c 里新增 isnanF32/isinfF32/isfiniteF32/fabsF32Rep/
+  # copysignF32Rep/fmaxAbsF32/ilogbAbsF32/scalbnF32 这套位模式基础设施 +
+  # __divsc3（照 compiler-rt divsc3.c 的 Smith's method + C99 Annex G
+  # NaN/Inf/0 特判逻辑结构照抄，用纯位模式运算重写、复用既有
+  # __addsf3/__subsf3/__mulsf3/__divsf3）。独立标准编译（真实 musl 构建
+  # 参数）0 未定义符号；ELF relocation 记录确认 __divsc3 里全部调用只指向
+  # 已验证的 __mulsf3/__addsf3/__divsf3/__eqsf2/__nesf2/__unordsf2（0 处
+  # 自递归）。host fuzz harness（改名、直接 #include 实际提交源文件，
+  # oracle 是 divsc3.c 的逐语句原生 float 移植、`-ffp-contract=off` 避免
+  # FMA 融合造成的假不一致）：279,841 个显式 NaN/Inf/0/次正规数边界交叉积
+  # + 按 Annex G 三个恢复分支各自命中的具名向量 + 随机 fuzz，共
+  # ~828 万次检查 0 不一致；7 个独立负控制（fmaxAbsF32 的 NaN 分支、
+  # ilogbAbsF32 的指数偏置、scalbnF32 的上溢饱和值和 tie 舍入、__divsc3
+  # 三个 Annex G 恢复分支各自的条件）全部被立即抓到。complex-5.c
+  # FAIL_LINK -> PASS，gcc-c-torture 全量 1465/104/124/15（对比基线
+  # 1464/104/125/15，精确 +1 PASS/-1 FAIL_LINK，逐文件核对仅 complex-5.c
+  # 变化，0 回归）。llvm-lit tests/lit/E2E 78/78 不变；
+  # tools/run_differential.py AGREE(4-way)=200/DIVERGE=0 不变（本任务不
+  # 涉及指令语义）。musl 侧改动用普通 git commit（69cadae0）落地，
+  # git format-patch 导出为 components/musl/patches/
+  # 0014-dadao-add-divsc3-single-precision-complex-division.patch 并追加
+  # 进 series；干净 pin-commit（0784374d561435f7c787a555aeab8ede699ed298）
+  # checkout 上完整 series `git am` 全部 14 个 patch 成功，replay tree
+  # hash（c1b7c2544d09b9ec6eb766765d39e4e6e9108b38）与开发树 tree hash
+  # 完全一致。
+
 - id: frame-offset-no-imms12-range-check-silent-wraparound
   title: "DADAOFrameLowering::emitPrologue/emitEpilogue 和 DADAORegisterInfo::eliminateFrameIndex 的全部 6 个 case（ADDI_RB_FI/LDO_FI/STO_FI/LDO_RB_FI/STO_RB_FI）把 FrameOff/StackSize 不做范围检查直接塞进 imms12（12-bit 有符号，[-2048,2047]）立即数字段；一旦函数栈帧或某个局部变量的最终帧内偏移超出该范围，立即数在 MCCodeEmitter 层被静默按 12-bit 环回截断（无 assert/无告警），产生完全错误的地址——这是 pr56866.c TIMEOUT 的根因，且是一个通用的、影响面覆盖'任意栈使用超过约 2KB 的函数'的后端正确性缺口，不是 rotate/窄位宽特有问题"
   status: closed

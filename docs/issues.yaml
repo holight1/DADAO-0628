@@ -450,32 +450,3 @@
   # 现在这个 override 只是"当前阶段安全、需要在有动态链接需求时重新审视"
   # 的临时措施，不是长久方案。
 
-- id: musl-softfloat-shim-missing-divsc3
-  title: "softfloat_shim.c 未实现 __divsc3（单精度复数除法，C99 Annex G / compiler-rt divsc3.c 的 Smith 算法），gcc-c-torture 全量语料库（1708 个用例）里仅 complex-5.c 一个文件因此仍 FAIL_LINK（独立验证：complex-6.c/complex-7.c 用到的是相等比较/相减/构造，不需要 __divsc3，链接已在 ML-028a 补齐比较+算术家族后转 PASS）"
-  status: open
-  scope: [musl, softfloat]
-  blocks: [complex-5.c]
-  resolved_by: null
-  # ML-028a（2026-07-24）评估记录：
-  #
-  # ML-026a 的 92 文件符号并集报告里列出了 __divsc3，但逐一 grep + 独立
-  # 探针编译确认 92 个文件里实际引用 __divsc3 的只有 complex-5.c 一个
-  # （`y = p(x, 1.0f / z)`，`z` 是 `float __complex__`，"实数 / 复数"触发
-  # C99 复数除法）。complex-6.c 只有一次简单赋值/构造、complex-7.c 只有
-  # `!=` 相等比较（触发的是 __nesf2 之类的比较符号，本任务已补齐），两者
-  # 都不需要 __divsc3——独立编译验证过（补齐本任务其余符号后二者均转
-  # PASS，且 FAIL_LINK 错误信息里从未出现过 __divsc3）。
-  #
-  # 未在 ML-028a 内实现的原因：__divsc3 的算法（Smith's method：先用
-  # logb/scalbn 把分母重新定标避免中间溢出，再按 C99 Annex G 对
-  # NaN/inf/0 的各种组合做专门特判，见
-  # .work/source/llvm/compiler-rt/lib/builtins/divsc3.c）在"复杂度"这个
-  # 维度上和本文件其余全部符号（__addsf3/__divsf3/比较家族/int64<->float
-  # 转换等，全部是闭式位模式运算，没有任何依赖其它超越函数或多步骤特判
-  # 表）不是同一量级——需要先实现或复用 logb/scalbn/isnan/isinf 这一层
-  # （本文件目前完全没有这套基础设施），且 Annex G 的特判分支本身就需要
-  # 单独设计验证向量，不是"改几个位宽常量"就能照抄已有函数模式完成的
-  # 工作。按 ML-028a 任务书的应急条款（"如果这 92 个文件里实际用到
-  # __divsc3 的只有个位数...且实现复杂度明显超出其它符号...允许作为独立
-  # 后续任务留待以后处理"）登记为独立任务，不阻塞本次 92 文件里其余 81
-  # 个的收尾。
