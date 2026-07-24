@@ -1534,3 +1534,70 @@ tracked), vector-legalizer + `__int128` calling-convention failures
 (17 files combined, possibly one shared "128-bit return value CC
 allocation" crash site), `BlockAddress`/computed-goto (3 files), plus
 two low-priority singletons not worth their own task.
+
+## ML-036a: fix P0 -O0 negative-polarity single-bit AND mask drop (2026-07-24)
+
+Root cause: `DADAOTargetLowering` never called `setBooleanContents()`,
+defaulting to `UndefinedBooleanContent` — wrong for this target, whose
+real invariant is `ZeroOrOneBooleanContent` (`lowerSETCC` always
+materializes a genuine 0-or-1 value across the full register width, and
+the actual `BRNZ`/`BRZ` branch instructions test the whole register for
+non-zero-ness, not just bit 0 — they never mask themselves). Under the
+wrong default, `TargetLowering::promoteTargetBoolean` widens a narrower
+i1 boolean for `BRCOND` consumption via `ANY_EXTEND` instead of
+`ZERO_EXTEND`. At `-O0` (clang forces `optnone` → `CodeGenOptLevel::
+None` for the whole SelectionDAG pipeline regardless of `llc`'s own `-O`
+flag — verified directly: the same `optnone`-tagged IR produces
+identical, identically-wrong assembly under both `llc -O0` and
+`llc -O2`), `DAGCombiner`'s generic combines collapse a negative-
+polarity single-bit AND-and-compare-to-zero pattern (`(x & 1) == 0`,
+true branch is the `else` arm) first via the standard `xor(setcc,true)
+-> setcc-with-negated-cc` fold, then further into a bare
+`truncate(loadedByte, i1)` (valid, since truncating to i1 is exactly bit
+0). Re-widening that i1 for `BRCOND` under `ANY_EXTEND` then
+algebraically cancels straight through the truncate — legal precisely
+because `ANY_EXTEND` permits garbage upper bits — producing an unmasked
+load that `BRNZ` tests against the *whole* byte instead of just bit 0.
+Positive-polarity forms (`if (x & 1)`) never reach this DAGCombine shape
+(the `and`+`setcc` survive intact to instruction selection) and were
+never affected.
+
+Fix: `llvm/lib/Target/DADAO/DADAOISelLowering.cpp` — one line,
+`setBooleanContents(ZeroOrOneBooleanContent)`, plus a 24-line comment
+explaining the mechanism. Forces the same widening through
+`ZERO_EXTEND`, under which `ZERO_EXTEND(TRUNCATE(X))` cannot cancel for
+free — it must materialize a real mask — restoring the dropped
+`and rd,rd,<mask>`.
+
+Verified with a 1152-vector (4 widths × 4 mask values × 4 comparison
+forms × 2 polarities × 9 inputs) host-native-vs-QEMU ground-truth
+differential, not hand-computed expected values (the task's own
+self-review caught and discarded two flawed test-generation scripts
+along the way — an exit-code-overflow bug and a hand-derived-expected-
+value sign error — before settling on this method): 45/1152 vectors
+diverge before the fix, all from the 9/128 function shapes with
+`mask=1` (matching the diagnosed DAGCombine trigger exactly — the
+combine only fires for this shape) and covering int/char/short but
+never `long`; 0/1152 after. `960608-1.c` (a bitfield read) was
+confirmed — not just inferred from "flipped to PASS" — to be the same
+root cause via direct before/after `.s` comparison, finding the identical
+missing-`and`-after-`shru` signature at the same instruction position.
+
+Architect independently verified: rebuilt the toolchain; reproduced the
+original 3-line minimal repro directly (now exits 1, correct, was 0);
+ran the 10 directed CodeGen lit tests (10/10, including the new
+`negative-polarity-bitand-mask.ll`) and the full E2E suite (78/78,
+including the new project-level test); reran the full 1708-file
+gcc-c-torture sweep twice for repeatability and got the exact reported
+`1464/104/125/15` both times, plus confirmed the 3 target files
+individually via `--filter`; reran `run_differential.py` (unchanged, as
+expected for a codegen-only fix) and `manifest_check.py`/
+`check_issues.py` (both PASS, issue correctly moved from `issues.yaml`
+to `issues-archive.yaml`); replayed the full 61-patch LLVM series from a
+bare manifest-pin checkout and confirmed the tree hash matches
+`.work/llvm` HEAD exactly.
+
+**gcc-c-torture running total: 1328→1464/1708 (85.7%)**. This closes out
+the single highest-priority item on ML-035a's list; remaining: `__divsc3`
+(1 file), the vector-legalizer/`__int128` calling-convention cluster (17
+files), `BlockAddress` (3 files), and two low-priority singletons.
