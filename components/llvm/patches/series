@@ -48,3 +48,5 @@
 0048-DADAO-fix-ISD-CALLSEQ_START-END-glue-linkage-bug-ML-.patch
 0049-dadao-mc-immediate-range-validation.patch
 0050-DADAO-implement-caller-populated-varargs-save-area.patch
+0051-DADAO-materialize-large-frame-offsets.patch
+0052-DADAO-make-frame-offset-scavenging-spill-safe.patch

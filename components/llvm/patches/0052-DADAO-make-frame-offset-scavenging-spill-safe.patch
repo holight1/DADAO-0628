@@ -1,0 +1,275 @@
+From 032fab81c9bfd770e9da95c4fca5a23b52cd01b7 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 09:58:44 +0800
+Subject: [PATCH] DADAO: make frame offset scavenging spill-safe
+
+---
+ llvm/lib/Target/DADAO/DADAOFrameLowering.cpp  | 64 ++++++++++++++-
+ llvm/lib/Target/DADAO/DADAORegisterInfo.cpp   | 29 +++++--
+ .../CodeGen/DADAO/large-frame-offsets.mir     | 82 ++++++++++++++++++-
+ 3 files changed, 159 insertions(+), 16 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+index 645143d915fe..0181cd0b8d84 100644
+--- a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+@@ -22,6 +22,56 @@ namespace {
+ 
+ constexpr uint64_t DADAOFrameAlignment = 8;
+ 
++bool mayNeedFrameOffsetScavenging(const MachineFunction &MF,
++                                  uint64_t EstimatedFrameSize) {
++  const MachineFrameInfo &MFI = MF.getFrameInfo();
++
++  for (const MachineBasicBlock &MBB : MF) {
++    for (const MachineInstr &MI : MBB) {
++      unsigned FIOperand;
++      int64_t GEPOffset = 0;
++      switch (MI.getOpcode()) {
++      default:
++        continue;
++      case DADAO::ADDI_RB_FI:
++        FIOperand = 2;
++        break;
++      case DADAO::LDO_FI:
++      case DADAO::STO_FI:
++      case DADAO::LDO_RB_FI:
++      case DADAO::STO_RB_FI:
++        FIOperand = 3;
++        GEPOffset = MI.getOperand(2).getImm();
++        break;
++      }
++
++      // Once either independent component is already outside imms12, no
++      // object placement can prove that every final Total is reachable.
++      if (!isInt<12>(GEPOffset) || EstimatedFrameSize > 2047)
++        return true;
++
++      int FI = MI.getOperand(FIOperand).getIndex();
++      if (MFI.isFixedObjectIndex(FI)) {
++        int64_t Total;
++        if (AddOverflow<int64_t>(MFI.getObjectOffset(FI),
++                                 static_cast<int64_t>(EstimatedFrameSize),
++                                 Total) ||
++            AddOverflow<int64_t>(Total, GEPOffset, Total) || !isInt<12>(Total))
++          return true;
++        continue;
++      }
++
++      // Local objects have not been laid out yet.  Their final SP-relative
++      // FrameOff lies between zero and the estimated final frame size.  If
++      // either end plus the instruction's GEP offset leaves imms12, the
++      // elimination path may need to spill a scavenged RD temporary.
++      if (!isInt<12>(GEPOffset + static_cast<int64_t>(EstimatedFrameSize)))
++        return true;
++    }
++  }
++  return false;
++}
++
+ uint64_t getDADAOFrameSize(const MachineFunction &MF) {
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
+   return alignTo(MFI.getStackSize(), DADAOFrameAlignment);
+@@ -91,12 +141,18 @@ void DADAOFrameLowering::emitEpilogue(MachineFunction &MF,
+ void DADAOFrameLowering::processFunctionBeforeFrameFinalized(
+     MachineFunction &MF, RegScavenger *RS) const {
+   MachineFrameInfo &MFI = MF.getFrameInfo();
+-  if (!RS || MFI.estimateStackSize(MF) <= 2047)
++  if (!RS)
++    return;
++
++  uint64_t EstimatedFrameSize = MFI.estimateStackSize(MF);
++  if (!mayNeedFrameOffsetScavenging(MF, EstimatedFrameSize))
+     return;
+ 
+-  // Large frame-index elimination may need to spill its scavenged RD
+-  // temporary.  PEI places this emergency slot closest to the final SP, so
+-  // the spill/reload itself remains reachable with a small frame offset.
++  // Any out-of-range final Total (FrameOff + GEPOff), including one caused by
++  // a large fixed incoming offset or a large GEP on a small local frame, may
++  // need to spill its scavenged RD temporary.  PEI places this emergency slot
++  // closest to the final SP, so its own spill/reload cannot recurse into the
++  // large-offset materialization path.
+   int FI = MFI.CreateSpillStackObject(8, Align(8));
+   RS->addScavengingFrameIndex(FI);
+ }
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+index 09d7c698f20b..cb39d51a9ada 100644
+--- a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+@@ -117,6 +117,15 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+         .addReg(ScratchRD, RegState::Kill);
+   };
+ 
++  auto getScratchRB = [&]() {
++    // RB5 is ABI-reserved and therefore cannot occur in compiler-allocated
++    // RB spill/reload operands.  Keep explicit MIR using RB5 correct as well:
++    // using it as an RB store source or load destination would otherwise
++    // clobber the value before the memory instruction.
++    Register ValueReg = MI.getOperand(0).getReg();
++    return ValueReg == DADAO::RB5 ? DADAO::RB6 : DADAO::RB5;
++  };
++
+   switch (MI.getOpcode()) {
+   default:
+     llvm_unreachable("eliminateFrameIndex: unexpected opcode");
+@@ -124,10 +133,11 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     int64_t GEPOff = MI.getOperand(2).getImm();
+     int64_t Total = FrameOff + GEPOff;
+     if (!isInt<12>(Total)) {
+-      materializeFrameAddress(DADAO::RB5, Total);
++      Register AddressReg = getScratchRB();
++      materializeFrameAddress(AddressReg, Total);
+       MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RRII))
+                                     .add(MI.getOperand(0))
+-                                    .addReg(DADAO::RB5, RegState::Kill)
++                                    .addReg(AddressReg, RegState::Kill)
+                                     .addImm(0);
+       MIB.setMemRefs(MI.memoperands());
+       MI.eraseFromParent();
+@@ -145,10 +155,11 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     int64_t GEPOff = MI.getOperand(2).getImm();
+     int64_t Total = FrameOff + GEPOff;
+     if (!isInt<12>(Total)) {
+-      materializeFrameAddress(DADAO::RB5, Total);
++      Register AddressReg = getScratchRB();
++      materializeFrameAddress(AddressReg, Total);
+       MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::STO_RRII))
+                                     .add(MI.getOperand(0))
+-                                    .addReg(DADAO::RB5, RegState::Kill)
++                                    .addReg(AddressReg, RegState::Kill)
+                                     .addImm(0);
+       MIB.setMemRefs(MI.memoperands());
+       MI.eraseFromParent();
+@@ -181,11 +192,12 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     int64_t GEPOff = MI.getOperand(2).getImm();
+     int64_t Total = FrameOff + GEPOff;
+     if (!isInt<12>(Total)) {
+-      materializeFrameAddress(DADAO::RB5, Total);
++      Register AddressReg = getScratchRB();
++      materializeFrameAddress(AddressReg, Total);
+       MachineInstrBuilder MIB =
+           BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RBRRII))
+               .add(MI.getOperand(0))
+-              .addReg(DADAO::RB5, RegState::Kill)
++              .addReg(AddressReg, RegState::Kill)
+               .addImm(0);
+       MIB.setMemRefs(MI.memoperands());
+       MI.eraseFromParent();
+@@ -205,11 +217,12 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     int64_t GEPOff = MI.getOperand(2).getImm();
+     int64_t Total = FrameOff + GEPOff;
+     if (!isInt<12>(Total)) {
+-      materializeFrameAddress(DADAO::RB5, Total);
++      Register AddressReg = getScratchRB();
++      materializeFrameAddress(AddressReg, Total);
+       MachineInstrBuilder MIB =
+           BuildMI(MBB, II, DL, TII->get(DADAO::STO_RBRRII))
+               .add(MI.getOperand(0))
+-              .addReg(DADAO::RB5, RegState::Kill)
++              .addReg(AddressReg, RegState::Kill)
+               .addImm(0);
+       MIB.setMemRefs(MI.memoperands());
+       MI.eraseFromParent();
+diff --git a/llvm/test/CodeGen/DADAO/large-frame-offsets.mir b/llvm/test/CodeGen/DADAO/large-frame-offsets.mir
+index 46849f528c79..8d9784c4e490 100644
+--- a/llvm/test/CodeGen/DADAO/large-frame-offsets.mir
++++ b/llvm/test/CodeGen/DADAO/large-frame-offsets.mir
+@@ -14,6 +14,15 @@
+     %slot = alloca i64, align 8
+     ret void
+   }
++
++  define void @small_frame_large_gep_pressure() {
++    %slot = alloca i64, align 8
++    ret void
++  }
++
++  define void @large_fixed_offset_rb5() {
++    ret void
++  }
+ ...
+ ---
+ name:            large_frame_pseudos
+@@ -96,9 +105,74 @@ body:             |
+     ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
+     ; CHECK-NEXT:  $rd19 = LDO_RRII killed $rb5, 0
+ 
+-    $rd16 = LDO_FI $rb1, 2047, %stack.0.slot
+-    $rd17 = LDO_FI $rb1, 2048, %stack.0.slot
+-    $rd18 = LDO_FI $rb1, -2048, %stack.0.slot
+-    $rd19 = LDO_FI $rb1, -2049, %stack.0.slot
++    ; The large cases reserve an eight-byte emergency slot, so compensate for
++    ; the local object's final FrameOff=8 when selecting exact Total values.
++    $rd16 = LDO_FI $rb1, 2039, %stack.0.slot
++    $rd17 = LDO_FI $rb1, 2040, %stack.0.slot
++    $rd18 = LDO_FI $rb1, -2056, %stack.0.slot
++    $rd19 = LDO_FI $rb1, -2057, %stack.0.slot
++    RET_PSEUDO
++...
++---
++name:            small_frame_large_gep_pressure
++tracksRegLiveness: true
++frameInfo:
++  maxAlignment:    8
++  adjustsStack:    false
++  hasCalls:        false
++  maxCallFrameSize: 4294967295
++fixedStack:
++stack:
++  - { id: 0, name: slot, type: default, offset: 0, size: 8,
++      alignment: 8, stack-id: default, callee-saved-register: '',
++      callee-saved-restored: true, debug-info-variable: '',
++      debug-info-expression: '', debug-info-location: '' }
++body:             |
++  bb.0:
++    liveins: $rd8, $rd9, $rd10, $rd11, $rd12, $rd13, $rd14, $rd15, $rd16, $rd17, $rd18, $rd19, $rd20, $rd21, $rd22, $rd23, $rd24, $rd25, $rd26, $rd27, $rd28, $rd29, $rd30, $rd31, $rd32, $rd33, $rd34, $rd35, $rd36, $rd37, $rd38, $rd39, $rd40, $rd41, $rd42, $rd43, $rd44, $rd45, $rd46, $rd47, $rd48, $rd49, $rd50, $rd51, $rd52, $rd53, $rd54, $rd55, $rd56, $rd57, $rd58, $rd59, $rd60, $rd61, $rd62, $rd63, $rb8
++
++    ; The local frame itself is only eight bytes.  The large GEP offset must
++    ; still reserve an emergency slot: every allocatable RD is live here, so
++    ; frame-index elimination is forced to spill and restore its temporary.
++    ; CHECK-LABEL: name: small_frame_large_gep_pressure
++    ; CHECK:       STO_RRII killed $rd{{[0-9]+}}, $rb1, 0
++    ; CHECK:       $rd{{[0-9]+}} = SETZW_RWII 0, {{4096|4104}}
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK:       STO_RBRRII $rb8, killed $rb5, 0
++    ; CHECK:       $rd{{[0-9]+}} = LDO_RRII $rb1, 0
++
++    STO_RB_FI $rb8, $rb1, 4096, %stack.0.slot
++    RET_PSEUDO implicit $rd8, implicit $rd9, implicit $rd10, implicit $rd11, implicit $rd12, implicit $rd13, implicit $rd14, implicit $rd15, implicit $rd16, implicit $rd17, implicit $rd18, implicit $rd19, implicit $rd20, implicit $rd21, implicit $rd22, implicit $rd23, implicit $rd24, implicit $rd25, implicit $rd26, implicit $rd27, implicit $rd28, implicit $rd29, implicit $rd30, implicit $rd31, implicit $rd32, implicit $rd33, implicit $rd34, implicit $rd35, implicit $rd36, implicit $rd37, implicit $rd38, implicit $rd39, implicit $rd40, implicit $rd41, implicit $rd42, implicit $rd43, implicit $rd44, implicit $rd45, implicit $rd46, implicit $rd47, implicit $rd48, implicit $rd49, implicit $rd50, implicit $rd51, implicit $rd52, implicit $rd53, implicit $rd54, implicit $rd55, implicit $rd56, implicit $rd57, implicit $rd58, implicit $rd59, implicit $rd60, implicit $rd61, implicit $rd62, implicit $rd63
++...
++---
++name:            large_fixed_offset_rb5
++tracksRegLiveness: true
++frameInfo:
++  maxAlignment:    8
++  adjustsStack:    false
++  hasCalls:        false
++  maxCallFrameSize: 4294967295
++fixedStack:
++  - { id: 0, type: default, offset: 4096, size: 8, alignment: 8,
++      stack-id: default, isImmutable: false, isAliased: false,
++      callee-saved-register: '', callee-saved-restored: true,
++      debug-info-variable: '', debug-info-expression: '',
++      debug-info-location: '' }
++stack:
++body:             |
++  bb.0:
++    liveins: $rb5
++
++    ; Explicit MIR may mention reserved RB5 even though register allocation
++    ; never can.  Use RB6 for the address so an RB store source/load result in
++    ; RB5 is not clobbered by address materialization.
++    ; CHECK-LABEL: name: large_fixed_offset_rb5
++    ; CHECK:       $rb6 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  STO_RBRRII $rb5, killed $rb6, 0
++    ; CHECK:       $rb6 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  $rb5 = LDO_RBRRII killed $rb6, 0
++
++    STO_RB_FI $rb5, $rb1, 0, %fixed-stack.0
++    $rb5 = LDO_RB_FI $rb1, 0, %fixed-stack.0
+     RET_PSEUDO
+ ...
+-- 
+2.43.0
+

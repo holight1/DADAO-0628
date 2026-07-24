@@ -1,0 +1,729 @@
+From 245d4f42a5d860ab2f763a99dd96bb51c7dce633 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 09:42:15 +0800
+Subject: [PATCH] DADAO: materialize large frame offsets
+
+---
+ llvm/lib/Target/DADAO/DADAOFrameLowering.cpp  |  66 ++++++++--
+ llvm/lib/Target/DADAO/DADAOFrameLowering.h    |   2 +
+ llvm/lib/Target/DADAO/DADAOInstrInfo.cpp      |  73 ++++++-----
+ llvm/lib/Target/DADAO/DADAOInstrInfo.h        |  28 ++--
+ llvm/lib/Target/DADAO/DADAORegisterInfo.cpp   | 120 +++++++++++++-----
+ llvm/lib/Target/DADAO/DADAORegisterInfo.h     |   9 +-
+ .../DADAO/frame-lowering-stack-alignment.ll   |  18 +--
+ .../test/CodeGen/DADAO/large-frame-offsets.ll |  48 +++++++
+ .../CodeGen/DADAO/large-frame-offsets.mir     | 104 +++++++++++++++
+ 9 files changed, 364 insertions(+), 104 deletions(-)
+ create mode 100644 llvm/test/CodeGen/DADAO/large-frame-offsets.ll
+ create mode 100644 llvm/test/CodeGen/DADAO/large-frame-offsets.mir
+
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+index ef0a01f46570..645143d915fe 100644
+--- a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+@@ -1,12 +1,13 @@
+ //===-- DADAOFrameLowering.cpp - DADAO Frame Lowering ---------------------===//
+ #include "DADAOFrameLowering.h"
++#include "DADAOInstrInfo.h"
+ #include "DADAOMachineFunctionInfo.h"
+ #include "DADAOSubtarget.h"
+-#include "DADAOInstrInfo.h"
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineFunction.h"
+ #include "llvm/CodeGen/MachineInstrBuilder.h"
+ #include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/RegisterScavenging.h"
+ #include "llvm/Support/MathExtras.h"
+ 
+ #define GET_REGINFO_ENUM
+@@ -29,9 +30,8 @@ uint64_t getDADAOFrameSize(const MachineFunction &MF) {
+ } // namespace
+ 
+ void DADAOFrameLowering::emitPrologue(MachineFunction &MF,
+-                                       MachineBasicBlock &MBB) const {
+-  const DADAOInstrInfo *TII =
+-      MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
++                                      MachineBasicBlock &MBB) const {
++  const DADAOInstrInfo *TII = MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
+ 
+   uint64_t StackSize = getDADAOFrameSize(MF);
+   if (StackSize == 0)
+@@ -40,15 +40,28 @@ void DADAOFrameLowering::emitPrologue(MachineFunction &MF,
+   MachineBasicBlock::iterator MBBI = MBB.begin();
+   DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
+ 
+-  BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++  int64_t Adjustment = -static_cast<int64_t>(StackSize);
++  if (isInt<12>(Adjustment)) {
++    BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++        .addReg(DADAO::RB1)
++        .addImm(Adjustment);
++    return;
++  }
++
++  // RD2 is ABI-reserved and never allocated.  Integer arguments start at
++  // RD16, so using RD2 before any callee code cannot destroy an incoming
++  // argument.
++  TII->materializeImm64(MBB, MBBI, DL, DADAO::RD2, Adjustment,
++                        MachineInstr::FrameSetup);
++  BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDRB_ORRR), DADAO::RB1)
+       .addReg(DADAO::RB1)
+-      .addImm(-static_cast<int64_t>(StackSize));
++      .addReg(DADAO::RD2, RegState::Kill)
++      .setMIFlag(MachineInstr::FrameSetup);
+ }
+ 
+ void DADAOFrameLowering::emitEpilogue(MachineFunction &MF,
+-                                       MachineBasicBlock &MBB) const {
+-  const DADAOInstrInfo *TII =
+-      MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
++                                      MachineBasicBlock &MBB) const {
++  const DADAOInstrInfo *TII = MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
+ 
+   uint64_t StackSize = getDADAOFrameSize(MF);
+   if (StackSize == 0)
+@@ -57,13 +70,40 @@ void DADAOFrameLowering::emitEpilogue(MachineFunction &MF,
+   MachineBasicBlock::iterator MBBI = MBB.getFirstTerminator();
+   DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
+ 
+-  BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++  int64_t Adjustment = static_cast<int64_t>(StackSize);
++  if (isInt<12>(Adjustment)) {
++    BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++        .addReg(DADAO::RB1)
++        .addImm(Adjustment);
++    return;
++  }
++
++  // RD2 is also safe here: scalar return values use RD31, and RD2 is
++  // non-allocatable with no ABI return role.
++  TII->materializeImm64(MBB, MBBI, DL, DADAO::RD2, Adjustment,
++                        MachineInstr::FrameDestroy);
++  BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDRB_ORRR), DADAO::RB1)
+       .addReg(DADAO::RB1)
+-      .addImm(static_cast<int64_t>(StackSize));
++      .addReg(DADAO::RD2, RegState::Kill)
++      .setMIFlag(MachineInstr::FrameDestroy);
++}
++
++void DADAOFrameLowering::processFunctionBeforeFrameFinalized(
++    MachineFunction &MF, RegScavenger *RS) const {
++  MachineFrameInfo &MFI = MF.getFrameInfo();
++  if (!RS || MFI.estimateStackSize(MF) <= 2047)
++    return;
++
++  // Large frame-index elimination may need to spill its scavenged RD
++  // temporary.  PEI places this emergency slot closest to the final SP, so
++  // the spill/reload itself remains reachable with a small frame offset.
++  int FI = MFI.CreateSpillStackObject(8, Align(8));
++  RS->addScavengingFrameIndex(FI);
+ }
+ 
+-StackOffset DADAOFrameLowering::getFrameIndexReference(
+-    const MachineFunction &MF, int FI, Register &FrameReg) const {
++StackOffset
++DADAOFrameLowering::getFrameIndexReference(const MachineFunction &MF, int FI,
++                                           Register &FrameReg) const {
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
+   FrameReg = DADAO::RB1;
+ 
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.h b/llvm/lib/Target/DADAO/DADAOFrameLowering.h
+index 994f70c0cb0f..6eddab1e223c 100644
+--- a/llvm/lib/Target/DADAO/DADAOFrameLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.h
+@@ -13,6 +13,8 @@ public:
+ 
+   void emitPrologue(MachineFunction &MF, MachineBasicBlock &MBB) const override;
+   void emitEpilogue(MachineFunction &MF, MachineBasicBlock &MBB) const override;
++  void processFunctionBeforeFrameFinalized(MachineFunction &MF,
++                                           RegScavenger *RS) const override;
+ 
+   bool hasFPImpl(const MachineFunction &MF) const override { return false; }
+ 
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+index 0f01f4ac651b..44b4a6edcb9b 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.cpp
+@@ -18,11 +18,10 @@ DADAOInstrInfo::DADAOInstrInfo(const DADAOSubtarget &STI)
+                         /*CatchRet=*/0, /*ReturnOpcode=*/0) {}
+ 
+ void DADAOInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
+-                                  MachineBasicBlock::iterator MBBI,
+-                                  const DebugLoc &DL, Register DstReg,
+-                                  Register SrcReg, bool KillSrc,
+-                                  bool RenamableDest,
+-                                  bool RenamableSrc) const {
++                                 MachineBasicBlock::iterator MBBI,
++                                 const DebugLoc &DL, Register DstReg,
++                                 Register SrcReg, bool KillSrc,
++                                 bool RenamableDest, bool RenamableSrc) const {
+   if (DADAO::GPRBRegClass.contains(DstReg) &&
+       DADAO::GPRDRegClass.contains(SrcReg)) {
+     BuildMI(MBB, MBBI, DL, get(DADAO::RD2RB_ORRI), DstReg)
+@@ -54,6 +53,32 @@ void DADAOInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
+   llvm_unreachable("copyPhysReg: unsupported register class pair");
+ }
+ 
++void DADAOInstrInfo::materializeImm64(MachineBasicBlock &MBB,
++                                      MachineBasicBlock::iterator MBBI,
++                                      const DebugLoc &DL, Register DstReg,
++                                      int64_t Value,
++                                      MachineInstr::MIFlag Flag) const {
++  assert(Value != 0 && "zero does not need large-immediate materialization");
++  uint64_t UValue = static_cast<uint64_t>(Value);
++  bool First = true;
++
++  for (unsigned WydePos = 0; WydePos != 4; ++WydePos) {
++    uint16_t Wyde = static_cast<uint16_t>((UValue >> (WydePos * 16)) & 0xffff);
++    if (Wyde == 0)
++      continue;
++
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, MBBI, DL, get(First ? DADAO::SETZW_RWII : DADAO::ORW_RWII),
++                DstReg)
++            .addImm(WydePos)
++            .addImm(Wyde);
++    if (Flag != MachineInstr::NoFlags)
++      MIB.setMIFlag(Flag);
++    First = false;
++  }
++  assert(!First && "nonzero immediate must contain a nonzero wyde");
++}
++
+ bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+   MachineBasicBlock &MBB = *MI.getParent();
+   DebugLoc DL = MI.getDebugLoc();
+@@ -147,29 +172,15 @@ bool DADAOInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+   case DADAO::CONST_WYDE: {
+     Register Dst = MI.getOperand(0).getReg();
+     int64_t Val = MI.getOperand(1).getImm();
+-    uint64_t UVal = static_cast<uint64_t>(Val);
+-    bool First = true;
+-
+-    for (int w = 0; w < 4; w++) {
+-      uint16_t Wyde = static_cast<uint16_t>((UVal >> (w * 16)) & 0xFFFF);
+-      if (Wyde == 0)
+-        continue;
+-      if (First) {
+-        BuildMI(MBB, MI, DL, get(DADAO::SETZW_RWII), Dst)
+-            .addImm(w).addImm(Wyde);
+-        First = false;
+-      } else {
+-        BuildMI(MBB, MI, DL, get(DADAO::ORW_RWII), Dst)
+-            .addImm(w).addImm(Wyde);
+-      }
+-    }
++    if (Val != 0)
++      materializeImm64(MBB, MI, DL, Dst, Val);
+     MI.eraseFromParent();
+     return true;
+   }
+   case DADAO::RET_PSEUDO: {
+     BuildMI(MBB, MI, DL, get(DADAO::RET_RIII))
+         .addReg(DADAO::RD0) // rdha = rd0 (value already in $rd31)
+-        .addImm(0);          // imm18 = 0
++        .addImm(0);         // imm18 = 0
+     MI.eraseFromParent();
+     return true;
+   }
+@@ -223,8 +234,7 @@ void DADAOInstrInfo::storeRegToStackSlot(
+   MachineFrameInfo &MFI = MF.getFrameInfo();
+   MachineMemOperand *MMO = MF.getMachineMemOperand(
+       MachinePointerInfo::getFixedStack(MF, FrameIndex),
+-      MachineMemOperand::MOStore, MFI.getObjectSize(FrameIndex),
+-      Align(8));
++      MachineMemOperand::MOStore, MFI.getObjectSize(FrameIndex), Align(8));
+   if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass) {
+     BuildMI(MBB, MBBI, DL, get(DADAO::STO_FI))
+         .addReg(SrcReg, getKillRegState(IsKill))
+@@ -249,17 +259,18 @@ void DADAOInstrInfo::storeRegToStackSlot(
+   }
+ }
+ 
+-void DADAOInstrInfo::loadRegFromStackSlot(
+-    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI, Register DstReg,
+-    int FrameIndex, const TargetRegisterClass *RC, Register VReg,
+-    unsigned SubReg, MachineInstr::MIFlag Flags) const {
++void DADAOInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
++                                          MachineBasicBlock::iterator MBBI,
++                                          Register DstReg, int FrameIndex,
++                                          const TargetRegisterClass *RC,
++                                          Register VReg, unsigned SubReg,
++                                          MachineInstr::MIFlag Flags) const {
+   DebugLoc DL = MBB.findDebugLoc(MBBI);
+   MachineFunction &MF = *MBB.getParent();
+   MachineFrameInfo &MFI = MF.getFrameInfo();
+   MachineMemOperand *MMO = MF.getMachineMemOperand(
+       MachinePointerInfo::getFixedStack(MF, FrameIndex),
+-      MachineMemOperand::MOLoad, MFI.getObjectSize(FrameIndex),
+-      Align(8));
++      MachineMemOperand::MOLoad, MFI.getObjectSize(FrameIndex), Align(8));
+   if (RC == &DADAO::GPRDRegClass || RC == &DADAO::GPRD_AllocatableRegClass) {
+     BuildMI(MBB, MBBI, DL, get(DADAO::LDO_FI))
+         .addDef(DstReg)
+@@ -280,4 +291,4 @@ void DADAOInstrInfo::loadRegFromStackSlot(
+   } else {
+     llvm_unreachable("loadRegFromStackSlot: unsupported register class");
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.h b/llvm/lib/Target/DADAO/DADAOInstrInfo.h
+index d2cf1eff65ec..124181b50d49 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.h
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.h
+@@ -29,18 +29,22 @@ public:
+ 
+   bool expandPostRAPseudo(MachineInstr &MI) const override;
+ 
+-  void storeRegToStackSlot(MachineBasicBlock &MBB,
+-                           MachineBasicBlock::iterator MBBI, Register SrcReg,
+-                           bool IsKill, int FrameIndex,
+-                           const TargetRegisterClass *RC, Register VReg,
+-                           MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
+-
+-  void loadRegFromStackSlot(MachineBasicBlock &MBB,
+-                            MachineBasicBlock::iterator MBBI, Register DstReg,
+-                            int FrameIndex, const TargetRegisterClass *RC,
+-                            Register VReg, unsigned SubReg = 0,
+-                            MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
++  void
++  materializeImm64(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
++                   const DebugLoc &DL, Register DstReg, int64_t Value,
++                   MachineInstr::MIFlag Flag = MachineInstr::NoFlags) const;
++
++  void storeRegToStackSlot(
++      MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI, Register SrcReg,
++      bool IsKill, int FrameIndex, const TargetRegisterClass *RC, Register VReg,
++      MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
++
++  void loadRegFromStackSlot(
++      MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI, Register DstReg,
++      int FrameIndex, const TargetRegisterClass *RC, Register VReg,
++      unsigned SubReg = 0,
++      MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
+ };
+ 
+ } // namespace llvm
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+index cd7a15cab55a..09d7c698f20b 100644
+--- a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+@@ -19,8 +19,10 @@
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineFunction.h"
+ #include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/RegisterScavenging.h"
+ #include "llvm/CodeGen/TargetSubtargetInfo.h"
+ #include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/MathExtras.h"
+ 
+ #define GET_REGINFO_TARGET_DESC
+ #include "DADAOGenRegisterInfo.inc"
+@@ -31,17 +33,15 @@ DADAORegisterInfo::DADAORegisterInfo() : DADAOGenRegisterInfo(0) {}
+ 
+ const uint16_t *
+ DADAORegisterInfo::getCalleeSavedRegs(const MachineFunction * /*MF*/) const {
+-  static const uint16_t CSRegs[] = {
+-    DADAO::RD8,  DADAO::RD9,  DADAO::RD10, DADAO::RD11,
+-    DADAO::RD12, DADAO::RD13, DADAO::RD14, DADAO::RD15,
+-    0
+-  };
++  static const uint16_t CSRegs[] = {DADAO::RD8,  DADAO::RD9,  DADAO::RD10,
++                                    DADAO::RD11, DADAO::RD12, DADAO::RD13,
++                                    DADAO::RD14, DADAO::RD15, 0};
+   return CSRegs;
+ }
+ 
+ const uint32_t *
+ DADAORegisterInfo::getCallPreservedMask(const MachineFunction &MF,
+-                                         CallingConv::ID /*CC*/) const {
++                                        CallingConv::ID /*CC*/) const {
+   // Compute mask: callee-saved + reserved registers are preserved across calls
+   BitVector Saved(getNumRegs());
+   const uint16_t *CS = getCalleeSavedRegs(&MF);
+@@ -94,29 +94,49 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+   MachineInstr &MI = *II;
+   MachineBasicBlock &MBB = *MI.getParent();
+   MachineFunction &MF = *MBB.getParent();
+-  const DADAOInstrInfo *TII =
+-      MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
++  const DADAOInstrInfo *TII = MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
+   DebugLoc DL = MI.getDebugLoc();
+ 
+   int FrameIndex = MI.getOperand(FIOperandNum).getIndex();
+   Register FrameReg = getFrameRegister(MF);
+ 
+   const DADAOSubtarget &ST = MF.getSubtarget<DADAOSubtarget>();
+-  StackOffset StackOff = ST.getFrameLowering()->getFrameIndexReference(
+-      MF, FrameIndex, FrameReg);
++  StackOffset StackOff =
++      ST.getFrameLowering()->getFrameIndexReference(MF, FrameIndex, FrameReg);
+   int64_t FrameOff = StackOff.getFixed() + SPAdj;
+ 
++  auto materializeFrameAddress = [&](Register AddressReg, int64_t Offset) {
++    assert(RS && "large frame offsets require register scavenging");
++    Register ScratchRD = RS->scavengeRegisterBackwards(
++        DADAO::GPRD_AllocatableRegClass, II, /*RestoreAfter=*/false, SPAdj);
++    assert(ScratchRD && "register scavenger failed for large frame offset");
++
++    TII->materializeImm64(MBB, II, DL, ScratchRD, Offset);
++    BuildMI(MBB, II, DL, TII->get(DADAO::ADDRB_ORRR), AddressReg)
++        .addReg(FrameReg)
++        .addReg(ScratchRD, RegState::Kill);
++  };
++
+   switch (MI.getOpcode()) {
+   default:
+     llvm_unreachable("eliminateFrameIndex: unexpected opcode");
+   case DADAO::LDO_FI: {
+     int64_t GEPOff = MI.getOperand(2).getImm();
+     int64_t Total = FrameOff + GEPOff;
+-    MachineInstrBuilder MIB =
+-        BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RRII))
+-            .add(MI.getOperand(0))
+-            .add(MI.getOperand(1))
+-            .addImm(Total);
++    if (!isInt<12>(Total)) {
++      materializeFrameAddress(DADAO::RB5, Total);
++      MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RRII))
++                                    .add(MI.getOperand(0))
++                                    .addReg(DADAO::RB5, RegState::Kill)
++                                    .addImm(0);
++      MIB.setMemRefs(MI.memoperands());
++      MI.eraseFromParent();
++      return true;
++    }
++    MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RRII))
++                                  .add(MI.getOperand(0))
++                                  .add(MI.getOperand(1))
++                                  .addImm(Total);
+     MIB.setMemRefs(MI.memoperands());
+     MI.eraseFromParent();
+     return true;
+@@ -124,19 +144,33 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+   case DADAO::STO_FI: {
+     int64_t GEPOff = MI.getOperand(2).getImm();
+     int64_t Total = FrameOff + GEPOff;
+-    MachineInstrBuilder MIB =
+-        BuildMI(MBB, II, DL, TII->get(DADAO::STO_RRII))
+-            .add(MI.getOperand(0))
+-            .add(MI.getOperand(1))
+-            .addImm(Total);
++    if (!isInt<12>(Total)) {
++      materializeFrameAddress(DADAO::RB5, Total);
++      MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::STO_RRII))
++                                    .add(MI.getOperand(0))
++                                    .addReg(DADAO::RB5, RegState::Kill)
++                                    .addImm(0);
++      MIB.setMemRefs(MI.memoperands());
++      MI.eraseFromParent();
++      return true;
++    }
++    MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::STO_RRII))
++                                  .add(MI.getOperand(0))
++                                  .add(MI.getOperand(1))
++                                  .addImm(Total);
+     MIB.setMemRefs(MI.memoperands());
+     MI.eraseFromParent();
+     return true;
+   }
+   case DADAO::ADDI_RB_FI: {
++    if (!isInt<12>(FrameOff)) {
++      materializeFrameAddress(MI.getOperand(0).getReg(), FrameOff);
++      MI.eraseFromParent();
++      return true;
++    }
+     BuildMI(MBB, II, DL, TII->get(DADAO::ADDI_RBRRII))
+-        .add(MI.getOperand(0))  // rbha (dest)
+-        .add(MI.getOperand(1))  // rbhb (base = RB1)
++        .add(MI.getOperand(0)) // rbha (dest)
++        .add(MI.getOperand(1)) // rbhb (base = RB1)
+         .addImm(FrameOff);
+     MI.eraseFromParent();
+     return true;
+@@ -146,11 +180,21 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     // not the RD-target LDO_RRII used by plain LDO_FI above.
+     int64_t GEPOff = MI.getOperand(2).getImm();
+     int64_t Total = FrameOff + GEPOff;
+-    MachineInstrBuilder MIB =
+-        BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RBRRII))
+-            .add(MI.getOperand(0))
+-            .add(MI.getOperand(1))
+-            .addImm(Total);
++    if (!isInt<12>(Total)) {
++      materializeFrameAddress(DADAO::RB5, Total);
++      MachineInstrBuilder MIB =
++          BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RBRRII))
++              .add(MI.getOperand(0))
++              .addReg(DADAO::RB5, RegState::Kill)
++              .addImm(0);
++      MIB.setMemRefs(MI.memoperands());
++      MI.eraseFromParent();
++      return true;
++    }
++    MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RBRRII))
++                                  .add(MI.getOperand(0))
++                                  .add(MI.getOperand(1))
++                                  .addImm(Total);
+     MIB.setMemRefs(MI.memoperands());
+     MI.eraseFromParent();
+     return true;
+@@ -160,11 +204,21 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     // not the RD-target STO_RRII used by plain STO_FI above.
+     int64_t GEPOff = MI.getOperand(2).getImm();
+     int64_t Total = FrameOff + GEPOff;
+-    MachineInstrBuilder MIB =
+-        BuildMI(MBB, II, DL, TII->get(DADAO::STO_RBRRII))
+-            .add(MI.getOperand(0))
+-            .add(MI.getOperand(1))
+-            .addImm(Total);
++    if (!isInt<12>(Total)) {
++      materializeFrameAddress(DADAO::RB5, Total);
++      MachineInstrBuilder MIB =
++          BuildMI(MBB, II, DL, TII->get(DADAO::STO_RBRRII))
++              .add(MI.getOperand(0))
++              .addReg(DADAO::RB5, RegState::Kill)
++              .addImm(0);
++      MIB.setMemRefs(MI.memoperands());
++      MI.eraseFromParent();
++      return true;
++    }
++    MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::STO_RBRRII))
++                                  .add(MI.getOperand(0))
++                                  .add(MI.getOperand(1))
++                                  .addImm(Total);
+     MIB.setMemRefs(MI.memoperands());
+     MI.eraseFromParent();
+     return true;
+@@ -174,4 +228,4 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+ 
+ Register DADAORegisterInfo::getFrameRegister(const MachineFunction &MF) const {
+   return DADAO::RB1;
+-}
+\ No newline at end of file
++}
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.h b/llvm/lib/Target/DADAO/DADAORegisterInfo.h
+index 7983c3996168..3a9aa1df23f8 100644
+--- a/llvm/lib/Target/DADAO/DADAORegisterInfo.h
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.h
+@@ -26,12 +26,15 @@ struct DADAORegisterInfo : public DADAOGenRegisterInfo {
+   const uint16_t *
+   getCalleeSavedRegs(const MachineFunction *MF = nullptr) const override;
+ 
+-  const uint32_t *
+-  getCallPreservedMask(const MachineFunction &MF,
+-                       CallingConv::ID CC) const override;
++  const uint32_t *getCallPreservedMask(const MachineFunction &MF,
++                                       CallingConv::ID CC) const override;
+ 
+   BitVector getReservedRegs(const MachineFunction &MF) const override;
+ 
++  bool requiresRegisterScavenging(const MachineFunction &MF) const override {
++    return true;
++  }
++
+   bool eliminateFrameIndex(MachineBasicBlock::iterator II, int SPAdj,
+                            unsigned FIOperandNum,
+                            RegScavenger *RS = nullptr) const override;
+diff --git a/llvm/test/CodeGen/DADAO/frame-lowering-stack-alignment.ll b/llvm/test/CodeGen/DADAO/frame-lowering-stack-alignment.ll
+index 8435959324e9..6cffcfeeda82 100644
+--- a/llvm/test/CodeGen/DADAO/frame-lowering-stack-alignment.ll
++++ b/llvm/test/CodeGen/DADAO/frame-lowering-stack-alignment.ll
+@@ -48,20 +48,14 @@ define void @direct_trap() {
+   ret void
+ }
+ 
+-; A variadic function with a small local frame has a 120-byte register-save
+-; area.  Its effective frame is 128 bytes; the ordinary local/callee-saved
+-; slots remain above the lower save area.
++; Since DL-072a, the caller owns the unified varargs save area.  A variadic
++; callee with no local objects therefore remains frame-free.
+ define i32 @varargs_narrow(i32 %count, ...) {
+ ; MIR-LABEL: name:            varargs_narrow
+-; MIR:          stackSize:       8
+-; MIR:          $rb1 = ADDI_RBRRII $rb1, -128
+-; MIR:          STO_RRII {{.*}}, $rb1, 0
+-; MIR:          STO_RRII {{.*}}, $rb1, 112
+-; MIR:          $rb1 = ADDI_RBRRII $rb1, 128
++; MIR:          stackSize:       0
++; MIR-NOT:      $rb1 = ADDI_RBRRII $rb1
+ ; CHECK-LABEL: varargs_narrow:
+-; CHECK:       addi rb1, rb1, -128
+-; CHECK:       sto rd17, rb1, 0
+-; CHECK:       sto rd{{[0-9]+}}, rb1, 112
+-; CHECK:       addi rb1, rb1, 128
++; CHECK-NOT:   addi rb1, rb1
++; CHECK:       ret rd0, 0
+   ret i32 %count
+ }
+diff --git a/llvm/test/CodeGen/DADAO/large-frame-offsets.ll b/llvm/test/CodeGen/DADAO/large-frame-offsets.ll
+new file mode 100644
+index 000000000000..621d82bd0456
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/large-frame-offsets.ll
+@@ -0,0 +1,48 @@
++; RUN: llc -mtriple=dadao-unknown-elf -O0 < %s | FileCheck %s
++
++; Large frames must not silently wrap signed 12-bit stack adjustments or
++; frame-index offsets.  Volatile accesses keep both the near and far objects
++; observable, and the pointer slot forces RB-bank spill/reload coverage.
++define i64 @large_frame_offsets(i64 %seed, ptr %pointer) {
++; CHECK-LABEL: large_frame_offsets:
++; CHECK:       setzw rd2,
++; CHECK:       add rb1, rb1, rd2
++; CHECK:       stb
++; CHECK:       ldbu
++; CHECK:       setzw rd2,
++; CHECK:       add rb1, rb1, rd2
++entry:
++  %large = alloca [4096 x i8], align 8
++  %scalar = alloca i64, align 8
++  %pointer.slot = alloca ptr, align 8
++  %near = getelementptr inbounds [4096 x i8], ptr %large, i64 0, i64 0
++  %far = getelementptr inbounds [4096 x i8], ptr %large, i64 0, i64 4095
++  store volatile i8 17, ptr %near, align 1
++  store volatile i8 29, ptr %far, align 1
++  store volatile i64 %seed, ptr %scalar, align 8
++  %loaded.seed = load volatile i64, ptr %scalar, align 8
++  store volatile ptr %pointer, ptr %pointer.slot, align 8
++  %loaded.pointer = load volatile ptr, ptr %pointer.slot, align 8
++  %pointer.value = ptrtoint ptr %loaded.pointer to i64
++  %near.value = load volatile i8, ptr %near, align 1
++  %far.value = load volatile i8, ptr %far, align 1
++  %near.ext = zext i8 %near.value to i64
++  %far.ext = zext i8 %far.value to i64
++  %sum.0 = add i64 %loaded.seed, %pointer.value
++  %sum.1 = add i64 %sum.0, %near.ext
++  %sum.2 = add i64 %sum.1, %far.ext
++  ret i64 %sum.2
++}
++
++; A genuinely small frame remains on the original single-immediate path.
++define i64 @small_frame_unchanged(i64 %seed) {
++; CHECK-LABEL: small_frame_unchanged:
++; CHECK:       addi rb1, rb1, -8
++; CHECK-NOT:   add rb1, rb1, rd2
++; CHECK:       addi rb1, rb1, 8
++entry:
++  %slot = alloca i64, align 8
++  store volatile i64 %seed, ptr %slot, align 8
++  %value = load volatile i64, ptr %slot, align 8
++  ret i64 %value
++}
+diff --git a/llvm/test/CodeGen/DADAO/large-frame-offsets.mir b/llvm/test/CodeGen/DADAO/large-frame-offsets.mir
+new file mode 100644
+index 000000000000..46849f528c79
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/large-frame-offsets.mir
+@@ -0,0 +1,104 @@
++# RUN: llc -mtriple=dadao-unknown-elf -run-pass=prologepilog \
++# RUN:   -verify-machineinstrs %s -o - | FileCheck %s
++
++--- |
++  target datalayout = "E-m:e-i64:64-i128:128-n64-S64"
++  target triple = "dadao-unknown-unknown-elf"
++
++  define void @large_frame_pseudos() {
++    %large = alloca [4096 x i8], align 8
++    ret void
++  }
++
++  define void @signed_imms12_boundaries() {
++    %slot = alloca i64, align 8
++    ret void
++  }
++...
++---
++name:            large_frame_pseudos
++tracksRegLiveness: true
++frameInfo:
++  maxAlignment:    8
++  adjustsStack:    false
++  hasCalls:        false
++  maxCallFrameSize: 4294967295
++fixedStack:
++  - { id: 0, type: default, offset: 4096, size: 8, alignment: 8,
++      stack-id: default, isImmutable: false, isAliased: false,
++      callee-saved-register: '', callee-saved-restored: true,
++      debug-info-variable: '', debug-info-expression: '',
++      debug-info-location: '' }
++stack:
++  - { id: 0, name: large, type: default, offset: 0, size: 4096,
++      alignment: 8, stack-id: default, callee-saved-register: '',
++      callee-saved-restored: true, debug-info-variable: '',
++      debug-info-expression: '', debug-info-location: '' }
++body:             |
++  bb.0:
++    ; Positive out-of-range frame references cover ADDI_RB_FI and both the
++    ; RD- and RB-bank load/store pseudos.
++    ; CHECK-LABEL: name: large_frame_pseudos
++    ; CHECK:       $rd2 = frame-setup SETZW_RWII
++    ; CHECK:       $rb1 = frame-setup ADDRB_ORRR $rb1, killed $rd2
++    ; CHECK:       $rd{{[0-9]+}} = SETZW_RWII 0, {{8[0-9]+}}
++    ; CHECK-NEXT:  $rb8 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  $rd8 = LDO_RRII killed $rb5, 0
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  STO_RRII killed $rd8, killed $rb5, 0
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  $rb9 = LDO_RBRRII killed $rb5, 0
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  STO_RBRRII killed $rb9, killed $rb5, 0
++    ; Negative Total=FrameOff+GEPOff coverage for both RD memory pseudos.
++    ; CHECK:       ORW_RWII
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  $rd10 = LDO_RRII killed $rb5, 0
++    ; CHECK:       ORW_RWII
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  STO_RRII killed $rd10, killed $rb5, 0
++    ; CHECK:       $rd2 = frame-destroy SETZW_RWII
++    ; CHECK:       $rb1 = frame-destroy ADDRB_ORRR $rb1, killed $rd2
++
++    $rb8 = ADDI_RB_FI $rb1, %fixed-stack.0
++    $rd8 = LDO_FI $rb1, 0, %fixed-stack.0
++    STO_FI killed $rd8, $rb1, 0, %fixed-stack.0
++    $rb9 = LDO_RB_FI $rb1, 0, %fixed-stack.0
++    STO_RB_FI killed $rb9, $rb1, 0, %fixed-stack.0
++    $rd10 = LDO_FI $rb1, -8192, %stack.0.large
++    STO_FI killed $rd10, $rb1, -8192, %stack.0.large
++    RET_PSEUDO
++...
++---
++name:            signed_imms12_boundaries
++tracksRegLiveness: true
++frameInfo:
++  maxAlignment:    8
++  adjustsStack:    false
++  hasCalls:        false
++  maxCallFrameSize: 4294967295
++fixedStack:
++stack:
++  - { id: 0, name: slot, type: default, offset: 0, size: 8,
++      alignment: 8, stack-id: default, callee-saved-register: '',
++      callee-saved-restored: true, debug-info-variable: '',
++      debug-info-expression: '', debug-info-location: '' }
++body:             |
++  bb.0:
++    ; CHECK-LABEL: name: signed_imms12_boundaries
++    ; CHECK:       $rd16 = LDO_RRII $rb1, 2047
++    ; CHECK:       $rd{{[0-9]+}} = SETZW_RWII 0, 2048
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  $rd17 = LDO_RRII killed $rb5, 0
++    ; CHECK:       $rd18 = LDO_RRII $rb1, -2048
++    ; CHECK:       ORW_RWII 3, 65535
++    ; CHECK:       $rb5 = ADDRB_ORRR $rb1, killed $rd{{[0-9]+}}
++    ; CHECK-NEXT:  $rd19 = LDO_RRII killed $rb5, 0
++
++    $rd16 = LDO_FI $rb1, 2047, %stack.0.slot
++    $rd17 = LDO_FI $rb1, 2048, %stack.0.slot
++    $rd18 = LDO_FI $rb1, -2048, %stack.0.slot
++    $rd19 = LDO_FI $rb1, -2049, %stack.0.slot
++    RET_PSEUDO
++...
+-- 
+2.43.0
+

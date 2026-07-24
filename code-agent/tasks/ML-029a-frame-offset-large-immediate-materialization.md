@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent
 
-**状态**: 待处理
+**状态**: 已完成（独立 review Accepted）
 
 ## 硬约束（务必遵守，违反视为任务失败）
 
@@ -128,3 +128,125 @@
   校验要用 `volatile`）
 - LLVM 其它 in-tree target（RISC-V/ARM）的 `eliminateFrameIndex` 对大偏移量的
   `RegScavenger` 用法，作为正确 API 使用范式参考
+
+## 完成区
+
+**状态**：已完成；独立 subagent review 已 Accepted。
+
+### 根因确认与实现
+
+- ML-027a 的字节级诊断正确：真正的 switch 共有 5 个 frame-index pseudo
+  case（任务标题里的“6 个”是计数笔误），加上 prologue/epilogue 两条直接
+  构造路径，均会把超范围值直接送入 signed imms12。
+- LLVM 普通提交：
+  - `245d4f42a5d8`（parent `3aa546d1d0cd`）：主体大 frame offset
+    materialization；
+  - `032fab81c9bf`（parent `245d4f42a5d8`）：独立集成检查发现
+    small-frame + large-GEP/fixed-offset 在 RD 高压下缺少 emergency slot，
+    以及显式 MIR 的 RB5 source/dest collision 后，新增的 spill-safe
+    follow-up。
+  两者均为普通 commit；未 amend、rebase、`git am` 或 reset 改写历史。
+- `DADAOInstrInfo::materializeImm64` 复用既有 `SETZW` + `ORW` wyde 拼接法。
+  `CONST_WYDE=0` 的既有行为保持不变。
+- prologue/epilogue 对 `isInt<12>` 的小帧保留原单条 `ADDI_RBRRII`；
+  大帧用 ABI-reserved、非 allocatable 且不承载参数/返回值的 RD2 物化有
+  符号调整量，再用 `ADDRB_ORRR rb1,rb1,rd2` 调整 SP。
+- PEI 的 5 个 pseudo 全部先检查最终 `FrameOff + GEPOff`。超范围时通过
+  `RegScavenger::scavengeRegisterBackwards` 安全取得 allocatable RD 临时
+  寄存器，物化完整偏移；通常以 reserved RB5 作为瞬时有效地址寄存器，
+  再将原 load/store 改为相同 memory operand、立即数 0。若显式 MIR 的
+  RB load/store value operand 本身是 RB5，则改用同为 reserved 的 RB6，
+  避免地址物化提前覆盖 source/dest。`ADDI_RB_FI` 直接写原 destination
+  RB。
+- `processFunctionBeforeFrameFinalized` 不再只看
+  `estimateStackSize > 2047`：它扫描五类实际 FI pseudo，并对尚未布局的
+  local object 使用 `[0, estimated-frame-size] + GEPOff` 保守范围，对
+  fixed object 使用其已知 offset + estimated frame + GEPOff。只要最终
+  Total 可能超出 imms12，就预留 8-byte emergency scavenger slot。PEI
+  将该 slot 放在最靠近 final SP 的位置，使其自身 spill/reload 保持小
+  offset、不会递归物化；不可能走大 Total 的普通小帧仍不增加 slot。
+- 顺带修正 DL-072a 后已过时的 varargs callee-save-area LLVM 测试：
+  caller 负责统一保存区时，无 local 的 varargs callee 应保持 frame-free。
+
+### 修改与导出
+
+- LLVM：`DADAOFrameLowering.{cpp,h}`、`DADAORegisterInfo.{cpp,h}`、
+  `DADAOInstrInfo.{cpp,h}`。
+- LLVM 回归：`large-frame-offsets.{ll,mir}` 与
+  `frame-lowering-stack-alignment.ll`。
+- 运行回归：`tests/lit/E2E/frame_offset_large.test` 与
+  `Inputs/frame_offset_large.c`。
+- patch：
+  `components/llvm/patches/0051-DADAO-materialize-large-frame-offsets.patch`
+  与
+  `0052-DADAO-make-frame-offset-scavenging-spill-safe.patch`，均已追加
+  `series`。原计划单个 0051 扩为 0051+0052，是因为 0051 提交后的独立
+  集成 finding 要求保留既有普通 commit、以新的普通 follow-up 修正，未
+  改写 0051。
+- issue：`frame-offset-no-imms12-range-check-silent-wraparound` 已从 open
+  registry 移到 archive。
+
+### 验收结果
+
+1. LLVM 定向 IR/MIR：2/2 PASS；DADAO CodeGen 目录：5/5 PASS。
+   MIR 明确锁定 `2047/-2048` 仍走直接立即数、`2048/-2049` 走物化，
+   并覆盖 prologue/epilogue、`ADDI_RB_FI`、RD/RB load/store、正负大偏移。
+   新增 small-frame + large-GEP 用例把 RD8..RD63 全部保持 live，实际观察
+   到 emergency `STO_RRII`、偏移物化、原 RB store、`LDO_RRII` restore；
+   large fixed offset + 显式 RB5 store/load 则锁定 RB6 地址 scratch。
+2. 新增 volatile 大帧 E2E：QEMU+gem5 正例均 exit 42；故意改错期望值的
+   negative-control build 在两后端均 exit 1。全量 E2E：73/73 PASS。
+3. `pr56866.c`：QEMU 由 TIMEOUT 转 PASS；同一 ELF 在 gem5
+   `SIM_END: trap-exit code=0`。
+4. gcc-c-torture 1708 项：
+   `PASS=1412 / FAIL_COMPILE=113 / FAIL_LINK=133 / FAIL_RUN=50 /
+   TIMEOUT=0`。相对落地前真实基线
+   `1409/113/133/52/1`：PASS +3、FAIL_RUN -2、TIMEOUT -1；无分类总数
+   漂移，也没有旧 PASS 数下降。
+5. differential：
+   `AGREE(3-way)=200, DIVERGE=0`；
+   `AGREE(4-way)=200, SAIL-DIVERGE=0`。
+6. 裸 manifest pin `ca7933e47d3a...` 依次 plain `git am`：
+   52/52 PASS；replay tree 与 LLVM commit `032fab81c9bf` tree 同为
+   `09a9fe311ef08133a65a6435de26003768d6bb8c`。
+
+### 已知边界
+
+- 本任务关闭的是 frame adjustment/frame-index 的 imms12 缺口；不宣称
+  所有非 frame 的 imms12 生产者都由本任务覆盖。
+- RB5 是 ABI-reserved scratch，RD2 是 ABI-reserved prologue/epilogue
+  scratch；实现不占用 incoming argument（RD/RB16+）或 return（RD/RB31）。
+
+## 审阅记录（实现者自审）
+
+| Finding | 处置 |
+|---|---|
+| 直接固定一个 allocatable RD 会破坏活跃值 | PEI 强制使用 RegScavenger；MIR verifier 与真实大帧执行通过 |
+| store 源在指令后可能已 dead，不能凭 live-out 直接挑寄存器 | 使用 `scavengeRegisterBackwards(..., II, RestoreAfter=false)`，覆盖原指令位置，而不是只调用 `FindUnusedReg` |
+| scavenger 自身 spill 可能递归触发大偏移 | 初版只按 frame estimate 预留不足；0052 改为扫描实际 pseudo 的最终 Total 保守范围，small-frame + large-GEP 的 RD8..RD63 全活 MIR 已强制并验证 emergency spill/restore |
+| 固定 RB5 地址 scratch 可能覆盖 RB store source/load dest | 正常 RA 不会分配 reserved RB5；0052 仍使显式 RB5 operand 自动改用 reserved RB6，并由 fixed-offset MIR 锁定 |
+| prologue/epilogue scratch 可能破坏参数或返回值 | 仅用 ABI-reserved RD2；参数从 RD16 开始，scalar return 在 RD31 |
+| 小帧路径可能因新 slot/metadata 漂移 | 仅当扫描证明某个 FI pseudo 的最终 Total 可能越界才创建 slot；普通小帧汇编回归保持原单指令 |
+| 只验证 pr56866 可能遗漏“侥幸 PASS”变化 | 重跑完整 1708 corpus、73 E2E 与四方差分 |
+| LLVM 全目录首次发现 varargs 旧断言失败 | 确认为 DL-072a 后的 stale callee-save-area 测试，按 caller-save-area 事实修正后 5/5 |
+
+**实现者自审判决：PASS，提交独立 subagent review。**
+
+## 独立 subagent review（2026-07-24）
+
+- 审查记录：
+  `docs/reviews/ML-029a-independent-review-20260724.md`。
+- 审查对象为最终 LLVM HEAD `032fab81c9bf`，覆盖主体提交
+  `245d4f42a5d8`、spill-safe follow-up `032fab81c9bf`、0051/0052 patch、
+  运行测试与 issue 关闭记录。
+- 独立定向验证：新增 LLVM IR/MIR 2/2 PASS，DADAO CodeGen 5/5 PASS；
+  E2E 73/73 PASS；gcc-c-torture 为
+  `1412/113/133/50/0`，相对基线旧 PASS 零退化；三方/四方 differential
+  均 200 AGREE、0 DIVERGE；manifest pin 上 plain `git am` 52/52，
+  replay tree 与最终 LLVM tree 一致。
+- reviewer 未发现 blocking、major 或 minor finding。其两条 informational
+  仅说明测试覆盖的组合方式与临时审查沙箱配置，不影响实现或验收结论。
+- 架构师收尾时保留了 ML-027a issue 的完整诊断历史，仅将状态、解决提交和
+  ML-029a 最终证据补入 archive，避免关闭 issue 时丢失既有调查记录。
+
+**独立 reviewer 判决：Accepted，无 blocking finding。**
