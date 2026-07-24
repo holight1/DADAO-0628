@@ -76,3 +76,55 @@
   issue，避免把已知问题重新当成"新发现"）
 - `docs/development-roadmap.md`（`ML-027a`~`ML-034a` 各任务的详细修复历史，
   帮助判断某类失败是否已经是某个已知机制的残留边界情况）
+
+## 完成区
+
+**基线确认**：重跑 `python3 tests/scripts/gcc_torture_sweep.py --workers 8` 得到
+`PASS=1461 FAIL_COMPILE=104 FAIL_LINK=125 FAIL_RUN=18`，与任务书给出的基线逐字节
+一致，无环境漂移。
+
+**产出**：`docs/reviews/ML-035a-gcc-torture-gap-rescan-2026-07-24.md`（详细子分类+
+文件清单+优先级建议，见该报告）。未改动任何 `.work/*`/backend/QEMU/gem5/musl/LLVM
+源码，纯扫描+独立诊断探针（探针文件在临时 scratchpad，未提交仓库）。
+
+**FAIL_COMPILE（104）**：84 个已知/可解释（clang 前端能力边界或 upstream 自身
+跳过条目：`setjmp_longjmp_unsupported` 34、`nested_function` 29、`vla_in_struct`
+8、`return_type_needs_dash_W_flag` 3、`pointer_type_strictness` 2、
+`alignment_mismatch` 2、其余 6 类各 1）+ 20 个真实候选缺陷（向量类型 legalizer
+11 个 + `__int128` CallingConv 6 个 + `BlockAddress` 3 个）——**这 20 个文件与
+`ML-026a` 报告逐字节相同，`ML-027a`~`ML-034a` 均未触碰这条路径，零进展也零新
+发现**；本次新发现向量和 `__int128` 共享同一段"128-bit 宽返回值 CC 分配"崩溃
+站点（`CallingConvLower.cpp:174`/"unable to allocate function return #1"），是
+可能一次覆盖两个类型家族的杠杆点。
+
+**FAIL_LINK（125）**：100% 落位到已知类别（`companion_no_main`+镜像情形 106、
+`gnu89_inline_semantics` 12、`dash_O0_link_error_idiom` 2、`known_gcc_only_builtin`
+3、`setjmp_longjmp_link` 1）+ 已登记 open issue（`__divsc3`，1 个文件）——**零新
+发现，`ML-028a`/`ML-030a` 已经把这条线上的集中簇挖完**，不建议在此再单独立项。
+
+**FAIL_RUN（18，剔除 2 个永久 ABI 排除后 16 个）**：6 个已知 upstream 自身跳过、
+3 个 fopen-for-write 已知系统调用面缺口、2 个已知架构级问题（`20101011-1.c`
+缺 `-D` 宏 / `nestfunc-4.c` RASOF）、2 个低优先级独立候选（float→int 边界转换、
+向量标量化正确性），以及**本次最重要的发现**：
+
+- **对 `ML-026a` 报告的一处更正**：`ML-026a` 把 `931102-1.c`/`931102-2.c` 误并入
+  "12 文件变参传小 struct 实参"簇（源码里完全没有 `va_arg` 用法，逐文件复核
+  证伪）。该簇其余 10 个真正含 `va_arg` 的文件**已经全部 PASS**（`ML-031a`/
+  `ML-034a` 期间修复），包括此前"顺带翻盘未深挖"的 `pr38151.c`（`_Complex`
+  变参 corruption issue）**本次确认也已 PASS**（是否关闭该 issue 留给后续
+  任务判断）。
+- `931102-1.c`/`931102-2.c` 实际是一个**此前完全未被记录的真实 miscompile**：
+  单比特 AND 掩码测试（`if ((x&1)==0)`/`if (!(x&1))` 这类负极性写法）在 `-O0`
+  下会把 `and rd,rd,1` 指令静默丢弃，直接对未掩码的原始字节做条件分支，导致
+  "低位为 0 但整字节非零"的输入得到错误的分支结果；`-O2` 下不复现；
+  `960608-1.c`（位域读取）疑似同一根因家族的另一触发形状，但未能孤立出统一
+  的最小触发条件。**这是本次扫描识别出的最高优先级后续项**——文件命中数少
+  （2 确诊+1 强嫌疑），但这类"不崩溃、只是运行时结果错误"的静默 miscompile
+  风险面（`if(!(x&1))`/`while((x&mask)==0)`/单比特位域读取都是常见真实 C
+  写法）远大于文件计数本身，建议登记 issue 并作为 P0 下发诊断+修复任务。
+
+**优先级建议**（详见报告 §4）：P0 单比特 AND 掩码丢弃 miscompile（中等工作量，
+真正价值在风险面非文件数）；P1 `__divsc3`（已登记 issue，中等工作量，1 文件）；
+P2 向量+`__int128` CC 分配共享杠杆点（大工作量，合计 17 文件）；P3
+`BlockAddress`（中等工作量，3 文件）/RASOF 架构问题（大工作量，架构决策）；
+P4 两个低优先级单文件项，不单独立项。
