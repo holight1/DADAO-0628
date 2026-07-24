@@ -1431,3 +1431,60 @@ vector-legalize/`BlockAddress`, `qrduino`-O2 and the `_Complex` variadic
 corruption as new, explicitly-documented-not-fixed defects, plus the
 still-open `musl-softfloat-shim-missing-divsc3` (`__divsc3`) and
 `dadao-hfa-argument-not-implemented` issues.
+
+## ML-034a: remove `-ffreestanding` from test/scan compilation (2026-07-24)
+
+The project's gcc-c-torture sweep and E2E lit tests compiled user
+programs with `-ffreestanding`, a holdover from before the project had a
+real libc. `-ffreestanding` disables C11's guarantee that a `main()`
+falling off the end implicitly returns 0 — since the project now links a
+real, statically-linked musl (`_start`/`__libc_start_main` since
+ML-007a..012a), that guarantee is both available and correct, and its
+absence was misclassifying logically-correct torture files as
+`FAIL_RUN` (the exact false-failure source ML-026a's original scan
+flagged). Removed from `tests/scripts/{gcc_torture_sweep,embench_sweep}.py`
+and the 10 E2E lit tests that used it; musl's own build
+(`-ffreestanding` in its own `Makefile`) is untouched — that's normal
+upstream musl practice, unrelated to how test programs get compiled.
+
+Result: gcc-c-torture PASS 1438→1461 (25 files flip to PASS: 6
+FAIL_LINK→PASS, 19 FAIL_RUN→PASS — more than ML-026a's original ~12-15
+estimate, confirmed exact by file-level diff, not estimated). Also
+surfaced 2 genuine, non-fake regressions (`20050604-1.c` — MMX/SSE-style
+vector union arithmetic; `pr63302.c` — `__int128` bit-masking), both
+root-caused to the same mechanism via a standalone IR/asm diff: hosted
+mode's dead `%retval` slot shifts `main()`'s stack frame from 0 bytes to
+an 8-byte (non-16-byte-multiple) adjustment, and the callee functions
+holding the actual 128-bit-wide locals compute their frame offsets
+assuming a 16-byte-aligned incoming stack pointer — an assumption that
+was only ever true by luck across the previously-exercised call chains,
+not an enforced invariant. `DADAOFrameLowering.h` declares `Align(8)`,
+which matches the wiki's ABI type table exactly (`DADAO-21-ABI`'s
+sizeof/Alignment table tops out at 8-byte types — `long`/pointer/
+`double` — with aggregates "at least 8-byte aligned"; 128-bit types
+have no defined DADAO ABI alignment contract at all). Presented to the
+user as a genuine ABI-scope decision (same shape as the HFA exclusion):
+extend the ABI to define 128-bit alignment and add dynamic stack
+realignment support to the backend, or register it as a permanent,
+documented exclusion. **User chose exclusion** — registered in
+`docs/issues.yaml` (`dadao-frame-lowering-8byte-align-insufficient-for-
+16byte-locals`, reworded to state `DADAOFrameLowering`'s `Align(8)` is
+correct per spec, not a bug) alongside the existing HFA exclusion; these
+2 files are expected to remain permanently non-PASS with this documented
+reason.
+
+Architect independently verified: confirmed the exact file list (12
+files touched, `-ffreestanding` fully gone from test-compilation scope,
+musl's own Makefile untouched); reran the full 1708-file gcc-c-torture
+sweep and got the exact reported `1461/104/125/18`; computed the
+file-level diff programmatically against the pre-task baseline JSON and
+confirmed exactly 25 improvements + 2 regressions + 0 other changes,
+matching the subagent's report line for line; independently reproduced
+the root cause with a fresh `-emit-llvm`/`llc` diff for `pr63302.c`
+(confirmed the dead `%retval` slot, the 8-byte `main()` frame adjustment,
+and that `foo()`'s own prologue is byte-for-byte identical between hosted
+and freestanding); reran the full E2E suite (77/77) and
+`run_differential.py`/`manifest_check.py`/`check_issues.py` (all
+unchanged/PASS).
+
+**gcc-c-torture running total: 1328→1461/1708 (85.6%)**.
