@@ -1289,3 +1289,53 @@ verify DL-072a's varargs fix covers struct-by-value args, P1 the
 relocation/large-constant-addressing bug, P1 re-evaluate `-ffreestanding`,
 P2 VLA/`__int128`/vector-legalize/`alloca`/`BlockAddress`, plus the new
 `musl-softfloat-shim-missing-divsc3` issue from ML-028a.
+
+## ML-030a: relocation-range overflow for large GlobalAddress constant offsets (2026-07-24)
+
+Root cause: `DADAOTargetLowering` never overrode `TargetLowering::
+isOffsetFoldingLegal`, so it inherited the base class's permissive
+default (`true`). `SelectionDAG::FoldSymbolOffset` used that to fold
+`ADD(GlobalAddress, Constant)` into a single `GlobalAddress(offset)` node
+with no check on the constant's magnitude. Source patterns like
+`a[i - 2000000000L]` (`960321-1.c`/`pr79286.c`) folded the huge constant
+straight into the symbol expression, which both `RELA_RIII` and
+`ADDI_RBRRII` encode into an 18-bit-range relocation field (`imms18`,
+`contracts/isa/spec.md` §2.2, range `[-131072,131071]`) — `ld.lld` then
+correctly rejected `a-2000000000` as an out-of-range relocation.
+
+Fix: override the hook to unconditionally return `false`, matching the
+established convention across AArch64/RISC-V/MIPS/Sparc/LoongArch (all
+read directly to confirm none of them fold either — they keep the ADD
+node separate and rely on an as-yet-nonexistent-for-DADAO peephole to
+re-fold small/mid-range offsets later "when profitable"). This forces
+large offsets through the existing `ISD::Constant → CONST_WYDE →
+materializeImm64` register-materialization path established by ML-029a —
+no new materialization machinery needed, pure reuse. A same-day
+self-review follow-up commit (`fada3562a00e`, comment-only) disclosed a
+finding the implementer's own subagent caught: offsets in the
+`(2047,131071]` mid-range, which used to fold into the relocation for
+free, now cost two extra instructions (`setzw`/`orw` + `add`) since the
+hook has no visibility into the post-fold magnitude and must reject
+unconditionally — the same tradeoff every peer backend accepts, now
+explicitly documented rather than just implied by "small offsets remain
+cheap."
+
+Architect-verified independently end-to-end: rebuilt the toolchain from
+scratch, reran the 6 directed `CodeGen/DADAO` lit tests (6/6 PASS,
+including the new `large-global-offsets.ll`), reran the full E2E suite
+(74/74 PASS, including the new `global_offset_large.test` with its
+negative control), directly reproduced `960321-1.c`/`pr79286.c` flipping
+to `PASS`, reran the full 1708-file gcc-c-torture sweep myself and got
+the exact same breakdown (`1414/113/131/50/0`) the implementer reported,
+replayed the full 54-patch LLVM series from a bare manifest-pin checkout
+with tree-hash identity confirmed, and reran `run_differential.py`/
+`manifest_check.py`/`check_issues.py` (AGREE unchanged, all PASS).
+
+**gcc-c-torture running total: 1328→1414/1708 (82.8%)**, zero regressions
+(exactly the two targeted files flipped, confirmed via full-corpus sweep
+re-run, not just aggregate counts). Remaining open items from ML-026a's
+original list: **P1 aggregate/struct-by-value ABI parameter passing
+(ML-031a, in progress)**, P1 re-evaluate `-ffreestanding` (user decided
+2026-07-24 to remove it and switch to hosted mode — not yet started),
+P2 VLA/`__int128`/vector-legalize/`BlockAddress`, plus the open
+`musl-softfloat-shim-missing-divsc3` issue from ML-028a.
