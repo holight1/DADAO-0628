@@ -289,37 +289,6 @@
   # 全树 `make -k lib/libc.a`（干净 `-j1` 串行重建，逐对象独立复测）确认
   # daemon.c 确实是被 `-O0` 掩盖、非被修复，未发现新增触发文件。
 
-- id: musl-backend-dynamic-stackalloc-unimplemented
-  title: "musl `execl`/`execle`/`execlp`/`execvp`/`getcwd`/`res_msend`/`dcngettext` 编译时撞 'Cannot select: tNN: i64,ch = dynamic_stackalloc ...' — DADAO 后端从未实现 ISD::DYNAMIC_STACKALLOC 的合法化/选择"
-  status: open
-  scope: [CodeGen]
-  blocks: null
-  resolved_by: null
-  # ML-021a（2026-07-22）：修复同一基本块 ≥2 个直接 CALL 的
-  # ISD::CALLSEQ_START/END glue 链 bug（见 musl-backend-assert-illegal-
-  # result-number / musl-backend-assert-node-already-inserted 归档条目）
-  # 后，全量 musl fresh 编译（干净重跑 `make -k -j1 lib/crt1.o lib/libc.a`，
-  # 逐对象独立复测）首次让这 7 个文件真正走到指令选择这一步才曝光——此前
-  # 它们大概率先撞上面两条已归档的 BuildSchedUnits 断言（这几个文件同时
-  # 用到 execve/getcwd 等系统调用封装里常见的"变长参数数组"或
-  # snprintf/vsnprintf 风格的可变长缓冲区，即 IR 层的
-  # `alloca <非常量 count>`，legalize 后变成 `ISD::DYNAMIC_STACKALLOC`），
-  # 而非本次改动引入的新回归——ML-021a 的 DAG 转储/lit E2E/差分对比均未
-  # 涉及 dynamic_stackalloc 节点，改动范围与本类别无交集。
-  #
-  # 具体崩溃：`fatal error: error in backend: Cannot select: tNN: i64,ch =
-  # dynamic_stackalloc tMM:1, tKK, Constant:i64<0>`（DAGToDAG 阶段，
-  # SelectionDAGISel 报"无法选择"而非断言/UNREACHABLE——即 DADAO
-  # DADAOISelLowering.cpp 从未对 `ISD::DYNAMIC_STACKALLOC` 调用
-  # `setOperationAction`，也没有对应的 `Pat<>`/手工 Select() 分支）。这是
-  # 一个缺失特性（VLA / 运行时决定大小的 alloca），不是 glue 链一类的拓扑
-  # bug，需要单独设计"运行时调整 rb1(SP)"的降低序列（真正的寄存器调整，
-  # 不能像 ADJCALLSTACKDOWN/UP 那样直接吃 eliminateCallFramePseudoInstr
-  # 的 no-op 快捷路径），留给独立任务。
-  # 触发对象（7 个）：process/execl.c、process/execle.c、process/execlp.c、
-  # process/execvp.c、unistd/getcwd.c、network/res_msend.c、
-  # locale/dcngettext.c。
-
 - id: blockcopy-rb-source-64bit-fidelity-backend-divergence
   title: "QEMU 与 gem5 对 RB-bank block-copy 指令（rd2rb/rb2rb 写 → rb2rd/rb2rb 读）在源寄存器高 16 位非零时是否保真存在真实分歧，且分歧依赖\"写入该寄存器所用的指令类别\"而非仅寄存器内容——现有逐指令语义向量（per-instruction state injection）测不出这种序列相关性"
   status: open

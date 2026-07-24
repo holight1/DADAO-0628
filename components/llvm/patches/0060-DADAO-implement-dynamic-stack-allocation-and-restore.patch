@@ -1,0 +1,816 @@
+From dd80ef109bbb0a8f1bcc83c4377e46fec832b37f Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 16:31:36 +0800
+Subject: [PATCH] DADAO: implement dynamic stack allocation and restore
+
+---
+ llvm/lib/Target/DADAO/DADAOFrameLowering.cpp  | 133 ++++++++-
+ llvm/lib/Target/DADAO/DADAOFrameLowering.h    |   5 +-
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   |  83 +++++-
+ llvm/lib/Target/DADAO/DADAOISelLowering.h     |  36 ++-
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       |  10 +
+ llvm/lib/Target/DADAO/DADAORegisterInfo.cpp   |  14 +-
+ llvm/test/CodeGen/DADAO/dynamic-stackalloc.ll | 266 ++++++++++++++++++
+ 7 files changed, 503 insertions(+), 44 deletions(-)
+ create mode 100644 llvm/test/CodeGen/DADAO/dynamic-stackalloc.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+index 0181cd0b8d84..9df43912586d 100644
+--- a/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.cpp
+@@ -22,6 +22,11 @@ namespace {
+ 
+ constexpr uint64_t DADAOFrameAlignment = 8;
+ 
++bool needsDADAOFramePointer(const MachineFunction &MF) {
++  const MachineFrameInfo &MFI = MF.getFrameInfo();
++  return MFI.hasVarSizedObjects() || MFI.isFrameAddressTaken();
++}
++
+ bool mayNeedFrameOffsetScavenging(const MachineFunction &MF,
+                                   uint64_t EstimatedFrameSize) {
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
+@@ -74,39 +79,111 @@ bool mayNeedFrameOffsetScavenging(const MachineFunction &MF,
+ 
+ uint64_t getDADAOFrameSize(const MachineFunction &MF) {
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
+-  return alignTo(MFI.getStackSize(), DADAOFrameAlignment);
++  // An FP frame has one ABI-mandated slot at incoming_sp - 8 for the
++  // caller's rb2.  It is managed explicitly in the prologue/epilogue and
++  // therefore is not represented by a MachineFrameInfo object.
++  uint64_t FPSlot = needsDADAOFramePointer(MF) ? 8 : 0;
++  return alignTo(MFI.getStackSize() + FPSlot, DADAOFrameAlignment);
+ }
+ 
+ } // namespace
+ 
++bool DADAOFrameLowering::hasFPImpl(const MachineFunction &MF) const {
++  // Once a dynamic allocation moves rb1, fixed objects and spills need a
++  // stable base.  The ABI-designated frame pointer is rb2.
++  return needsDADAOFramePointer(MF);
++}
++
++void DADAOFrameLowering::replaceAdjDynAllocPseudo(MachineFunction &MF) const {
++  const DADAOInstrInfo *TII = MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
++  uint64_t MaxCallFrameSize = MF.getFrameInfo().getMaxCallFrameSize();
++
++  for (MachineBasicBlock &MBB : MF) {
++    for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
++      if (MI.getOpcode() != DADAO::ADJDYNALLOC)
++        continue;
++
++      DebugLoc DL = MI.getDebugLoc();
++      Register Dst = MI.getOperand(0).getReg();
++      Register Src = MI.getOperand(1).getReg();
++
++      // The actual SP stays below the reserved outgoing-argument area.
++      // Return a pointer above that area so later calls cannot overwrite the
++      // dynamic object.  Src is in RD because the runtime subtraction is
++      // ordinary i64 arithmetic; bridge the final address back to RB.
++      BuildMI(MBB, MI, DL, TII->get(DADAO::RD2RB_ORRI), Dst)
++          .addReg(Src)
++          .addImm(1);
++      if (MaxCallFrameSize) {
++        if (isInt<12>(MaxCallFrameSize)) {
++          BuildMI(MBB, MI, DL, TII->get(DADAO::ADDI_RBRRII), Dst)
++              .addReg(Dst)
++              .addImm(MaxCallFrameSize);
++        } else {
++          TII->materializeImm64(MBB, MI, DL, DADAO::RD2, MaxCallFrameSize);
++          BuildMI(MBB, MI, DL, TII->get(DADAO::ADDRB_ORRR), Dst)
++              .addReg(Dst)
++              .addReg(DADAO::RD2, RegState::Kill);
++        }
++      }
++      MI.eraseFromParent();
++    }
++  }
++}
++
+ void DADAOFrameLowering::emitPrologue(MachineFunction &MF,
+                                       MachineBasicBlock &MBB) const {
+   const DADAOInstrInfo *TII = MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
+ 
+   uint64_t StackSize = getDADAOFrameSize(MF);
++  bool HasFP = hasFP(MF);
+   if (StackSize == 0)
+     return;
+ 
+   MachineBasicBlock::iterator MBBI = MBB.begin();
+   DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
+ 
++  if (HasFP) {
++    // contracts/abi/spec.md §5.2:
++    //   [incoming_sp - 8] = old rb2
++    //   rb2 = incoming_sp - 8
++    BuildMI(MBB, MBBI, DL, TII->get(DADAO::STO_RBRRII))
++        .addReg(DADAO::RB2)
++        .addReg(DADAO::RB1)
++        .addImm(-8)
++        .setMIFlag(MachineInstr::FrameSetup);
++    BuildMI(MBB, MBBI, DL, TII->get(DADAO::RB2RB_ORRI), DADAO::RB2)
++        .addReg(DADAO::RB1)
++        .addImm(1)
++        .setMIFlag(MachineInstr::FrameSetup);
++    BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB2)
++        .addReg(DADAO::RB2)
++        .addImm(-8)
++        .setMIFlag(MachineInstr::FrameSetup);
++  }
++
+   int64_t Adjustment = -static_cast<int64_t>(StackSize);
+   if (isInt<12>(Adjustment)) {
+-    BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++            .addReg(DADAO::RB1)
++            .addImm(Adjustment);
++    if (HasFP)
++      MIB.setMIFlag(MachineInstr::FrameSetup);
++  } else {
++    // RD2 is ABI-reserved and never allocated.  Integer arguments start at
++    // RD16, so using RD2 before any callee code cannot destroy an incoming
++    // argument.
++    TII->materializeImm64(MBB, MBBI, DL, DADAO::RD2, Adjustment,
++                          MachineInstr::FrameSetup);
++    BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDRB_ORRR), DADAO::RB1)
+         .addReg(DADAO::RB1)
+-        .addImm(Adjustment);
+-    return;
++        .addReg(DADAO::RD2, RegState::Kill)
++        .setMIFlag(MachineInstr::FrameSetup);
+   }
+ 
+-  // RD2 is ABI-reserved and never allocated.  Integer arguments start at
+-  // RD16, so using RD2 before any callee code cannot destroy an incoming
+-  // argument.
+-  TII->materializeImm64(MBB, MBBI, DL, DADAO::RD2, Adjustment,
+-                        MachineInstr::FrameSetup);
+-  BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDRB_ORRR), DADAO::RB1)
+-      .addReg(DADAO::RB1)
+-      .addReg(DADAO::RD2, RegState::Kill)
+-      .setMIFlag(MachineInstr::FrameSetup);
++  if (HasFP)
++    replaceAdjDynAllocPseudo(MF);
+ }
+ 
+ void DADAOFrameLowering::emitEpilogue(MachineFunction &MF,
+@@ -114,12 +191,28 @@ void DADAOFrameLowering::emitEpilogue(MachineFunction &MF,
+   const DADAOInstrInfo *TII = MF.getSubtarget<DADAOSubtarget>().getInstrInfo();
+ 
+   uint64_t StackSize = getDADAOFrameSize(MF);
++  bool HasFP = hasFP(MF);
+   if (StackSize == 0)
+     return;
+ 
+   MachineBasicBlock::iterator MBBI = MBB.getFirstTerminator();
+   DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
+ 
++  if (HasFP) {
++    // Dynamic allocations may still be live at function exit, so restore
++    // rb1 from the stable frame pointer instead of adding a fixed size to a
++    // moving SP.  Then recover the caller's rb2 from its ABI slot.
++    BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
++        .addReg(DADAO::RB2)
++        .addImm(8)
++        .setMIFlag(MachineInstr::FrameDestroy);
++    BuildMI(MBB, MBBI, DL, TII->get(DADAO::LDO_RBRRII), DADAO::RB2)
++        .addReg(DADAO::RB1)
++        .addImm(-8)
++        .setMIFlag(MachineInstr::FrameDestroy);
++    return;
++  }
++
+   int64_t Adjustment = static_cast<int64_t>(StackSize);
+   if (isInt<12>(Adjustment)) {
+     BuildMI(MBB, MBBI, DL, TII->get(DADAO::ADDI_RBRRII), DADAO::RB1)
+@@ -145,6 +238,8 @@ void DADAOFrameLowering::processFunctionBeforeFrameFinalized(
+     return;
+ 
+   uint64_t EstimatedFrameSize = MFI.estimateStackSize(MF);
++  if (hasFP(MF))
++    EstimatedFrameSize += 8;
+   if (!mayNeedFrameOffsetScavenging(MF, EstimatedFrameSize))
+     return;
+ 
+@@ -161,6 +256,18 @@ StackOffset
+ DADAOFrameLowering::getFrameIndexReference(const MachineFunction &MF, int FI,
+                                            Register &FrameReg) const {
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
++  if (hasFP(MF)) {
++    FrameReg = DADAO::RB2;
++
++    // rb2 points at incoming_sp - 8.  Incoming fixed objects therefore gain
++    // 8, while ordinary locals retain their negative MFI offset and are
++    // naturally placed below the saved-FP slot.
++    int64_t Offset = MFI.getObjectOffset(FI);
++    if (MFI.isFixedObjectIndex(FI))
++      Offset += 8;
++    return StackOffset::getFixed(Offset);
++  }
++
+   FrameReg = DADAO::RB1;
+ 
+   int64_t FrameSize = static_cast<int64_t>(getDADAOFrameSize(MF));
+diff --git a/llvm/lib/Target/DADAO/DADAOFrameLowering.h b/llvm/lib/Target/DADAO/DADAOFrameLowering.h
+index 6eddab1e223c..06c989c6cddf 100644
+--- a/llvm/lib/Target/DADAO/DADAOFrameLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOFrameLowering.h
+@@ -16,7 +16,7 @@ public:
+   void processFunctionBeforeFrameFinalized(MachineFunction &MF,
+                                            RegScavenger *RS) const override;
+ 
+-  bool hasFPImpl(const MachineFunction &MF) const override { return false; }
++  bool hasFPImpl(const MachineFunction &MF) const override;
+ 
+   // Call lowering writes outgoing stack arguments (including the unified
+   // varargs save area) at SP-relative offsets.  Reserve the largest such
+@@ -33,6 +33,9 @@ public:
+                                 MachineBasicBlock::iterator MI) const override {
+     return MBB.erase(MI);
+   }
++
++private:
++  void replaceAdjDynAllocPseudo(MachineFunction &MF) const;
+ };
+ 
+ } // namespace llvm
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 4cbd7abce32b..6717840c889e 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -11,6 +11,7 @@
+ #include "llvm/CodeGen/SelectionDAG.h"
+ #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
+ #include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/MathExtras.h"
+ 
+ using namespace llvm;
+ 
+@@ -20,6 +21,21 @@ using namespace llvm;
+ 
+ char llvm::DADAOMachineFunctionInfo::ID = 0;
+ 
++static SDValue getOutgoingStackAddress(SelectionDAG &DAG, const SDLoc &DL,
++                                       uint64_t Offset) {
++  SDValue SP = DAG.getRegister(DADAO::RB1, MVT::i64);
++  SDValue PtrOff = DAG.getIntPtrConstant(Offset, DL);
++
++  // Small offsets are folded into the load/store's native imms12 addressing
++  // mode by DADAODAGToDAGISel.  A generic ADD cannot represent the large
++  // case: i64 arithmetic is allocated to GPRD, so feeding physical rb1 to it
++  // silently reads the same-numbered RD register.  Keep the base in GPRB and
++  // materialize the large constant in GPRD for the ISA's add-rb operation.
++  if (isInt<12>(static_cast<int64_t>(Offset)))
++    return DAG.getNode(ISD::ADD, DL, MVT::i64, SP, PtrOff);
++  return DAG.getNode(DADAOISD::ADDRB, DL, MVT::i64, SP, PtrOff);
++}
++
+ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+                                          const DADAOSubtarget &STI)
+     : TargetLowering(TM, STI) {
+@@ -49,6 +65,9 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+ 
+   setOperationAction(ISD::VASTART, MVT::Other, Custom);
+   setOperationAction({ISD::VAARG, ISD::VACOPY, ISD::VAEND}, MVT::Other, Expand);
++  setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i64, Custom);
++  setOperationAction({ISD::STACKSAVE, ISD::STACKRESTORE}, MVT::Other, Expand);
++  setStackPointerRegisterToSaveRestore(DADAO::RB1);
+ 
+   setOperationAction(ISD::ROTL, MVT::i64, Expand);
+   setOperationAction(ISD::ROTR, MVT::i64, Expand);
+@@ -64,6 +83,7 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+ 
+   setTargetDAGCombine(ISD::BRCOND);
+   setOperationAction(ISD::FrameIndex, MVT::i64, Custom);
++  setOperationAction(ISD::FRAMEADDR, MVT::i64, Custom);
+   setOperationAction(ISD::SETCC, MVT::i64, Custom);
+   setOperationAction(ISD::SELECT_CC, MVT::i64, Expand);
+   setOperationAction(ISD::GlobalAddress, MVT::i64, Custom);
+@@ -173,11 +193,7 @@ SDValue DADAOTargetLowering::LowerCall(
+       unsigned LocMemOffset = VA.getLocMemOffset();
+       if (IsVarArg && Outs[i].Flags.isVarArg())
+         LocMemOffset += VarArgsSaveSize;
+-      SDValue PtrOff = DAG.getIntPtrConstant(
+-          LocMemOffset, DL);
+-      SDValue DstAddr = DAG.getNode(ISD::ADD, DL, MVT::i64,
+-                                     DAG.getRegister(DADAO::RB1, MVT::i64),
+-                                     PtrOff);
++      SDValue DstAddr = getOutgoingStackAddress(DAG, DL, LocMemOffset);
+       SDValue Store = DAG.getStore(Chain, DL, Arg, DstAddr,
+                                     MachinePointerInfo::getStack(MF, LocMemOffset));
+       MemOpChains.push_back(Store);
+@@ -187,10 +203,7 @@ SDValue DADAOTargetLowering::LowerCall(
+       assert(Arg.getValueType() == MVT::i64 &&
+              "DADAO scalar varargs must be legalized to one 64-bit slot");
+       unsigned SaveOffset = FixedStackBytes + i * 8;
+-      SDValue PtrOff = DAG.getIntPtrConstant(SaveOffset, DL);
+-      SDValue DstAddr =
+-          DAG.getNode(ISD::ADD, DL, MVT::i64,
+-                      DAG.getRegister(DADAO::RB1, MVT::i64), PtrOff);
++      SDValue DstAddr = getOutgoingStackAddress(DAG, DL, SaveOffset);
+       MemOpChains.push_back(
+           DAG.getStore(Chain, DL, Arg, DstAddr,
+                        MachinePointerInfo::getStack(MF, SaveOffset)));
+@@ -385,6 +398,8 @@ SDValue DADAOTargetLowering::LowerOperation(SDValue Op,
+     return LowerBR_CC(Op, DAG);
+   case ISD::FrameIndex:
+     return lowerFrameIndex(Op, DAG);
++  case ISD::FRAMEADDR:
++    return lowerFRAMEADDR(Op, DAG);
+   case ISD::SETCC:
+     return lowerSETCC(Op, DAG);
+   case ISD::GlobalAddress:
+@@ -399,12 +414,62 @@ SDValue DADAOTargetLowering::LowerOperation(SDValue Op,
+     return lowerConstantPool(Op, DAG);
+   case ISD::VASTART:
+     return lowerVASTART(Op, DAG);
++  case ISD::DYNAMIC_STACKALLOC:
++    return lowerDYNAMIC_STACKALLOC(Op, DAG);
+   default:
+     break;
+   }
+   return SDValue();
+ }
+ 
++SDValue DADAOTargetLowering::lowerDYNAMIC_STACKALLOC(SDValue Op,
++                                                     SelectionDAG &DAG) const {
++  SDLoc DL(Op);
++  SDValue Chain = Op.getOperand(0);
++  SDValue Size = Op.getOperand(1);
++
++  // Serialize the real rb1 update with other stack users.  This is a genuine
++  // SP change; the surrounding zero-sized call-sequence markers only carry
++  // ordering and are erased by frame lowering.
++  Chain = DAG.getCALLSEQ_START(Chain, 0, 0, DL);
++  SDValue SP = DAG.getCopyFromReg(Chain, DL, DADAO::RB1, MVT::i64);
++  Chain = SP.getValue(1);
++
++  SDValue NewSP = DAG.getNode(ISD::SUB, DL, MVT::i64, SP, Size);
++  Align Alignment = cast<ConstantSDNode>(Op.getOperand(2))->getAlignValue();
++  if (Alignment > Align(8))
++    NewSP =
++        DAG.getNode(ISD::AND, DL, MVT::i64, NewSP,
++                    DAG.getSignedConstant(-Alignment.value(), DL, MVT::i64));
++
++  Chain = DAG.getCopyToReg(Chain, DL, DADAO::RB1, NewSP);
++  Chain = DAG.getCALLSEQ_END(Chain, 0, 0, SDValue(), DL);
++
++  // Keep the outgoing-argument area below the returned dynamic object.  The
++  // final offset is not known until frame layout, so defer it to a pseudo.
++  SDValue Address = DAG.getNode(DADAOISD::ADJDYNALLOC, DL, MVT::i64, NewSP);
++  return DAG.getMergeValues({Address, Chain}, DL);
++}
++
++SDValue DADAOTargetLowering::lowerFRAMEADDR(SDValue Op,
++                                            SelectionDAG &DAG) const {
++  MachineFrameInfo &MFI = DAG.getMachineFunction().getFrameInfo();
++  MFI.setFrameAddressIsTaken(true);
++
++  SDLoc DL(Op);
++  EVT VT = Op.getValueType();
++  SDValue FrameAddr =
++      DAG.getCopyFromReg(DAG.getEntryNode(), DL, DADAO::RB2, VT);
++
++  // rb2 points directly at the slot containing the caller's saved rb2.
++  // Following that zero-offset chain therefore walks older frames.
++  unsigned Depth = Op.getConstantOperandVal(0);
++  while (Depth--)
++    FrameAddr = DAG.getLoad(VT, DL, DAG.getEntryNode(), FrameAddr,
++                            MachinePointerInfo());
++  return FrameAddr;
++}
++
+ SDValue DADAOTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
+   SDValue Chain = Op.getOperand(0);
+   ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(1))->get();
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index 63d848f06e45..fdc00f6c320b 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -11,22 +11,26 @@ enum NodeType {
+   FIRST_NUMBER = ISD::BUILTIN_OP_END,
+   RET_GLUE,
+   CALL,
+-  BREQ,   // (chain, lhs, rhs, dest) — breq  two-reg compare-equal branch
+-  BRNE,   // (chain, lhs, rhs, dest) — brne  two-reg compare-not-equal branch
+-  BRZ,    // (chain, val, dest) — brz   branch if val==0
+-  BRNZ,   // (chain, val, dest) — brnz  branch if val!=0
+-  BRN,    // (chain, val, dest) — brn   branch if val<0  (negative)
+-  BRNN,   // (chain, val, dest) — brnn  branch if val>=0 (non-negative)
+-  BRP,    // (chain, val, dest) — brp   branch if val>0  (positive)
+-  BRNP,   // (chain, val, dest) — brnp  branch if val<=0 (non-positive)
+-  CMP,    // (lhs, rhs) → i64  cmps result (−1/0/1)
+-  CMPU,   // (lhs, rhs) → i64  cmpu result (−1/0/1)
+-  SEL,    // (cond, false, true) → i64  conditional select via csz
+-  FI_ADDR, // (TargetFrameIndex) → i64  frame address in GPRB
++  BREQ,     // (chain, lhs, rhs, dest) — breq  two-reg compare-equal branch
++  BRNE,     // (chain, lhs, rhs, dest) — brne  two-reg compare-not-equal branch
++  BRZ,      // (chain, val, dest) — brz   branch if val==0
++  BRNZ,     // (chain, val, dest) — brnz  branch if val!=0
++  BRN,      // (chain, val, dest) — brn   branch if val<0  (negative)
++  BRNN,     // (chain, val, dest) — brnn  branch if val>=0 (non-negative)
++  BRP,      // (chain, val, dest) — brp   branch if val>0  (positive)
++  BRNP,     // (chain, val, dest) — brnp  branch if val<=0 (non-positive)
++  CMP,      // (lhs, rhs) → i64  cmps result (−1/0/1)
++  CMPU,     // (lhs, rhs) → i64  cmpu result (−1/0/1)
++  SEL,      // (cond, false, true) → i64  conditional select via csz
++  FI_ADDR,  // (TargetFrameIndex) → i64  frame address in GPRB
+   PCREL_HI, // (GlobalAddress) → i64  page-aligned PC-relative address in RB
+-  BRIND,   // (chain, target) — indirect branch
+-  JT_ADDR, // (TargetJumpTable) → i64  jump table address
+-  CP_ADDR, // (TargetConstantPool) → i64  constant pool address
++  BRIND,    // (chain, target) — indirect branch
++  JT_ADDR,  // (TargetJumpTable) → i64  jump table address
++  CP_ADDR,  // (TargetConstantPool) → i64  constant pool address
++  // (base in RB, offset in RD) → address in RB
++  ADDRB,
++  // (new SP in RD) → dynamic object address in RB
++  ADJDYNALLOC,
+ };
+ } // namespace DADAOISD
+ 
+@@ -96,6 +100,7 @@ public:
+ private:
+   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerFrameIndex(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerFRAMEADDR(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerSETCC(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerBRCOND(SDValue Op, SelectionDAG &DAG) const;
+@@ -103,6 +108,7 @@ private:
+   SDValue lowerJumpTable(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerConstantPool(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerVASTART(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
+ };
+ 
+ } // namespace llvm
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 3af69decb94d..3b358d28c45a 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -128,6 +128,8 @@ def DADAOPCRelHi : SDNode<"DADAOISD::PCREL_HI", SDTIntUnaryOp>;
+ def DADAObrind   : SDNode<"DADAOISD::BRIND", SDT_DADAOBrInd, [SDNPHasChain]>;
+ def DADAOjt_addr : SDNode<"DADAOISD::JT_ADDR", SDTIntUnaryOp>;
+ def DADAOcp_addr : SDNode<"DADAOISD::CP_ADDR", SDTIntUnaryOp>;
++def DADAOAddrB : SDNode<"DADAOISD::ADDRB", SDTIntBinOp>;
++def DADAOAdjDynAlloc : SDNode<"DADAOISD::ADJDYNALLOC", SDTIntUnaryOp>;
+ 
+ // Minimal CodeGen-only pseudos (spike scaffold, throwaway).
+ // These bring GPRD-typed i64 add/return down to MIR so finalize-isel can
+@@ -272,6 +274,12 @@ def ADDI_RB_FI : DADAOPseudo<(outs GPRB:$rbha), (ins GPRB:$rbhb, i64imm:$fi), []
+ // Large constant materialization via setzw + orw wyde sequence
+ def CONST_WYDE : DADAOPseudo<(outs GPRD:$dst), (ins i64imm:$val), []>;
+ 
++// Dynamic-allocation address adjustment.  Frame lowering replaces this once
++// the reserved outgoing-call-frame size is final.
++def ADJDYNALLOC
++    : DADAOPseudo<(outs GPRB:$dst), (ins GPRD:$src),
++                  [(set GPRB:$dst, (DADAOAdjDynAlloc GPRD:$src))]>;
++
+ //===----------------------------------------------------------------------===//
+ // MISC-Norm (op=0x10)
+ //===----------------------------------------------------------------------===//
+@@ -307,6 +315,8 @@ def CMPRB_ORRR : F_ORRR_CMPRB<0x2D, (outs GPRD:$rdhb), (ins GPRB:$rbhc, GPRB:$rb
+ def ADDRB_ORRR : F_ORRR_ADDRB<0x2E, (outs GPRB:$rbhb), (ins GPRB:$rbhc, GPRD:$rdhd), "add $rbhb, $rbhc, $rdhd", []>;
+ def SUBRB_ORRR : F_ORRR_ADDRB<0x2F, (outs GPRB:$rbhb), (ins GPRB:$rbhc, GPRD:$rdhd), "sub $rbhb, $rbhc, $rdhd", []>;
+ }
++def : Pat<(DADAOAddrB GPRB:$rbhc, GPRD:$rdhd), (ADDRB_ORRR GPRB:$rbhc,
++                                                   GPRD:$rdhd)>;
+ 
+ //===----------------------------------------------------------------------===//
+ // Integer arithmetic (op=0x12-0x1F)
+diff --git a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+index cb39d51a9ada..b67e67d94112 100644
+--- a/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
++++ b/llvm/lib/Target/DADAO/DADAORegisterInfo.cpp
+@@ -145,7 +145,7 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     }
+     MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RRII))
+                                   .add(MI.getOperand(0))
+-                                  .add(MI.getOperand(1))
++                                  .addReg(FrameReg)
+                                   .addImm(Total);
+     MIB.setMemRefs(MI.memoperands());
+     MI.eraseFromParent();
+@@ -167,7 +167,7 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     }
+     MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::STO_RRII))
+                                   .add(MI.getOperand(0))
+-                                  .add(MI.getOperand(1))
++                                  .addReg(FrameReg)
+                                   .addImm(Total);
+     MIB.setMemRefs(MI.memoperands());
+     MI.eraseFromParent();
+@@ -181,7 +181,7 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     }
+     BuildMI(MBB, II, DL, TII->get(DADAO::ADDI_RBRRII))
+         .add(MI.getOperand(0)) // rbha (dest)
+-        .add(MI.getOperand(1)) // rbhb (base = RB1)
++        .addReg(FrameReg)
+         .addImm(FrameOff);
+     MI.eraseFromParent();
+     return true;
+@@ -205,7 +205,7 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     }
+     MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::LDO_RBRRII))
+                                   .add(MI.getOperand(0))
+-                                  .add(MI.getOperand(1))
++                                  .addReg(FrameReg)
+                                   .addImm(Total);
+     MIB.setMemRefs(MI.memoperands());
+     MI.eraseFromParent();
+@@ -230,7 +230,7 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+     }
+     MachineInstrBuilder MIB = BuildMI(MBB, II, DL, TII->get(DADAO::STO_RBRRII))
+                                   .add(MI.getOperand(0))
+-                                  .add(MI.getOperand(1))
++                                  .addReg(FrameReg)
+                                   .addImm(Total);
+     MIB.setMemRefs(MI.memoperands());
+     MI.eraseFromParent();
+@@ -240,5 +240,7 @@ bool DADAORegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+ }
+ 
+ Register DADAORegisterInfo::getFrameRegister(const MachineFunction &MF) const {
+-  return DADAO::RB1;
++  const TargetFrameLowering *TFI =
++      MF.getSubtarget<DADAOSubtarget>().getFrameLowering();
++  return TFI->hasFP(MF) ? DADAO::RB2 : DADAO::RB1;
+ }
+diff --git a/llvm/test/CodeGen/DADAO/dynamic-stackalloc.ll b/llvm/test/CodeGen/DADAO/dynamic-stackalloc.ll
+new file mode 100644
+index 000000000000..1a0fdc923458
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/dynamic-stackalloc.ll
+@@ -0,0 +1,266 @@
++; RUN: llc -mtriple=dadao-unknown-elf -O0 < %s | \
++; RUN:   FileCheck %s --check-prefix=CHECK
++; RUN: llc -mtriple=dadao-unknown-elf -O2 < %s | \
++; RUN:   FileCheck %s --check-prefix=CHECK
++; RUN: llc -mtriple=dadao-unknown-elf -O0 < %s | \
++; RUN:   FileCheck %s --check-prefix=NO-RD-RB
++; RUN: llc -mtriple=dadao-unknown-elf -O2 < %s | \
++; RUN:   FileCheck %s --check-prefix=NO-RD-RB
++; RUN: llc -mtriple=dadao-unknown-elf -O0 -stop-after=prologepilog < %s | \
++; RUN:   FileCheck %s --check-prefix=MIR
++
++declare ptr @llvm.stacksave.p0()
++declare void @llvm.stackrestore.p0(ptr)
++declare void @callee17(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64)
++
++; A runtime-sized, over-aligned object uses a real rb1 update.  The fixed
++; object remains rb2-relative after that update, and function exit restores
++; rb1 from rb2 rather than adding a fixed size to the moving SP.
++define i64 @dynamic_fixed(i64 %size, i64 %value) {
++; CHECK-LABEL: dynamic_fixed:
++; CHECK:       sto rb2, rb1, -8
++; CHECK:       rb2rb rb2, rb1, 1
++; CHECK:       addi rb2, rb2, -8
++; CHECK:       sub {{rd[0-9]+}}, {{rd[0-9]+}}, {{rd[0-9]+}}, {{rd[0-9]+}}
++; CHECK:       and {{rd[0-9]+}}, {{rd[0-9]+}}, {{rd[0-9]+}}
++; CHECK:       rd2rb rb1,
++; CHECK:       ldo rd31, rb2,
++; CHECK:       addi rb1, rb2, 8
++; CHECK:       ldo rb2, rb1, -8
++; MIR-LABEL: name:            dynamic_fixed
++; MIR:          $rb2 = frame-setup RB2RB_ORRI $rb1, 1
++; MIR:          $rb1 = frame-setup ADDI_RBRRII $rb1,
++; MIR:          $rb1 = frame-destroy ADDI_RBRRII $rb2, 8
++; MIR-NEXT:     $rb2 = frame-destroy LDO_RBRRII $rb1, -8
++  %fixed = alloca i64, align 8
++  store volatile i64 %value, ptr %fixed, align 8
++  %dyn = alloca i8, i64 %size, align 16
++  store volatile i8 17, ptr %dyn, align 16
++  %fixed.value = load volatile i64, ptr %fixed, align 8
++  ret i64 %fixed.value
++}
++
++; stacksave returns the current real SP, and stackrestore writes that exact
++; value back before a second dynamic allocation.
++define ptr @save_restore(i64 %size) {
++; CHECK-LABEL: save_restore:
++; CHECK:       rb2rd [[SAVED:rd[0-9]+]], rb1, 1
++; CHECK:       rd2rb rb1, [[SAVED]], 1
++; CHECK:       rd2rb rb1,
++  %saved = call ptr @llvm.stacksave.p0()
++  %first = alloca i8, i64 %size, align 8
++  store volatile i8 23, ptr %first, align 8
++  call void @llvm.stackrestore.p0(ptr %saved)
++  %second = alloca i8, i64 %size, align 8
++  store volatile i8 29, ptr %second, align 8
++  ret ptr %second
++}
++
++; Seventeen integer arguments force an eight-byte reserved outgoing call
++; frame.  ADJDYNALLOC must return new_sp + 8 so the call's stack argument
++; cannot overlap the dynamic object.
++define i8 @dynamic_call_frame(i64 %size) {
++; CHECK-LABEL: dynamic_call_frame:
++; CHECK:       rd2rb rb1, [[NEWSP:rd[0-9]+]], 1
++; CHECK-NEXT:  rd2rb [[DYN:rb[0-9]+]], [[NEWSP]], 1
++; CHECK-NEXT:  addi [[DYN]], [[DYN]], 8
++; CHECK:       call callee17
++; CHECK:       ldbu {{rd[0-9]+}}, [[DYN]], 0
++  %dyn = alloca i8, i64 %size, align 8
++  store volatile i8 37, ptr %dyn, align 8
++  call void @callee17(i64 0, i64 1, i64 2, i64 3, i64 4, i64 5, i64 6,
++                      i64 7, i64 8, i64 9, i64 10, i64 11, i64 12, i64 13,
++                      i64 14, i64 15, i64 16)
++  %value = load volatile i8, ptr %dyn, align 8
++  ret i8 %value
++}
++
++; Three hundred integer arguments reserve 2272 bytes (> signed imms12) while
++; the runtime VLA remains live.  Both ADJDYNALLOC and the final stack-argument
++; address must use RB-base + materialized-RD-offset operations; rb1 must never
++; enter an RD ADD as the same-numbered rd1.
++declare void @callee300(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
++                       i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)
++define i8 @dynamic_large_call_frame(i64 %size) {
++; CHECK-LABEL: dynamic_large_call_frame:
++; CHECK:       rd2rb rb1, [[LARGENEWSP:rd[0-9]+]], 1
++; CHECK-NEXT:  rd2rb [[LARGEDYN:rb[0-9]+]], [[LARGENEWSP]], 1
++; CHECK:       setzw [[FRAMESIZE:rd[0-9]+]], 0, 2272
++; CHECK-NEXT:  add [[LARGEDYN]], [[LARGEDYN]], [[FRAMESIZE]]
++; CHECK:       setzw [[LASTOFF:rd[0-9]+]], 0, 2264
++; CHECK:       add [[LASTADDR:rb[0-9]+]], rb1, [[LASTOFF]]
++; CHECK:       sto {{rd[0-9]+}}, [[LASTADDR]], 0
++; CHECK:       call callee300
++; CHECK:       ldbu {{rd[0-9]+}}, [[LARGEDYN]], 0
++; NO-RD-RB-LABEL: dynamic_large_call_frame:
++; NO-RD-RB-NOT: add {{rd[0-9]+}}, rd1,
++; NO-RD-RB: call callee300
++  %dyn = alloca i8, i64 %size, align 16
++  store volatile i8 41, ptr %dyn, align 16
++  call void @callee300(i64 0, i64 1, i64 2, i64 3, i64 4, i64 5,
++                       i64 6, i64 7, i64 8, i64 9, i64 10, i64 11,
++                       i64 12, i64 13, i64 14, i64 15, i64 16, i64 17,
++                       i64 18, i64 19, i64 20, i64 21, i64 22, i64 23,
++                       i64 24, i64 25, i64 26, i64 27, i64 28, i64 29,
++                       i64 30, i64 31, i64 32, i64 33, i64 34, i64 35,
++                       i64 36, i64 37, i64 38, i64 39, i64 40, i64 41,
++                       i64 42, i64 43, i64 44, i64 45, i64 46, i64 47,
++                       i64 48, i64 49, i64 50, i64 51, i64 52, i64 53,
++                       i64 54, i64 55, i64 56, i64 57, i64 58, i64 59,
++                       i64 60, i64 61, i64 62, i64 63, i64 64, i64 65,
++                       i64 66, i64 67, i64 68, i64 69, i64 70, i64 71,
++                       i64 72, i64 73, i64 74, i64 75, i64 76, i64 77,
++                       i64 78, i64 79, i64 80, i64 81, i64 82, i64 83,
++                       i64 84, i64 85, i64 86, i64 87, i64 88, i64 89,
++                       i64 90, i64 91, i64 92, i64 93, i64 94, i64 95,
++                       i64 96, i64 97, i64 98, i64 99, i64 100, i64 101,
++                       i64 102, i64 103, i64 104, i64 105, i64 106, i64 107,
++                       i64 108, i64 109, i64 110, i64 111, i64 112, i64 113,
++                       i64 114, i64 115, i64 116, i64 117, i64 118, i64 119,
++                       i64 120, i64 121, i64 122, i64 123, i64 124, i64 125,
++                       i64 126, i64 127, i64 128, i64 129, i64 130, i64 131,
++                       i64 132, i64 133, i64 134, i64 135, i64 136, i64 137,
++                       i64 138, i64 139, i64 140, i64 141, i64 142, i64 143,
++                       i64 144, i64 145, i64 146, i64 147, i64 148, i64 149,
++                       i64 150, i64 151, i64 152, i64 153, i64 154, i64 155,
++                       i64 156, i64 157, i64 158, i64 159, i64 160, i64 161,
++                       i64 162, i64 163, i64 164, i64 165, i64 166, i64 167,
++                       i64 168, i64 169, i64 170, i64 171, i64 172, i64 173,
++                       i64 174, i64 175, i64 176, i64 177, i64 178, i64 179,
++                       i64 180, i64 181, i64 182, i64 183, i64 184, i64 185,
++                       i64 186, i64 187, i64 188, i64 189, i64 190, i64 191,
++                       i64 192, i64 193, i64 194, i64 195, i64 196, i64 197,
++                       i64 198, i64 199, i64 200, i64 201, i64 202, i64 203,
++                       i64 204, i64 205, i64 206, i64 207, i64 208, i64 209,
++                       i64 210, i64 211, i64 212, i64 213, i64 214, i64 215,
++                       i64 216, i64 217, i64 218, i64 219, i64 220, i64 221,
++                       i64 222, i64 223, i64 224, i64 225, i64 226, i64 227,
++                       i64 228, i64 229, i64 230, i64 231, i64 232, i64 233,
++                       i64 234, i64 235, i64 236, i64 237, i64 238, i64 239,
++                       i64 240, i64 241, i64 242, i64 243, i64 244, i64 245,
++                       i64 246, i64 247, i64 248, i64 249, i64 250, i64 251,
++                       i64 252, i64 253, i64 254, i64 255, i64 256, i64 257,
++                       i64 258, i64 259, i64 260, i64 261, i64 262, i64 263,
++                       i64 264, i64 265, i64 266, i64 267, i64 268, i64 269,
++                       i64 270, i64 271, i64 272, i64 273, i64 274, i64 275,
++                       i64 276, i64 277, i64 278, i64 279, i64 280, i64 281,
++                       i64 282, i64 283, i64 284, i64 285, i64 286, i64 287,
++                       i64 288, i64 289, i64 290, i64 291, i64 292, i64 293,
++                       i64 294, i64 295, i64 296, i64 297, i64 298, i64 299)
++  %value = load volatile i8, ptr %dyn, align 16
++  ret i8 %value
++}
++
++; A 300-argument variadic call has both a 2400-byte source-order save area
++; and 2272 bytes of ordinary stack overflow.  Lock both large address paths.
++declare void @varcallee300(i64, ...)
++define i8 @dynamic_large_vararg_frame(i64 %size) {
++; CHECK-LABEL: dynamic_large_vararg_frame:
++; CHECK:       rd2rb rb1, [[VARNEWSP:rd[0-9]+]], 1
++; CHECK-NEXT:  rd2rb [[VARDYN:rb[0-9]+]], [[VARNEWSP]], 1
++; CHECK:       setzw [[VARSIZE:rd[0-9]+]], 0, 4672
++; CHECK-NEXT:  add [[VARDYN]], [[VARDYN]], [[VARSIZE]]
++; CHECK:       setzw [[SAVEOFF:rd[0-9]+]], 0, 2392
++; CHECK:       add {{rb[0-9]+}}, rb1, [[SAVEOFF]]
++; CHECK:       setzw [[OVERFLOWOFF:rd[0-9]+]], 0, 4664
++; CHECK:       add {{rb[0-9]+}}, rb1, [[OVERFLOWOFF]]
++; CHECK:       call varcallee300
++; NO-RD-RB-LABEL: dynamic_large_vararg_frame:
++; NO-RD-RB-NOT: add {{rd[0-9]+}}, rd1,
++; NO-RD-RB: call varcallee300
++  %dyn = alloca i8, i64 %size, align 16
++  store volatile i8 43, ptr %dyn, align 16
++  call void (i64, ...) @varcallee300(i64 0, i64 1, i64 2, i64 3, i64 4, i64 5,
++                                        i64 6, i64 7, i64 8, i64 9, i64 10, i64 11,
++                                        i64 12, i64 13, i64 14, i64 15, i64 16, i64 17,
++                                        i64 18, i64 19, i64 20, i64 21, i64 22, i64 23,
++                                        i64 24, i64 25, i64 26, i64 27, i64 28, i64 29,
++                                        i64 30, i64 31, i64 32, i64 33, i64 34, i64 35,
++                                        i64 36, i64 37, i64 38, i64 39, i64 40, i64 41,
++                                        i64 42, i64 43, i64 44, i64 45, i64 46, i64 47,
++                                        i64 48, i64 49, i64 50, i64 51, i64 52, i64 53,
++                                        i64 54, i64 55, i64 56, i64 57, i64 58, i64 59,
++                                        i64 60, i64 61, i64 62, i64 63, i64 64, i64 65,
++                                        i64 66, i64 67, i64 68, i64 69, i64 70, i64 71,
++                                        i64 72, i64 73, i64 74, i64 75, i64 76, i64 77,
++                                        i64 78, i64 79, i64 80, i64 81, i64 82, i64 83,
++                                        i64 84, i64 85, i64 86, i64 87, i64 88, i64 89,
++                                        i64 90, i64 91, i64 92, i64 93, i64 94, i64 95,
++                                        i64 96, i64 97, i64 98, i64 99, i64 100, i64 101,
++                                        i64 102, i64 103, i64 104, i64 105, i64 106, i64 107,
++                                        i64 108, i64 109, i64 110, i64 111, i64 112, i64 113,
++                                        i64 114, i64 115, i64 116, i64 117, i64 118, i64 119,
++                                        i64 120, i64 121, i64 122, i64 123, i64 124, i64 125,
++                                        i64 126, i64 127, i64 128, i64 129, i64 130, i64 131,
++                                        i64 132, i64 133, i64 134, i64 135, i64 136, i64 137,
++                                        i64 138, i64 139, i64 140, i64 141, i64 142, i64 143,
++                                        i64 144, i64 145, i64 146, i64 147, i64 148, i64 149,
++                                        i64 150, i64 151, i64 152, i64 153, i64 154, i64 155,
++                                        i64 156, i64 157, i64 158, i64 159, i64 160, i64 161,
++                                        i64 162, i64 163, i64 164, i64 165, i64 166, i64 167,
++                                        i64 168, i64 169, i64 170, i64 171, i64 172, i64 173,
++                                        i64 174, i64 175, i64 176, i64 177, i64 178, i64 179,
++                                        i64 180, i64 181, i64 182, i64 183, i64 184, i64 185,
++                                        i64 186, i64 187, i64 188, i64 189, i64 190, i64 191,
++                                        i64 192, i64 193, i64 194, i64 195, i64 196, i64 197,
++                                        i64 198, i64 199, i64 200, i64 201, i64 202, i64 203,
++                                        i64 204, i64 205, i64 206, i64 207, i64 208, i64 209,
++                                        i64 210, i64 211, i64 212, i64 213, i64 214, i64 215,
++                                        i64 216, i64 217, i64 218, i64 219, i64 220, i64 221,
++                                        i64 222, i64 223, i64 224, i64 225, i64 226, i64 227,
++                                        i64 228, i64 229, i64 230, i64 231, i64 232, i64 233,
++                                        i64 234, i64 235, i64 236, i64 237, i64 238, i64 239,
++                                        i64 240, i64 241, i64 242, i64 243, i64 244, i64 245,
++                                        i64 246, i64 247, i64 248, i64 249, i64 250, i64 251,
++                                        i64 252, i64 253, i64 254, i64 255, i64 256, i64 257,
++                                        i64 258, i64 259, i64 260, i64 261, i64 262, i64 263,
++                                        i64 264, i64 265, i64 266, i64 267, i64 268, i64 269,
++                                        i64 270, i64 271, i64 272, i64 273, i64 274, i64 275,
++                                        i64 276, i64 277, i64 278, i64 279, i64 280, i64 281,
++                                        i64 282, i64 283, i64 284, i64 285, i64 286, i64 287,
++                                        i64 288, i64 289, i64 290, i64 291, i64 292, i64 293,
++                                        i64 294, i64 295, i64 296, i64 297, i64 298, i64 299)
++  %value = load volatile i8, ptr %dyn, align 16
++  ret i8 %value
++}
++
++; Frame-address depth zero is the ABI frame pointer.  Following offset zero
++; walks the saved-rb2 chain for deeper frames.
++define ptr @frame_address_zero() {
++; CHECK-LABEL: frame_address_zero:
++; CHECK:       rb2rd [[FRAME:rd[0-9]+]], rb2, 1
++; CHECK-NEXT:  rd2rb rb31, [[FRAME]], 1
++  %frame = call ptr @llvm.frameaddress.p0(i32 0)
++  ret ptr %frame
++}
++
++declare ptr @llvm.frameaddress.p0(i32 immarg)
+-- 
+2.43.0
+

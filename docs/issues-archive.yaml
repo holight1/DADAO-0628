@@ -1246,3 +1246,65 @@
   # memset 的 16/17B 边界、tail/non-tail 以及 256KiB copy；全部正常生成
   # 普通 call，pr28982b.c 保持 PASS，全量 E2E 76/76、torture 分布
   # 1429/113/131/35，旧结果逐文件零变化。
+
+- id: musl-backend-dynamic-stackalloc-unimplemented
+  title: "musl `execl`/`execle`/`execlp`/`execvp`/`getcwd`/`res_msend`/`dcngettext` 编译时撞 'Cannot select: tNN: i64,ch = dynamic_stackalloc ...' — DADAO 后端从未实现 ISD::DYNAMIC_STACKALLOC 的合法化/选择"
+  status: closed
+  scope: [CodeGen]
+  blocks: null
+  resolved_by: "ML-033a; LLVM dd80ef109bbb0a8f1bcc83c4377e46fec832b37f; patch 0060-DADAO-implement-dynamic-stack-allocation-and-restore.patch"
+  # ML-021a（2026-07-22）：修复同一基本块 ≥2 个直接 CALL 的
+  # ISD::CALLSEQ_START/END glue 链 bug（见 musl-backend-assert-illegal-
+  # result-number / musl-backend-assert-node-already-inserted 归档条目）
+  # 后，全量 musl fresh 编译（干净重跑 `make -k -j1 lib/crt1.o lib/libc.a`，
+  # 逐对象独立复测）首次让这 7 个文件真正走到指令选择这一步才曝光——此前
+  # 它们大概率先撞上面两条已归档的 BuildSchedUnits 断言（这几个文件同时
+  # 用到 execve/getcwd 等系统调用封装里常见的"变长参数数组"或
+  # snprintf/vsnprintf 风格的可变长缓冲区，即 IR 层的
+  # `alloca <非常量 count>`，legalize 后变成 `ISD::DYNAMIC_STACKALLOC`），
+  # 而非本次改动引入的新回归——ML-021a 的 DAG 转储/lit E2E/差分对比均未
+  # 涉及 dynamic_stackalloc 节点，改动范围与本类别无交集。
+  #
+  # 具体崩溃：`fatal error: error in backend: Cannot select: tNN: i64,ch =
+  # dynamic_stackalloc tMM:1, tKK, Constant:i64<0>`（DAGToDAG 阶段，
+  # SelectionDAGISel 报"无法选择"而非断言/UNREACHABLE——即 DADAO
+  # DADAOISelLowering.cpp 从未对 `ISD::DYNAMIC_STACKALLOC` 调用
+  # `setOperationAction`，也没有对应的 `Pat<>`/手工 Select() 分支）。这是
+  # 一个缺失特性（VLA / 运行时决定大小的 alloca），不是 glue 链一类的拓扑
+  # bug，需要单独设计"运行时调整 rb1(SP)"的降低序列（真正的寄存器调整，
+  # 不能像 ADJCALLSTACKDOWN/UP 那样直接吃 eliminateCallFramePseudoInstr
+  # 的 no-op 快捷路径），留给独立任务。
+  # 触发对象（7 个）：process/execl.c、process/execle.c、process/execlp.c、
+  # process/execvp.c、unistd/getcwd.c、network/res_msend.c、
+  # locale/dcngettext.c。
+  #
+  # ML-033a 初版（2026-07-24）：LLVM 790bfb4cd40f 实现 DYNAMIC_STACKALLOC、
+  # STACKSAVE、STACKRESTORE lowering，并为动态 frame 使用 ABI §4 的 rb2
+  # frame-pointer 链；固定 frame、动态区、调用序列和 epilogue 分离。运行时
+  # size 先按至少 8 字节（请求更高对齐时按请求值）向上对齐，再通过 RD/RB
+  # 桥接调整真实 rb1；大 size 不依赖 imms12。新增 ADJDYNALLOC pseudo，
+  # 在最终 outgoing call-frame 大小已知后修正返回指针。
+  #
+  # fresh musl 后逐对象 `make -B -j1` 复核：上述 7 个对象全部编译成功；
+  # best-effort libc.a 从此前约 10 个失败对象降至 3 个既有、无关对象
+  # （legacy/daemon.o、regex/glob.o、regex/regcomp.o），归档 1344 个对象。
+  # 9 个 gcc-c-torture 目标全部由 FAIL_COMPILE 转 PASS；1708 全量分布从
+  # 1429/113/131/35 变为 1438/104/131/35，只有目标 9 项正向变化，既有
+  # PASS 零回归。全量 E2E 77/77、DADAO CodeGen 9/9、四方差分
+  # AGREE=200/DIVERGE=0；初版 patch 0060 的 stable patch-id 为
+  # 3322ef1ae303bed6f4723c468bf6f69df532563a。
+  #
+  # ML-033a 独立 review 修复轮次（2026-07-24）：review 的 300 参数 +
+  # runtime VLA probe 暴露 LowerCall 在 >imms12 的普通栈参数和 vararg
+  # save-area 地址上把物理 rb1 送入 RD ADD，导致 rb1 被误读为 rd1（QEMU=1、
+  # gem5=134，fault 0x8d8）。最终 amend commit dd80ef109bbb 新增共享
+  # getOutgoingStackAddress；大偏移严格下降为 GPRB base + materialized GPRD
+  # offset 的 ADDRB_ORRR，不按参数个数或测试特殊处理。
+  #
+  # CodeGen 正式覆盖 2272-byte fixed outgoing area，以及 2400-byte vararg
+  # save-area + 2272-byte overflow（总 4672）；E2E 在 5003-byte runtime
+  # VLA 存活时执行 300 参数调用，O0/O2 的 QEMU/gem5 正例均 42、负控均 1。
+  # 修复后 CodeGen 9/9、E2E 77/77、目标 torture 9/9、musl 对象 7/7、
+  # differential DIVERGE=0；1708 sweep 仍为 1438/104/131/35，和修复前
+  # JSON 逐文件 STATUS_MISMATCH=0。最终 patch 0060 为 816 行，commit 与
+  # patch stable patch-id 均为 0fc8ec3758064b86133aa6c8d0a396fdbaec576b。
