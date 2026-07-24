@@ -1,0 +1,25 @@
+// ML-031a: aggregate (struct) parameter/return-value ABI -- HPA (RB bank,
+// including nested/over-aligned layout with an 8-byte internal padding gap),
+// non-homogeneous RD-split (1-4 opaque 8-byte blocks, including a partial
+// trailing block and the exact 32-byte boundary), > 32B indirect (caller
+// temporary + RB pointer, with an alias check proving it is an independent
+// copy), and both aggregate-return modes (<= 64 bits scalar RD31, > 64 bits
+// hidden sret with two non-aliasing calls).
+//
+// Values are loaded from volatile storage. The second build changes the final
+// sret expectation after all prior ABI paths run; both simulators must reject
+// it with the specific error code, proving the checks were not optimized away.
+//
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -O0 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/agg_args_named.c -o %t.o0.elf
+// RUN: %llvm-objcopy -O binary %t.o0.elf %t.o0.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O2 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/agg_args_named.c -o %t.o2.elf
+// RUN: %llvm-objcopy -O binary %t.o2.elf %t.o2.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O0 -DNEGATIVE_CONTROL=1 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/agg_args_named.c -o %t.negative.elf
+// RUN: %llvm-objcopy -O binary %t.negative.elf %t.negative.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.negative.bin >/dev/null 2>&1; test $? -eq 93'
+// RUN: bash -c '%gem5 %gem5_se %t.negative.elf >/dev/null 2>&1; test $? -eq 93'

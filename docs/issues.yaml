@@ -12,6 +12,78 @@
 # docs/issues-archive.yaml (same schema) -- day-to-day lookup/registration
 # of new issues only needs this file.
 
+- id: dadao-hfa-argument-not-implemented
+  title: "HFA (homogeneous floating-point aggregate) argument passing is not implemented -- DADAOABIInfo::classifyArgumentType falls back to the pre-ML-031a indirect (byval) DefaultABIInfo behavior, unchanged, because the DADAO LLVM backend has no RF register class / floating-point CodeGen support at all"
+  status: open
+  scope: [abi, codegen, floating-point]
+  blocks: "full DADAO-21 ABI §聚合类型参数 HFA conformance (RF bank passing)"
+  resolved_by: null
+  # ML-031a (aggregate struct ABI parameter passing) implemented HPA (RB
+  # bank)/RD-split/indirect/sret in full per wiki, but explicitly excluded
+  # HFA per its硬约束 -- DADAO has never registered f32/f64 as a legal type
+  # with an associated register class (ML-020a/ML-025a already noted this
+  # for scalar floats; ML-031a confirms the same gap blocks aggregate HFA).
+  # DADAOABIInfo::classifyArgumentType (clang/lib/CodeGen/Targets/DADAO.cpp)
+  # detects a genuine HFA (all leaves are the same type: all float or all
+  # double, <= 4 fields) via the
+  # same flatten() helper used for HPA, emits a compiler warning identifying
+  # the type, and returns getNaturalAlignIndirect(Ty, AS) (ByVal=true) --
+  # bit-for-bit the same classification EVERY aggregate got before ML-031a,
+  # so no new runtime risk is introduced for this subset. Empirically, this
+  # fallback happens to produce a correct result for gcc-c-torture's
+  # 920625-1.c (a `struct { double x, y; }` passed as a vararg to a
+  # long-lived global-array source) purely because the DADAO backend has no
+  # byval-specific CC lowering code at all, so the "byval" pointer Clang
+  # emits degenerates into passing the caller's own live address straight
+  # through -- this is NOT a real, spec-conformant HFA implementation and
+  # must not be read as "HFA basically works"; a NAMED (non-vararg) HFA
+  # argument, or a vararg one sourced from a short-lived local instead of a
+  # stable global, would not have this accidental safety net. Implementing
+  # real conformant HFA support requires adding an RF register class and
+  # associated CodeGen infrastructure first -- an independent, comparably
+  # sized project, not a follow-on to ML-031a.
+  # Also see docs/wiki-questions.md #6 (RD-split block ordering) and #7
+  # (aggregate vararg-slot justification direction) for two related ABI
+  # wording ambiguities ML-031a resolved with a documented choice rather
+  # than blocking on.
+
+- id: dadao-complex-vararg-padded-struct-field-corruption
+  title: "_Complex int field inside a struct passed as a vararg reads back corrupted (imaginary part) when the struct has non-natural trailing padding (e.g. from a zero-size `__attribute__((aligned))` member pushing total size past the natural size) -- gcc-c-torture pr38151.c"
+  status: open
+  scope: [codegen, complex-numbers, varargs]
+  blocks: null
+  resolved_by: null
+  # Found during ML-031a's gcc-c-torture re-sweep (code-agent/tasks/
+  # ML-031a-aggregate-struct-abi-parameter-passing.md 完成区). pr38151.c
+  # passes `struct S2848 { unsigned int a;
+  # _Complex int b; struct {} __attribute__((aligned)) c; }` (16 bytes,
+  # sizeof/alignof both 16 due to the empty aligned member) as a vararg;
+  # `arg.a` and `__real__ arg.b` read back correctly but `__imag__ arg.b`
+  # (struct offset 8-11, the start of the second 8-byte save-area slot)
+  # does not match the caller's value, so the torture file's internal
+  # check calls abort() (exit 127, gcc-c-torture's own failure signal).
+  # Architect ground-truth isolation (four minimal probes, freestanding,
+  # both QEMU and gem5 not required since QEMU alone reproduces/clears it):
+  #   1. Same struct passed as a NAMED (non-vararg) argument: PASSES.
+  #   2. Same 16-byte layout via vararg but with the _Complex field
+  #      replaced by an equivalent plain `struct { int re, im; }`: PASSES.
+  #   3. A smaller (12-byte, no trailing padding) struct with a real
+  #      _Complex int field, via vararg: PASSES.
+  #   4. The exact S2848 layout (_Complex + trailing padding) via vararg:
+  #      FAILS (imaginary part only).
+  # This isolates the bug to the specific combination of (a) the vararg
+  # aggregate memcpy-reconstruction path (`arg = __builtin_va_arg(ap,
+  # struct S2848)`) and (b) Clang's `_Complex` real/imaginary-component
+  # lvalue access applied to that reconstructed temporary when the
+  # underlying type has non-multiple-of-natural-size trailing padding --
+  # not the ML-031a aggregate-ABI byte-block classification/transport
+  # itself (probes 1-3 all exercise ML-031a's new RD-split/vararg-slot code
+  # paths correctly). Confirmed pre-existing: pr38151.c was already in the
+  # FAIL_RUN/abort_127 bucket in ML-026a's original sweep (docs/reviews/
+  # ML-026a-gcc-c-torture-sweep-2026-07-24.md, listed among the 9
+  # "尚未深挖" files) -- ML-031a did not introduce this, only diagnosed it;
+  # not fixed as part of ML-031a (orthogonal to aggregate parameter ABI).
+
 - id: gem5-differential-harness-stale-blanket-skip-rasuf
   title: "run_gem5_test.py's blanket jump/call/ret+expected_fault SKIP rule (tests/scripts/run_gem5_test.py:104-106) predates ML-015c's vector reclassification and now structurally skips 2 real RASUF vectors gem5 already implements correctly, inflating gem5-SKIP from 0 to 2 in tools/run_differential.py"
   status: open
@@ -145,37 +217,6 @@
   scope: [SEE, SBI, FP]
   blocks: null
   resolved_by: null  # 各 deferred 域启动时回放吸收；见 docs/reviews/wiki-upgrade-9f378f4.md
-
-- id: codegen-tailcall-lowercall-assert
-  title: "DADAO LowerCall 从未实现 tail-call opt-out，-O1+ 对 return foo(...) 形态尝试 sibling-call 下降，撞 LowerCall emitted a return value for a tail call 断言"
-  status: open
-  scope: [CodeGen]
-  blocks: [llvm-test-suite-t3-above-o0]
-  resolved_by: null
-  # DL-065a 验证阶段发现（2026-07-14，subagent）：修完 call 隐式寄存器范围
-  # 溢出后，对全部 963 个 picolibc .c 文件做 -O1 扫描，仍有 113 个文件在
-  # 一个不同、独立的断言上崩溃：LowerCall emitted a return value for a
-  # tail call!——DADAO 的 LowerCall 从未加 isEligibleForTailCallOptimization
-  # 之类的覆写去关闭尾调用优化，故 -O1+ 遇到 `return foo(...);` 形态的
-  # 代码会尝试 sibling-call 下降并崩溃。与 DL-065a 的隐式寄存器问题是两个
-  # 独立缺口，未修复（本任务范围之外）。是 llvm-test-suite（ADR-0012 T3）
-  # 在高于 -O0 跑起来前的另一个必修项，与 dadao-oz-undef-physreg 一起构成
-  # -O1+ 支持的两大缺口。
-  #
-  # ML-012a（2026-07-17）：musl 自己的 crt/crt1.c（_start_c 尾部调用
-  # __libc_start_main）和 src/env/__libc_start_main.c（stage2(...) 尾部
-  # 调用）在 config.mak 默认 -O2 下都直接命中这个断言，阻塞了 musl 首个
-  # 真实链接 E2E 里程碑。**未修复 LLVM**——在 `arch/dadao/arch.mak`
-  # （musl 侧、component-lock 允许的 arch 集成文件）里加
-  # `CFLAGS_AUTO += -fno-optimize-sibling-calls`，全树生效，验证直接从
-  # 崩溃变为编译干净（-O2 不变，只是不再尝试 sibling-call 下降）。这是一
-  # 个安全、可移植、只关闭优化的标准编译器开关，不改变任何程序语义，
-  # 不是修复 LowerCall 本身。副作用（有益）：同一批全树 `make -k` 扫描
-  # 显示这个断言此前命中的全部约 229 个 musl 文件在加此开关后全部消失
-  # （ML-012a 完整失败分类：229→0），是这个开关对整个 issue 的一次大规
-  # 模、非侵入性缓解，但 `codegen-tailcall-lowercall-assert` 本身（LLVM
-  # 从未实现 tail-call opt-out）仍未修复、仍是 open——任何不走 musl
-  # arch.mak（例如 llvm-test-suite 的独立 -O1+ 编译路径）的构建仍会命中。
 
 - id: codegen-atomic-ops-unimplemented
   title: "DADAO 后端从未实现原子操作 codegen（ATOMIC_FENCE/LOAD/STORE/LOAD_ADD/SWAP 均 Cannot select，ATOMIC_CMP_SWAP 降级到未实现的 libcall 路径）"

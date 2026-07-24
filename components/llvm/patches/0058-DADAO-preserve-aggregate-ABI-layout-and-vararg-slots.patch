@@ -1,0 +1,261 @@
+From 36abcbd6369d3a16e360f894b3f0ca2c896698a1 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 13:56:39 +0800
+Subject: [PATCH] DADAO: preserve aggregate ABI layout and vararg slots
+
+---
+ clang/lib/CodeGen/Targets/DADAO.cpp      | 116 ++++++++++++++++++++---
+ clang/test/CodeGen/DADAO/aggregate-abi.c |  24 ++++-
+ 2 files changed, 124 insertions(+), 16 deletions(-)
+
+diff --git a/clang/lib/CodeGen/Targets/DADAO.cpp b/clang/lib/CodeGen/Targets/DADAO.cpp
+index 0b7ca92f7dab..a733ce7680ef 100644
+--- a/clang/lib/CodeGen/Targets/DADAO.cpp
++++ b/clang/lib/CodeGen/Targets/DADAO.cpp
+@@ -16,9 +16,11 @@
+ // ~/DADAO-wiki/DADAO-21-ABI-应用程序二进制接口.md §聚合类型参数/
+ // §聚合类型返回值/§可变参数 "大于8字节的聚合变参" (ML-031a):
+ //
+-//   - HPA (homogeneous pointer aggregate, <= 4 pointer leaves): Direct,
+-//     coerced to `[N x ptr]` -- CC_DADAO's existing CCIfPtr rule places each
+-//     flattened leaf in the RB bank for free (no backend change needed).
++//   - HPA (homogeneous pointer aggregate, <= 4 pointer leaves):
++//     CoerceAndExpand using each leaf's real AST byte offset. Padding is
++//     represented explicitly in the coercion type and removed from the IR
++//     signature, so every pointer leaf becomes one pointer argument and
++//     CC_DADAO places it in the RB bank without losing padded/nested fields.
+ //   - HFA (homogeneous float/double aggregate): detected but explicitly NOT
+ //     implemented -- DADAO's LLVM backend has no RF register class / FP
+ //     CodeGen support at all (ML-020a/ML-025a). Falls back unchanged to the
+@@ -50,6 +52,7 @@
+ #include "ABIInfoImpl.h"
+ #include "TargetInfo.h"
+ #include "clang/Basic/Diagnostic.h"
++#include "llvm/ADT/SmallVector.h"
+ #include "llvm/IR/DerivedTypes.h"
+ 
+ using namespace clang;
+@@ -80,15 +83,21 @@ enum class HomogKind { None, Pointer, Float32, Float64 };
+ // empty *top-level* aggregate is handled separately via isEmptyRecord
+ // before this function is ever called.
+ bool flattenHomogeneous(ASTContext &Ctx, QualType Ty, HomogKind &Kind,
+-                        unsigned &Count) {
++                        unsigned &Count, CharUnits BaseOffset,
++                        SmallVectorImpl<CharUnits> *PointerOffsets) {
+   if (const auto *RT = Ty->getAsCanonical<RecordType>()) {
+     const RecordDecl *RD = RT->getDecl()->getDefinitionOrSelf();
+     if (RD->isUnion())
+       return false;
++    const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
++    unsigned FieldIndex = 0;
+     for (const FieldDecl *FD : RD->fields()) {
+       if (FD->isBitField())
+         return false;
+-      if (!flattenHomogeneous(Ctx, FD->getType(), Kind, Count))
++      CharUnits FieldOffset =
++          Ctx.toCharUnitsFromBits(Layout.getFieldOffset(FieldIndex++));
++      if (!flattenHomogeneous(Ctx, FD->getType(), Kind, Count,
++                              BaseOffset + FieldOffset, PointerOffsets))
+         return false;
+     }
+     return true;
+@@ -110,6 +119,8 @@ bool flattenHomogeneous(ASTContext &Ctx, QualType Ty, HomogKind &Kind,
+     return false;
+ 
+   ++Count;
++  if (ThisKind == HomogKind::Pointer && PointerOffsets)
++    PointerOffsets->push_back(BaseOffset);
+   return Count <= DADAOMaxAggregateRegs;
+ }
+ 
+@@ -117,19 +128,27 @@ class DADAOABIInfo : public DefaultABIInfo {
+ public:
+   using DefaultABIInfo::DefaultABIInfo;
+ 
+-  ABIArgInfo classifyArgumentType(QualType Ty) const;
++  ABIArgInfo classifyArgumentType(QualType Ty,
++                                  bool IsNamedArgument = true) const;
+   ABIArgInfo classifyReturnType(QualType RetTy) const;
+ 
+   void computeInfo(CGFunctionInfo &FI) const override {
+     if (!getCXXABI().classifyReturnType(FI))
+       FI.getReturnInfo() = classifyReturnType(FI.getReturnType());
+-    for (auto &I : FI.arguments())
+-      I.info = classifyArgumentType(I.type);
++    unsigned ArgNo = 0;
++    const unsigned NumRequiredArgs = FI.getNumRequiredArgs();
++    for (auto &I : FI.arguments()) {
++      I.info = classifyArgumentType(I.type, ArgNo < NumRequiredArgs);
++      ++ArgNo;
++    }
+   }
+ 
+   RValue EmitVAArg(CodeGenFunction &CGF, Address VAListAddr, QualType Ty,
+                    AggValueSlot Slot) const override {
+-    bool IsIndirect = classifyArgumentType(Ty).isIndirect();
++    // A va_arg is necessarily unnamed. Keep its classification separate
++    // from a named >32-byte aggregate, which is passed indirectly.
++    bool IsIndirect =
++        classifyArgumentType(Ty, /*IsNamedArgument=*/false).isIndirect();
+     // Scalars are right-adjusted within their 8-byte slot (wiki "大端序
+     // slot 布局"). Aggregates are left-justified (natural struct byte
+     // order): this file's own register/argument coercion
+@@ -148,6 +167,8 @@ public:
+ 
+ private:
+   void reportHFAUnsupported(QualType Ty) const;
++  ABIArgInfo classifyAggregateVarArg(QualType Ty) const;
++  ABIArgInfo coerceAndExpandHPA(ArrayRef<CharUnits> LeafOffsets) const;
+ };
+ 
+ void DADAOABIInfo::reportHFAUnsupported(QualType Ty) const {
+@@ -162,7 +183,68 @@ void DADAOABIInfo::reportHFAUnsupported(QualType Ty) const {
+   Diags.Report(DiagID) << Ty.getAsString();
+ }
+ 
+-ABIArgInfo DADAOABIInfo::classifyArgumentType(QualType Ty) const {
++ABIArgInfo
++DADAOABIInfo::coerceAndExpandHPA(ArrayRef<CharUnits> LeafOffsets) const {
++  assert(!LeafOffsets.empty() &&
++         LeafOffsets.size() <= DADAOMaxAggregateRegs);
++
++  llvm::Type *I8 = llvm::Type::getInt8Ty(getVMContext());
++  llvm::Type *PtrTy = llvm::PointerType::get(getVMContext(), /*AS=*/0);
++  SmallVector<llvm::Type *, 8> CoerceElts;
++  SmallVector<llvm::Type *, DADAOMaxAggregateRegs> UnpaddedElts;
++
++  CharUnits Cursor = CharUnits::Zero();
++  for (CharUnits Offset : LeafOffsets) {
++    assert(Offset >= Cursor && "HPA leaves must be in layout order");
++    if (Offset > Cursor)
++      CoerceElts.push_back(llvm::ArrayType::get(
++          I8, (Offset - Cursor).getQuantity()));
++    CoerceElts.push_back(PtrTy);
++    UnpaddedElts.push_back(PtrTy);
++    Cursor = Offset + CharUnits::fromQuantity(DADAORegisterBytes);
++  }
++
++  // Explicit byte arrays carry every layout gap, so a packed LLVM struct
++  // reproduces the AST offsets exactly even for over-aligned nested records.
++  llvm::StructType *CoerceTy =
++      llvm::StructType::get(getVMContext(), CoerceElts, /*isPacked=*/true);
++  llvm::Type *UnpaddedTy =
++      UnpaddedElts.size() == 1
++          ? UnpaddedElts.front()
++          : llvm::StructType::get(getVMContext(), UnpaddedElts,
++                                  /*isPacked=*/false);
++  return ABIArgInfo::getCoerceAndExpand(CoerceTy, UnpaddedTy);
++}
++
++ABIArgInfo DADAOABIInfo::classifyAggregateVarArg(QualType Ty) const {
++  HomogKind Kind = HomogKind::None;
++  unsigned Count = 0;
++  bool Homogeneous =
++      flattenHomogeneous(getContext(), Ty, Kind, Count, CharUnits::Zero(),
++                         /*PointerOffsets=*/nullptr) &&
++      Count > 0;
++
++  // HFA remains explicitly outside ML-031a: do not silently claim that the
++  // RD save-area representation implements the wiki's missing RF-bank ABI.
++  if (Homogeneous &&
++      (Kind == HomogKind::Float32 || Kind == HomogKind::Float64)) {
++    reportHFAUnsupported(Ty);
++    return getNaturalAlignIndirect(Ty, getDataLayout().getAllocaAddrSpace());
++  }
++
++  // Unlike a named >32-byte aggregate, every non-HFA aggregate vararg is
++  // serialized inline into ceil(sizeof(T)/8) consecutive data slots.
++  CharUnits Size = getContext().getTypeInfoInChars(Ty).Width;
++  unsigned Blocks = static_cast<unsigned>(
++      (Size.getQuantity() + DADAORegisterBytes - 1) / DADAORegisterBytes);
++  if (Blocks == 0)
++    Blocks = 1;
++  return ABIArgInfo::getDirect(llvm::ArrayType::get(
++      llvm::Type::getInt64Ty(getVMContext()), Blocks));
++}
++
++ABIArgInfo DADAOABIInfo::classifyArgumentType(QualType Ty,
++                                               bool IsNamedArgument) const {
+   Ty = useFirstFieldIfTransparentUnion(Ty);
+ 
+   if (!isAggregateTypeForABI(Ty))
+@@ -177,15 +259,21 @@ ABIArgInfo DADAOABIInfo::classifyArgumentType(QualType Ty) const {
+   if (isEmptyRecord(getContext(), Ty, /*AllowArrays=*/true))
+     return ABIArgInfo::getIgnore();
+ 
++  if (!IsNamedArgument)
++    return classifyAggregateVarArg(Ty);
++
+   HomogKind Kind = HomogKind::None;
+   unsigned Count = 0;
++  SmallVector<CharUnits, DADAOMaxAggregateRegs> PointerOffsets;
+   bool Homogeneous =
+-      flattenHomogeneous(getContext(), Ty, Kind, Count) && Count > 0;
++      flattenHomogeneous(getContext(), Ty, Kind, Count, CharUnits::Zero(),
++                         &PointerOffsets) &&
++      Count > 0;
+ 
+   if (Homogeneous && Kind == HomogKind::Pointer) {
+-    // HPA: RB bank, one slot per leaf pointer field.
+-    llvm::Type *PtrTy = llvm::PointerType::get(getVMContext(), /*AS=*/0);
+-    return ABIArgInfo::getDirect(llvm::ArrayType::get(PtrTy, Count));
++    // HPA: preserve each leaf's true offset while exposing one pointer IR
++    // argument per leaf, hence one RB-bank slot.
++    return coerceAndExpandHPA(PointerOffsets);
+   }
+ 
+   if (Homogeneous &&
+diff --git a/clang/test/CodeGen/DADAO/aggregate-abi.c b/clang/test/CodeGen/DADAO/aggregate-abi.c
+index 988eea493539..5c292bb1cfa7 100644
+--- a/clang/test/CodeGen/DADAO/aggregate-abi.c
++++ b/clang/test/CodeGen/DADAO/aggregate-abi.c
+@@ -8,6 +8,8 @@
+ // RUN: %clang_cc1 -triple dadao -O0 -emit-llvm -o /dev/null %s 2>&1 | FileCheck %s --check-prefix=HFA-WARN
+ 
+ typedef struct { void *p, *q, *r; } HPA3;      /* 24B, 3 pointer leaves */
++typedef struct { void *p; } __attribute__((aligned(16))) HPAInner;
++typedef struct { HPAInner i; void *q; } PaddedHPA;
+ typedef struct { char c, d, e, f, g; } Tiny5;  /* 5B,  1 RD block (partial) */
+ typedef struct { long a, b, c, d; } Quad32;    /* 32B, 4 RD blocks (boundary) */
+ typedef struct { long a, b, c, d, e; } Big40;  /* 40B, > 32B -> indirect */
+@@ -15,10 +17,19 @@ typedef struct { float f; double d; } MixedFP; /* mixed float types: not HFA */
+ typedef struct { void *p[2]; } PtrArray;       /* array leaf: not HPA */
+ typedef struct { double x, y; } HFA2;           /* genuine HFA: unsupported */
+ 
+-// HPA: coerced to an array of 3 pointers (RB bank via CC_DADAO's CCIfPtr).
+-// CHECK: define{{.*}} i32 @use_hpa([3 x ptr] %v.coerce)
++// HPA: expanded to one pointer IR argument per leaf, hence one RB slot each.
++// CHECK: define{{.*}} i32 @use_hpa(ptr %{{.*}}, ptr %{{.*}}, ptr %{{.*}})
+ int use_hpa(HPA3 v) { return (int)((long)v.p ^ (long)v.q ^ (long)v.r); }
+ 
++// Internal padding is represented in the coercion type, then removed from the
++// signature. The second leaf is loaded from its real offset 16, not padding
++// at offset 8.
++// CHECK: define{{.*}} i32 @use_padded_hpa(ptr %{{.*}}, ptr %{{.*}})
++// CHECK: getelementptr inbounds nuw <{ ptr, [8 x i8], ptr }>, ptr %v, i32 0, i32 2
++int use_padded_hpa(PaddedHPA v) {
++  return v.i.p != v.q;
++}
++
+ // Non-HFA/HPA, <= 32 bytes: coerced to an array of ceil(size/8) i64 blocks.
+ // CHECK: define{{.*}} i32 @use_tiny([1 x i64] %v.coerce)
+ int use_tiny(Tiny5 v) { return v.c + v.d + v.e + v.f + v.g; }
+@@ -52,6 +63,15 @@ int use_hfa(HFA2 v) {
+ // CHECK-NOT: byval
+ int use_big(Big40 v) { return (int)(v.a + v.b + v.c + v.d + v.e); }
+ 
++// An unnamed >32B aggregate is not classified like the named indirect case:
++// it occupies ceil(40/8)=5 inline save-area slots, followed by the scalar.
++// CHECK: define{{.*}} i32 @call_big_vararg(
++// CHECK: call i32 (i32, ...) @take_big_vararg(i32{{.*}} 1, [5 x i64] %{{.*}}, i32{{.*}} 777)
++int take_big_vararg(int n, ...);
++int call_big_vararg(Big40 v) {
++  return take_big_vararg(1, v, 777);
++}
++
+ // Aggregate return <= 64 bits: Direct i64 (RD31), not indirect.
+ // CHECK: define{{.*}} i64 @make_tiny()
+ Tiny5 make_tiny(void) {
+-- 
+2.43.0
+

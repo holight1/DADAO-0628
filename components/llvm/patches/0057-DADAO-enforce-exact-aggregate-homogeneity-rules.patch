@@ -1,0 +1,121 @@
+From 53e5e16e829a7614133eded5c3270fa62508db84 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 13:36:13 +0800
+Subject: [PATCH] DADAO: enforce exact aggregate homogeneity rules
+
+---
+ clang/lib/CodeGen/Targets/DADAO.cpp      | 28 ++++++++++--------------
+ clang/test/CodeGen/DADAO/aggregate-abi.c | 22 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 16 deletions(-)
+
+diff --git a/clang/lib/CodeGen/Targets/DADAO.cpp b/clang/lib/CodeGen/Targets/DADAO.cpp
+index 64750965cbee..0b7ca92f7dab 100644
+--- a/clang/lib/CodeGen/Targets/DADAO.cpp
++++ b/clang/lib/CodeGen/Targets/DADAO.cpp
+@@ -62,7 +62,9 @@ constexpr unsigned DADAOMaxAggregateRegs = 4;
+ constexpr unsigned DADAORegisterBytes = 8;
+ 
+ // Leaf kind an homogeneous aggregate is built from (wiki "同质检查").
+-enum class HomogKind { None, Pointer, Float };
++// Float and double are distinct because an HFA requires every leaf to have
++// the same floating-point type, not merely to be floating-point.
++enum class HomogKind { None, Pointer, Float32, Float64 };
+ 
+ // Recursively flatten Ty (wiki "递归展开聚合类型的所有嵌套 struct 成员，得到
+ // 叶子字段列表") accumulating leaf fields into Kind/Count. Returns false as
+@@ -70,10 +72,9 @@ enum class HomogKind { None, Pointer, Float };
+ // the recursion ("union 直接判定为不满足条件"), a bitfield (not addressed by
+ // the wiki; conservatively disqualifying is the safe reading), a mixed leaf
+ // kind, a non-pointer/non-float leaf, or more than DADAOMaxAggregateRegs
+-// leaves ("计数检查"). Fixed-size array members are flattened element by
+-// element -- the wiki text only walks nested *struct* members and gives no
+-// array example, but this is the natural, conservative extension of the
+-// same recursive rule (see docs/wiki-questions.md). A truly-empty nested
++// leaves ("计数检查"). Arrays are not recursively flattened: the normative
++// rule names nested struct members only, so extending it to array elements
++// would silently create an additional ABI rule. A truly-empty nested
+ // record (zero fields, e.g. a `struct {}` member) contributes zero leaves
+ // and does not by itself disqualify the enclosing aggregate; an entirely
+ // empty *top-level* aggregate is handled separately via isEmptyRecord
+@@ -93,19 +94,13 @@ bool flattenHomogeneous(ASTContext &Ctx, QualType Ty, HomogKind &Kind,
+     return true;
+   }
+ 
+-  if (const auto *AT = Ctx.getAsConstantArrayType(Ty)) {
+-    uint64_t N = AT->getZExtSize();
+-    for (uint64_t I = 0; I < N; ++I)
+-      if (!flattenHomogeneous(Ctx, AT->getElementType(), Kind, Count))
+-        return false;
+-    return true;
+-  }
+-
+   HomogKind ThisKind;
+   if (Ty->isPointerType())
+     ThisKind = HomogKind::Pointer;
+-  else if (Ty->isRealFloatingType())
+-    ThisKind = HomogKind::Float;
++  else if (Ty->isSpecificBuiltinType(BuiltinType::Float))
++    ThisKind = HomogKind::Float32;
++  else if (Ty->isSpecificBuiltinType(BuiltinType::Double))
++    ThisKind = HomogKind::Float64;
+   else
+     return false;
+ 
+@@ -193,7 +188,8 @@ ABIArgInfo DADAOABIInfo::classifyArgumentType(QualType Ty) const {
+     return ABIArgInfo::getDirect(llvm::ArrayType::get(PtrTy, Count));
+   }
+ 
+-  if (Homogeneous && Kind == HomogKind::Float) {
++  if (Homogeneous &&
++      (Kind == HomogKind::Float32 || Kind == HomogKind::Float64)) {
+     // HFA: explicitly out of scope, see file header comment.
+     reportHFAUnsupported(Ty);
+     return getNaturalAlignIndirect(Ty, getDataLayout().getAllocaAddrSpace());
+diff --git a/clang/test/CodeGen/DADAO/aggregate-abi.c b/clang/test/CodeGen/DADAO/aggregate-abi.c
+index 8b5730b26441..988eea493539 100644
+--- a/clang/test/CodeGen/DADAO/aggregate-abi.c
++++ b/clang/test/CodeGen/DADAO/aggregate-abi.c
+@@ -5,11 +5,15 @@
+ // tests/lit/E2E/agg_args_named.test / agg_vararg_multislot.test.
+ //
+ // RUN: %clang_cc1 -triple dadao -O0 -emit-llvm -o - %s | FileCheck %s
++// RUN: %clang_cc1 -triple dadao -O0 -emit-llvm -o /dev/null %s 2>&1 | FileCheck %s --check-prefix=HFA-WARN
+ 
+ typedef struct { void *p, *q, *r; } HPA3;      /* 24B, 3 pointer leaves */
+ typedef struct { char c, d, e, f, g; } Tiny5;  /* 5B,  1 RD block (partial) */
+ typedef struct { long a, b, c, d; } Quad32;    /* 32B, 4 RD blocks (boundary) */
+ typedef struct { long a, b, c, d, e; } Big40;  /* 40B, > 32B -> indirect */
++typedef struct { float f; double d; } MixedFP; /* mixed float types: not HFA */
++typedef struct { void *p[2]; } PtrArray;       /* array leaf: not HPA */
++typedef struct { double x, y; } HFA2;           /* genuine HFA: unsupported */
+ 
+ // HPA: coerced to an array of 3 pointers (RB bank via CC_DADAO's CCIfPtr).
+ // CHECK: define{{.*}} i32 @use_hpa([3 x ptr] %v.coerce)
+@@ -23,6 +27,24 @@ int use_tiny(Tiny5 v) { return v.c + v.d + v.e + v.f + v.g; }
+ // CHECK: define{{.*}} i32 @use_quad([4 x i64] %v.coerce)
+ int use_quad(Quad32 v) { return (int)(v.a + v.b + v.c + v.d); }
+ 
++// HFA requires every leaf to have the same floating-point type. Mixing float
++// and double therefore follows the ordinary <=32B RD-split path.
++// CHECK: define{{.*}} i32 @use_mixed_fp([2 x i64] %v.coerce)
++int use_mixed_fp(MixedFP v) { return (int)(v.f + (float)v.d); }
++
++// The normative flatten rule recursively expands nested structs, not array
++// elements. A pointer array field is therefore not an HPA and uses RD-split.
++// CHECK: define{{.*}} i32 @use_ptr_array([2 x i64] %v.coerce)
++int use_ptr_array(PtrArray v) { return v.p[0] != v.p[1]; }
++
++// A genuine same-type HFA remains explicitly unsupported until RF CodeGen
++// exists. Lock both the diagnostic and the current indirect fallback.
++// CHECK: define{{.*}} i32 @use_hfa(ptr{{.*}} byval(%struct.HFA2){{.*}} %v)
++// HFA-WARN: warning: DADAO ABI: 'HFA2' is a homogeneous floating-point aggregate
++int use_hfa(HFA2 v) {
++  return (int)(v.x + v.y);
++}
++
+ // > 32 bytes: indirect, ByVal=false -- a plain pointer parameter (no
+ // `byval` attribute), matching "caller allocates a temporary and passes
+ // its address" (not a byval-copy-in-outgoing-stack-area scheme).
+-- 
+2.43.0
+

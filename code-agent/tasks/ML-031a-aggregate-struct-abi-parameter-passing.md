@@ -2,7 +2,7 @@
 
 **执行环境**: 本地 subagent
 
-**状态**: 待处理
+**状态**: 已完成（最终独立复审 Accepted）
 
 ## 硬约束（务必遵守，违反视为任务失败）
 
@@ -159,3 +159,253 @@ abi/spec.md` §2.4 明确标注"Excluded from M1"的能力，既没有实现也�
 - `feedback_volatile_needed_for_memory_verification_tests`（新测试涉及
   写读回校验要用volatile）
 - `docs/wiki-questions.md`（若发现wiki歧义，参照DL-072a §5条目的格式追加）
+
+## 完成区
+
+**状态**：已完成；第一轮四项 blocker 已整改，最终独立复审 Accepted
+
+**修改文件**：
+
+- `.work/source/llvm`（普通 git commit，5 个）：
+  - `clang/lib/CodeGen/Targets/DADAO.cpp`：新增 `DADAOABIInfo::classifyArgumentType`/
+    `classifyReturnType`（HPA/HFA/RD-split/indirect/sret 全套分类逻辑 + `flattenHomogeneous`
+    递归展开helper）+ 修复 `EmitVAArg` 的 `IsIndirect`（此前硬编码 `false`）/
+    `ForceRightAdjust`（此前硬编码 `true`，聚合体现在按 `!isAggregateTypeForABI(Ty)` 判定）。
+  - `clang/test/CodeGen/DADAO/aggregate-abi.c`（新增，IR级FileCheck定向测试）。
+  - `llvm/lib/Target/DADAO/DADAOISelLowering.cpp`：`MaxStoresPerMemset/Memcpy/Memmove`
+    从 `UINT_MAX` 改为 `16`（回归测试中发现的必要修复，见下方"回归诊断"）。
+  - 架构师接手复核后修正 HFA/HPA flatten 的两个 spec 偏差：`float` 与
+    `double` 现在按不同 leaf type 判定，混合类型不会误报为 HFA；数组字段不再
+    被擅自展开为 HFA/HPA leaf（wiki 仅授权递归展开 nested struct）。新增
+    mixed-float、pointer-array 与真实 HFA warning/fallback 的 IR/诊断回归。
+  - 第一轮独立 review 后新增 `36abcbd6369d`：HPA 改用带真实 AST field offset
+    的 `CoerceAndExpand`，不再把 padding 当 pointer leaf；非 HFA 聚合变参使用
+    独立分类，`>32B` 仍按 `ceil(size/8)` 个连续 inline data slot 传递。
+  - 第一轮独立 review 后新增 `86656a445241`：在
+    `DADAOMachineFunctionInfo` 保存 hidden sret 地址并在每个 return 前显式恢复
+    RB16；`DADAOTargetLowering::LowerCall` 对目标全局保守关闭尚未实现的 tail-call
+    lowering，有限 `MaxStoresPerMem*` 阈值产生的 libcall 统一走普通 call。
+  - 已导出 `components/llvm/patches/0055-DADAO-implement-aggregate-struct-parameter-return-va.patch`
+    + `0056-DADAO-bound-MaxStoresPerMem-instead-of-unconditional.patch`
+    + `0057-DADAO-enforce-exact-aggregate-homogeneity-rules.patch`
+    + `0058-DADAO-preserve-aggregate-ABI-layout-and-vararg-slots.patch`
+    + `0059-DADAO-preserve-sret-and-disable-unsupported-tail-cal.patch`，追加进
+    `components/llvm/patches/series`。
+- `tests/lit/E2E/Inputs/agg_args_named.c` + `tests/lit/E2E/agg_args_named.test`（新增，
+  HPA（含 nested/over-aligned、内部 padding）/RD-split各尺寸/32B边界/>32B
+  间接引用别名检测/两种返回值模式（sret callee 含内部 pointer call）；输入来自
+  volatile storage，NEGATIVE_CONTROL 在全部主路径执行后于最终 sret 检查触发）。
+- `tests/lit/E2E/Inputs/agg_vararg_multislot.c` + `tests/lit/E2E/agg_vararg_multislot.test`
+  （新增，变参聚合体跨多个8字节slot，覆盖12B/16B及40B `>32B`+尾随标量；
+  输入来自 volatile storage，并有独立的双后端 NEGATIVE_CONTROL；O2 不再使用
+  `-fno-optimize-sibling-calls` 测试侧绕行）。
+- `contracts/abi/spec.md`：§2.4（聚合参数）、§3.3（sret）、§6（Open Issues 表 Varargs/HFA/
+  Complex aggregate ABI 三行）从"Excluded from M1"改为标注实际实现范围。
+- `docs/wiki-questions.md`：新增 #6（RD-split 高位块/高寄存器顺序歧义）、#7（聚合体变参
+  slot 内左右对齐方向未定义）。
+- `docs/issues.yaml`：新增 2 个 open issue：`dadao-hfa-argument-not-implemented`、
+  `dadao-complex-vararg-padded-struct-field-corruption`；整改 B4 后将既有
+  `codegen-tailcall-lowercall-assert` 完整历史迁移至 `docs/issues-archive.yaml`
+  并标记由 `86656a445241`/0059 关闭。
+
+**验收结果**：
+
+1. **15 个原始 torture 文件重跑**（`--filter
+   "stdarg-3|strct-stdarg-1|strct-varg-1|va-arg-22|pr38151|920625-1|920908-1|931004-|pr44575"`，
+   实际匹配 22 个文件——`931004-` 前缀匹配 7 个变体，`pr38151` 等各匹配 1 个）：
+   **21/22 PASS**。**14/15** 个原始目标文件转 PASS；`pr38151.c` 仍 `FAIL_RUN`——
+   已诊断为与聚合ABI无关的独立既有缺陷（`_Complex int` 字段 + 变参memcpy重建交互，
+   见下方"回归诊断"和 `docs/issues.yaml` 新增条目），不在本任务范围内修复。
+   **额外发现并顺带修复 1 个不在原15个清单内的文件**：`20040703-1.c`
+   （`FAIL_RUN`→`PASS`，本任务的通用HPA/RD-split实现覆盖到的额外用例）。
+
+2. **判别性测试**：`tests/lit/E2E/agg_args_named.test`（HPA 3指针字段、
+   nested/over-aligned padded HPA、RD-split
+   5种尺寸含5B、8B、16B、20B、32B边界/>32B间接引用+独立副本别名检测/聚合返回值
+   ≤64位与>64位两种模式含双次sret调用不互相覆盖，NEGATIVE_CONTROL 变体验证
+   全路径后的 sret 负控制）+ `tests/lit/E2E/agg_vararg_multislot.test`
+   （12B/16B/40B 三种变参聚合体跨 slot，各带尾随标量验证 slot 计数正确）+
+   `clang/test/CodeGen/DADAO/aggregate-abi.c`（IR级签名断言）。双后端（QEMU+gem5）、
+   O0/O2 全部 PASS。架构师接手后补齐 volatile 来源，并把具名测试的负控制移到
+   所有主路径之后；变参测试也新增自己的负控制。最终两个正例与两个负控制均在
+   QEMU+gem5 通过。
+
+3. **全量 `llvm-lit tests/lit/E2E/`**：**76/76 PASS**（改动前 74/74，含本任务
+   新增2个）。
+
+4. **全量 gcc-c-torture 重扫**（`python3 tests/scripts/gcc_torture_sweep.py`）：
+   - 改动前基线（stash 掉 `.work/source/llvm` 改动、重建 clang 后实测）：
+     `PASS=1414 FAIL_COMPILE=113 FAIL_LINK=131 FAIL_RUN=50`（与
+     `ML-030a` 完成区声称基线一致）。
+   - 改动后：`PASS=1429 FAIL_COMPILE=113 FAIL_LINK=131 FAIL_RUN=35`。
+   - 逐文件精确 diff（1708 个文件全部比对 status）：**恰好 15 个文件状态变化，
+     全部是 `FAIL_RUN → PASS`，零回归**（无任何原 PASS/其它状态的文件退化）：
+     `20040703-1.c, 920625-1.c, 920908-1.c, 931004-{2,4,6,8,10,12,14}.c,
+     pr44575.c, stdarg-3.c, strct-stdarg-1.c, strct-varg-1.c, va-arg-22.c`。
+
+5. **回归诊断（`pr28982b.c`，中途发现的真实回归，已修复）**：初次全量重扫发现
+   `pr28982b.c` 从 `PASS` 退化为 `FAIL_COMPILE`（编译器崩溃）。根因定位：该文件
+   `struct big { int i[0x10000]; }`（256KB）按值传参，命中本任务新增的 `>32B
+   indirect(ByVal=false)` 路径——与此前"所有聚合体一律 `ByVal=true`"不同，
+   `ByVal=false` 会让 Clang 在 IR 层真正 emit 一次 `llvm.memcpy`（此前 `ByVal=true`
+   从不在 IR 层生成 memcpy，且 DADAO 后端完全没有 byval CC lowering 代码，等效于
+   静默传递一个未拷贝的别名指针——这也解释了为什么当年这个测试"能过"）。该
+   `llvm.memcpy` 命中 `DADAOISelLowering.cpp` 里 `MaxStoresPerMemcpy = UINT_MAX`
+   （源自 `ML-003a-d`，注释写"since brcond-based expansion was previously
+   unselectable"——即当年 call 选择本身有 bug 的临时规避，不是刻意"永不 emit
+   mem* libcall"的freestanding设计决策），导致 SelectionDAG 尝试为 256KB
+   拷贝展开 32768+ 个 store 节点直接崩溃。用一个独立、脱离聚合体ABI的最小复现
+   （`__builtin_memcpy(dst, src, 262144)`，无struct参与）确认这是预先存在、与本
+   任务无关的通用缺陷，只是此前从未被真正触发过（memcpy只在 IR 层真正生成时
+   才会经过这条 lowering 路径）。修复：`MaxStoresPerMemset/Memcpy/Memmove` 改为
+   `16`（对齐 `LanaiISelLowering.cpp` 现有精度，call 选择基础设施在
+   ML-003a-d 之后已大幅成熟，验证超阈值拷贝改走真实 `memcpy` 调用后
+   `pr28982b.c` 编译链接运行全部通过，且不影响任何 nostdlib E2E 测试
+   ——它们都不构造接近这个量级的聚合体/memcpy）。修复后重跑确认：`pr28982b.c`
+   回到 `PASS`，全量重扫仍是"恰好15个文件变化、零回归"（见上）。
+
+6. **`pr38151.c` 独立诊断（未在本任务范围内修复，如实记录不夸大）**：
+   通过4个最小化探针隔离：①具名参数传同一 layout（`_Complex int` +
+   `__attribute__((aligned))` 空成员导致16字节尺寸/16字节对齐）——PASS；
+   ②同尺寸16字节变参但把 `_Complex int` 换成等价的 `struct{int re,im;}`——PASS；
+   ③更小（12字节，无trailing padding）的 `_Complex int` 变参——PASS；④原始
+   `S2848` layout 变参——FAIL（仅虚部 `__imag__` 读回错误，`.a`/`__real__` 均正确）。
+   四个探针共同锁定：缺陷特定于"变参聚合体 memcpy 重建路径" + "`_Complex`
+   实部/虚部lvalue访问应用在该重建临时对象上"这一组合，且要求trailing padding
+   同时存在；与本任务的字节块ABI分类/传输机制本身无关（探针①②③都真实
+   走了本任务的新RD-split/变参slot代码路径且正确）。`pr38151.c` 在 `ML-026a`
+   原始扫描里已经是 `FAIL_RUN`（"尚未深挖"9个文件之一）——本任务未引入此
+   缺陷，只是诊断清楚了它，未修复（与聚合类型ABI传参正交）。已登记
+   `docs/issues.yaml` `dadao-complex-vararg-padded-struct-field-corruption`。
+
+7. **HFA 场景既有出现排查**：`grep` `tests/lit/E2E/Inputs/*.c` 与 musl
+   `src/*/*.c` 未发现任何既有 struct-with-float-field 按值传递的用例（唯二
+   命中 `double`/`float` 关键词的文件是注释提到软浮点符号，非实际HFA用法）；
+   全量 E2E 76/76 零回归也间接印证没有既有测试路径因 HFA fallback 行为
+   （本任务保持与此前完全一致，未改动）而改变结果。gcc-c-torture 里唯一
+   真实 HFA 用例是 `920625-1.c` 的 `point`（`struct{double x,y;}`）变参子测试
+   `va1`——该子测试意外PASS，但已在 `docs/issues.yaml` 的
+   `dadao-hfa-argument-not-implemented` 条目里如实注明：这是 DADAO 后端从未
+   实现 byval CC lowering 导致的"传裸别名指针、恰好因为源数据是长寿命全局数组
+   而蒙对"的偶然结果，不是真正符合 spec 的 HFA 实现，不能理解为"HFA 已经可用"。
+
+8. **`python3 tools/run_differential.py`**：`AGREE(3-way)=200 DIVERGE=0`，
+   `AGREE(4-way)=200 SAIL-DIVERGE=0` —— 与改动前完全一致（本任务不改指令语义）。
+
+9. **`python3 scripts/manifest_check.py`**：PASS。**`python3 scripts/check_issues.py`**：
+   PASS（Open=23 Closed=38 Total=61）。**`python3 scripts/check_wiki_refs.py
+   --profile abi`**：PASS（0 DANGLING/0 UNPARSEABLE/0 缺引用）。
+   **`python3 scripts/check_wiki_drift.py`**：PASS。**`python3
+   scripts/check_lit_bytes.py`**：69 patterns OK。
+
+10. **patch 导出与独立验证**：0055-0059 均已追加进 `series`；在干净
+    pin-commit（`ca7933e47d3a...`）checkout 上依次 plain `git am` 全部
+    **59/59**，成功、无冲突，最终 tree 与开发树（`86656a445241`）同为
+    `5eb4aa6953eb634052fecad3fd0e187aa103e204`。
+
+11. **`.work/source/llvm` 侧改动均为普通 `git commit`**（未做
+    `git rebase`/`git am` 重放历史/`git reset --hard`）：
+    - `9079603c93f3`："DADAO: implement aggregate (struct) parameter/return-value ABI"
+    - `ac7c52aa6cd4`："DADAO: bound MaxStoresPerMem* instead of unconditional UINT_MAX"
+    - `53e5e16e829a`："DADAO: enforce exact aggregate homogeneity rules"
+    - `36abcbd6369d`："DADAO: preserve aggregate ABI layout and vararg slots"
+    - `86656a445241`："DADAO: preserve sret and disable unsupported tail calls"
+
+12. **架构师接手及四项整改后的最终重跑**：原目标 filter 仍为
+    `21 PASS / 1 FAIL_RUN`（`pr38151.c`）；加 `pr28982b` 后为
+    `22 PASS / 1 FAIL_RUN`。全量 1708 项仍为
+    `PASS=1429 / FAIL_COMPILE=113 / FAIL_LINK=131 / FAIL_RUN=35`，与接手时
+    `gcc-torture-results.json` 逐文件 status mismatch 为 0；E2E 76/76；
+    三方/四方 differential 均 200 AGREE、0 DIVERGE；manifest、issue、ABI、
+    wiki refs/drift 与 lit-bytes 门禁全部 PASS。
+
+13. **第一轮独立 review 四项 blocking finding 整改**：
+    - **B1 padded/nested HPA**：`36abcbd6369d` 扩展 recursive flatten，同步记录
+      每个 pointer leaf 的真实 AST byte offset；按 offset 构造含显式 byte-padding
+      的 packed `CoerceToType` 与无 padding 的 pointer 参数序列。IR 现在把
+      `PaddedHPA` 展开为两个独立 pointer 参数，callee 重组时第二个字段明确定位
+      offset 16；新增 over-aligned nested HPA 双后端运行检查，原 review 的
+      exit 17 已消失。
+    - **B2 `>32B` vararg**：`computeInfo` 按 `FI.getNumRequiredArgs()` 区分 named/
+      unnamed；非 HFA 聚合变参始终 direct-coerce 为
+      `[ceil(sizeof(T)/8) x i64]`，不复用 named `>32B` indirect。40B `Big40`
+      实际产生 5 个连续 slot，后接 `999` 标量，O0/O2 QEMU+gem5 均 PASS；HFA
+      仍走明确 warning + indirect fallback，未虚假声称 RF ABI 已实现。
+    - **B3 sret RB16**：`86656a445241` 在 `LowerFormalArguments` 将 hidden sret
+      pointer 保存到 GPRB virtual register，内部 call 的 regmask 使其正常
+      spill/reload；`LowerReturn` 显式 copy 回 RB16 并加入 RET live-out。
+      `aggregate-sret-preserve.ll` 锁定 `call sink` 后 `ldo rb16,...` 再 `ret`。
+    - **B4 mem* tail call**：同一提交在 `LowerCall` 入口统一
+      `CLI.IsTailCall=false`，只关闭 DADAO 尚未实现的优化，不伪造 tail-call
+      支持。`mem-intrinsic-libcall-no-tail.ll` 覆盖 memcpy/memmove/memset 的
+      16/17B 边界、tail/non-tail 及 256KiB 路径；17B/大路径生成普通 call，
+      不再 assertion，`pr28982b.c` 保持 PASS。
+
+14. **整改后最终证据**（最终构建产物 revision =
+    `86656a44524167b605274b616906f8d432563f6e`）：
+    - Clang aggregate ABI + DADAO CodeGen：**9/9 PASS**；
+    - 全量 E2E：**76/76 PASS**，其中 padded HPA、40B vararg+tail、
+      internal-call sret 均在 QEMU+gem5 覆盖；
+    - 目标 torture（原 filter + `pr28982b`）：**22 PASS / 1 FAIL_RUN**，
+      唯一失败仍为已登记的既有 `pr38151.c`；
+    - 全量 torture：`1429/113/131/35`，与整改前 JSON 1708 项逐文件
+      status mismatch = **0**；
+    - differential：3-way/4-way 均 `AGREE=200`、`DIVERGE=0`；
+      manifest/issues/wiki refs/wiki drift/CodeGen ABI/lit-bytes 全部 PASS；
+      issue registry 更新后 `Open=22 / Closed=39 / Total=61`。
+
+15. **patch provenance**：0058/0059 的 SHA256 分别与对应 commit 的 fresh
+    `git format-patch --stdout` 精确一致：
+    `84c3ad2f94aee140bfca4b8c2884bd276d265bbed4b9acbc2b8ec406aa9f96d5`、
+    `789653ef0ffc8304f0419460dc65dc588fd063aeb4a39cc66ce0ecf60f2bb875`。
+    从 manifest pin `ca7933e47d3a...` 在独立临时 clone 中按 series 顺序
+    plain `git am` **59/59** 成功；replay tree 与 LLVM HEAD tree 均为
+    `5eb4aa6953eb634052fecad3fd0e187aa103e204`。
+
+**遗留问题**：
+
+- `dadao-hfa-argument-not-implemented`（open）：HFA（同质浮点聚合，RF bank）
+  未实现，需要先给 DADAO 加完整浮点寄存器类/CodeGen基础设施，是独立的大工程。
+- `dadao-complex-vararg-padded-struct-field-corruption`（open）：`_Complex int`
+  字段 + 变参聚合体memcpy重建路径 + 非天然尺寸trailing padding 三者组合时
+  虚部读回错误（`pr38151.c`），与本任务的聚合ABI机制正交，未修复。
+- `docs/wiki-questions.md` #6/#7：两处wiki文字未覆盖到的边界情况（RD-split
+  高低寄存器顺序、聚合变参slot内左右对齐方向），已采用最合理的读法并记录理由，
+  等待 wiki 团队确认。
+
+## 审阅记录（subagent）
+
+### 第一轮独立 review（2026-07-24）
+
+- 报告：`docs/reviews/ML-031a-independent-review-20260724.md`
+- 判决：**Needs changes**
+- blocking findings：
+  1. `[N x ptr]` coercion 会让带内部 padding 的递归 HPA 丢失非连续字段；
+  2. `>32B` 聚合变参错误复用 named indirect 分类，只保存一个 pointer slot；
+  3. sret callee 内部发生 pointer call 后，返回前没有把原 sret 地址恢复到 RB16；
+  4. 0056 让 17B 以上尾位置 mem* 进入尚未实现完整的 tail-call lowering，
+     在 `-O2` 触发 assertion。
+- 第一轮 review 同时确认：0057 的 exact-homogeneity 修复正确；E2E 76/76、
+  torture 1429/113/131/35、differential 200/0 和 57/57 replay 数字可信，但
+  这些既有测试没有覆盖上述四个边界，不能抵消 findings。
+- 当前处置：四项均作为 ML-031a 完成前的阻断项整改，不降级为后续 issue，也不以
+  现有绿色数字提前关闭任务。整改后的最终独立复审由主 agent 另行显式管理；
+  本 agent 不再自行派生 reviewer。
+
+### 最终独立复审（2026-07-24）
+
+- 报告：`docs/reviews/ML-031a-independent-rereview-20260724.md`
+- 判决：**Accepted**
+- 第一轮 B1-B4 均由最终 reviewer 独立确认关闭：
+  - padded/nested HPA 的 AST offset、RB16/RB17 物理映射与 bank overflow；
+  - 40B 非 HFA 聚合变参的 5 个 inline slot、尾随标量位置与双后端执行；
+  - internal pointer call 后 sret 地址恢复到 RB16/live-out；
+  - mem* 16/17B、tail/non-tail、256KiB 路径与 `pr28982b.c`。
+- 独立结果：Clang/CodeGen 9/9、E2E 76/76、torture
+  `1429/113/131/35` 且逐文件零变化、三方/四方 differential 200/0、
+  plain `git am` 59/59、replay tree 与 LLVM HEAD 一致。
+- 无 blocking/major finding。唯一 Minor N1 是永久
+  `mem-intrinsic-libcall-no-tail.ll` 采用代表性矩阵；reviewer 已用临时 18-case
+  完整矩阵确认全部编译成功，建议以后按需固化，不阻断本任务。
+
+**最终独立 reviewer 判决：Accepted。**

@@ -52,3 +52,8 @@
 0052-DADAO-make-frame-offset-scavenging-spill-safe.patch
 0053-DADAO-reject-GlobalAddress-Constant-offset-folding.patch
 0054-DADAO-clarify-isOffsetFoldingLegal-perf-tradeoff-sco.patch
+0055-DADAO-implement-aggregate-struct-parameter-return-va.patch
+0056-DADAO-bound-MaxStoresPerMem-instead-of-unconditional.patch
+0057-DADAO-enforce-exact-aggregate-homogeneity-rules.patch
+0058-DADAO-preserve-aggregate-ABI-layout-and-vararg-slots.patch
+0059-DADAO-preserve-sret-and-disable-unsupported-tail-cal.patch

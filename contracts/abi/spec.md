@@ -4,9 +4,10 @@
 **Source**: Wiki commit `9f378f4426e131903d60a208766086ae74a53c89` (SimRISC 0.4.1)
 **Status**: Candidate
 
-M1 BasicCodeGen scope: non-variadic functions, scalar integer and pointer
-arguments/returns only. Floating-point, HFA/HPA, varargs, and complex
-aggregates are excluded.
+The implemented scope now includes scalar integer/pointer calls, varargs,
+HPA, ordinary aggregate RD-split/indirect arguments, and both aggregate
+return modes. Floating-point/HFA register-bank passing and the separately
+tracked complex-vararg padded-struct defect remain excluded.
 
 ---
 
@@ -132,10 +133,50 @@ The remaining arguments share one area in global declaration order:
 
 ### 2.4 Aggregate Arguments
 
-**Excluded from M1.** M1 BasicCodeGen handles scalar integers and pointers only.
-Aggregate parameter passing rules (HFA/HPA, ≤32B register unpacking,
->32B indirect pointer) are defined in wiki §DADAO-21-ABI §聚合类型参数
-but are not used by M1 BasicCodeGen.
+**Implemented (ML-031a), except HFA.** Aggregate (struct/union) arguments are
+classified by a recursive flatten of nested structs (arrays are not an
+implicit extension; union at any nesting level disqualifies) into leaf fields, per
+wiki §DADAO-21-ABI §聚合类型参数:
+
+- **HPA** (homogeneous pointer aggregate, ≤ 4 pointer leaves): passed via the
+  RB bank, one slot per leaf. Implemented with
+  `ABIArgInfo::getCoerceAndExpand`: the padded coercion type records each
+  pointer leaf's real AST byte offset (including nested/over-aligned layout
+  gaps), while the unpadded IR signature exposes one pointer argument per
+  leaf for `CC_DADAO::CCIfPtr`. This avoids treating padding bytes as a
+  pointer slot.
+- **HFA** (all leaves are the same type, either all `float` or all `double`):
+  **excluded** — DADAO's LLVM
+  backend has no RF register class / floating-point CodeGen support at all
+  (ML-020a/ML-025a). Detected structurally by the same flatten but falls
+  back unchanged to the pre-ML-031a indirect (byval) classification, with a
+  compiler warning. Tracked as `docs/issues.yaml`
+  `dadao-hfa-argument-not-implemented`.
+- **Otherwise, ≤ 32 bytes**: split into 1-4 opaque 8-byte blocks in the RD
+  bank. Implemented as `ABIArgInfo::getDirect`, coerced to
+  `[ceil(size/8) x i64]`. Block-to-register ordering follows natural
+  ascending memory order (offset 0 → the argument's lowest-numbered
+  register) — the wiki's "高位块先入高寄存器" phrasing has no worked example
+  and reads inconsistently with HFA/HPA's own ascending-order examples; see
+  `docs/wiki-questions.md` #6 for the full writeup and rationale.
+- **Otherwise (> 32 bytes)**: indirect — caller allocates a temporary and
+  passes its address through the RB bank. Implemented as
+  `ABIArgInfo::getIndirect(..., ByVal=false)`: a plain RB-bank pointer, not a
+  `byval`-attributed copy-in-outgoing-stack-area scheme.
+
+Non-HFA variadic aggregates use a classification distinct from named
+arguments: they occupy `ceil(sizeof(T)/8)` consecutive inline data slots even
+when `sizeof(T) > 32`, rather than reusing the named-argument indirect-pointer
+rule. The existing caller-populated save-area loop then stores every flattened
+SelectionDAG block in source order. Sub-8-byte trailing blocks (aggregate
+sizes not a multiple of 8) are left-justified within the save area (real bytes
+first, then padding) rather than right-adjusted like narrow scalars — see
+`docs/wiki-questions.md` #7. HFA varargs remain excluded with the same
+diagnostic/indirect fallback as named HFA arguments.
+
+Implementation: `clang/lib/CodeGen/Targets/DADAO.cpp` (`DADAOABIInfo`);
+`components/llvm/patches/0055-...patch`, exact-homogeneity follow-up
+`0057-...patch`, and padded-HPA/large-vararg correction `0058-...patch`.
 
 ---
 
@@ -175,16 +216,24 @@ the "scan from last declaration" rule and the example `(int x, int y, …)
 in `docs/open-spec-issues.md` and must be resolved before M1 can implement
 multiple returns. §3.2 is therefore Excluded from M1.]
 
-### 3.3 Structure Return (sret) (Post-M1 / Informative)
+### 3.3 Structure Return (sret)
 
-**Excluded from M1 BasicCodeGen.** Provided here for reference only.
-
-Aggregates > 64 bits use hidden sret [wiki §DADAO-21-ABI §返回值 §聚合类型返回值]:
+**Implemented (ML-031a).** Aggregates > 64 bits use hidden sret
+[wiki §DADAO-21-ABI §返回值 §聚合类型返回值]:
 - Caller pre-allocates space and passes the address as a hidden first
   argument in **rb16**.
 - Callee writes the result through `rb16` and preserves `rb16` after return.
 
-Aggregates ≤ 64 bits are returned in rd31.
+Aggregates ≤ 64 bits are returned in rd31 — **unconditionally on size alone**,
+independent of HFA/HPA leaf shape (a small all-pointer or all-float aggregate
+still returns via rd31 as a raw scalar bit pattern, not rb31/rf31). Both
+cases implemented as `ABIArgInfo::getDirect(i64)` (≤ 64 bits) /
+`ABIArgInfo::getIndirect` (> 64 bits) in `DADAOABIInfo::classifyReturnType`
+(`clang/lib/CodeGen/Targets/DADAO.cpp`). For >64-bit returns, backend lowering
+copies the incoming hidden pointer into a GPRB virtual register and explicitly
+restores it to rb16 on every return; normal call-clobber handling therefore
+preserves the value across internal pointer-argument calls
+(`components/llvm/patches/0059-...patch`).
 
 ---
 
@@ -315,10 +364,10 @@ of rb2, avoiding the high-16-bit preservation issue of `addi` (ISA §4.4).
 
 | Issue | Impact | Reference |
 |-------|--------|-----------|
-| Varargs | **Scalar RD/RB path implemented by DL-072a (LLVM `3aa546d1d0cd`, patch 0050).** Per wiki §可变参数, the caller—not the callee—writes every named and unnamed argument in original declaration order into one contiguous 8-byte-slot save area while retaining normal register/overflow passing. `va_start` addresses that caller-populated area after the named slots; `va_arg` advances by 8 and right-adjusts narrow values on big-endian DADAO. The former callee-side RD-only spill is deleted; mixed RD/RB, overflow, real `printf("%s %s")`, and real `scanf("%d",&x)` are dual-backend tested. RF varargs and full aggregate coverage remain outside DL-072a; the wiki wording conflict between “incoming SP is save-area base” and “overflow→locals→save area from low to high” remains tracked in `docs/open-spec-issues.md`. | `docs/open-spec-issues.md` |
-| HFA/HPA | Excluded from M1; aggregate classification rules defined in wiki | `docs/open-spec-issues.md` |
+| Varargs | **Scalar RD/RB path implemented by DL-072a (LLVM `3aa546d1d0cd`, patch 0050); aggregate vararg coverage added by ML-031a (patches 0055/0058).** Per wiki §可变参数, the caller—not the callee—writes every named and unnamed argument in original declaration order into one contiguous 8-byte-slot save area while retaining normal register/overflow passing. `va_start` addresses that caller-populated area after the named slots; `va_arg` advances by 8 and right-adjusts narrow *scalar* values on big-endian DADAO (aggregates are left-justified, ML-031a — see `docs/wiki-questions.md` #7). A non-HFA aggregate vararg occupies `ceil(sizeof(T)/8)` consecutive inline slots, including above the named 32-byte indirect threshold. The former callee-side RD-only spill is deleted; mixed RD/RB, overflow, real `printf("%s %s")`, `scanf("%d",&x)`, and 12/16/40-byte aggregate-vararg slot crossing are dual-backend tested. RF (HFA) varargs remain outside scope (`dadao-hfa-argument-not-implemented`); the wiki wording conflict between "incoming SP is save-area base" and "overflow→locals→save area from low to high" remains tracked in `docs/open-spec-issues.md`. | `docs/open-spec-issues.md` |
+| HFA | **Excluded (ML-031a), tracked as `docs/issues.yaml` `dadao-hfa-argument-not-implemented`** — DADAO has no RF register class / floating-point CodeGen support at all; HPA is implemented (see §2.4/§3.3). | `docs/issues.yaml` |
 | Mixed-bank multi-return | [OPEN] Excluded from M1; Wiki ordering conflict must be resolved before Advanced CodeGen | `docs/open-spec-issues.md` |
-| Complex aggregate ABI | Struct splitting rules for >64-bit non-HFA/HPA aggregates; deferred post-M2 | — |
+| Complex aggregate ABI | **Implemented (ML-031a)** — HPA/RD-split/indirect argument passing and both return modes (§2.4/§3.3); only HFA (RF bank) remains excluded. | — |
 | Dynamic linking TLS | Excluded from M1 | `docs/open-spec-issues.md` |
 | Frame pointer convention | Optional rbfp use is a CodeGen optimization choice; this contract does not mandate either strategy | — |
 

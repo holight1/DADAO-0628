@@ -1,0 +1,22 @@
+// ML-031a: variadic aggregate parameters spanning multiple 8-byte save-area
+// slots (wiki §可变参数 "大于 8 字节的聚合变参") -- an exact-multiple-of-8
+// struct (16B, 2 slots), a non-multiple-of-8 struct (12B, rounds up to
+// 2 slots), and a >32B struct (40B, 5 inline data slots) each followed by a
+// trailing scalar vararg, proving slot accounting is independent of the
+// named-argument indirect threshold.
+// Inputs are loaded from volatile storage. A negative-control build changes
+// the final expected scalar after both aggregate va_arg reads have executed.
+//
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -O0 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/agg_vararg_multislot.c -o %t.o0.elf
+// RUN: %llvm-objcopy -O binary %t.o0.elf %t.o0.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O2 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/agg_vararg_multislot.c -o %t.o2.elf
+// RUN: %llvm-objcopy -O binary %t.o2.elf %t.o2.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O0 -DNEGATIVE_CONTROL=1 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/agg_vararg_multislot.c -o %t.negative.elf
+// RUN: %llvm-objcopy -O binary %t.negative.elf %t.negative.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.negative.bin >/dev/null 2>&1; test $? -eq 9'
+// RUN: bash -c '%gem5 %gem5_se %t.negative.elf >/dev/null 2>&1; test $? -eq 9'

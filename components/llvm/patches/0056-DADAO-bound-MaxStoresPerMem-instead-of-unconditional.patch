@@ -1,0 +1,70 @@
+From ac7c52aa6cd4d253543f49134bf5c9bd3a3f9786 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 13:05:36 +0800
+Subject: [PATCH 56/56] DADAO: bound MaxStoresPerMem* instead of unconditional
+ UINT_MAX
+
+ML-003a-d set MaxStoresPerMemset/Memcpy/Memmove = UINT_MAX to force full
+inline expansion, working around brcond-based call selection being
+unselectable at that point in bring-up -- not a deliberate 'never emit a
+mem* libcall' freestanding design choice. Left unconditional, the DAG
+legalizer never falls back to a libcall regardless of copy size, which
+crashes SelectionDAG node construction for a large-enough aggregate copy.
+
+Surfaced by ML-031a's gcc-c-torture regression sweep: pr28982b.c passes a
+256KB struct by value, which the new >32-byte indirect-argument path
+lowers to a caller-side temporary + a real llvm.memcpy (the pre-existing
+always-indirect-byval classification never actually copied anything at
+the IR level, since this backend has no byval CC lowering, so the crash
+was latent/unreached before). Reproduced independent of any aggregate-ABI
+code with a bare __builtin_memcpy of the same size.
+
+16 matches LanaiISelLowering.cpp's MaxStoresPerMemcpy (this backend's
+nearest scalar-RISC precedent elsewhere in-tree); copies above the
+threshold now lower to a real call to memcpy/memmove/memset, which musl
+provides in every environment in this project large enough to reach one.
+Full E2E lit (nostdlib) and the full gcc-c-torture sweep (musl-linked)
+both confirm zero regression.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TSiWyHquQwjpeRvvKSQEQN
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp | 22 ++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 73ebf3979a12..d9221bb25da8 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -68,9 +68,25 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::SELECT_CC, MVT::i64, Expand);
+   setOperationAction(ISD::GlobalAddress, MVT::i64, Custom);
+ 
+-  MaxStoresPerMemset = UINT_MAX;
+-  MaxStoresPerMemcpy = UINT_MAX;
+-  MaxStoresPerMemmove = UINT_MAX;
++  // ML-003a-d originally set these to UINT_MAX ("force full inline
++  // expansion... since brcond-based expansion was previously unselectable")
++  // -- a workaround for a since-fixed gap in call/branch selection, not a
++  // deliberate "never emit a mem* libcall" freestanding design choice. An
++  // unconditional UINT_MAX means the DAG legalizer never falls back to a
++  // libcall regardless of copy size, which crashes SelectionDAG node
++  // construction for pathologically large aggregate copies (ML-031a: a
++  // 256KB struct-by-value argument, gcc-c-torture pr28982b.c, hit this via
++  // the >32-byte indirect-argument path's caller-side temporary copy).
++  // 16 matches LanaiISelLowering.cpp's MaxStoresPerMemcpy (already this
++  // backend's nearest scalar-RISC precedent elsewhere in this file/
++  // DADAOCallingConv.td); copies above the threshold now lower to a real
++  // call to the target's memcpy/memmove/memset (musl provides these for
++  // every environment in this project that can reach such a large copy --
++  // nostdlib E2E lit tests never construct aggregates anywhere near this
++  // size).
++  MaxStoresPerMemset = 16;
++  MaxStoresPerMemcpy = 16;
++  MaxStoresPerMemmove = 16;
+ 
+   setMaxAtomicSizeInBitsSupported(0);
+ 
+-- 
+2.43.0
+

@@ -1207,3 +1207,42 @@
   # Clang DADAO ABI 同步固定 va_arg 为每次 +8，大端窄整数从 slot+4 读取。
   # 独立真实验收：混合 RD/RB、fixed/unnamed overflow、printf("%s %s")、
   # scanf("%d",&x) 均在 QEMU/gem5 通过；scanf 原 XFAIL 已删除。
+- id: codegen-tailcall-lowercall-assert
+  title: "DADAO LowerCall 从未实现 tail-call opt-out，-O1+ 对 return foo(...) 形态尝试 sibling-call 下降，撞 LowerCall emitted a return value for a tail call 断言"
+  status: closed
+  scope: [CodeGen]
+  blocks: [llvm-test-suite-t3-above-o0]
+  resolved_by: "ML-031a; LLVM 86656a445241; patch 0059-DADAO-preserve-sret-and-disable-unsupported-tail-cal.patch"
+  # DL-065a 验证阶段发现（2026-07-14，subagent）：修完 call 隐式寄存器范围
+  # 溢出后，对全部 963 个 picolibc .c 文件做 -O1 扫描，仍有 113 个文件在
+  # 一个不同、独立的断言上崩溃：LowerCall emitted a return value for a
+  # tail call!——DADAO 的 LowerCall 从未加 isEligibleForTailCallOptimization
+  # 之类的覆写去关闭尾调用优化，故 -O1+ 遇到 `return foo(...);` 形态的
+  # 代码会尝试 sibling-call 下降并崩溃。与 DL-065a 的隐式寄存器问题是两个
+  # 独立缺口，未修复（本任务范围之外）。是 llvm-test-suite（ADR-0012 T3）
+  # 在高于 -O0 跑起来前的另一个必修项，与 dadao-oz-undef-physreg 一起构成
+  # -O1+ 支持的两大缺口。
+  #
+  # ML-012a（2026-07-17）：musl 自己的 crt/crt1.c（_start_c 尾部调用
+  # __libc_start_main）和 src/env/__libc_start_main.c（stage2(...) 尾部
+  # 调用）在 config.mak 默认 -O2 下都直接命中这个断言，阻塞了 musl 首个
+  # 真实链接 E2E 里程碑。**未修复 LLVM**——在 `arch/dadao/arch.mak`
+  # （musl 侧、component-lock 允许的 arch 集成文件）里加
+  # `CFLAGS_AUTO += -fno-optimize-sibling-calls`，全树生效，验证直接从
+  # 崩溃变为编译干净（-O2 不变，只是不再尝试 sibling-call 下降）。这是一
+  # 个安全、可移植、只关闭优化的标准编译器开关，不改变任何程序语义，
+  # 不是修复 LowerCall 本身。副作用（有益）：同一批全树 `make -k` 扫描
+  # 显示这个断言此前命中的全部约 229 个 musl 文件在加此开关后全部消失
+  # （ML-012a 完整失败分类：229→0），是这个开关对整个 issue 的一次大规
+  # 模、非侵入性缓解，但 `codegen-tailcall-lowercall-assert` 本身（LLVM
+  # 从未实现 tail-call opt-out）仍未修复、仍是 open——任何不走 musl
+  # arch.mak（例如 llvm-test-suite 的独立 -O1+ 编译路径）的构建仍会命中。
+  #
+  # ML-031a（2026-07-24）：0056 的有限 MaxStoresPerMem* 阈值让普通 17B
+  # 以上 mem* libcall 首次稳定进入该路径，独立 review 将其提升为 blocking。
+  # LLVM 86656a445241 在 DADAOTargetLowering::LowerCall 入口统一清除
+  # CLI.IsTailCall；这是目标尚无 sibling-call ABI/指令 lowering 时的保守
+  # opt-out，不假装实现 tail call。新增 CodeGen 回归覆盖 memcpy/memmove/
+  # memset 的 16/17B 边界、tail/non-tail 以及 256KiB copy；全部正常生成
+  # 普通 call，pr28982b.c 保持 PASS，全量 E2E 76/76、torture 分布
+  # 1429/113/131/35，旧结果逐文件零变化。

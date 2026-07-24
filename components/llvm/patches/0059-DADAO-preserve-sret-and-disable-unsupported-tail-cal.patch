@@ -1,0 +1,237 @@
+From 86656a44524167b605274b616906f8d432563f6e Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 13:58:49 +0800
+Subject: [PATCH] DADAO: preserve sret and disable unsupported tail calls
+
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   | 37 ++++++++
+ .../Target/DADAO/DADAOMachineFunctionInfo.h   |  5 ++
+ .../CodeGen/DADAO/aggregate-sret-preserve.ll  | 26 ++++++
+ .../DADAO/mem-intrinsic-libcall-no-tail.ll    | 90 +++++++++++++++++++
+ 4 files changed, 158 insertions(+)
+ create mode 100644 llvm/test/CodeGen/DADAO/aggregate-sret-preserve.ll
+ create mode 100644 llvm/test/CodeGen/DADAO/mem-intrinsic-libcall-no-tail.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index d9221bb25da8..4cbd7abce32b 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -129,6 +129,13 @@ SDValue DADAOTargetLowering::LowerCall(
+   CallingConv::ID CallConv = CLI.CallConv;
+   bool IsVarArg = CLI.IsVarArg;
+ 
++  // DADAO has no tail-call lowering. In particular, libcalls introduced by
++  // the finite MaxStoresPerMem* thresholds may arrive here marked tail and
++  // otherwise trip the generic "tail calls have no return values" invariant.
++  // Conservatively lower every call as an ordinary call until the target has
++  // a complete sibling-call ABI and instruction path.
++  CLI.IsTailCall = false;
++
+   MachineFunction &MF = DAG.getMachineFunction();
+ 
+   SmallVector<CCValAssign, 16> ArgLocs;
+@@ -300,6 +307,22 @@ SDValue DADAOTargetLowering::LowerFormalArguments(
+     }
+   }
+ 
++  // The ABI requires a hidden sret address received in RB16 to remain in
++  // RB16 on return. Preserve it in a GPRB virtual register so normal call
++  // clobber handling spills/restores it across any calls in the function.
++  if (MF.getFunction().hasStructRetAttr()) {
++    DADAOMachineFunctionInfo *DFI = MF.getInfo<DADAOMachineFunctionInfo>();
++    Register Reg = DFI->getSRetReturnReg();
++    if (!Reg) {
++      Reg = RegInfo.createVirtualRegister(&DADAO::GPRBRegClass);
++      DFI->setSRetReturnReg(Reg);
++    }
++    assert(!InVals.empty() && "sret function must have a hidden pointer");
++    SDValue Copy =
++        DAG.getCopyToReg(DAG.getEntryNode(), DL, Reg, InVals.front());
++    Chain = DAG.getNode(ISD::TokenFactor, DL, MVT::Other, Copy, Chain);
++  }
++
+   if (IsVarArg) {
+     MachineFrameInfo &MFI = MF.getFrameInfo();
+     DADAOMachineFunctionInfo *DFI = MF.getInfo<DADAOMachineFunctionInfo>();
+@@ -336,6 +359,20 @@ SDValue DADAOTargetLowering::LowerReturn(
+     RetOps.push_back(DAG.getRegister(VA.getLocReg(), VA.getLocVT()));
+   }
+ 
++  if (DAG.getMachineFunction().getFunction().hasStructRetAttr()) {
++    MachineFunction &MF = DAG.getMachineFunction();
++    DADAOMachineFunctionInfo *DFI = MF.getInfo<DADAOMachineFunctionInfo>();
++    Register Reg = DFI->getSRetReturnReg();
++    assert(Reg &&
++           "SRetReturnReg should have been set in LowerFormalArguments");
++    SDValue Val = DAG.getCopyFromReg(Chain, DL, Reg, MVT::i64);
++    Chain = Val.getValue(1);
++    Chain = DAG.getCopyToReg(Chain, DL, DADAO::RB16, Val, Glue);
++    Glue = Chain.getValue(1);
++    RetOps.push_back(DAG.getRegister(DADAO::RB16, MVT::i64));
++  }
++
++  RetOps[0] = Chain;
+   if (Glue.getNode())
+     RetOps.push_back(Glue);
+   return DAG.getNode(DADAOISD::RET_GLUE, DL, MVT::Other, RetOps);
+diff --git a/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h b/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
+index 98d61ee5a330..54e6fdb073b0 100644
+--- a/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
++++ b/llvm/lib/Target/DADAO/DADAOMachineFunctionInfo.h
+@@ -3,6 +3,7 @@
+ #define LLVM_LIB_TARGET_DADAO_DADAOMACHINEFUNCTIONINFO_H
+ 
+ #include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/Register.h"
+ 
+ namespace llvm {
+ 
+@@ -11,6 +12,7 @@ class TargetSubtargetInfo;
+ 
+ class DADAOMachineFunctionInfo : public MachineFunctionInfo {
+   int VarArgsFrameIndex = -1;
++  Register SRetReturnReg;
+ 
+ public:
+   static char ID;
+@@ -18,6 +20,9 @@ public:
+ 
+   int getVarArgsFrameIndex() const { return VarArgsFrameIndex; }
+   void setVarArgsFrameIndex(int Index) { VarArgsFrameIndex = Index; }
++
++  Register getSRetReturnReg() const { return SRetReturnReg; }
++  void setSRetReturnReg(Register Reg) { SRetReturnReg = Reg; }
+ };
+ 
+ } // namespace llvm
+diff --git a/llvm/test/CodeGen/DADAO/aggregate-sret-preserve.ll b/llvm/test/CodeGen/DADAO/aggregate-sret-preserve.ll
+new file mode 100644
+index 000000000000..e9d14c004cd6
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/aggregate-sret-preserve.ll
+@@ -0,0 +1,26 @@
++; ML-031a B3: the hidden sret address received in RB16 must be restored to
++; RB16 before return, even when an internal pointer-argument call clobbers it.
++;
++; RUN: llc -mtriple=dadao -O2 < %s | FileCheck %s
++
++%Big = type { i64, i64, i64, i64, i64 }
++
++declare void @sink(ptr)
++
++define void @make(ptr noalias sret(%Big) %out, ptr %p) {
++; CHECK-LABEL: make:
++; CHECK: call sink
++; CHECK: ldo rb16, rb1, 0
++; CHECK: ret rd0, 0
++  call void @sink(ptr %p)
++  store i64 1, ptr %out, align 8
++  %b = getelementptr inbounds %Big, ptr %out, i64 0, i32 1
++  store i64 2, ptr %b, align 8
++  %c = getelementptr inbounds %Big, ptr %out, i64 0, i32 2
++  store i64 3, ptr %c, align 8
++  %d = getelementptr inbounds %Big, ptr %out, i64 0, i32 3
++  store i64 4, ptr %d, align 8
++  %e = getelementptr inbounds %Big, ptr %out, i64 0, i32 4
++  store i64 5, ptr %e, align 8
++  ret void
++}
+diff --git a/llvm/test/CodeGen/DADAO/mem-intrinsic-libcall-no-tail.ll b/llvm/test/CodeGen/DADAO/mem-intrinsic-libcall-no-tail.ll
+new file mode 100644
+index 000000000000..ccbb876e0686
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/mem-intrinsic-libcall-no-tail.ll
+@@ -0,0 +1,90 @@
++; ML-031a B4: DADAO does not implement tail calls. Finite MaxStoresPerMem*
++; thresholds must still lower tail-position mem* intrinsics to ordinary
++; libcalls without assertion. Cover 16/17-byte boundary, tail/non-tail, and
++; the 256 KiB path that motivated the finite threshold.
++;
++; RUN: llc -mtriple=dadao -O2 < %s | FileCheck %s
++
++declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly,
++                                    i64, i1 immarg)
++declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly,
++                                     i64, i1 immarg)
++declare void @llvm.memset.p0.i64(ptr writeonly, i8, i64, i1 immarg)
++declare void @observe(ptr)
++
++define void @memcpy16_tail(ptr %d, ptr %s) {
++; CHECK-LABEL: memcpy16_tail:
++; CHECK-NOT: call memcpy
++; CHECK: ret rd0, 0
++  tail call void @llvm.memcpy.p0.p0.i64(ptr align 1 %d, ptr align 1 %s,
++                                        i64 16, i1 false)
++  ret void
++}
++
++define void @memcpy17_tail(ptr %d, ptr %s) {
++; CHECK-LABEL: memcpy17_tail:
++; CHECK: call memcpy
++; CHECK: ret rd0, 0
++  tail call void @llvm.memcpy.p0.p0.i64(ptr align 1 %d, ptr align 1 %s,
++                                        i64 17, i1 false)
++  ret void
++}
++
++define void @memcpy17_nontail(ptr %d, ptr %s) {
++; CHECK-LABEL: memcpy17_nontail:
++; CHECK: call memcpy
++; CHECK: call observe
++; CHECK: ret rd0, 0
++  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %d, ptr align 1 %s,
++                                   i64 17, i1 false)
++  call void @observe(ptr %d)
++  ret void
++}
++
++define void @memcpy256k_tail(ptr %d, ptr %s) {
++; CHECK-LABEL: memcpy256k_tail:
++; CHECK: call memcpy
++; CHECK: ret rd0, 0
++  tail call void @llvm.memcpy.p0.p0.i64(ptr align 8 %d, ptr align 8 %s,
++                                        i64 262144, i1 false)
++  ret void
++}
++
++define void @memmove17_tail(ptr %d, ptr %s) {
++; CHECK-LABEL: memmove17_tail:
++; CHECK: call memmove
++; CHECK: ret rd0, 0
++  tail call void @llvm.memmove.p0.p0.i64(ptr align 1 %d, ptr align 1 %s,
++                                         i64 17, i1 false)
++  ret void
++}
++
++define void @memmove17_nontail(ptr %d, ptr %s) {
++; CHECK-LABEL: memmove17_nontail:
++; CHECK: call memmove
++; CHECK: call observe
++; CHECK: ret rd0, 0
++  call void @llvm.memmove.p0.p0.i64(ptr align 1 %d, ptr align 1 %s,
++                                    i64 17, i1 false)
++  call void @observe(ptr %d)
++  ret void
++}
++
++define void @memset17_tail(ptr %d) {
++; CHECK-LABEL: memset17_tail:
++; CHECK: call memset
++; CHECK: ret rd0, 0
++  tail call void @llvm.memset.p0.i64(ptr align 1 %d, i8 0,
++                                     i64 17, i1 false)
++  ret void
++}
++
++define void @memset17_nontail(ptr %d) {
++; CHECK-LABEL: memset17_nontail:
++; CHECK: call memset
++; CHECK: call observe
++; CHECK: ret rd0, 0
++  call void @llvm.memset.p0.i64(ptr align 1 %d, i8 0, i64 17, i1 false)
++  call void @observe(ptr %d)
++  ret void
++}
+-- 
+2.43.0
+

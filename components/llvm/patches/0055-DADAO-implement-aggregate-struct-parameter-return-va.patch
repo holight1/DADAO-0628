@@ -1,0 +1,365 @@
+From 9079603c93f3b922d0c63c95dcb8d5c219b39917 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 24 Jul 2026 13:05:23 +0800
+Subject: [PATCH 55/56] DADAO: implement aggregate (struct)
+ parameter/return-value ABI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+contracts/abi/spec.md §2.4 (wiki DADAO-21-ABI §聚合类型参数/§聚合类型返回值,
+ML-031a):
+
+- HPA (homogeneous pointer aggregate, <= 4 pointer leaves): Direct, coerced
+  to [N x ptr] -- CC_DADAO's existing CCIfPtr rule places each flattened
+  leaf in the RB bank for free.
+- HFA (homogeneous float/double aggregate): detected via the same
+  flatten() recursion but explicitly NOT implemented -- DADAO has no RF
+  register class / floating-point CodeGen support at all. Reports a
+  compiler warning and falls back unchanged to the pre-existing
+  DefaultABIInfo indirect(byval) classification (docs/issues.yaml:
+  dadao-hfa-argument-not-implemented).
+- Otherwise, <= 32 bytes: Direct, coerced to [ceil(size/8) x i64] (1-4
+  opaque 8-byte blocks in the RD bank).
+- Otherwise (> 32 bytes): Indirect, ByVal=false -- caller allocates a
+  temporary and passes its address as a plain RB-bank pointer.
+- Aggregate return <= 64 bits: Direct i64 (RD31), unconditional on
+  HFA/HPA shape per wiki. > 64 bits: Indirect (hidden sret, lands in RB16
+  for free since CGCall.cpp always visits it first).
+- EmitVAArg: IsIndirect now follows the real classification (was
+  hardcoded false, silently wrong for the new >32B indirect case);
+  ForceRightAdjust is now false for aggregates (natural/left-justified
+  placement, matching this file's own coercion padding direction) and
+  unchanged (true) for scalars.
+
+Added clang/test/CodeGen/DADAO/aggregate-abi.c (directed IR-level check of
+the coerced signatures); tests/lit/E2E/agg_args_named.test and
+agg_vararg_multislot.test (runtime QEMU+gem5 coverage, in the DADAO-0628
+superproject) cover the same ground end to end.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TSiWyHquQwjpeRvvKSQEQN
+---
+ clang/lib/CodeGen/Targets/DADAO.cpp      | 220 ++++++++++++++++++++++-
+ clang/test/CodeGen/DADAO/aggregate-abi.c |  58 ++++++
+ 2 files changed, 275 insertions(+), 3 deletions(-)
+ create mode 100644 clang/test/CodeGen/DADAO/aggregate-abi.c
+
+diff --git a/clang/lib/CodeGen/Targets/DADAO.cpp b/clang/lib/CodeGen/Targets/DADAO.cpp
+index da8a6cd103eb..64750965cbee 100644
+--- a/clang/lib/CodeGen/Targets/DADAO.cpp
++++ b/clang/lib/CodeGen/Targets/DADAO.cpp
+@@ -5,29 +5,243 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ //===----------------------------------------------------------------------===//
++//
++// DADAO ABI implementation (contracts/abi/spec.md §2).
++//
++// Scalar arguments/returns use DefaultABIInfo's generic direct/extend
++// classification unchanged (§2.1-2.3, DL-072a's varargs save area covers
++// their register/stack/vararg-slot mechanics).
++//
++// Aggregate (struct/union) classification below implements
++// ~/DADAO-wiki/DADAO-21-ABI-应用程序二进制接口.md §聚合类型参数/
++// §聚合类型返回值/§可变参数 "大于8字节的聚合变参" (ML-031a):
++//
++//   - HPA (homogeneous pointer aggregate, <= 4 pointer leaves): Direct,
++//     coerced to `[N x ptr]` -- CC_DADAO's existing CCIfPtr rule places each
++//     flattened leaf in the RB bank for free (no backend change needed).
++//   - HFA (homogeneous float/double aggregate): detected but explicitly NOT
++//     implemented -- DADAO's LLVM backend has no RF register class / FP
++//     CodeGen support at all (ML-020a/ML-025a). Falls back unchanged to the
++//     pre-ML-031a DefaultABIInfo behavior (natural-align indirect) and is
++//     reported via a compiler warning + docs/issues.yaml
++//     (dadao-hfa-argument-not-implemented). See docs/wiki-questions.md.
++//   - Otherwise, <= 32 bytes: Direct, coerced to `[ceil(size/8) x i64]`
++//     (1-4 opaque 8-byte blocks in the RD bank via the existing
++//     CCIfType<[i64]> rule).
++//   - Otherwise (> 32 bytes): Indirect, ByVal=false -- caller allocates a
++//     temporary and passes its address as a plain RB-bank pointer (matches
++//     "caller 在栈上分配临时空间，callee 通过 RB bank 中的指针访问").
++//
++// Aggregate returns (wiki is unconditional on size, independent of HFA/HPA
++// leaf shape): <= 64 bits -> Direct i64 (RD31); > 64 bits -> Indirect
++// (hidden sret, address passed as the first argument -- lands in RB16 for
++// free since CC_DADAO visits it first).
++//
++// The one "高位块先入高寄存器" (RD-split multi-block ordering) wiki phrase
++// has no worked example (every other rule in this section does) and reads
++// inconsistently with the HFA/HPA examples' own ascending field-order
++// convention; this implementation keeps natural ascending block order
++// (memory offset 0 -> first/lowest-numbered register of the argument's
++// allocation), the zero-custom-code default `[N x iN]` coercion already
++// gives for free. See docs/wiki-questions.md for the full writeup.
++//
++//===----------------------------------------------------------------------===//
+ 
+ #include "ABIInfoImpl.h"
+ #include "TargetInfo.h"
++#include "clang/Basic/Diagnostic.h"
++#include "llvm/IR/DerivedTypes.h"
+ 
+ using namespace clang;
+ using namespace clang::CodeGen;
+ 
+ namespace {
+ 
++// contracts/abi/spec.md §2.4 / wiki "最多消耗 4 个寄存器槽位（32 字节）".
++constexpr unsigned DADAOMaxAggregateRegs = 4;
++constexpr unsigned DADAORegisterBytes = 8;
++
++// Leaf kind an homogeneous aggregate is built from (wiki "同质检查").
++enum class HomogKind { None, Pointer, Float };
++
++// Recursively flatten Ty (wiki "递归展开聚合类型的所有嵌套 struct 成员，得到
++// 叶子字段列表") accumulating leaf fields into Kind/Count. Returns false as
++// soon as the aggregate can no longer be homogeneous: a union anywhere in
++// the recursion ("union 直接判定为不满足条件"), a bitfield (not addressed by
++// the wiki; conservatively disqualifying is the safe reading), a mixed leaf
++// kind, a non-pointer/non-float leaf, or more than DADAOMaxAggregateRegs
++// leaves ("计数检查"). Fixed-size array members are flattened element by
++// element -- the wiki text only walks nested *struct* members and gives no
++// array example, but this is the natural, conservative extension of the
++// same recursive rule (see docs/wiki-questions.md). A truly-empty nested
++// record (zero fields, e.g. a `struct {}` member) contributes zero leaves
++// and does not by itself disqualify the enclosing aggregate; an entirely
++// empty *top-level* aggregate is handled separately via isEmptyRecord
++// before this function is ever called.
++bool flattenHomogeneous(ASTContext &Ctx, QualType Ty, HomogKind &Kind,
++                        unsigned &Count) {
++  if (const auto *RT = Ty->getAsCanonical<RecordType>()) {
++    const RecordDecl *RD = RT->getDecl()->getDefinitionOrSelf();
++    if (RD->isUnion())
++      return false;
++    for (const FieldDecl *FD : RD->fields()) {
++      if (FD->isBitField())
++        return false;
++      if (!flattenHomogeneous(Ctx, FD->getType(), Kind, Count))
++        return false;
++    }
++    return true;
++  }
++
++  if (const auto *AT = Ctx.getAsConstantArrayType(Ty)) {
++    uint64_t N = AT->getZExtSize();
++    for (uint64_t I = 0; I < N; ++I)
++      if (!flattenHomogeneous(Ctx, AT->getElementType(), Kind, Count))
++        return false;
++    return true;
++  }
++
++  HomogKind ThisKind;
++  if (Ty->isPointerType())
++    ThisKind = HomogKind::Pointer;
++  else if (Ty->isRealFloatingType())
++    ThisKind = HomogKind::Float;
++  else
++    return false;
++
++  if (Kind == HomogKind::None)
++    Kind = ThisKind;
++  else if (Kind != ThisKind)
++    return false;
++
++  ++Count;
++  return Count <= DADAOMaxAggregateRegs;
++}
++
+ class DADAOABIInfo : public DefaultABIInfo {
+ public:
+   using DefaultABIInfo::DefaultABIInfo;
+ 
++  ABIArgInfo classifyArgumentType(QualType Ty) const;
++  ABIArgInfo classifyReturnType(QualType RetTy) const;
++
++  void computeInfo(CGFunctionInfo &FI) const override {
++    if (!getCXXABI().classifyReturnType(FI))
++      FI.getReturnInfo() = classifyReturnType(FI.getReturnType());
++    for (auto &I : FI.arguments())
++      I.info = classifyArgumentType(I.type);
++  }
++
+   RValue EmitVAArg(CodeGenFunction &CGF, Address VAListAddr, QualType Ty,
+                    AggValueSlot Slot) const override {
+-    return emitVoidPtrVAArg(CGF, VAListAddr, Ty, /*IsIndirect=*/false,
++    bool IsIndirect = classifyArgumentType(Ty).isIndirect();
++    // Scalars are right-adjusted within their 8-byte slot (wiki "大端序
++    // slot 布局"). Aggregates are left-justified (natural struct byte
++    // order): this file's own register/argument coercion
++    // (CreateCoercedLoad, CGCall.cpp) pads a non-multiple-of-8 aggregate's
++    // *trailing* bytes when producing the coerced `[N x i64]`/`[N x ptr]`
++    // value, so the matching save-area slot has real data at the *start*
++    // of the (possibly multi-slot) region, not the end -- see
++    // docs/wiki-questions.md.
++    bool ForceRightAdjust = !isAggregateTypeForABI(Ty);
++    return emitVoidPtrVAArg(CGF, VAListAddr, Ty, IsIndirect,
+                             getContext().getTypeInfoInChars(Ty),
+-                            CharUnits::fromQuantity(8),
++                            CharUnits::fromQuantity(DADAORegisterBytes),
+                             /*AllowHigherAlign=*/false, Slot,
+-                            /*ForceRightAdjust=*/true);
++                            ForceRightAdjust);
+   }
++
++private:
++  void reportHFAUnsupported(QualType Ty) const;
+ };
+ 
++void DADAOABIInfo::reportHFAUnsupported(QualType Ty) const {
++  DiagnosticsEngine &Diags = CGT.getCGM().getDiags();
++  unsigned DiagID = Diags.getCustomDiagID(
++      DiagnosticsEngine::Warning,
++      "DADAO ABI: '%0' is a homogeneous floating-point aggregate (HFA); "
++      "RF-bank aggregate passing is not implemented (docs/issues.yaml: "
++      "dadao-hfa-argument-not-implemented) -- falling back to indirect "
++      "(pointer) passing, which does not conform to the DADAO-21 ABI "
++      "contract for this argument");
++  Diags.Report(DiagID) << Ty.getAsString();
++}
++
++ABIArgInfo DADAOABIInfo::classifyArgumentType(QualType Ty) const {
++  Ty = useFirstFieldIfTransparentUnion(Ty);
++
++  if (!isAggregateTypeForABI(Ty))
++    return DefaultABIInfo::classifyArgumentType(Ty);
++
++  // Non-trivial C++ records: kept for parity with every other in-tree
++  // ABIInfo (DADAO E2E coverage is C-only, so this is defensive only).
++  if (CGCXXABI::RecordArgABI RAA = getRecordArgABI(Ty, getCXXABI()))
++    return getNaturalAlignIndirect(Ty, getDataLayout().getAllocaAddrSpace(),
++                                   RAA == CGCXXABI::RAA_DirectInMemory);
++
++  if (isEmptyRecord(getContext(), Ty, /*AllowArrays=*/true))
++    return ABIArgInfo::getIgnore();
++
++  HomogKind Kind = HomogKind::None;
++  unsigned Count = 0;
++  bool Homogeneous =
++      flattenHomogeneous(getContext(), Ty, Kind, Count) && Count > 0;
++
++  if (Homogeneous && Kind == HomogKind::Pointer) {
++    // HPA: RB bank, one slot per leaf pointer field.
++    llvm::Type *PtrTy = llvm::PointerType::get(getVMContext(), /*AS=*/0);
++    return ABIArgInfo::getDirect(llvm::ArrayType::get(PtrTy, Count));
++  }
++
++  if (Homogeneous && Kind == HomogKind::Float) {
++    // HFA: explicitly out of scope, see file header comment.
++    reportHFAUnsupported(Ty);
++    return getNaturalAlignIndirect(Ty, getDataLayout().getAllocaAddrSpace());
++  }
++
++  CharUnits Size = getContext().getTypeInfoInChars(Ty).Width;
++  if (Size.getQuantity() <=
++      static_cast<int64_t>(DADAOMaxAggregateRegs * DADAORegisterBytes)) {
++    unsigned Blocks = static_cast<unsigned>(
++        (Size.getQuantity() + DADAORegisterBytes - 1) / DADAORegisterBytes);
++    if (Blocks == 0)
++      Blocks = 1;
++    llvm::Type *I64 = llvm::Type::getInt64Ty(getVMContext());
++    return ABIArgInfo::getDirect(llvm::ArrayType::get(I64, Blocks));
++  }
++
++  // > 32 bytes: caller-allocated temporary, address passed as a plain RB
++  // pointer (ByVal=false -- no `byval` attribute, so CC_DADAO's existing
++  // CCIfPtr rule handles it like any other pointer argument).
++  return getNaturalAlignIndirect(Ty, getDataLayout().getAllocaAddrSpace(),
++                                 /*ByVal=*/false);
++}
++
++ABIArgInfo DADAOABIInfo::classifyReturnType(QualType RetTy) const {
++  if (RetTy->isVoidType())
++    return ABIArgInfo::getIgnore();
++
++  if (!isAggregateTypeForABI(RetTy))
++    return DefaultABIInfo::classifyReturnType(RetTy);
++
++  if (isEmptyRecord(getContext(), RetTy, /*AllowArrays=*/true))
++    return ABIArgInfo::getIgnore();
++
++  CharUnits Size = getContext().getTypeInfoInChars(RetTy).Width;
++  if (Size.getQuantity() <= static_cast<int64_t>(DADAORegisterBytes)) {
++    // wiki: "长度 ≤ 64 位的聚合类型，使用标量返回值规则（通过 RD31 返回）"
++    // -- unconditional, independent of HFA/HPA leaf classification.
++    return ABIArgInfo::getDirect(llvm::Type::getInt64Ty(getVMContext()));
++  }
++
++  // wiki: "长度大于 64 位的聚合类型，采用 hidden sret 模式" -- caller
++  // pre-allocates, address passed as the hidden first argument. It lands in
++  // RB16 for free: CGCall.cpp always prepends the sret pointer as argument
++  // 0, and CC_DADAO's CCIfPtr rule assigns the first-visited pointer
++  // argument to RB16.
++  return getNaturalAlignIndirect(RetTy, getDataLayout().getAllocaAddrSpace());
++}
++
+ class DADAOTargetCodeGenInfo : public TargetCodeGenInfo {
+ public:
+   explicit DADAOTargetCodeGenInfo(CodeGenTypes &CGT)
+diff --git a/clang/test/CodeGen/DADAO/aggregate-abi.c b/clang/test/CodeGen/DADAO/aggregate-abi.c
+new file mode 100644
+index 000000000000..8b5730b26441
+--- /dev/null
++++ b/clang/test/CodeGen/DADAO/aggregate-abi.c
+@@ -0,0 +1,58 @@
++// ML-031a: aggregate (struct) parameter/return-value ABI classification
++// (contracts/abi/spec.md §2.4) -- directed IR-level check of the coerced
++// signatures DADAOABIInfo::classifyArgumentType/classifyReturnType produce,
++// complementing the runtime (QEMU+gem5) coverage in
++// tests/lit/E2E/agg_args_named.test / agg_vararg_multislot.test.
++//
++// RUN: %clang_cc1 -triple dadao -O0 -emit-llvm -o - %s | FileCheck %s
++
++typedef struct { void *p, *q, *r; } HPA3;      /* 24B, 3 pointer leaves */
++typedef struct { char c, d, e, f, g; } Tiny5;  /* 5B,  1 RD block (partial) */
++typedef struct { long a, b, c, d; } Quad32;    /* 32B, 4 RD blocks (boundary) */
++typedef struct { long a, b, c, d, e; } Big40;  /* 40B, > 32B -> indirect */
++
++// HPA: coerced to an array of 3 pointers (RB bank via CC_DADAO's CCIfPtr).
++// CHECK: define{{.*}} i32 @use_hpa([3 x ptr] %v.coerce)
++int use_hpa(HPA3 v) { return (int)((long)v.p ^ (long)v.q ^ (long)v.r); }
++
++// Non-HFA/HPA, <= 32 bytes: coerced to an array of ceil(size/8) i64 blocks.
++// CHECK: define{{.*}} i32 @use_tiny([1 x i64] %v.coerce)
++int use_tiny(Tiny5 v) { return v.c + v.d + v.e + v.f + v.g; }
++
++// Exact 32-byte boundary: still Direct (4 blocks), not indirect.
++// CHECK: define{{.*}} i32 @use_quad([4 x i64] %v.coerce)
++int use_quad(Quad32 v) { return (int)(v.a + v.b + v.c + v.d); }
++
++// > 32 bytes: indirect, ByVal=false -- a plain pointer parameter (no
++// `byval` attribute), matching "caller allocates a temporary and passes
++// its address" (not a byval-copy-in-outgoing-stack-area scheme).
++// CHECK: define{{.*}} i32 @use_big(ptr{{.*}} %v)
++// CHECK-NOT: byval
++int use_big(Big40 v) { return (int)(v.a + v.b + v.c + v.d + v.e); }
++
++// Aggregate return <= 64 bits: Direct i64 (RD31), not indirect.
++// CHECK: define{{.*}} i64 @make_tiny()
++Tiny5 make_tiny(void) {
++  Tiny5 t;
++  t.c = 1;
++  t.d = 2;
++  t.e = 3;
++  t.f = 4;
++  t.g = 5;
++  return t;
++}
++
++// Aggregate return > 64 bits: hidden sret, address as the first argument
++// (wiki: `struct Big make_big(int a)` -> `void make_big(struct Big*
++// sret_ptr, int a)`, sret_ptr lands in RB16 via CC_DADAO's CCIfPtr rule
++// since it is visited first).
++// CHECK: define{{.*}} void @make_big(ptr{{.*}} sret(%struct.Big40){{.*}} %agg.result, i64{{.*}} %a)
++Big40 make_big(long a) {
++  Big40 r;
++  r.a = a;
++  r.b = 2;
++  r.c = 3;
++  r.d = 4;
++  r.e = 5;
++  return r;
++}
+-- 
+2.43.0
+
