@@ -1,0 +1,33 @@
+// ML-041a: runtime E2E regression guard for computed goto / GCC "labels as
+// values" (&&label + goto *ptr). Locks down ISD::BlockAddress Custom
+// lowering (rela+addi materialization reused from GlobalAddress,
+// DADAOISD::PCREL_HI) actually driving a real indirect branch through the
+// pre-existing BRIND -> JUMP_PSEUDO_INDIRECT mechanism (already used by
+// ordinary `switch` jump-table dispatch) to the correct label, at both -O0
+// and -O2, on both backends.
+//
+// The volatile-driven runtime selector (dispatch(g_sel), g_sel not a
+// compile-time constant) prevents the compiler from folding the indirect
+// jump into a direct one; per-label volatile hit counters make a wrong
+// target, a missed jump, or a silent fallthrough directly observable. The
+// negative control asserts the inverse invariant (every counter still
+// zero), which a correct implementation must fail, proving the positive
+// check is a real assertion and not vacuously true.
+//
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -O0 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/computed_goto_dispatch.c -o %t.o0.elf
+// RUN: %llvm-objcopy -O binary %t.o0.elf %t.o0.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O2 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/computed_goto_dispatch.c -o %t.o2.elf
+// RUN: %llvm-objcopy -O binary %t.o2.elf %t.o2.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O0 -DNEGATIVE_CONTROL -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/computed_goto_dispatch.c -o %t.o0.neg.elf
+// RUN: %llvm-objcopy -O binary %t.o0.neg.elf %t.o0.neg.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.neg.bin >/dev/null 2>&1; test $? -eq 1'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.neg.elf >/dev/null 2>&1; test $? -eq 1'
+// RUN: %clang --target=dadao-unknown-elf -O2 -DNEGATIVE_CONTROL -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/computed_goto_dispatch.c -o %t.o2.neg.elf
+// RUN: %llvm-objcopy -O binary %t.o2.neg.elf %t.o2.neg.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.neg.bin >/dev/null 2>&1; test $? -eq 1'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.neg.elf >/dev/null 2>&1; test $? -eq 1'

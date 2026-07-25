@@ -1,0 +1,230 @@
+From df7f057f76ef5732eb80eeb31f3d6029e004e37b Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 08:35:18 +0800
+Subject: [PATCH] DADAO: implement BlockAddress lowering, reuse existing BRIND
+ for indirectbr (ML-041a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Computed goto (&&label / goto *ptr) crashed CodeGen with "Cannot select:
+... BlockAddress<@fn, %label> 0" because ISD::BlockAddress had no
+setOperationAction at all. ISD::BRIND and ISD::JumpTable were already
+Custom-lowered for ordinary `switch` jump-table dispatch (BRIND ->
+JUMP_PSEUDO_INDIRECT, JumpTable/ConstantPool -> the same rela+addi
+DADAOISD::PCREL_HI sequence GlobalAddress uses) — indirectbr needed no new
+code at all, since SelectionDAGBuilder lowers it straight to the
+already-selected ISD::BRIND. Only BlockAddress itself needed the same
+Custom GlobalAddress-style lowering (new lowerBlockAddress, wrapping a
+TargetBlockAddress operand in DADAOISD::PCREL_HI — the manual DAGToDAG
+selection for that node only inspects operand 0 generically, so no
+DAGToDAG change was needed), plus a DADAOAsmPrinter::MO_BlockAddress case
+(GetBlockAddressSymbol, mirroring the existing MO_GlobalAddress case).
+Label-difference static initializers (&&a - &&b, as used by
+gcc-c-torture pr70460.c) resolve entirely through generic
+AsmPrinter/MCAssembler constant folding with no DADAO-specific code.
+
+Fixes gcc-c-torture 990208-1.c/comp-goto-1.c/pr70460.c (all 3 now PASS).
+Full sweep: 1482/87/124/15 (was 1479/90/124/15, exactly +3/-3, zero other
+change). New CodeGen lit test (blockaddress-indirectbr.ll) + E2E lit test
+(computed_goto_dispatch.test, O0+O2, dual backend, volatile + negative
+control).
+---
+ llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp     | 18 +++++
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   | 27 +++++++
+ llvm/lib/Target/DADAO/DADAOISelLowering.h     |  6 +-
+ .../CodeGen/DADAO/blockaddress-indirectbr.ll  | 77 +++++++++++++++++++
+ 4 files changed, 127 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/test/CodeGen/DADAO/blockaddress-indirectbr.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+index 58c4509c9363..b43290118d0f 100644
+--- a/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
++++ b/llvm/lib/Target/DADAO/DADAOAsmPrinter.cpp
+@@ -109,6 +109,24 @@ private:
+         MCOp = MCOperand::createExpr(Expr);
+         break;
+       }
++      case MachineOperand::MO_BlockAddress: {
++        // ML-041a: computed goto (`&&label`). GetBlockAddressSymbol is the
++        // standard AsmPrinter hook for a basic block's address-taken label
++        // -- it also registers the block with MachineModuleInfo so
++        // AsmPrinter::emitBasicBlockStart emits this symbol even for a
++        // block that would otherwise get no label at all (pure
++        // fallthrough), the same class of problem emitFunctionBodyStart
++        // above works around by hand for jump-table targets, but here it's
++        // handled by target-independent AsmPrinter code -- no DADAO-side
++        // fix needed.
++        const MCExpr *Expr = MCSymbolRefExpr::create(
++            GetBlockAddressSymbol(MO.getBlockAddress()), OutContext);
++        if (int64_t Offset = MO.getOffset())
++          Expr = MCBinaryExpr::createAdd(
++              Expr, MCConstantExpr::create(Offset, OutContext), OutContext);
++        MCOp = MCOperand::createExpr(Expr);
++        break;
++      }
+       case MachineOperand::MO_ExternalSymbol:
+         MCOp = MCOperand::createExpr(MCSymbolRefExpr::create(
+             GetExternalSymbolSymbol(MO.getSymbolName()), OutContext));
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 47d796aa360e..da8af65dee45 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -112,6 +112,15 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   setOperationAction(ISD::SETCC, MVT::i64, Custom);
+   setOperationAction(ISD::SELECT_CC, MVT::i64, Expand);
+   setOperationAction(ISD::GlobalAddress, MVT::i64, Custom);
++  // ML-041a: computed goto (`&&label` / GCC "labels as values") lowers a
++  // basic block's address to ISD::BlockAddress. Left at its default action
++  // this node reaches the DAGToDAG matcher unselected ("Cannot select: ...
++  // BlockAddress<@fn, %label> 0") because there is no Pat<> for a bare
++  // target-independent BlockAddressSDNode. Route it through the same
++  // Custom lowering as GlobalAddress: a basic block's address is,
++  // link-time, just another local symbol reference materialized with
++  // rela+addi (see lowerBlockAddress/DADAOISD::PCREL_HI below).
++  setOperationAction(ISD::BlockAddress, MVT::i64, Custom);
+ 
+   // ML-003a-d originally set these to UINT_MAX ("force full inline
+   // expansion... since brcond-based expansion was previously unselectable")
+@@ -450,6 +459,8 @@ SDValue DADAOTargetLowering::LowerOperation(SDValue Op,
+     return lowerSETCC(Op, DAG);
+   case ISD::GlobalAddress:
+     return lowerGlobalAddress(Op, DAG);
++  case ISD::BlockAddress:
++    return lowerBlockAddress(Op, DAG);
+   case ISD::BRCOND:
+     return lowerBRCOND(Op, DAG);
+   case ISD::BRIND:
+@@ -680,6 +691,22 @@ SDValue DADAOTargetLowering::lowerGlobalAddress(SDValue Op,
+   return DAG.getNode(DADAOISD::PCREL_HI, DL, MVT::i64, GA);
+ }
+ 
++SDValue DADAOTargetLowering::lowerBlockAddress(SDValue Op,
++                                               SelectionDAG &DAG) const {
++  // Mirrors lowerGlobalAddress above: a basic block's address (GCC computed
++  // goto's `&&label`) is, at link time, just another local symbol — the
++  // same rela(page)+addi(lo) materialization sequence applies unchanged
++  // (DADAOISD::PCREL_HI's manual DAGToDAG selection in
++  // DADAOISelDAGToDAG.cpp only inspects Node->getOperand(0) generically; it
++  // never checks whether that operand is a TargetGlobalAddress or a
++  // TargetBlockAddress).
++  SDLoc DL(Op);
++  BlockAddressSDNode *BN = cast<BlockAddressSDNode>(Op);
++  SDValue BA = DAG.getTargetBlockAddress(BN->getBlockAddress(), MVT::i64,
++                                         BN->getOffset());
++  return DAG.getNode(DADAOISD::PCREL_HI, DL, MVT::i64, BA);
++}
++
+ bool DADAOTargetLowering::isOffsetFoldingLegal(
+     const GlobalAddressSDNode *GA) const {
+   // See the declaration comment in DADAOISelLowering.h (ML-030a): folding a
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index fb718d1ff4a4..b6a570840727 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -23,7 +23,10 @@ enum NodeType {
+   CMPU,     // (lhs, rhs) → i64  cmpu result (−1/0/1)
+   SEL,      // (cond, false, true) → i64  conditional select via csz
+   FI_ADDR,  // (TargetFrameIndex) → i64  frame address in GPRB
+-  PCREL_HI, // (GlobalAddress) → i64  page-aligned PC-relative address in RB
++  PCREL_HI, // (GlobalAddress|BlockAddress) → i64  page-aligned PC-relative
++            // address in RB (ML-041a: BlockAddress reuses the same
++            // rela+addi materialization as GlobalAddress — a basic block's
++            // address is just another link-time symbol reference)
+   BRIND,    // (chain, target) — indirect branch
+   JT_ADDR,  // (TargetJumpTable) → i64  jump table address
+   CP_ADDR,  // (TargetConstantPool) → i64  constant pool address
+@@ -136,6 +139,7 @@ private:
+   SDValue lowerFRAMEADDR(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerSETCC(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
++  SDValue lowerBlockAddress(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerBRCOND(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerBRIND(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerJumpTable(SDValue Op, SelectionDAG &DAG) const;
+diff --git a/llvm/test/CodeGen/DADAO/blockaddress-indirectbr.ll b/llvm/test/CodeGen/DADAO/blockaddress-indirectbr.ll
+new file mode 100644
+index 000000000000..083923d1e102
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/blockaddress-indirectbr.ll
+@@ -0,0 +1,77 @@
++; RUN: llc -mtriple=dadao-unknown-elf -O0 < %s | FileCheck %s
++
++; ML-041a: computed goto / GCC "labels as values" (`&&label` / `goto *ptr`).
++; ISD::BlockAddress previously had no setOperationAction at all, so it
++; reached the DAGToDAG matcher unselected: "Cannot select: t.: i64 =
++; BlockAddress<@fn, %label> 0". This backend already implements
++; ISD::BRIND (indirect branch) and ISD::JumpTable as Custom lowerings used
++; by ordinary `switch` jump-table dispatch (DADAOISD::BRIND ->
++; JUMP_PSEUDO_INDIRECT, DADAOISD::JT_ADDR reusing the rela+addi
++; materialization sequence) -- BlockAddress only needed the same
++; GlobalAddress-style Custom lowering (DADAOISD::PCREL_HI) that JumpTable
++; and ConstantPool already share; indirectbr itself needed no new code at
++; all, since it is target-independently lowered straight to ISD::BRIND,
++; already Custom-lowered/selected.
++
++@dispatch.table = internal unnamed_addr constant [3 x ptr]
++    [ptr blockaddress(@dispatch, %L_a),
++     ptr blockaddress(@dispatch, %L_b),
++     ptr blockaddress(@dispatch, %L_c)]
++
++define dso_local i64 @dispatch(i64 %sel) {
++; CHECK-LABEL: dispatch:
++entry:
++  %idx = getelementptr inbounds [3 x ptr], ptr @dispatch.table, i64 0, i64 %sel
++  %target = load ptr, ptr %idx, align 8
++  ; The jump table's own base address is materialized exactly like any
++  ; other symbol reference (ML-013a/030a rela+addi sequence, reused
++  ; unmodified for a table of BlockAddress entries).
++; CHECK: rela {{rb[0-9]+}}, dispatch.table{{$}}
++; CHECK: addi {{rb[0-9]+}}, {{rb[0-9]+}}, dispatch.table{{$}}
++  ; indirectbr selects through the pre-existing BRIND -> JUMP_PSEUDO_INDIRECT
++  ; -> rd2rb + jump expansion (DADAOInstrInfo.cpp expandPostRAPseudo), the
++  ; same indirect-jump mechanism ordinary `switch` jump tables already use
++  ; -- no new instruction selection was needed for this half of the task.
++; CHECK: rd2rb {{rb[0-9]+}}, {{rd[0-9]+}}, 1
++; CHECK: jump {{rb[0-9]+}}, rd0, 0
++  indirectbr ptr %target, [label %L_a, label %L_b, label %L_c]
++
++L_a:
++; CHECK: .Ltmp0:{{.*}}Block address taken
++  ret i64 1
++
++L_b:
++; CHECK: .Ltmp1:{{.*}}Block address taken
++  ret i64 2
++
++L_c:
++; CHECK: .Ltmp2:{{.*}}Block address taken
++  ret i64 3
++}
++
++; A single, isolated blockaddress with no indirectbr at all (label address
++; taken and stored, but never jumped to from this function -- the exact
++; shape of gcc-c-torture 990208-1.c) must also lower cleanly: BlockAddress
++; alone, without BRIND, still needs the Custom lowering added by this
++; change.
++define dso_local void @take_address_only(ptr %out) {
++; CHECK-LABEL: take_address_only:
++entry:
++  br label %here
++
++here:
++; CHECK: .Ltmp3:{{.*}}Block address taken
++; CHECK: rela {{rb[0-9]+}}, .Ltmp3{{$}}
++; CHECK: addi {{rb[0-9]+}}, {{rb[0-9]+}}, .Ltmp3{{$}}
++  store ptr blockaddress(@take_address_only, %here), ptr %out, align 8
++  ret void
++}
++
++; The jump table's data-section entries themselves must be plain absolute
++; symbol references to the address-taken labels (proves MO_BlockAddress ->
++; MCSymbolRefExpr -> GetBlockAddressSymbol reached the object-file/data
++; emission path correctly, not just the instruction-encoding path above).
++; CHECK: dispatch.table:
++; CHECK-NEXT: .quad .Ltmp0
++; CHECK-NEXT: .quad .Ltmp1
++; CHECK-NEXT: .quad .Ltmp2
+-- 
+2.43.0
+
