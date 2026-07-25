@@ -1814,3 +1814,28 @@ series to a matching tree hash.
 **K1 remaining**: `cfx_smon` real guest handler (KL-103a), then MMU/TLB
 + interrupt dispatch (including the gem5 port, per the bounded-scope
 decision above).
+
+## K1: O3 real `trap cfx_smon` entry flow in QEMU (2026-07-26) — see `code-agent/tasks/KL-115a-*.md`, `code-agent/tasks/KL-116a-*.md`
+
+KL-115a (recon) found O3 was bigger than a "guest handler example" —
+the whole trap entry-flow state machine (save context, mode switch,
+save cause, jump exception vector) had never been implemented for any
+cfx, and `trap`'s `cfxcode==2` branch was unconditionally monopolized
+by the pre-existing host/SE syscall shortcut in both QEMU and gem5,
+which can't coexist with a real entry-flow on the same trigger
+condition. User chose a default-off QEMU CPU property
+(`cfx-smon-real`) over redefining O3's target cfx or a dishonest
+func-value hack. KL-116a implemented it: wiki steps 2-6 are
+legitimately skipped (`CFXTRAP` is hardware-nonmaskable for
+`cfx_smon`), steps 7-10 are a new state machine that, for the first
+time, populates a cfx's exception frame via a genuine hardware trap
+entry rather than O1's software `cfx2rc` stub. Architect independently
+rebuilt QEMU, reran the A/B probe pair (profile off/on) confirming
+byte-identical shortcut behavior when off and a correct full round
+trip when on, reproduced a documented-not-fixed pre-existing CLI
+parsing bug, and replayed the 26-patch series to a matching tree hash.
+
+**K1 remaining**: gem5 port of O3, then MMU/TLB + interrupt dispatch.
+Per user instruction (2026-07-26), tasks from here on are dispatched to
+Codex rather than architect-run subagents — independent ground-truth
+review standard is unchanged.
