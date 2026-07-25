@@ -1635,3 +1635,13 @@ larger-scope by-value-vector-argument CC gap, correctly split off as a
 new issue rather than forced). gcc-c-torture: 1473→1479/1708 (86.6%),
 zero regressions. Full E2E (80/80), CodeGen lit (12/12) pass; 63-patch
 LLVM series replays clean with matching tree hash.
+
+## ML-041a: implement `BlockAddress`/computed-goto (2026-07-25) — see `code-agent/tasks/ML-041a-implement-blockaddress-indirectbr.md` 完成区
+
+Needed almost no new mechanism — `indirectbr` was already fully working
+via the existing jump-table dispatch infrastructure; only `BlockAddress`
+itself needed a `GlobalAddress`-style Custom lowering. 3/3 target files
+PASS. gcc-c-torture: 1479→1482/1708 (86.8%), zero regressions (full
+1708-file resweep repeated twice for stability). Full E2E (81/81),
+CodeGen lit (13/13) pass; 64-patch LLVM series replays clean with
+matching tree hash.
