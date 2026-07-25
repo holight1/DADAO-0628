@@ -1,0 +1,255 @@
+From e877c5aaee50a8c8ec879aa0be90a94fdbf92007 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 07:14:41 +0800
+Subject: [PATCH] arch/dadao: implement real cfx_smon trap entry (KL-117a)
+
+---
+ src/arch/dadao/DADAOISA.py |  5 ++++
+ src/arch/dadao/decoder.cc  | 55 +++++++++++++++++++++++++++++++++-----
+ src/arch/dadao/isa.cc      | 11 +++++++-
+ src/arch/dadao/isa.hh      | 27 ++++++++++++++++---
+ tests/dadao/dadao_se.py    |  7 +++++
+ 5 files changed, 94 insertions(+), 11 deletions(-)
+
+diff --git a/src/arch/dadao/DADAOISA.py b/src/arch/dadao/DADAOISA.py
+index bc2d2fbf30..7eb639a5c3 100644
+--- a/src/arch/dadao/DADAOISA.py
++++ b/src/arch/dadao/DADAOISA.py
+@@ -1,6 +1,11 @@
+ from m5.objects.BaseISA import BaseISA
++from m5.params import Param
+ 
+ class DADAOISA(BaseISA):
+     type = 'DADAOISA'
+     cxx_class = 'gem5::DADAOISA::ISA'
+     cxx_header = 'arch/dadao/isa.hh'
++    cfx_smon_real = Param.Bool(
++        False,
++        "Route trap cfx_smon through the guest exception vector instead of "
++        "the SE syscall shortcut")
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 5e6d86940e..f23f1330ac 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -701,10 +701,43 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"cmp.rb";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
+ // === trap (ciii, op=0x76, spec §系统类指令): cfx_smon(cfxcode=2) responder ===
+-class TrapInst : public StaticInst { RegId srcRegs[0], dstRegs[0]; uint8_t cfxcode; public:
+-TrapInst(uint8_t ha) : StaticInst("trap", enums::No_OpClass), cfxcode(ha) {
++class TrapInst : public StaticInst { RegId srcRegs[0], dstRegs[0];
++  uint8_t cfxcode; uint32_t rawInsn; public:
++TrapInst(uint32_t w)
++  : StaticInst("trap", enums::No_OpClass), cfxcode(ha(w)), rawInsn(w) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
+ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  ISA *isa = static_cast<ISA *>(xc->tcBase()->getIsaPtr());
++  if (cfxcode == CfxCodeSmon && isa->cfxSmonReal) {
++    PCState pc = xc->pcState().as<PCState>();
++    uint64_t causeIp = pc.instAddr();
++    RunMode modeBefore = isa->innerRunMode;
++    isa->cfxSmonFrame.prevRunMode = isa->innerRunMode;
++    isa->cfxSmonFrame.prevCfxMask = isa->innerCfxMask;
++    isa->innerRunMode = RunModeSupv;
++    isa->innerCfxMask = ~0ULL;
++    isa->innerCfxCode = CfxCodeSmon;
++    isa->cfxSmonFrame.causeId = CfxCauseCfxtrap;
++    isa->cfxSmonFrame.causeIp = causeIp;
++    isa->cfxSmonFrame.causeInfo = rawInsn;
++    uint64_t target = isa->cfxSmonSupvExcpVector & MASK48;
++    // Keep TrapInst's pre-existing sequential advancePC() contract so the
++    // default-off path remains valid for both simple and O3 front ends. For
++    // real entry, make the generic advance land exactly at the vector by
++    // staging target as NPC (including the target==0 wraparound case).
++    pc.set(target);
++    pc.pc(target - 4);
++    pc.npc(target);
++    xc->pcState(pc);
++    std::cerr << "dadao: trap cfx_smon mode " << (int)modeBefore
++              << "->" << (int)isa->innerRunMode
++              << " inner_cfx_code=" << (unsigned)isa->innerCfxCode
++              << " cause_id=0x" << std::hex << isa->cfxSmonFrame.causeId
++              << " cause_ip=0x" << causeIp
++              << " cause_info=0x" << isa->cfxSmonFrame.causeInfo
++              << " vector=0x" << target << std::dec << "\n";
++    return NoFault;
++  }
+   if (cfxcode == 2) {
+     ThreadContext *tc = xc->tcBase();
+     uint64_t sysno = tc->getReg(intRegId(RD_BASE + 16));
+@@ -899,6 +932,11 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     isa->cfxHypvCgRegDeleg[cfxcode_] = value | (1ULL << 3);
+     return NoFault;
+   }
++  // SEE §3 cfx_smon cg2/rc10: supervisor exception-vector address.
++  if (cfxcode_ == CfxCodeSmon && cg_ == 2 && rc_ == 10) {
++    isa->cfxSmonSupvExcpVector = value & MASK48;
++    return NoFault;
++  }
+   // SEE §3 cg5 exception-frame registers -- O1 scope only implements the
+   // three fields the HBI §3 handoff stub writes for cfx_power.
+   if (cfxcode_ == CfxCodePower && cg_ == 5) {
+@@ -956,15 +994,18 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     uint64_t mask = isa->cfxEscapeCfxMask[isa->innerCfxCode][(int)isa->innerRunMode];
+     if ((mask >> cfxcode_) & 1) RET_ILLI;
+   }
+-  // Only cfx_power's exception frame exists (O1 scope); escaping any other
+-  // cfxcode that passed the check above has no frame to restore from and
+-  // falls back to a zeroed frame instead of fabricating per-cfx state that
+-  // was never written.
++  // KL-117a adds cfx_smon's hardware-written frame alongside cfx_power's
++  // software-populated O1 handoff frame. Other cfxcodes retain the existing
++  // zero fallback.
+   uint64_t prevRunMode, prevCfxMask, causeIp;
+   if (cfxcode_ == CfxCodePower) {
+     prevRunMode = isa->cfxPowerFrame.prevRunMode;
+     prevCfxMask = isa->cfxPowerFrame.prevCfxMask;
+     causeIp = isa->cfxPowerFrame.causeIp;
++  } else if (cfxcode_ == CfxCodeSmon) {
++    prevRunMode = isa->cfxSmonFrame.prevRunMode;
++    prevCfxMask = isa->cfxSmonFrame.prevCfxMask;
++    causeIp = isa->cfxSmonFrame.causeIp;
+   } else {
+     prevRunMode = RunModeUser; prevCfxMask = 0; causeIp = 0;
+   }
+@@ -1104,7 +1145,7 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     case 0x6D: return StaticInstPtr(new CallRInst(ha(w), hb(w), imm12s(w))); // call_r §5.4
+     case 0x6E: return StaticInstPtr(new RetInst(ha(w), imm18s(w)));   // ret   §5.5
+     case 0x73: return StaticInstPtr(new CFX2RCInst(ha(w), hb(w), hc(w), hd(w))); // cfx2rc §系统类指令 (KL-113a)
+-    case 0x76: return StaticInstPtr(new TrapInst(ha(w)));              // trap  §系统
++    case 0x76: return StaticInstPtr(new TrapInst(w));                  // trap  §系统
+     case 0x77: return StaticInstPtr(new EscapeInst(ha(w), imm18s(w))); // escape §系统类指令 (KL-113a)
+     default:   return StaticInstPtr(new UnknownInst()); // reserved major op → UNDI
+     }
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index 91f0986fc6..321eee658d 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -21,7 +21,8 @@ RegClass vecPredRegClass(VecPredRegClass, VecPredRegClassName, 1, debug::IntRegs
+ RegClass matRegClass(MatRegClass, MatRegClassName, 0, debug::MatRegs);
+ RegClass ccRegClass(CCRegClass, CCRegClassName, 0, debug::IntRegs);
+ 
+-ISA::ISA(const Params &p) : BaseISA(p, "dadao")
++ISA::ISA(const Params &p)
++    : BaseISA(p, "dadao"), cfxSmonReal(p.cfx_smon_real)
+ {
+     _regClasses.push_back(&intRegClass);
+     _regClasses.push_back(&floatRegClass);
+@@ -59,6 +60,12 @@ ISA::clear()
+     cfxPowerFrame.prevRunMode = RunModeHypv;
+     cfxPowerFrame.prevCfxMask = ~0ULL;
+     cfxPowerFrame.causeIp = 0;
++    cfxSmonFrame.prevRunMode = RunModeUser;
++    cfxSmonFrame.prevCfxMask = 0;
++    cfxSmonFrame.causeId = 0;
++    cfxSmonFrame.causeIp = 0;
++    cfxSmonFrame.causeInfo = 0;
++    cfxSmonSupvExcpVector = 0;
+     for (int i = 0; i < 64; i++) {
+         cfxHypvCgRegDeleg[i] = ~0ULL;
+         for (int m = 0; m < 4; m++)
+@@ -84,6 +91,8 @@ ISA::copyRegsFrom(ThreadContext *src)
+         innerCfxCode = srcIsa->innerCfxCode;
+         innerCfxMask = srcIsa->innerCfxMask;
+         cfxPowerFrame = srcIsa->cfxPowerFrame;
++        cfxSmonFrame = srcIsa->cfxSmonFrame;
++        cfxSmonSupvExcpVector = srcIsa->cfxSmonSupvExcpVector;
+         for (int i = 0; i < 64; i++) {
+             cfxHypvCgRegDeleg[i] = srcIsa->cfxHypvCgRegDeleg[i];
+             for (int m = 0; m < 4; m++)
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+index 91a6684e9b..143e506721 100644
+--- a/src/arch/dadao/isa.hh
++++ b/src/arch/dadao/isa.hh
+@@ -31,10 +31,13 @@ enum RunMode : uint8_t
+     RunModeHypv = 3,
+ };
+ 
+-// cfx_power's cfxcode [wiki §DADAO-12-SEE §4 "cfx_power" L630] -- the only
+-// cfx with an implemented cg5 exception frame in this O1/O2 subset.
++// cfx_smon and cfx_power cfxcodes [wiki §DADAO-12-SEE].
++constexpr uint8_t CfxCodeSmon = 2;
+ constexpr uint8_t CfxCodePower = 63;
+ 
++// cfx_smon's architecturally non-maskable CFXTRAP cause.
++constexpr uint64_t CfxCauseCfxtrap = 1ULL << 0;
++
+ // HEE §1 cg3/rc12 "hypv cg reg delegation" (per-cfxcode storage)
+ // [wiki §DADAO-13-HEE §1 L24].
+ constexpr uint8_t CfxHypvCgRegDelegCg = 3;
+@@ -57,6 +60,18 @@ struct CfxPowerFrame
+     uint64_t causeIp = 0;
+ };
+ 
++// KL-117a: cfx_smon's hardware-written exception frame. Unlike the
++// cfx_power handoff frame above, the real trap entry also records cause
++// identity and the raw trapping instruction.
++struct CfxSmonFrame
++{
++    uint64_t prevRunMode = RunModeUser;
++    uint64_t prevCfxMask = 0;
++    uint64_t causeId = 0;
++    uint64_t causeIp = 0;
++    uint64_t causeInfo = 0;
++};
++
+ class ISA : public BaseISA
+ {
+   protected:
+@@ -73,7 +88,11 @@ class ISA : public BaseISA
+         return new PCState(new_inst_addr);
+     }
+ 
+-    // KL-113a CFX privilege state. Plain ISA-class members rather than
++    // KL-117a profile switch. It is immutable ISA configuration rather than
++    // architectural state, so copyRegsFrom() deliberately does not copy it.
++    const bool cfxSmonReal;
++
++    // KL-113a/KL-117a CFX privilege state. Plain ISA-class members rather than
+     // miscRegFile entries: miscRegFile (std::vector<RegVal>, NumMiscRegs=1)
+     // is designed for scalar registers, while cfxHypvCgRegDeleg[64] and
+     // cfxEscapeCfxMask[64][4] are per-cfxcode/per-mode arrays that don't fit
+@@ -83,6 +102,8 @@ class ISA : public BaseISA
+     uint8_t innerCfxCode = CfxCodePower;
+     uint64_t innerCfxMask = ~0ULL;
+     CfxPowerFrame cfxPowerFrame;
++    CfxSmonFrame cfxSmonFrame;
++    uint64_t cfxSmonSupvExcpVector = 0;
+     uint64_t cfxHypvCgRegDeleg[64];
+     uint64_t cfxEscapeCfxMask[64][4];
+ 
+diff --git a/tests/dadao/dadao_se.py b/tests/dadao/dadao_se.py
+index 0a7c2c3dbc..bc7f523a7d 100755
+--- a/tests/dadao/dadao_se.py
++++ b/tests/dadao/dadao_se.py
+@@ -6,6 +6,7 @@ loader path, runs it on a DADAO AtomicSimpleCPU, and exits the gem5 process with
+ the exit code carried by the halting instruction (halt -> exitSimLoop(code)).
+ 
+ Usage: build/DADAO/gem5.opt tests/dadao/dadao_se.py <binary.elf>
++       build/DADAO/gem5.opt tests/dadao/dadao_se.py <binary.elf> --cfx-smon-real
+ """
+ import sys
+ 
+@@ -20,6 +21,11 @@ system.clk_domain = SrcClockDomain(
+ system.mem_mode = "atomic"
+ system.mem_ranges = [AddrRange("512MiB")]
+ system.cpu = DADAOAtomicSimpleCPU()
++cfx_smon_real = False
++if len(sys.argv) > 2:
++    if sys.argv[2] != "--cfx-smon-real":
++        raise SystemExit(f"unknown option: {sys.argv[2]}")
++    cfx_smon_real = True
+ 
+ system.membus = SystemXBar()
+ system.cpu.icache_port = system.membus.cpu_side_ports
+@@ -40,6 +46,7 @@ process.cmd = [binary]
+ process.executable = binary
+ system.cpu.workload = process
+ system.cpu.createThreads()
++system.cpu.isa[0].cfx_smon_real = cfx_smon_real
+ 
+ root = Root(full_system=False, system=system)
+ m5.instantiate()
+-- 
+2.43.0
+
