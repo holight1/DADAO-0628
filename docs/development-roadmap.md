@@ -1700,3 +1700,21 @@ ADR-0015's own framing, this is an independent track from gcc-c-torture
 (most torture cases are single-process pure computation that don't need
 a real kernel); the vector-by-value CC gap and the remaining low-priority
 singletons stay open, revisitable later, not blocking.
+
+## K1: RegRAS bank save/restore — spec + QEMU (2026-07-25) — see `code-agent/tasks/KL-106a/107a/108a-*.md`
+
+`KL-106a` (research): confirmed `ldmo-ra`/`stmo-ra`'s encoding/alignment/
+bounds/ordering are fully wiki-defined, but the refcount-field (`bits
+[63:48]`) behavior during whole-bank transfer is genuinely undefined —
+registered in the new `docs/wiki-deviations.md` (a consolidated ledger
+of every wiki-silent/contradicted decision the project has made,
+backfilled with 7 prior cases from this session). `KL-107a`: formalized
+these two instructions into `contracts/isa/spec.md §4.9` with the
+refcount field as an explicit, labeled project spec-decision (full
+64-bit raw copy, by analogy to `ra2rd`/`rd2ra`) — user-confirmed
+2026-07-25. `KL-108a`: implemented in QEMU, closing all 6 `QEMU-BUG`
+cells `check_legality_matrix.py` generated as a direct side effect of
+the spec change; round-trip content independently decoded and confirmed
+to exercise the documented test sequence; 23-patch QEMU series replays
+clean with matching tree hash. gem5 and LLVM MC support remain as
+separate follow-ups.
