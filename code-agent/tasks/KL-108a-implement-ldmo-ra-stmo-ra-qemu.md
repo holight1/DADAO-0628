@@ -91,3 +91,160 @@ opcode 会走 reserved/UNDI（`0x83`）路径，而不是 spec 现在要求的 I
   说明）
 - `feedback_dadao_test_vector_constraints`（历史踩坑：RB expected 值需
   48-bit 截断——但本任务 RA 是全64位不截断，两者不同，注意区分不要套错）
+
+---
+
+## 完成区（2026-07-25）
+
+**状态**：已完成；实现、执行者自审与独立 subagent review 均通过。
+
+**QEMU 落地**：
+
+- 普通 commit：
+  `b9f412ceaadcb8c07c2289cc7a53589b0ef0fa31`
+  （`target/dadao: implement RA multi load and store`）。
+- 改动严格限于：
+  - `target/dadao/insn.decode`
+  - `target/dadao/translate.c`
+- 统计：2 files changed，74 insertions。
+- patch：
+  `components/qemu/patches/0023-target-dadao-implement-RA-multi-load-and-store.patch`
+  （116 行），已追加 `components/qemu/patches/series`。
+- commit 与 patch 的 stable patch-id 均为
+  `290a623b471ef96137719d6586ce581b8040d599`；QEMU worktree clean。
+
+**实现内容**：
+
+- decodetree 新增 `0x67 ldmo_ra`、`0x6F stmo_ra` 两个 `rrri` pattern。
+- 翻译器对 `immu6=0` 或 `raha+immu6>64` 生成 ILLI；`ra0` 没有被错误地
+  套用 RB 目的寄存器的禁用规则。
+- EA 使用 `rbhb[47:0]+rdhc[47:0]+i*8` 并在每步截到 48 位；访存使用
+  big-endian 64-bit、8-byte alignment 的 TCG MemOp，因此未对齐走现有
+  MALIGN 精确异常路径。
+- `ldmo-ra` 直接把完整 64 位内存值写入 `env.ra[]`，`stmo-ra` 直接把
+  `env.ra[]` 的完整 64 位写入内存；没有对 `bits[63:48]` 做 mask、清零、
+  校验或重算。循环按 `i` 递增，每个元素先读源再写目的。
+
+**验证结果**：
+
+1. 增量构建：
+   `ninja -C .work/source/qemu/build qemu-system-dadao` → PASS。
+2. 修改前合法性矩阵精确复现 6 个目标缺陷：
+   - `immu6=0`：`ldmo-ra`/`stmo-ra` 各 1；
+   - `raha+immu6>64`：各 1；
+   - data MALIGN：各 1；
+   - 均为 expected ILLI/MALIGN、actual UNDI。
+3. 修改后 `python3 scripts/check_legality_matrix.py`：
+   - 上述 6 项全部 `QEMU[OK]`；
+   - `QEMU-BUG (check-1): 0`；
+   - `opcodes-漏 (check-2): 0`。
+   - 工具仍报告这 6 项 `向量-缺`，按工具合同为非阻塞 backlog，不是
+     QEMU 语义失败。
+4. 正常路径高 16 位 round-trip：
+   - 输入槽值：
+     `0xA5C3123456789ABC`、`0xFFFFFEDCBA987654`；
+   - 指令序列：
+     `ldmo-ra ra10..ra11` → `stmo-ra` 保存 → 从全零区 `ldmo-ra` 覆盖清空
+     → 从保存区 `ldmo-ra` 恢复 → `stmo-ra` 写到输出区；
+   - 客体随后用普通 `ldo` 比较保存区和输出区的两个完整 64 位值；
+   - `.work/evidence/KL-108a-roundtrip.bin` SHA-256
+     `a9eb52e7ef27f2aa5a3b1439ac8f168e3b4e4e889907054f3973dc6cffdd3b7c`；
+   - QEMU exit = **0**。两个值的高 16 位分别为 `0xA5C3`、`0xFFFF`，
+     证明未被截断或清零。
+5. `python3 tools/run_differential.py`：
+   - `AGREE(3-way)=200`，gem5-SKIP=2，`DIVERGE=0`；
+   - `AGREE(4-way)=200`，Sail-SKIP=2，`SAIL-DIVERGE=0`。
+6. patch series 独立 replay：
+   - manifest QEMU pin `385b0a7d9785c8f3ac7b116d7f31d61502b55183`
+     （peel 后 commit `7c949c53e936...`）；
+   - plain `git am` 依次应用 23/23 patch，全部成功；
+   - replay tree 与开发树 tree 均为
+     `04f99adc5c46feeaf379930fc706105742cab049`；
+   - 临时 worktree 已清理。
+7. `manifest_check.py`、`check_issues.py`、`git diff --check`：PASS。
+
+## 执行者自审：审阅记录
+
+**判决**：自审通过，未发现阻塞 finding。
+
+- 编码与字段：`0x67/0x6F` 及 `ha/hb/hc/hd` 与
+  `contracts/isa/spec.md §4.9` 一致。
+- 合法性：RA bank 允许 `ra0`，只检查 count 非零和 bank 上界；未复制
+  `ldmo-rb/stmo-rb` 的 `rb0` 禁止条件。
+- 地址与端序：RB/RD 地址操作数先各自截成 48 位，求和及逐元素偏移后仍按
+  48 位回绕；访存使用 `MO_BE|MO_[UQ/64]|MO_ALIGN_8`。
+- 数据保真：RA 读写路径没有任何 48 位 mask，正常路径用两个非零 refcount
+  高位值实际验证。
+- 范围：未修改 gem5、LLVM、helper/cpu 状态模型、根仓库测试框架或 issues；
+  未做 rebase/reset/am 开发树历史。`git am` 仅发生在独立临时 worktree。
+
+## 独立 subagent review（2026-07-25）
+
+**Verdict：Accepted。**
+
+### Findings
+
+- High：无。
+- Medium：无。
+- Low：无。
+
+### 独立静态核对
+
+- `contracts/isa/spec.md §4.9` 与 QEMU decode/translate 一致：
+  `ldmo-ra=0x67`、`stmo-ra=0x6F`；`@rrri` 将 `ha/hb/hc/hd`
+  分别解为 `raha/rbhb/rdhc/immu6`。
+- 合法性判断仅拒绝 `immu6=0` 和 `raha+immu6>64`，未错误拒绝
+  `raha=0`，因此 `ra0` 合法。
+- EA 先分别截取 `rbhb[47:0]`、`rdhc[47:0]`，基址求和及每个
+  `i*8` 偏移后均再次截为 48 位。
+- load/store 分别使用 `MO_BE|MO_UQ|MO_ALIGN_8` 和
+  `MO_BE|MO_64|MO_ALIGN_8`，满足大端、完整 64 位和 8-byte MALIGN；
+  RA 路径没有 48 位数据 mask，`bits[63:48]` 原样保留。
+- 两个循环均按 `i=0..immu6-1` 展开；每次先从该元素的源读取，再写入
+  目的，符合逐对先读后写语义。
+
+### 独立执行记录
+
+1. `python3 scripts/check_legality_matrix.py`
+   - exit 0；
+   - `ldmo-ra`/`stmo-ra` 的 `immu6=0`、range overflow、data MALIGN
+     六项均为 `QEMU[OK]`；
+   - 汇总 `matrix cells=143`、`QEMU-BUG=0`、`opcodes-漏=0`、
+     `向量-缺=110`。后者含本任务六项，按脚本合同为非阻塞 backlog，
+     与完成区声明一致。
+2. 独立生成 316-byte 判别 probe：
+   - 指令字 `ldmo-ra=0x670020C2`、`stmo-ra=0x6F004142`；
+   - 从 `ra0` 开始搬运两个值
+     `0xA5C3123456789ABC`、`0xFFFFFEDCBA987654`；
+   - load EA 使用
+     `(0x0000FFFFFFFFFFF8 + 0x0000000080002008) mod 2^48
+     = 0x80002000`，同时覆盖 `ra0` 合法、48-bit wrap、高 16 位保真和
+     `i` 顺序；
+   - probe SHA-256
+     `b413361a5a1255285b34fefcd2c6eb7abd03e481a5dddff5fd63bc24ae0e8138`，
+     QEMU exit 0。
+3. 复跑已有 roundtrip：
+   - `.work/evidence/KL-108a-roundtrip.bin` SHA-256
+     `a9eb52e7ef27f2aa5a3b1439ac8f168e3b4e4e889907054f3973dc6cffdd3b7c`；
+   - QEMU exit 0。
+4. `python3 tools/run_differential.py`
+   - `AGREE(3-way)=200`、gem5-SKIP=2、`DIVERGE=0`；
+   - `AGREE(4-way)=200`、Sail-SKIP=2、`SAIL-DIVERGE=0`。
+5. `ninja -C .work/source/qemu/build qemu-system-dadao`：PASS（4/4）。
+6. 组件与 patch 身份：
+   - QEMU HEAD 为
+     `b9f412ceaadcb8c07c2289cc7a53589b0ef0fa31`，worktree clean；
+   - commit 统计确为 2 files、74 insertions；
+   - patch 116 行，series 中恰好一条；
+   - commit/patch stable patch-id 均为
+     `290a623b471ef96137719d6586ce581b8040d599`。
+7. 从 manifest pin
+   `385b0a7d9785c8f3ac7b116d7f31d61502b55183`
+   （peel `7c949c53e936aa3a658d84ab53bae5cadaa5d59c`）在临时 clone 中执行
+   plain `git am`：23/23 PASS；replay tree 与开发树均为
+   `04f99adc5c46feeaf379930fc706105742cab049`。
+8. `python3 scripts/manifest_check.py`、`python3 scripts/check_issues.py`、
+   `git diff --check`：PASS。
+
+审阅未修改 QEMU 源码、patch、series、issues 或其他文档；未启动 nested
+subagent，未 commit。

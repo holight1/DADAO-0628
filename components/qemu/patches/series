@@ -21,3 +21,4 @@
 0020-dadao-cfx-state-scaffold.patch
 0021-target-dadao-add-SYS_writev-66-cfx_smon-responder-ML.patch
 0022-target-dadao-add-SYS_read-63-cfx_smon-responder-ML-0.patch
+0023-target-dadao-implement-RA-multi-load-and-store.patch

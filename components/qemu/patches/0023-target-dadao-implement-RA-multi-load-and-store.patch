@@ -1,0 +1,116 @@
+From b9f412ceaadcb8c07c2289cc7a53589b0ef0fa31 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 12:23:21 +0800
+Subject: [PATCH] target/dadao: implement RA multi load and store
+
+---
+ target/dadao/insn.decode |  4 +++
+ target/dadao/translate.c | 70 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/target/dadao/insn.decode b/target/dadao/insn.decode
+index ac7db47..0aab976 100644
+--- a/target/dadao/insn.decode
++++ b/target/dadao/insn.decode
+@@ -154,6 +154,8 @@ stmo_rb    01001111 ...... ...... ...... ...... @rrri
+ jump_i     01100100 ...... ...... ...... ...... @iiii
+ # op=0x65: jump register (rrii)
+ jump_r     01100101 ...... ...... ...... ...... @rrii
++# op=0x67: RA multi load (rrri)
++ldmo_ra    01100111 ...... ...... ...... ...... @rrri
+ 
+ # op=0x6C: call immediate (iiii)
+ call_i     01101100 ...... ...... ...... ...... @iiii
+@@ -161,6 +163,8 @@ call_i     01101100 ...... ...... ...... ...... @iiii
+ call_r     01101101 ...... ...... ...... ...... @rrii
+ # op=0x6E: return (riii)
+ ret        01101110 ...... ...... ...... ...... @riii
++# op=0x6F: RA multi store (rrri)
++stmo_ra    01101111 ...... ...... ...... ...... @rrri
+ 
+ # *** System / cfx instructions (SimRISC §系统类指令) ***
+ # op=0x76: trap-ciii — trap cfxcode, immu18
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index 3e9ca95..b9c3846 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -725,6 +725,76 @@ static bool trans_stmo_rb(DisasContext *ctx, arg_stmo_rb *a)
+     return true;
+ }
+ 
++/* === §4.9 RA Multi Load/Store (rrri) === */
++
++static TCGv_i64 gen_multi_ea_base(DisasContext *ctx, int rb, int rd)
++{
++    TCGv_i64 base = tcg_temp_new_i64();
++    TCGv_i64 index = tcg_temp_new_i64();
++
++    tcg_gen_ld_i64(base, tcg_env, offsetof(CPUDADAOState, rb[rb]));
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_ld_i64(index, tcg_env, offsetof(CPUDADAOState, rd[rd]));
++    tcg_gen_andi_i64(index, index, 0x0000FFFFFFFFFFFFULL);
++    tcg_gen_add_i64(base, base, index);
++    tcg_gen_andi_i64(base, base, 0x0000FFFFFFFFFFFFULL);
++    return base;
++}
++
++static TCGv_i64 gen_multi_ea(TCGv_i64 base, int index)
++{
++    TCGv_i64 ea = tcg_temp_new_i64();
++
++    tcg_gen_mov_i64(ea, base);
++    if (index) {
++        tcg_gen_addi_i64(ea, ea, index * 8);
++        tcg_gen_andi_i64(ea, ea, 0x0000FFFFFFFFFFFFULL);
++    }
++    return ea;
++}
++
++static bool trans_ldmo_ra(DisasContext *ctx, arg_ldmo_ra *a)
++{
++    if (a->hd == 0 || a->ha + a->hd > 64) {
++        gen_exception_illegal(ctx);
++        return true;
++    }
++
++    TCGv_i64 base = gen_multi_ea_base(ctx, a->hb, a->hc);
++
++    for (int i = 0; i < a->hd; i++) {
++        TCGv_i64 ea = gen_multi_ea(base, i);
++        TCGv_i64 value = tcg_temp_new_i64();
++
++        tcg_gen_qemu_ld_i64(value, ea, ctx->mem_idx,
++                            MO_BE | MO_UQ | MO_ALIGN_8);
++        tcg_gen_st_i64(value, tcg_env,
++                       offsetof(CPUDADAOState, ra[a->ha + i]));
++    }
++    return true;
++}
++
++static bool trans_stmo_ra(DisasContext *ctx, arg_stmo_ra *a)
++{
++    if (a->hd == 0 || a->ha + a->hd > 64) {
++        gen_exception_illegal(ctx);
++        return true;
++    }
++
++    TCGv_i64 base = gen_multi_ea_base(ctx, a->hb, a->hc);
++
++    for (int i = 0; i < a->hd; i++) {
++        TCGv_i64 ea = gen_multi_ea(base, i);
++        TCGv_i64 value = tcg_temp_new_i64();
++
++        tcg_gen_ld_i64(value, tcg_env,
++                       offsetof(CPUDADAOState, ra[a->ha + i]));
++        tcg_gen_qemu_st_i64(value, ea, ctx->mem_idx,
++                            MO_BE | MO_64 | MO_ALIGN_8);
++    }
++    return true;
++}
++
+ /* === §5.3 Jump / Call / Ret — Control Flow === */
+ 
+ static bool trans_jump_i(DisasContext *ctx, arg_jump_i *a)
+-- 
+2.43.0
+
