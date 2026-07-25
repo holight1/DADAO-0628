@@ -1718,3 +1718,19 @@ the spec change; round-trip content independently decoded and confirmed
 to exercise the documented test sequence; 23-patch QEMU series replays
 clean with matching tree hash. gem5 and LLVM MC support remain as
 separate follow-ups.
+
+`KL-109a`: gem5 implementation (`RAMultiLoadInst`/`RAMultiStoreInst` in
+`decoder.cc`, mirroring the existing RB-bank `MultiLoadInst`/
+`MultiStoreInst`). First review round caught a real High-severity bug —
+illegal-range encodings still registered out-of-bank `RegId` operands,
+crashing the host with SIGSEGV under `DADAOO3CPU` (masked by
+`AtomicSimpleCPU`'s fault-before-execute ordering) — fixed by only
+registering RA operands when the legality check passes, independently
+re-verified closed. Architect independently built a from-scratch minimal
+ELF (hand-encoded `.4byte` instruction word, linked with the project's
+own crt0.s/dadao.ld) and reproduced both the pre-fix crash scenario's
+absence and the correct ILLI/MALIGN fault delivery under `AtomicSimpleCPU`
+directly, not just re-running provided evidence; 17-patch gem5 series
+replays clean with matching tree hash. LLVM MC (assembler/disassembler)
+support for these two instructions remains the one outstanding piece
+before they're usable from real C/assembly source.
