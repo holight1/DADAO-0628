@@ -20,7 +20,8 @@ DEFAULT_QEMU = os.path.join(
 ALT_QEMU = os.path.expanduser(
     '~/toolchain/DADAO/__install/bin/qemu-system-dadao'
 )
-FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83, 'RASOF': 0x84, 'RASUF': 0x85}
+FAULT_CODES = {'ILLI': 0x82, 'MALIGN': 0x81, 'UNDI': 0x83, 'RASOF': 0x84,
+               'RASUF': 0x85, 'CFXREG': 0x86}
 
 
 def find_qemu():

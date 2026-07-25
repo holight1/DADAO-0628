@@ -999,16 +999,26 @@ no-op). The exact test-machine observable protocol is defined in ADR-0004.
 [wiki §SimRISC-04-系统类指令.md §特权指令; §DADAO-12-SEE-主管系统运行环境.md §5 异常进入与异常退出; §DADAO-23-HBI-超管系统二进制接口.md §3]
 
 This section formalizes `cfx2rc` and `escape` per the wiki's full
-architectural semantics. **QEMU's current implementation only covers the
-subset needed for the HBI §3 hypv→supv handoff success path (O1)** —
-`cfx2rc` restricted to the `cg=3/rc=12` delegation register and
-`cfx_power`'s `cg=5` exception frame, and `escape` restricted to
-`cfx_power` self-escape with no permission check. Permission
-enforcement (masks, delegation gating, **CFXREG**/reserved-cfxcode
-routing) and the remaining `cg0/cg1/cg2/cg4/cg6/cg7` register maps are
-**Excluded (M1 scope decision, KL-110a, 2026-07-25; O1/O2 split per
-`docs/reviews/kernel-cfx-state-patch-surface-20260721.md` §3 — O2's
-unauthorized/masked negative paths are a follow-up task, not this one)**.
+architectural semantics. **QEMU's implementation covers the O1 success
+path (KL-110a) plus two of O2's negative paths (KL-112a, 2026-07-25)** —
+`cfx2rc` implements the `cg=3/rc=12` delegation register,
+`cfx_power`'s `cg=5` exception frame, and CFXREG for `cfx_power`'s
+`cg=8` reserved `rc` range (design 3 / candidate C); `escape` implements
+`cfx_power` self-escape plus the cross-cfx `escape_cfx_mask` permission
+check (SEE §5 exception-exit step 0, design 1 / candidate B). Still
+**Excluded**: reserved-cfxcode entry-flow routing (see §8.1's bullet list
+below for the wiki citation), the remaining
+`cg0/cg1/cg2/cg4/cg6/cg7` register maps, and — deliberately, not merely
+deferred — the cross-cfx `cfx2rc_cfx_mask` check ("design 2" / candidate
+B2): implementing it as a blanket check makes HBI §3's own documented
+boot stub permanently illegal (11 of its 12 delegation-clearing `cfx2rc`
+calls are cross-cfx and that mask is never cleared), a genuine wiki
+contradiction recorded as `docs/wiki-deviations.md` #11, not an
+implementation-cost tradeoff. `cg_reg_deleg`'s own access-control
+semantics (candidate A) remain unimplemented per `docs/wiki-deviations.md`
+#10 (M1 scope decision, KL-110a/KL-112a, 2026-07-25; O1/O2 split per
+`docs/reviews/kernel-cfx-state-patch-surface-20260721.md` §3;
+`docs/reviews/kernel-hypv-supv-o2-permission-recon-20260725.md` §4).
 
 ### 8.1 `cfx2rc` / `cfx2rd` Register Transfer (crrr)
 
@@ -1024,9 +1034,10 @@ Semantic: `cfx2rc` writes `rdhd`'s value into the `(cg, rc)`-addressed register 
 
 Named-register syntax: `cfx2rc cfx_<cfxname>_<regname>, rdhd` expands to the standard 4-operand form by looking up `(cg, rc)` from the SEE/HEE register tables; this is an assembler convenience, not a distinct encoding. [wiki §SimRISC-04 L91–L103]
 
-Full semantics (wiki, not implemented by QEMU's O1 subset — see the scope note above):
-- Reserved `cfxcode` (7–14, 19–61) → **ILLI**, rerouted to the current mode's monitor. [wiki §DADAO-12-SEE §5 L712–L720]
-- Undefined `(cg, rc)` combination for the addressed `cfxcode`, or a read/write permission mismatch → **CFXREG**. [wiki §SimRISC-04 L87]
+Full semantics (wiki; see the scope note above for exactly what QEMU implements):
+- Reserved `cfxcode` (7–14, 19–61) → **ILLI**, rerouted to the current mode's monitor. Not implemented by QEMU (out of KL-112a's three designs). [wiki §DADAO-12-SEE §5 L712–L720]
+- Cross-cfx execute permission: if `cfxcode` differs from `inner_cfx_code` and `cfx_⟨cfxname⟩_<mode>_cfx2rc_cfx_mask` bit `cfxcode` is set → **ILLI**. Deliberately not implemented by QEMU — see the scope note above and `docs/wiki-deviations.md` #11 for why this check contradicts HBI §3's boot stub as literally documented. [wiki §DADAO-12-SEE §5 L711–L728; §DADAO-13-HEE §1 L15 (hypv); §DADAO-12-SEE §3 L277/L301/L321 (user/jail/supv)]
+- Undefined `(cg, rc)` combination for the addressed `cfxcode`, or a read/write permission mismatch → **CFXREG**. QEMU implements this specifically for `cfx_power`'s `cg=8` group (`rc` outside `{0,1}`, per §4's private register table below) — the one combination KL-112a established as genuinely reserved rather than merely QEMU-unimplemented; every other still-unbacked `(cg, rc)` combination (e.g. cg0-2's remaining mode registers, cg3's remaining hypv registers) is a silent no-op, not CFXREG, because those registers ARE wiki-defined and only lack QEMU storage so far. QEMU raises this as `EXCP_CFXREG` (exit code `0x86`, a project convention — the wiki defines no exit-code numbers, only the `1<<2` cause id). [wiki §SimRISC-04 L87; §DADAO-12-SEE §4 cfx_power 专有寄存器表 L634–L637] [spec-decision: KL-112a, 2026-07-25]
 - The data path only connects to the RD bank; RB/RF values must be staged through `setrd` first. [wiki §SimRISC-04 L89]
 
 ### 8.2 `trap` / `escape` (ciii)
@@ -1039,16 +1050,16 @@ escape    cfx_<cfxname>, imms18   ; return from the current cfx frame
 Encoding: §2.8 row 0111-0xxx col 110 (`trap`, `0x76`, M1-excluded per §7) / col 111 (`escape`, `0x77`). Format `ciii`.
 `ha`=cfxcode; `hb:hc:hd`=the 18-bit immediate (unsigned `immu18` for `trap`, signed `imms18` for `escape`). [wiki §SimRISC-00 §指令设计 L51–L53; §SimRISC-04 §陷入指令 L48–L58; §SimRISC-04 §退出指令 L60–L70]
 
-`escape` semantics (SEE §5 exception-exit flow — full wiki pseudocode; see the O1-subset note above for what QEMU currently executes):
+`escape` semantics (SEE §5 exception-exit flow — full wiki pseudocode; see the scope note above for what QEMU implements):
 
-0. If `cfxcode` (the escape operand) differs from the executing cfx (`inner_cfx_code`) and `cfx_⟨cfxname⟩_<mode>_escape_cfx_mask` bit `cfxcode` is set → **ILLI**, rerouted to the current mode's monitor. [wiki §DADAO-12-SEE §5 L824–L835]
+0. If `cfxcode` (the escape operand) differs from the executing cfx (`inner_cfx_code`) and `cfx_⟨cfxname⟩_<mode>_escape_cfx_mask` bit `cfxcode` is set → **ILLI**, rerouted to the current mode's monitor, and steps 1-4 below do not execute (no architectural side effect: `inner_run_mode`/`inner_cfx_mask` stay at their pre-`escape` values, PC does not move — same "precise fault" convention as §2.7). QEMU implements this check (KL-112a design 1 / candidate B, `EXCP_ILLI`, exit code `0x82`) — `⟨cfxname⟩`/`<mode>` below are read *before* this check, i.e. the not-yet-restored current values. [wiki §DADAO-12-SEE §5 L824–L835] [spec-decision: KL-112a, 2026-07-25]
 1. `inner_cfx_mask ← cfx_⟨cfxname⟩_excp_prev_cfx_mask`. [wiki §DADAO-12-SEE §5 L838]
 2. `inner_run_mode ← cfx_⟨cfxname⟩_excp_prev_run_mode`. [wiki §DADAO-12-SEE §5 L840]
-3. `cfx_⟨cfxname⟩_escape_num += 1`. [wiki §DADAO-12-SEE §5 L842]
+3. `cfx_⟨cfxname⟩_escape_num += 1`. Not implemented by QEMU (no cg4 counter storage exists for any cfx). [wiki §DADAO-12-SEE §5 L842]
 4. `inner_inst_pointer ← cfx_⟨cfxname⟩_excp_cause_ip + (imms18 << 2)`. [wiki §DADAO-12-SEE §5 L844]
 
 `⟨cfxname⟩` in steps 1–4 is `inner_cfx_code` (the cfx executing `escape`), per the wiki's own definition. [wiki §DADAO-12-SEE §5 L815]
-For a self-escape (the `escape` operand equals `inner_cfx_code`, as in the HBI §3 handoff stub), step 0's cross-cfx mask check does not apply.
+For a self-escape (the `escape` operand equals `inner_cfx_code`, as in the HBI §3 handoff stub), step 0's cross-cfx mask check does not apply — this is why O1's `escape cfx_power,0` is unaffected by design 1's addition.
 
 **wiki gap** (see `docs/wiki-deviations.md` #9 for the full record): the `escape` pseudocode above never assigns `inner_cfx_code` — there is no `cfx_<name>_excp_prev_cfx_code` register to restore it from, unlike `inner_run_mode`/`inner_cfx_mask` which each have a dedicated `prev_*` register. [wiki §DADAO-12-SEE §3 cg5 L357–L360]
 QEMU's O1 implementation therefore leaves `inner_cfx_code` unmodified by `escape`, matching the wiki's silence rather than inventing a restore rule [spec-decision: KL-110a, 2026-07-25].

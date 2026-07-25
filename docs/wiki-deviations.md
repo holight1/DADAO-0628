@@ -290,3 +290,67 @@
   拍板（如"deleg 拒绝统一按 CFXREG 处理，等同 SimRISC-04:87 第三分句"）。
 - **详见**：`docs/reviews/kernel-hypv-supv-o2-permission-recon-20260725.md`
   §2.1、§3
+
+### 11. `cfx2rc_cfx_mask` 跨 cfx 执行权限检查与 HBI §3 引导桩相互矛盾（KL-112a，2026-07-25）
+
+- **wiki 状态**：CONTRADICTION（不是沉默——两处正式文本都明确存在，字面
+  同时成立时互相冲突）。
+  1. `DADAO-12-SEE-主管系统运行环境.md` 第711-728行"异常进入流程"
+     伪代码：`elif cfxcode != inner_cfx_code and
+     cfx_⟨cfxname⟩_<mode>_<instr>_cfx_mask & (1 << cfxcode): cause <=
+     ILLI`（`<instr>=CFX2RC` 时即 `cfx2rc_cfx_mask`），对 `cfx2rc` 无条件
+     适用，不区分运行模式（`<mode>` 只是决定用哪一份寄存器，hypv 模式
+     没有被文字排除在检查之外）。
+  2. `DADAO-13-HEE-超管系统运行环境.md` 第15行：`cfx_⟨cfxname⟩_hypv_
+     cfx2rc_cfx_mask` 复位值="全1"（即默认禁止所有跨 cfx `cfx2rc`）。
+  3. `DADAO-23-HBI-超管系统二进制接口.md` 第31-64行 hypv→supv 移交
+     唯一文档化序列：前 12 条 `cfx2rc cfx_<name>_hypv_cg_reg_deleg, rd2`
+     （第34-45行，umon/jmon/smon/ptw/tlb/cache/hart/llc/pmem/timer/uart/
+     power）里，除最后一条（`cfx_power`）外，其余 11 条的目标 cfxcode
+     全部 ≠ `inner_cfx_code`（复位起恒为 `cfx_power`=63）——是**跨 cfx**
+     `cfx2rc`。这段引导代码全程**没有任何一条**写
+     `cfx_power_hypv_cfx2rc_cfx_mask`（该 (cg,rc)=(3,3) 从未出现在 HBI
+     §3 原文里）。
+  三者字面同时生效时得到矛盾：若 1+2 按字面严格执行，第一条
+  `cfx2rc cfx_umon_hypv_cg_reg_deleg, rd2`（cfxcode=umon=0）就会因
+  `cfx_power_hypv_cfx2rc_cfx_mask` 位0=1（从未清除）触发 ILLI——HBI §3
+  这段唯一文档化的引导序列会在第一条指令就永久失败。
+- **发现过程**：`KL-111a` 报告 §4 设计2（候选B2）提出"跨 cfx `cfx2rc`
+  权限检查"作为与设计1同构、"成本几乎为零"的可选附加负例，给出的验证
+  指令是一个独立场景（`cfx2rc cfx_smon_user_global_cfx_mask, rd2`），
+  报告本身没有针对 O1 回归重放验证。`KL-112a` 实现时先按候选B2字面实现，
+  **对 O1 回归探针重放时**（`tests/scripts/gen_kl110a_o1_probe.py` 生成
+  的原始 HBI §3 桩）实测发现第一条 `cfx2rc cfx_umon_hypv_cg_reg_deleg,
+  rd2` 就触发 ILLI，O1 回归从 exit=42 变成 exit=0x82——用真实回放而非
+  纸面推理确认了这个矛盾，是 KL-111a 调研阶段（未接触真实 QEMU 回归
+  套件）未能发现的。
+- **我们的决定**：候选B2（"设计2"）不在 KL-112a 实现——`cfx2rc` 只实现
+  设计3（reserved (cg,rc) → CFXREG），不实现跨 cfx `cfx2rc_cfx_mask`
+  检查。`target/dadao/helper.c::helper_cfx2rc()` 完全不读写
+  `cfx2rc_cfx_mask`，也没有为它分配任何 `CPUArchState` 存储（早期实现
+  版本加过 `cfx_cfx2rc_cfx_mask[64][4]` 数组和检查代码，因触发本条矛盾
+  已撤回，未落入最终 commit）。
+- **理由**：把 SEE §5 entry-flow 的通用检查按字面无条件套用到
+  `cfx2rc`，会让 wiki 自己给出的唯一 `cfx2rc` 真实使用范例（HBI §3
+  引导桩）永久非法——这不是"实现复杂度高"，是两处正式文本字面互斥，
+  在没有第三处 wiki 文字给出"hypv 模式豁免"或"引导阶段豁免"这类例外
+  规则之前，实现方只能二选一（要么破坏 HBI §3，要么不做这个检查），
+  凭空发明豁免规则违反项目"不发明未在 wiki 出现的规则"惯例（对照
+  第9条"不发明未定义的恢复规则"的同一原则）。设计1（`escape` 的
+  `escape_cfx_mask` 检查）没有这个问题——O1 的唯一 `escape` 使用
+  （`escape cfx_power,0`）是 self-escape（`cfxcode==inner_cfx_code`），
+  设计1的跨 cfx 检查按定义对 self-escape 不生效，两者不对称。
+- **影响范围**：K1 kernel bring-up 后续如果需要真正的跨 cfx `cfx2rc`
+  权限隔离（比如 supv 内核限制某些 cfx 只能被特定 cfx 访问），需要先
+  解决这条矛盾——可能的方向包括（未评估可行性，仅列出候选）："hypv 模式
+  下 cfx2rc_cfx_mask 检查不适用"这类模式豁免、"HBI §3 应该先写
+  cfx2rc_cfx_mask 但 wiki 漏写了"这类引导序列补全、或"这条检查实际只
+  适用于 supv/user/jail 模式，cg3/hypv 那份 cfx2rc_cfx_mask 寄存器的
+  存在只是为了寻址对称性，从不被读"这类范围收窄读法——均需 wiki 团队
+  澄清或项目自行拍板，本条只记录矛盾本身，不预判解法。
+- **状态**：OPEN。
+- **详见**：`docs/reviews/kernel-hypv-supv-o2-permission-recon-20260725.md`
+  §2.4（候选B2 原始提案）；`code-agent/tasks/
+  KL-112a-implement-hypv-supv-handoff-o2-qemu.md`（完成区，撤回过程与
+  A/B 回归重放证据）；`target/dadao/helper.c::helper_cfx2rc()`
+  函数级注释（撤回决定落地位置）。

@@ -23,3 +23,4 @@
 0022-target-dadao-add-SYS_read-63-cfx_smon-responder-ML-0.patch
 0023-target-dadao-implement-RA-multi-load-and-store.patch
 0024-target-dadao-implement-cfx2rc-escape-O1-hypv-supv-ha.patch
+0025-target-dadao-implement-hypv-supv-handoff-O2-negative.patch

@@ -1,0 +1,256 @@
+From 4d8d9fa85cef85aa807be3403aa77753f3878563 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 16:55:10 +0800
+Subject: [PATCH] target/dadao: implement hypv->supv handoff O2 negative paths
+ (KL-112a)
+
+Adds two of the three KL-111a-designed O2 (unauthorized/masked) negative
+paths for the hypv<->supv privilege-switch mechanism, following KL-110a's
+O1 success-path implementation:
+
+- design 1 (candidate B): helper_escape() now enforces SEE Sec.5
+  exception-exit step 0 -- the cross-cfx escape_cfx_mask permission
+  check. escape targeting a cfxcode other than inner_cfx_code is denied
+  (EXCP_ILLI) unless the mask bit is cleared; on denial none of steps
+  1-4 run (inner_run_mode/inner_cfx_mask/PC are left untouched, matching
+  the project's existing precise-fault convention). New per-(cfxcode,
+  mode) cfx_escape_cfx_mask[64][4] storage, reset default all-ones,
+  writable via cfx2rc (cg<=3, rc=7).
+
+- design 3 (candidate C): helper_cfx2rc() now raises EXCP_CFXREG (new
+  exception type, exit code 0x86) for cfx_power's cg=8 register group
+  when rc is outside the wiki-defined {0,1} range -- a genuinely
+  undefined (cg,rc) combination, not merely QEMU-unimplemented. Scoped
+  narrowly to this one combination rather than reinterpreting every
+  other still-unbacked (cg,rc) pair as CFXREG.
+
+design 2 (candidate B2, cross-cfx cfx2rc_cfx_mask check) was evaluated
+and deliberately NOT implemented: enforcing it as a blanket check makes
+HBI Sec.3's own documented boot stub permanently illegal, since 11 of
+its 12 delegation-clearing cfx2rc calls are cross-cfx and that mask is
+never cleared by the stub. Confirmed empirically by replaying the O1
+regression probe against an early implementation (exit 42 -> 0x82).
+Recorded as a genuine wiki contradiction, not an implementation-cost
+tradeoff (docs/wiki-deviations.md #11).
+
+O1 regression verified unaffected (self-escape has cfxcode ==
+inner_cfx_code, so design 1's check never applies to it).
+---
+ target/dadao/cpu.c    |   9 ++++
+ target/dadao/cpu.h    |  28 ++++++++++++
+ target/dadao/helper.c | 101 ++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 125 insertions(+), 13 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 948f261..605e5cc 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -52,6 +52,12 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+         /* HEE §1 cg3/rc12 init value = all-ones (all cg groups delegated
+          * to hypv only, until software clears bits via cfx2rc). */
+         env->cfx_hypv_cg_reg_deleg[i] = DADAO_CFX_MASK_ALL;
++        /* KL-112a design 1: escape_cfx_mask reset value = all-ones for
++         * every (cfxcode, mode) pair [wiki §DADAO-13-HEE §1 L19;
++         * §DADAO-12-SEE §3 L281/L305/L325]. */
++        for (int m = 0; m < 4; m++) {
++            env->cfx_escape_cfx_mask[i][m] = DADAO_CFX_MASK_ALL;
++        }
+     }
+     /* rf[0] reset = QNaN per ISA spec §1.2 (contracts/isa/spec.md) */
+     env->rf[0] = UINT64_C(0x7FF800007FC00000);
+@@ -139,6 +145,9 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+     case EXCP_UNDI:
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x83);
+         break;
++    case EXCP_CFXREG: /* KL-112a design 3: non-existent (cg,rc) -> CFXREG */
++        qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x86);
++        break;
+     case EXCP_CFXTRAP: {
+         uint64_t cfxcode = env->trap_cfxcode;
+         uint64_t func = env->trap_func;
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index ddfcb0d..45f64a5 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -10,6 +10,12 @@
+ #define EXCP_MALIGN 3
+ #define EXCP_EXIT   4
+ #define EXCP_CFXTRAP 5
++/* KL-112a design 3 (candidate C): non-existent (cg,rc) combination accessed
++ * via cfx2rc/cfx2rd. [wiki §SimRISC-04 §寄存器传输指令 L87] Exit code 0x86
++ * is a project convention (not a wiki-defined number), extending the
++ * existing 0x81-0x85 QEMU-fault exit code scheme contiguously (ADR-0004
++ * §Summary of Exit Code Layout). */
++#define EXCP_CFXREG 6
+ 
+ /* cfx_smon SYS_mmap (222) accounting-arena base (ML-007a). Must match the
+  * gem5 TrapInst::execute() constant exactly (components/gem5/patches) --
+@@ -63,6 +69,22 @@ typedef struct DADAOCfxPowerFrame {
+ #define DADAO_CFX_HYPV_CG_REG_DELEG_CG 3
+ #define DADAO_CFX_HYPV_CG_REG_DELEG_RC 12
+ 
++/* KL-112a design 1 (candidate B): "escape_cfx_mask" cross-cfx
++ * execute-permission register -- one 64-bit register per (cfxcode, mode)
++ * pair. `cg` selects the mode subgroup (0=user, 1=jail, 2=supv, 3=hypv,
++ * matching DADAORunMode's numeric values 1:1) and `rc`=7 selects this
++ * register [wiki §DADAO-13-HEE §1 L19 (hypv); §DADAO-12-SEE §3
++ * L281/L305/L325 (user/jail/supv)]. Indexed by raw cfxcode (0-63) so every
++ * cfx has its own copy, mirroring cfx_hypv_cg_reg_deleg's per-cfx layout
++ * above. Reset default is all-ones per the wiki table.
++ *
++ * The cfx2rc-instruction-type analog (`cfx2rc_cfx_mask`, rc=3, "design 2" /
++ * candidate B2) is deliberately NOT implemented -- see helper_cfx2rc()'s
++ * comment and `docs/wiki-deviations.md` #11: enforcing it as a blanket
++ * check breaks the O1 HBI §3 boot stub, which performs cross-cfx `cfx2rc`
++ * calls without ever clearing that mask. */
++#define DADAO_CFX_MASK_REG_ESCAPE 7
++
+ typedef struct CPUArchState CPUDADAOState;
+ typedef struct ArchCPU DADAOCPU;
+ typedef struct DADAOCPUClass DADAOCPUClass;
+@@ -86,6 +108,12 @@ struct CPUArchState {
+     target_ulong inner_cfx_mask;
+     DADAOCfxPowerFrame cfx_power_frame;
+     target_ulong cfx_hypv_cg_reg_deleg[64];
++    /* KL-112a design 1: cfx_escape_cfx_mask[cfxcode][mode], mode indexed by
++     * DADAORunMode's numeric values (USER=0/JAIL=1/SUPV=2/HYPV=3), matching
++     * the cg0-3 register-group numbering the wiki uses for this per-mode
++     * register. (No cfx_cfx2rc_cfx_mask storage -- design 2 is not
++     * implemented, see DADAO_CFX_MASK_REG_ESCAPE's comment above.) */
++    target_ulong cfx_escape_cfx_mask[64][4];
+     /* Scratch for a pending trap (cfx) syscall, passed helper -> do_interrupt.
+        Must NOT reuse rb[1]/rb[2] — rb1 is the stack pointer (ADR-0004). */
+     target_ulong trap_cfxcode;
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index f835683..d89de87 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -114,7 +114,25 @@ void helper_trap(CPUDADAOState *env, uint64_t cfxcode, uint64_t func)
+  * happen here and nowhere else in translate.c/cpu.c, per the KL-102a
+  * report's carrier-point design: add centralized cfx2rc/escape/enter/fault
+  * helpers in helper.c/.h; all prev/cause writes and restores happen only
+- * here. */
++ * here.
++ *
++ * KL-112a extends this with the O2 design 3 negative path (still
++ * centralized here, per the same carrier-point convention -- no checks
++ * added to translate.c): reserved (cg,rc) -> CFXREG (candidate C). Design 2
++ * (candidate B2, cross-cfx `cfx2rc` permission check) was evaluated and
++ * deliberately NOT implemented -- see the KL-112a completion notes and
++ * `docs/wiki-deviations.md` #11: enforcing `cfx_power_hypv_cfx2rc_cfx_mask`
++ * as a blanket check breaks the O1 regression, because HBI §3's own
++ * documented boot stub performs cross-cfx `cfx2rc` calls (delegation-
++ * clearing, targeting umon/jmon/smon/ptw/tlb/cache/hart/llc/pmem/timer/
++ * uart from cfx_power) without ever clearing that mask (reset default is
++ * all-ones = deny for every one of those calls). Implementing this check
++ * literally would make the wiki's own only documented `cfx2rc` usage
++ * sequence permanently illegal, which is not a defensible interpretation
++ * without an unwritten exemption rule this task is not positioned to
++ * invent. See
++ * `docs/reviews/kernel-hypv-supv-o2-permission-recon-20260725.md` §4
++ * design 2 for the original (untested-against-O1) proposal. */
+ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+                     uint64_t rc, uint64_t value)
+ {
+@@ -156,16 +174,57 @@ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         }
+     }
+ 
+-    /* Every other (cg, rc) combination -- full CFXREG fault semantics,
+-     * per-cfx cg0/cg1/cg2/cg4/cg6/cg7 register maps, reserved-cfxcode
+-     * routing to ILLI -- is out of O1 scope (KL-102a report §3.1/§4).
+-     * Treated as a silent no-op rather than fabricating state that has no
+-     * backing storage; not reachable by the HBI §3 handoff stub. */
++    if (cg <= 3 && rc == DADAO_CFX_MASK_REG_ESCAPE) {
++        /* KL-112a design 1 storage: cfx_<cfxname>_<mode>_escape_cfx_mask.
++         * `cg` selects the mode subgroup (0=user/1=jail/2=supv/3=hypv);
++         * `cfxcode` selects which cfx owns this register instance. [wiki
++         * §DADAO-13-HEE §1 L19; §DADAO-12-SEE §3 L281/L305/L325] Unlike
++         * design 2's cfx2rc_cfx_mask (deliberately not implemented, see the
++         * function-level comment above), this register has no HBI §3
++         * conflict -- the boot stub never writes or relies on it. */
++        env->cfx_escape_cfx_mask[cfxcode][cg] = value;
++        return;
++    }
++
++    if (cfxcode == DADAO_CFX_CODE_POWER && cg == 8 && rc > 1) {
++        /* KL-112a design 3 (candidate C): cfx_power's cg=8 private register
++         * group defines exactly two registers -- rc=0 (power_pending) and
++         * rc=1 (power_ctrl); every other rc under cg=8 for cfx_power is a
++         * genuinely non-existent (cg,rc) combination, not merely
++         * QEMU-unimplemented. [wiki §DADAO-12-SEE §4 cfx_power 专有寄存器表
++         * L634–L637; §SimRISC-04 §寄存器传输指令 L87 CFXREG trigger
++         * condition]
++         *
++         * Scoped narrowly to cfxcode==power/cg==8 rather than converting
++         * the whole default branch below into CFXREG: most of the other
++         * (cg,rc) combinations that still fall through to that silent
++         * no-op ARE wiki-defined registers (e.g. cg0-2's remaining mode
++         * registers, cg3's remaining hypv registers) that this M1 QEMU
++         * subset simply has not backed with storage yet -- reclassifying
++         * "unimplemented" as "does not exist" for those would be a false
++         * CFXREG and would contradict spec.md §8.1's own O1-subset framing
++         * (KL-111a report §2.3 confirms cg=8/cfx_power is the only
++         * combination this task's design 3 established as genuinely
++         * reserved). */
++        dadao_raise_exception(env, EXCP_CFXREG, GETPC());
++    }
++
++    /* Every other (cg, rc) combination -- full CFXREG fault semantics for
++     * the remaining per-cfx cg0/cg1/cg2/cg4/cg6/cg7 register maps and
++     * reserved-cfxcode routing to ILLI -- is out of O1/O2 scope (KL-102a
++     * report §3.1/§4; KL-112a scope note directly above). Treated as a
++     * silent no-op rather than fabricating state that has no backing
++     * storage; not reachable by the HBI §3 handoff stub or this task's
++     * validation scenarios. */
+ }
+ 
+ /* KL-110a: centralized escape state transition (HBI §3 O1 handoff subset
+  * only — cfx_power self-escape). See helper_cfx2rc's comment for the
+- * centralization rationale. */
++ * centralization rationale.
++ *
++ * KL-112a design 1 (candidate B) adds the SEE §5 exception-exit flow's step
++ * 0 (escape-cfx-mask permission check) that O1 intentionally left
++ * unimplemented -- see the scope note this replaces, below. */
+ void helper_escape(CPUDADAOState *env, uint64_t cfxcode, uint64_t imms18)
+ {
+     target_ulong prev_run_mode;
+@@ -177,12 +236,28 @@ void helper_escape(CPUDADAOState *env, uint64_t cfxcode, uint64_t imms18)
+     cfxcode &= 0x3F;
+     mode_before = env->inner_run_mode;
+ 
+-    /* SEE §5 exception-exit flow step 0 (escape-cfx-mask permission check)
+-     * is O2 scope and intentionally not implemented -- see KL-102a report
+-     * §3.2. Only cfx_power's exception frame exists (KL-102b); escaping
+-     * any other cfxcode has no frame to restore from and falls back to a
+-     * zeroed frame instead of fabricating per-cfx state that was never
+-     * written. */
++    /* KL-112a design 1 (candidate B): SEE §5 exception-exit flow step 0.
++     * `⟨cfxname⟩` = inner_cfx_code (the cfx executing this escape),
++     * `<mode>` = inner_run_mode *before* steps 1-2 restore it (i.e. the
++     * current, not-yet-restored value read here). [wiki §DADAO-12-SEE §5
++     * L815 (⟨cfxname⟩ binding), L824–L835 (step 0 pseudocode)] On failure:
++     * ILLI, and none of steps 1-4 below execute -- inner_run_mode/
++     * inner_cfx_mask stay at their current (pre-escape) values and PC does
++     * not move, matching this project's existing "precise fault, no
++     * architectural side effect" convention for ILLI/UNDI/MALIGN
++     * (contracts/isa/spec.md §2.7). */
++    if (cfxcode != env->inner_cfx_code) {
++        uint64_t escape_mask =
++            env->cfx_escape_cfx_mask[env->inner_cfx_code][env->inner_run_mode];
++        if ((escape_mask >> cfxcode) & 1) {
++            dadao_raise_exception(env, EXCP_ILLI, GETPC());
++        }
++    }
++
++    /* Only cfx_power's exception frame exists (KL-102b); escaping any other
++     * cfxcode that passed the check above has no frame to restore from and
++     * falls back to a zeroed frame instead of fabricating per-cfx state
++     * that was never written (unchanged from O1 -- KL-102a report §3.2). */
+     if (cfxcode == DADAO_CFX_CODE_POWER) {
+         prev_run_mode = env->cfx_power_frame.prev_run_mode;
+         prev_cfx_mask = env->cfx_power_frame.prev_cfx_mask;
+-- 
+2.43.0
+
