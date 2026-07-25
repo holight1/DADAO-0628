@@ -450,3 +450,69 @@
   # 现在这个 override 只是"当前阶段安全、需要在有动态链接需求时重新审视"
   # 的临时措施，不是长久方案。
 
+- id: dadao-vector-by-value-call-boundary-cc-unimplemented
+  title: "vector_size types passed/returned BY VALUE across a function call boundary crash CC allocation (CallingConvLower.cpp) -- DADAOCallingConv.td has no rule for the scalarized element types (e.g. i8/i16) a small vector splits into, and no design decision exists for how a vector-by-value argument/return should map onto DADAO's limited RD-bank register set (or fall back to indirect/sret like large aggregates already do)"
+  status: open
+  scope: [abi, codegen, calling-convention]
+  blocks: "3/9 gcc-c-torture files from ML-040a's vector-legalization fix (pr60960.c, simd-6.c, pr70903.c); would also block any future vector-by-value ABI conformance work"
+  resolved_by: null
+  # ML-040a (2026-07-25) diagnosed and fixed the getSetCCResultType
+  # assertion crash (TargetLoweringBase.cpp:1905) that blocked 9
+  # gcc-c-torture files using clang/GCC's `vector_size` attribute --
+  # DADAOTargetLowering::getSetCCResultType now overrides the base
+  # implementation the same way Sparc/CSKY do
+  # (VT.changeVectorElementTypeToInteger() for vector VTs), letting
+  # target-independent type legalization split/scalarize vector types down
+  # to legal scalar ops with no DADAO-specific "vector hardware" concept
+  # added. This closed 6/9 files for real (compile+link+run PASS under both
+  # QEMU and gem5, not just "compiles"): pr23135.c, pr53645.c, pr53645-2.c,
+  # scal-to-vec1.c, simd-1.c, simd-2.c.
+  #
+  # The remaining 3 (pr60960.c, simd-6.c, pr70903.c) hit a SEPARATE,
+  # unrelated crash that the getSetCCResultType fix does not touch:
+  #
+  #   fatal error: error in backend: unable to allocate function return #2
+  #   (pr60960.c's v4qi = unsigned char vector_size(4), 32-bit total;
+  #    simd-6.c's v8qi = unsigned char vector_size(8), 64-bit total)
+  #
+  #   UNREACHABLE executed at .../CallingConvLower.cpp:174!
+  #   (pr70903.c's V8/V32/V64 = vector_size(32), 256-bit total, mixing
+  #    8/32/64-bit element types via cross-type vector reinterpretation)
+  #
+  # Root cause (confirmed via -print-after-all / by hand-deriving what
+  # SelectionDAGBuilder's CC-analysis Outs list looks like): all three
+  # files have `__attribute__((noinline, noclone))` functions that take or
+  # return a vector BY VALUE. Because target-independent type legalization
+  # scalarizes a vector with no register class into N SEPARATE per-element
+  # scalar SDValues (e.g. v4qi -> 4 individual i8 values, NOT one packed
+  # i32), each element becomes its own CC-analysis entry -- but
+  # RetCC_DADAO/CC_DADAO (DADAOCallingConv.td) only define rules for
+  # CCIfPtr and CCIfType<[i64]>; an i8-typed entry matches neither, so
+  # CCState::AnalyzeReturn/AnalyzeCallResult has nowhere to put it and
+  # fatal-errors. This is a DIFFERENT mechanism from the getSetCCResultType
+  # crash and from the __int128-return CC fix (ML-038a, RD31/RD30 split):
+  # __int128 is a single value split into exactly 2 same-size i64 halves by
+  # DataLayout::isBigEndian()'s fixed splitting rule; a small vector
+  # instead explodes into as many CC entries as it has elements, and there
+  # is no existing wiki/spec ABI convention (contracts/abi/spec.md never
+  # mentions vector types at all) for how those should be
+  # packed/registered/indirected. pr70903.c's 256-bit-total vectors make
+  # this qualitatively worse -- far too wide for any register-based
+  # convention, and would need the SAME kind of indirect/sret fallback the
+  # aggregate-struct ABI (ML-031a) already has for large structs, except
+  # vector types don't currently go through that struct/aggregate
+  # classification path in clang's DADAO ABI info at all.
+  #
+  # ML-040a's task file explicitly scoped this out: fixing it for real
+  # requires a genuine new ABI design decision (how many registers, what
+  # order, when to fall back to indirect passing) analogous to the
+  # dedicated task DL-072a took for the varargs-pointer-bank ABI question --
+  # not "a few more setOperationAction declarations", which is what the
+  # task's hard-stop condition for over-scope work was calibrated against.
+  # Registered here rather than attempted; recommend a dedicated follow-up
+  # task if/when this is prioritized (bundle pr60960.c/simd-6.c under a
+  # "narrow vector fits in one register, pack via bitcast to iN" sub-case
+  # and treat pr70903.c's 256-bit case under the existing large-aggregate
+  # indirect/sret convention, since they are genuinely different sizes of
+  # problem).
+

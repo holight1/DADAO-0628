@@ -1,0 +1,219 @@
+From f7cc59f158fc2ee3971aeee33c2a615b7d2c9d24 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 08:09:14 +0800
+Subject: [PATCH] DADAO: declare getSetCCResultType for vector types (ML-040a)
+
+DADAO has no vector register class (addRegisterClass in
+DADAOISelLowering.cpp's constructor is only ever called for MVT::i64), so
+every clang/GCC vector_size-attribute type is an "illegal" type from day
+one. Target-independent SelectionDAG type legalization already knows how
+to split/scalarize such types down to legal per-element scalar ops with no
+DADAO-specific opt-in -- the one missing piece was
+TargetLoweringBase::getSetCCResultType, whose base implementation
+unconditionally asserts !VT.isVector(): target-independent DAG combining
+expands vector division/remainder using an internal SETCC-based sequence
+while the operand is still a vector type, before splitting/scalarizing
+narrows it to a legal scalar, so this hook fires first.
+
+Override it the same way Sparc/CSKY (also no vector register file) do:
+VT.changeVectorElementTypeToInteger() for vector VTs, unchanged base
+behavior otherwise. This is not a "vector hardware" addition -- it only
+tells the already-automatic legalization path what integer type each
+per-lane boolean should use.
+
+Fixes 6 of 9 originally crashing gcc-c-torture files (pr23135.c,
+pr53645.c, pr53645-2.c, scal-to-vec1.c, simd-1.c, simd-2.c) to real PASS
+(compile+link+run under both QEMU and gem5). The remaining 3
+(pr60960.c, simd-6.c, pr70903.c) pass a vector by value across a function
+call boundary and hit a separate, unrelated CC-allocation crash
+(CallingConvLower.cpp) that needs a real ABI design decision for
+vector-by-value arguments/returns -- out of scope here, tracked as
+docs/issues.yaml dadao-vector-by-value-call-boundary-cc-unimplemented.
+
+Adds llvm/test/CodeGen/DADAO/vector-type-legalization.ll covering the four
+vector shapes/operators actually exercised by the fixed corpus files
+(<2 x i32> add, <4 x i32> sdiv, <8 x i16> udiv, <4 x float> fdiv).
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   |   8 ++
+ llvm/lib/Target/DADAO/DADAOISelLowering.h     |  33 ++++++
+ .../CodeGen/DADAO/vector-type-legalization.ll | 105 ++++++++++++++++++
+ 3 files changed, 146 insertions(+)
+ create mode 100644 llvm/test/CodeGen/DADAO/vector-type-legalization.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index 8fbded022136..47d796aa360e 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -146,6 +146,14 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+   computeRegisterProperties(STI.getRegisterInfo());
+ }
+ 
++EVT DADAOTargetLowering::getSetCCResultType(const DataLayout &DL,
++                                            LLVMContext &Context,
++                                            EVT VT) const {
++  if (VT.isVector())
++    return VT.changeVectorElementTypeToInteger();
++  return TargetLowering::getSetCCResultType(DL, Context, VT);
++}
++
+ std::pair<unsigned, const TargetRegisterClass *>
+ DADAOTargetLowering::getRegForInlineAsmConstraint(
+     const TargetRegisterInfo *TRI, StringRef Constraint, MVT VT) const {
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.h b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+index fdc00f6c320b..fb718d1ff4a4 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.h
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.h
+@@ -97,6 +97,39 @@ public:
+   // in range would recover it but does not exist yet.
+   bool isOffsetFoldingLegal(const GlobalAddressSDNode *GA) const override;
+ 
++  // DADAO has no vector register class (addRegisterClass is only ever
++  // called for MVT::i64, see the constructor) -- every clang/GCC
++  // `vector_size`-attribute vector type is therefore an "illegal" type
++  // from day one, and target-independent SelectionDAG type legalization
++  // handles that automatically by recursively splitting a power-of-2-
++  // element-count vector (TypeSplitVector) down to single-element vectors
++  // and then scalarizing those (TypeScalarizeVector) into plain per-
++  // element scalar ops on the already-legal element type -- see
++  // TargetLoweringBase::computeRegisterProperties's default vector
++  // handling, which requires no DADAO-specific opt-in at all. But the
++  // *base* TargetLoweringBase::getSetCCResultType unconditionally asserts
++  // `!VT.isVector()` (TargetLoweringBase.cpp): several of the scalarized
++  // per-element operations vector code in this corpus uses (signed/
++  // unsigned division and remainder by a non-power-of-2 vector constant,
++  // in particular) get expanded by *target-independent* DAG legalization
++  // using an internal SETCC-based shift/compare/subtract sequence before
++  // the scalarization/splitting above ever narrows the operand down to a
++  // legal scalar type, so this hook is queried while the operand is still
++  // a vector type and the assert fires long before any DADAO-specific
++  // vector lowering code would run. This override is the same one Sparc/
++  // CSKY (also no vector register file) use: for a vector type, the SetCC
++  // result is itself a vector with the same element count, and
++  // `changeVectorElementTypeToInteger()` reuses the scalarized element's
++  // own integer counterpart as that per-lane boolean's type (matching
++  // ordinary scalar SETCC's `iN` result convention below), which is a
++  // legal type recursively through the same split/scalarize path as the
++  // vector operation itself -- no new register class or "vector hardware"
++  // concept required. The non-vector branch is unchanged from what the
++  // base class already returns for this target's pointer-sized boolean
++  // convention (MVT::i64).
++  EVT getSetCCResultType(const DataLayout &DL, LLVMContext &Context,
++                         EVT VT) const override;
++
+ private:
+   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+   SDValue lowerFrameIndex(SDValue Op, SelectionDAG &DAG) const;
+diff --git a/llvm/test/CodeGen/DADAO/vector-type-legalization.ll b/llvm/test/CodeGen/DADAO/vector-type-legalization.ll
+new file mode 100644
+index 000000000000..ad640a23288f
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/vector-type-legalization.ll
+@@ -0,0 +1,105 @@
++; ML-040a: DADAO has never had a vector register class (addRegisterClass in
++; DADAOISelLowering.cpp's constructor is only ever called for MVT::i64), so
++; every clang/GCC `vector_size`-attribute type used by the gcc-c-torture
++; corpus (pr23135.c, pr53645.c, pr53645-2.c, scal-to-vec1.c, simd-1.c,
++; simd-2.c) is an "illegal" type from day one. Target-independent
++; SelectionDAG type legalization already knows how to handle that with no
++; DADAO-specific opt-in at all -- TargetLoweringBase::computeRegisterProperties
++; recursively splits a power-of-2-element-count vector (TypeSplitVector) down
++; to single-element vectors and then scalarizes those (TypeScalarizeVector)
++; into plain per-element scalar ops on the legal element type. The one
++; missing piece was TargetLoweringBase::getSetCCResultType, whose *base*
++; implementation unconditionally asserts `!VT.isVector()`: several scalarized
++; operations (signed/unsigned division and remainder against a non-power-of-2
++; vector constant in particular) get expanded by *target-independent* DAG
++; combining using an internal SETCC-based sequence WHILE the operand is still
++; a vector type, i.e. before splitting/scalarizing has narrowed it down to a
++; legal scalar -- so this hook fires long before any DADAO-specific lowering
++; runs. DADAOTargetLowering::getSetCCResultType now overrides it the same way
++; Sparc/CSKY (also no vector register file) do:
++; `VT.changeVectorElementTypeToInteger()` for vector VTs, unchanged base
++; behavior otherwise.
++;
++; This test does not exercise vector types crossing a function call boundary
++; (by-value vector arguments/return values) -- that hits a SEPARATE,
++; unrelated crash (CC allocation, CallingConvLower.cpp) tracked as a distinct
++; open issue (see docs/issues.yaml
++; dadao-vector-by-value-call-boundary-cc-unimplemented) and is deliberately
++; out of scope here. Every function below only touches vectors via pointer
++; loads/stores, matching the real corpus files' shapes (pr23135.c/simd-1.c/
++; simd-2.c/pr53645*.c keep vector values in globals/locals and only pass
++; individually-extracted scalar elements across calls; scal-to-vec1.c never
++; calls a function that takes/returns a vector by value at all).
++;
++; RUN: llc -mtriple=dadao < %s | FileCheck %s
++
++; <2 x i32>, 64-bit total -- pr23135.c's `vecint` shape.
++define void @add_v2si(ptr %rp, ptr %ap, ptr %bp) {
++; CHECK-LABEL: add_v2si:
++; CHECK: add rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: add rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK-NOT: v0
++entry:
++  %a = load <2 x i32>, ptr %ap
++  %b = load <2 x i32>, ptr %bp
++  %r = add <2 x i32> %a, %b
++  store <2 x i32> %r, ptr %rp
++  ret void
++}
++
++; <4 x i32>, 128-bit total -- simd-1.c/pr53645.c's shape. Signed division is
++; the actual getSetCCResultType trigger (DAGCombiner::visitSDIV's build-sdiv
++; expansion queries the per-lane boolean type while %a/%b are still vectors).
++define void @sdiv_v4si(ptr %rp, ptr %ap, ptr %bp) {
++; CHECK-LABEL: sdiv_v4si:
++; CHECK: divs rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divs rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divs rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divs rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK-NOT: v0
++entry:
++  %a = load <4 x i32>, ptr %ap
++  %b = load <4 x i32>, ptr %bp
++  %r = sdiv <4 x i32> %a, %b
++  store <4 x i32> %r, ptr %rp
++  ret void
++}
++
++; <8 x i16>, 128-bit total -- simd-2.c/pr53645-2.c's shape. Unsigned
++; division/remainder on a narrower element type than the above, and the
++; widest element count in the "clean" (no call-boundary) subset of the
++; corpus.
++define void @udiv_v8hi(ptr %rp, ptr %ap, ptr %bp) {
++; CHECK-LABEL: udiv_v8hi:
++; CHECK: divu rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divu rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divu rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divu rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divu rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divu rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divu rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK: divu rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}, rd{{[0-9]+}}
++; CHECK-NOT: v0
++entry:
++  %a = load <8 x i16>, ptr %ap
++  %b = load <8 x i16>, ptr %bp
++  %r = udiv <8 x i16> %a, %b
++  store <8 x i16> %r, ptr %rp
++  ret void
++}
++
++; <4 x float>, 128-bit total -- scal-to-vec1.c's `vector(4, float)` shape.
++; Confirms the scalarization path also reaches DADAO's existing softfloat
++; libcall infrastructure (ML-020a/ML-022a) correctly for a vector operand,
++; not just integer division.
++define void @fdiv_v4sf(ptr %rp, ptr %ap, ptr %bp) {
++; CHECK-LABEL: fdiv_v4sf:
++; CHECK-COUNT-4: call __divsf3
++; CHECK-NOT: v0
++entry:
++  %a = load <4 x float>, ptr %ap
++  %b = load <4 x float>, ptr %bp
++  %r = fdiv <4 x float> %a, %b
++  store <4 x float> %r, ptr %rp
++  ret void
++}
+-- 
+2.43.0
+

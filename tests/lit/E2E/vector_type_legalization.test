@@ -1,0 +1,26 @@
+// ML-040a: runtime E2E regression guard for DADAOTargetLowering's new
+// getSetCCResultType override (vector type legalization -- see
+// Inputs/vector_type_legalization.c's header comment and
+// llvm/test/CodeGen/DADAO/vector-type-legalization.ll for the full
+// diagnosis, including the float-vector case this nostdlib test omits).
+// Compiles and runs real vector arithmetic (add/sub/mul/div/rem/and/or/
+// xor/neg/not on int vectors) at both -O0 and -O2, on both backends, plus
+// a negative control that must observably fail.
+
+// RUN: %llvm-mc -triple=dadao -filetype=obj -o %t.crt0.o %S/../../scripts/crt0.s
+// RUN: %clang --target=dadao-unknown-elf -O0 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/vector_type_legalization.c -o %t.o0.elf
+// RUN: %llvm-objcopy -O binary %t.o0.elf %t.o0.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O2 -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/vector_type_legalization.c -o %t.o2.elf
+// RUN: %llvm-objcopy -O binary %t.o2.elf %t.o2.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.bin >/dev/null 2>&1; test $? -eq 42'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.elf >/dev/null 2>&1; test $? -eq 42'
+// RUN: %clang --target=dadao-unknown-elf -O0 -DNEGATIVE_CONTROL -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/vector_type_legalization.c -o %t.o0.neg.elf
+// RUN: %llvm-objcopy -O binary %t.o0.neg.elf %t.o0.neg.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o0.neg.bin >/dev/null 2>&1; test $? -eq 1'
+// RUN: bash -c '%gem5 %gem5_se %t.o0.neg.elf >/dev/null 2>&1; test $? -eq 1'
+// RUN: %clang --target=dadao-unknown-elf -O2 -DNEGATIVE_CONTROL -nostdlib -Wl,-T,%S/../../scripts/dadao.ld %t.crt0.o %S/Inputs/vector_type_legalization.c -o %t.o2.neg.elf
+// RUN: %llvm-objcopy -O binary %t.o2.neg.elf %t.o2.neg.bin
+// RUN: bash -c '%qemu -M dadao-m1 -nographic -bios %trampoline -kernel %t.o2.neg.bin >/dev/null 2>&1; test $? -eq 1'
+// RUN: bash -c '%gem5 %gem5_se %t.o2.neg.elf >/dev/null 2>&1; test $? -eq 1'
