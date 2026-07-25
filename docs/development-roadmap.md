@@ -1835,7 +1835,22 @@ byte-identical shortcut behavior when off and a correct full round
 trip when on, reproduced a documented-not-fixed pre-existing CLI
 parsing bug, and replayed the 26-patch series to a matching tree hash.
 
-**K1 remaining**: gem5 port of O3, then MMU/TLB + interrupt dispatch.
+## K1: O3 real `trap cfx_smon` entry flow ported to gem5 (2026-07-26) — see `code-agent/tasks/KL-117a-*.md`
+
 Per user instruction (2026-07-26), tasks from here on are dispatched to
 Codex rather than architect-run subagents — independent ground-truth
-review standard is unchanged.
+review standard is unchanged (only performed when explicitly requested,
+per updated review-timing convention). Codex ported KL-116a's QEMU
+state machine to gem5: new `cfx_smon_real` ISA Param (default off),
+`CfxSmonFrame`, `cg2/rc10` `cfx2rc` write support, and the entry-flow
+state machine in `TrapInst::execute()` (using gem5's NPC-staging
+convention to redirect to the exception vector while preserving the
+default path's existing sequential `advancePC()` contract — a
+mid-review commit amend, confirmed by hand against gem5's
+`SimplePCState::advance()` semantics). Architect independently rebuilt
+gem5, reran the A/B probe (a "discriminating prior mask" trick proves
+the frame save/restore round-trip is genuine, not coincidental),
+confirmed the KL-113a O1/O2 probes and full E2E/differential suite are
+unchanged, and replayed the 19-patch series to a matching tree hash.
+
+**K1 remaining**: MMU/TLB + interrupt dispatch (QEMU + gem5).
