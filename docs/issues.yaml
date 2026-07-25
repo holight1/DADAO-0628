@@ -12,6 +12,33 @@
 # docs/issues-archive.yaml (same schema) -- day-to-day lookup/registration
 # of new issues only needs this file.
 
+- id: gcc-torture-20031003-1-float-int-boundary-saturation
+  title: "20031003-1.c: (int)2147483648.0f and (int)(float)2147483647 are boundary float->int conversions where the source value is at or beyond INT_MAX -- ISO C (6.3.1.4p1) leaves this undefined behavior; the test's own upstream source has an #ifdef __SPU__ branch acknowledging platform-dependent results, so a DADAO-specific non-saturating result is not a DADAO backend bug, just a different (also-conforming) UB outcome"
+  status: open
+  scope: [correctness, low-priority, deferred]
+  blocks: null
+  resolved_by: null
+  # Found by ML-026a's original scan, re-confirmed by ML-035a's rescan
+  # (2026-07-24, §3.5) as one of 2 low-priority FAIL_RUN singletons never
+  # deep-dived. Deferred at the close of the gcc-c-torture push
+  # (milestone closed 2026-07-25, see docs/development-roadmap.md) --
+  # registered here so it has a tracked reason rather than only living in
+  # a review report. Low priority: single file, behavior is UB per the
+  # C standard itself, upstream test already expects platform variance.
+- id: gcc-torture-pr85169-vector-scalarize-single-element-store
+  title: "pr85169.c: writing a single element of a 64-byte char vector_size vector loaded through a pointer, storing it back, produces a wrong result at runtime (FAIL_RUN, not a compile-time crash) -- likely a genuine correctness gap in the vector-scalarization memory path (distinct from ML-040a's getSetCCResultType fix and from dadao-vector-by-value-call-boundary-cc-unimplemented's by-value call-boundary gap, since this file never crosses a function call boundary with a vector operand)"
+  status: open
+  scope: [codegen, vector, low-priority, deferred]
+  blocks: null
+  resolved_by: null
+  # Found by ML-026a's original scan, re-confirmed by ML-035a's rescan
+  # (2026-07-24, §3.5). Deferred at the close of the gcc-c-torture push
+  # (milestone closed 2026-07-25, see docs/development-roadmap.md).
+  # Low priority per ML-035a's own assessment: single file, and DADAO
+  # has no real vector hardware at all -- value of chasing vector
+  # scalarization correctness further is limited relative to other
+  # priorities. Not deep-dived beyond confirming it's a genuine wrong
+  # runtime result, not merely "vector unsupported."
 - id: dadao-frame-lowering-8byte-align-insufficient-for-16byte-locals
   title: "128-bit-aligned locals (SIMD vector alloca, __int128 spill slot) are not supported by the DADAO ABI and are permanently excluded, like HFA -- the wiki's ABI type table (DADAO-21-ABI §Fundamental Types, the sizeof/Alignment table) never defines a type wider than 8 bytes (long/pointer/double top out at Alignment=8; aggregates are 'at least 8-byte aligned'), so __int128/vector are GNU extensions with no DADAO ABI alignment contract at all -- DADAOFrameLowering.h's declared Align(8) is therefore CORRECT per spec, not a bug to fix; the 2 gcc-c-torture files exercising these types are expected to remain non-PASS"
   status: open

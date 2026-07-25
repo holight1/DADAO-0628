@@ -1645,3 +1645,58 @@ PASS. gcc-c-torture: 1479→1482/1708 (86.8%), zero regressions (full
 1708-file resweep repeated twice for stability). Full E2E (81/81),
 CodeGen lit (13/13) pass; 64-patch LLVM series replays clean with
 matching tree hash.
+
+## Milestone: gcc-c-torture compiler-correctness push — closed (2026-07-25)
+
+User decision 2026-07-25: stop actively pursuing further gcc-c-torture
+PASS growth and move to kernel bring-up (ADR-0015 K1). This closes the
+arc that ran from ML-019a (roadmap A, 2026-07-22) through ML-041a
+(2026-07-25), executing ADR-0012 D5's "gcc-c-torture full pass, or a
+clearly documented reason for every failure" mandate.
+
+**Final state**: `PASS=1482 FAIL_COMPILE=87 FAIL_LINK=124 FAIL_RUN=15`
+out of 1708 (86.8%), up from ML-026a's original baseline of 1328
+(77.8%). Every remaining non-PASS file has a tracked, documented reason
+(`docs/issues.yaml`/`docs/issues-archive.yaml`), not a silent gap:
+
+- **FAIL_LINK (124)**: ML-035a's rescan found 100% already accounted
+  for by known, non-DADAO-bug causes — mostly (106) multi-file torture
+  companions missing `main` (a testsuite structure artifact, not a
+  backend defect) plus gnu89 inline semantics, known GCC-only builtins,
+  etc.
+- **FAIL_COMPILE (87)**: 84 are genuine, reasonable unsupported-language-
+  feature gaps (setjmp/longjmp 34, nested functions 29, VLA-in-struct 8,
+  etc.) — real "not supported" declarations, not bugs. The remaining 3
+  are `dadao-vector-by-value-call-boundary-cc-unimplemented` (found by
+  ML-040a): by-value vector arguments/returns need a genuine new ABI
+  design decision — same magnitude of work as DL-072a's varargs
+  pointer-bank design — deliberately not pursued without a dedicated
+  design decision first.
+- **FAIL_RUN (15)**: includes `dadao-frame-lowering-8byte-align-
+  insufficient-for-16byte-locals` (permanent ABI-scope exclusion, like
+  HFA — 2 files), known upstream/musl gaps, 2 known architecture issues,
+  and 2 newly-registered low-priority singletons
+  (`gcc-torture-20031003-1-float-int-boundary-saturation`,
+  `gcc-torture-pr85169-vector-scalarize-single-element-store`).
+
+**Sequence of fixes landed in this arc** (see each entry above for
+detail): ML-019a/020a/021a/022a (stdio+printf link chain),
+ML-024a/025a (malloc/scanf gaps), DL-072a (varargs pointer-bank ABI),
+ML-026a (first full-corpus scan), ML-027a/029a (frame-offset `imms12`
+silent-wraparound miscompile — a real, general correctness bug, not a
+torture-only edge case), ML-028a (92-file softfloat symbol family),
+ML-030a (relocation-range overflow), ML-031a (aggregate/struct ABI),
+ML-033a (dynamic stack allocation), ML-034a (`-ffreestanding` removal),
+ML-036a (P0: `-O0` negative-polarity single-bit-AND mask-drop
+miscompile — the highest-severity defect found in this entire arc),
+ML-037a (`__divsc3`), ML-038a (`__int128` return CC),
+ML-039a (`__int128` arithmetic libcalls), ML-040a (vector `SetCC`
+legalization), ML-041a (`BlockAddress`/computed goto).
+
+**Next**: kernel bring-up per ADR-0015, starting at K1 (SEE/interrupt/
+MMU-SBI infrastructure) — K0 research is already complete (KL-001a),
+with a K1 ten-task breakdown (KL-101a–110a) already proposed. Per
+ADR-0015's own framing, this is an independent track from gcc-c-torture
+(most torture cases are single-process pure computation that don't need
+a real kernel); the vector-by-value CC gap and the remaining low-priority
+singletons stay open, revisitable later, not blocking.
