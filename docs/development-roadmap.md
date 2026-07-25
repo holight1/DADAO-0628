@@ -1772,3 +1772,26 @@ hash. Full E2E (81/81) and differential checks unchanged.
 (KL-103a), then MMU/TLB + interrupt dispatch — followed by K2
 (bare-metal regression), K3 (real Linux 5.4 port), K4 (boot to a musl
 `/init`).
+
+## K1: hypv→supv privilege handoff O1 + O2 design1/design3 ported to gem5 (2026-07-25) — see `code-agent/tasks/KL-113a-*.md`
+
+Ported QEMU's verified `cfx2rc`/`escape` state machine to gem5
+field-for-field (CFX privilege state as plain `ISA`-class members,
+`CFX2RCInst`/`EscapeInst` StaticInsts, `CfxregFault`) — gem5 had none of
+this before (no `cfx2rc`/`escape` decoding, no privilege state at all).
+Design 2 skipped, same reasoning as QEMU's `docs/wiki-deviations.md`
+#11. gem5 SE mode has no bare-metal reset vector, so `ISA::clear()` at
+`ThreadContext` construction stands in for QEMU's post-reset
+observation point; verification reused the exact QEMU-side probe
+instruction streams rebased for gem5's ELF load address. Architect
+independently rebuilt gem5, reran all four probes with matching exit
+codes/traces, and replayed the full 18-patch series to a matching tree
+hash. Full E2E (81/81) and differential checks unchanged; scope
+explicitly bounded by user decision (2026-07-25) — gem5 parity
+continues through the rest of K1's bare-metal primitives (MMU/TLB,
+interrupt dispatch) but will be re-evaluated before K2, since gem5 was
+never meant to become a second kernel-boot platform.
+
+**Next in the K1 sequence**: LLVM MC support for `ldmo-ra`/`stmo-ra`/
+`cfx2rc`/`escape`, `cfx_smon` real guest handler (KL-103a), then MMU/TLB
++ interrupt dispatch.
