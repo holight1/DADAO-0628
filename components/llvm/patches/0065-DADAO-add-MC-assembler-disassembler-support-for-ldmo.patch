@@ -1,0 +1,264 @@
+From 1146c671a1ae418fd84733fa98fd58a559a5112d Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 18:02:15 +0800
+Subject: [PATCH] DADAO: add MC assembler/disassembler support for
+ ldmo-ra/stmo-ra/cfx2rc/escape (KL-114a)
+
+These four instructions (RegRAS whole-bank RA load/store, and the
+hypv->supv cfx register-transfer/exit pair) were already implemented and
+differentially verified in QEMU (KL-108a/110a/112a) and gem5
+(KL-109a/113a), but LLVM's assembler/disassembler had no knowledge of
+them at all -- every existing test exercised them via hand-encoded raw
+instruction words (tests/scripts/gen_kl110a_o1_probe.py etc.), not real
+.s source.
+
+- DADAOInstrFormats.td: new F_RRRI_RA class (RegRAS integer-bank
+  counterpart of F_RRRI_RB, field named raha instead of rbha) and new
+  F_CRRR class (cfxcode/cg/rc/rdhd, same base ha/hb/hc/hd bit layout as
+  every other format -- crrr only needed a class to name the fields
+  after their wiki roles).
+- DADAOInstrInfo.td: LDMO_RARRRI (op=0x67) / STMO_RA_RRRI (op=0x6F) using
+  the new GPRA register class (already declared, isAllocatable=0, unused
+  until now); CFX2RC_CRRR (op=0x73); ESCAPE_CIII (op=0x77, direct
+  TRAP_CIII twin). ldmo/stmo keep the bare "ldmo"/"stmo" mnemonic,
+  overloaded on the destination operand's register class exactly like
+  the existing RD-bank/RB-bank ldmo/stmo forms already are -- confirmed
+  by cross-referencing every already-implemented "-rb" row in
+  contracts/isa/spec.md's Appendix A (0x43 "ldo-rb", 0x47 "ldmo-rb", 0x4F
+  "stmo-rb") against its actual LLVM mnemonic (bare "ldo"/"ldmo"/"stmo"):
+  spec.md's "-ra"/"-rb" suffix is a prose disambiguation label for the
+  opcode table, not a distinct assembler token. A literal hyphenated
+  mnemonic is also not achievable through the stock MC lexer (identifier
+  grammar excludes '-'; confirmed empirically).
+- Disassembler/DADAODisassembler.cpp: new DecodeGPRARegisterClass,
+  the same handwritten RegNo->MCRegister mapping DecodeGPRBRegisterClass
+  already has, now needed because GPRA is used by a real instruction for
+  the first time.
+- cfx2rc/escape's cfxcode/cg/rc operands are bare six-bit immediates
+  (immu6/cfxcode6, both already-existing operand types sharing
+  Immu6AsmOperand) -- the wiki's cfx_<cfxname>_regname symbolic shorthand
+  (SimRISC-04 L91-97) is intentionally out of scope (KL-114a).
+
+Verified: all 8 encoded instruction words (ldmo/stmo ra1/ra63/ra0 with
+assorted rb/rd/imm6 operands, cfx2rc 63,8,1,rd2 -- the numeric form of
+wiki's own "cfx_power, 8, 1, rd2" worked example -- and 0,0,0,rd0, escape
+63,0 -- the exact final instruction of the KL-110a HBI handoff probe --
+and escape 5,-4) match byte-for-byte against independently computed
+ground truth using scripts/check_legality_matrix.py's encode() formula
+(op<<24|ha<<18|hb<<12|hc<<6|hd) cross-checked against
+target/dadao/insn.decode and tools/opcodes.yaml's field layout for all
+four opcodes. llvm-objdump -d round-trips every case back to the
+original mnemonic/operands. New lit tests: tests/lit/MC/Dadao/ra_ops.s,
+cfx_ops.s (llvm-mc -> objdump OBJ byte check + llvm-mc -filetype=asm ASM
+round-trip, this project's existing MC test convention), plus range
+validation additions to llvm/test/MC/DADAO/immediate-range-{valid,invalid}.s.
+No CodeGen/SelectionDAG lowering added (out of scope). Full regression:
+llvm/test/MC/DADAO (4/4), llvm/test/CodeGen/DADAO (13/13),
+tests/lit/MC/Dadao (16/16), tests/lit/E2E (81/81), tools/run_differential.py
+unchanged (AGREE(3-way)=200, AGREE(4-way)=200, DIVERGE=0).
+---
+ llvm/lib/Target/DADAO/DADAOInstrFormats.td    | 35 +++++++++++++++
+ llvm/lib/Target/DADAO/DADAOInstrInfo.td       | 43 +++++++++++++++++++
+ .../DADAO/Disassembler/DADAODisassembler.cpp  |  9 ++++
+ llvm/test/MC/DADAO/immediate-range-invalid.s  | 28 ++++++++++++
+ llvm/test/MC/DADAO/immediate-range-valid.s    | 13 ++++++
+ 5 files changed, 128 insertions(+)
+
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrFormats.td b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
+index 7bceb8a9f5c4..816ac9f3c6b3 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrFormats.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrFormats.td
+@@ -258,6 +258,41 @@ class F_RRRI_RB<dag outs, dag ins, string asmstr, list<dag> pattern>
+   let hd = imm6;
+ }
+ 
++// RA + RB + RD + 6-bit imm (rrri_ra) - raha, rbhb, rdhc, imm6
++// RegRAS integer-bank counterpart of F_RRRI_RB (wiki SimRISC-02
++// "存取RA寄存器": `ldmo raha, rbhb, rdhc, immu6` / `stmo raha, rbhb, rdhc,
++// immu6`, opcodes 0x67/0x6F). Same encoding layout as F_RRRI_RB, only the
++// ha-field operand's register class differs (GPRA instead of GPRB).
++class F_RRRI_RA<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> raha;
++  bits<6> rbhb;
++  bits<6> rdhc;
++  bits<6> imm6;
++  let ha = raha;
++  let hb = rbhb;
++  let hc = rdhc;
++  let hd = imm6;
++}
++
++// cfx register-transfer format (crrr) - cfxcode, cg, rc, rdhd
++// wiki SimRISC-04 "寄存器传输指令": `cfx2rc cfx_<cfxname>, cghb, rchc,
++// rdhd` (op=0x73). Bit layout is identical to the base InstDADAO
++// ha/hb/hc/hd split (same as F_RRRI/F_RRRI_RB/F_RRRI_RA); a dedicated
++// class exists only to name the four fields after their crrr roles
++// (cfxcode/cg/rc/rdhd) instead of reusing an unrelated rrri/rrrr name.
++class F_CRRR<dag outs, dag ins, string asmstr, list<dag> pattern>
++    : InstDADAO<outs, ins, asmstr, pattern> {
++  bits<6> cfxcode;
++  bits<6> cg;
++  bits<6> rc;
++  bits<6> rdhd;
++  let ha = cfxcode;
++  let hb = cg;
++  let hc = rc;
++  let hd = rdhd;
++}
++
+ // RD reg + ww + 16-bit imm (rwii) - rdha, ww, imm16
+ class F_RWII<dag outs, dag ins, string asmstr, list<dag> pattern>
+     : InstDADAO<outs, ins, asmstr, pattern> {
+diff --git a/llvm/lib/Target/DADAO/DADAOInstrInfo.td b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+index 3b358d28c45a..142c1a9b5377 100644
+--- a/llvm/lib/Target/DADAO/DADAOInstrInfo.td
++++ b/llvm/lib/Target/DADAO/DADAOInstrInfo.td
+@@ -424,6 +424,24 @@ let op = 0x65 in def JUMP_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb
+ // Jump / Call / Ret (op=0x64-0x6E)
+ //===----------------------------------------------------------------------===//
+ 
++// RA bank multi load (op=0x67) — rrri format, RegRAS integer-bank
++// counterpart of LDMO_RBRRRI (op=0x47). wiki SimRISC-02 "存取RA寄存器":
++// `ldmo raha, rbhb, rdhc, immu6`; same mnemonic as the RD/RB-bank ldmo
++// forms above, overloaded on the destination operand's register class
++// (GPRA here) exactly like ldmo already is between GPRD (op=0x37) and
++// GPRB (op=0x47). contracts/isa/spec.md §4.9/Appendix A labels this row
++// "ldmo-ra" in prose, but that suffix is the same documentation-only
++// disambiguation spec.md already uses for the RB-bank rows (0x43
++// "ldo-rb", 0x47 "ldmo-rb") whose real, already-implemented LLVM mnemonic
++// is bare "ldo"/"ldmo" (see LDO_RBRRII/LDMO_RBRRRI above) — not a
++// distinct assembler token. A literal hyphenated "ldmo-ra" mnemonic is
++// also not achievable through the generic MC lexer without bespoke
++// tokenizer surgery: LLVM's default AsmLexer identifier grammar
++// (`[a-zA-Z_$.@?][a-zA-Z0-9_$.@#?]*`) excludes '-', so "ldmo-ra" would
++// split into "ldmo" / "-" / "ra" tokens (confirmed empirically: it fails
++// to parse as a single mnemonic).
++let op = 0x67 in def LDMO_RARRRI : F_RRRI_RA<(outs GPRA:$raha), (ins GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "ldmo $raha, $rbhb, $rdhc, $imm6", []>;
++
+ // Real call instructions (used by ExpandPostRAPseudo)
+ // NOTE: no static Uses=[...] list (DL-065a) — see the identical rationale on
+ // CALL_PSEUDO_INDIRECT above; LowerCall's glued CopyToReg chain already
+@@ -446,11 +464,36 @@ let op = 0x6D in def CALL_RRII : F_RRII_JUMP<(outs), (ins GPRB:$rbha, GPRD:$rdhb
+ // verifier is the CALL at the *call site*, not the RET in the callee.
+ let op = 0x6E in def RET_RIII  : F_RIII_RD<(outs GPRD:$rdha), (ins imms18:$imm18), "ret $rdha, $imm18", []>;
+ 
++// RA bank multi store (op=0x6F) — rrri format, RegRAS integer-bank
++// counterpart of STMO_RB_RRRI (op=0x4F). wiki SimRISC-02 "存取RA寄存器":
++// `stmo raha, rbhb, rdhc, immu6`. Same "stmo-ra is a spec.md prose label,
++// not a distinct token" reasoning as LDMO_RARRRI above (STMO_RB_RRRI
++// itself is spec.md's "stmo-rb" row, mnemonic "stmo").
++let op = 0x6F in def STMO_RA_RRRI : F_RRRI_RA<(outs), (ins GPRA:$raha, GPRB:$rbhb, GPRD:$rdhc, immu6:$imm6), "stmo $raha, $rbhb, $rdhc, $imm6", []>;
++
++// cfx2rc (op=0x73) — crrr format: cfxcode in ha, cg in hb, rc in hc,
++// source rd register in hd. wiki SimRISC-04 "寄存器传输指令":
++// `cfx2rc cfx_<cfxname>, cghb, rchc, rdhd` — writes $rdhd into the cfx
++// register selected by (cfxcode, cg, rc). Only the bare-numeral operand
++// form is implemented here (cfxcode/cg/rc as plain immu6 integers); the
++// `cfx_<cfxname>_regname` symbolic shorthand from wiki SimRISC-04 L91-97
++// is a separate, larger feature and out of scope (KL-114a).
++let op = 0x73, hasSideEffects = 1 in
++def CFX2RC_CRRR : F_CRRR<(outs), (ins cfxcode6:$cfxcode, immu6:$cg, immu6:$rc, GPRD:$rdhd),
++                          "cfx2rc $cfxcode, $cg, $rc, $rdhd", []>;
++
+ // trap (op=0x76) — ciii format: cfxcode in ha, imm18 in hb+hc+hd
+ let op = 0x76, hasSideEffects = 1 in
+ def TRAP_CIII : F_RIII_RD<(outs), (ins cfxcode6:$rdha, imms18:$imm18),
+                            "trap $rdha, $imm18", []>;
+ 
++// escape (op=0x77) — ciii format: cfxcode in ha, imm18 in hb+hc+hd.
++// wiki SimRISC-04 "退出指令": `escape cfx_<cfxname>, imms18` — direct
++// mnemonic/format twin of trap (op=0x76), same F_RIII_RD template.
++let op = 0x77, hasSideEffects = 1 in
++def ESCAPE_CIII : F_RIII_RD<(outs), (ins cfxcode6:$rdha, imms18:$imm18),
++                             "escape $rdha, $imm18", []>;
++
+ //===----------------------------------------------------------------------===//
+ // CodeGen patterns — conditional branches (spec §5.1 / §5.2)
+ //===----------------------------------------------------------------------===//
+diff --git a/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp b/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
+index 3220fd99d201..c549185046f7 100644
+--- a/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
++++ b/llvm/lib/Target/DADAO/Disassembler/DADAODisassembler.cpp
+@@ -58,6 +58,15 @@ static DecodeStatus DecodeGPRBRegisterClass(MCInst &Inst, unsigned RegNo,
+   return MCDisassembler::Success;
+ }
+ 
++static DecodeStatus DecodeGPRARegisterClass(MCInst &Inst, unsigned RegNo,
++                                             uint64_t /*Address*/,
++                                             const MCDisassembler * /*Decoder*/) {
++  if (RegNo > 63)
++    return MCDisassembler::Fail;
++  Inst.addOperand(MCOperand::createReg(DADAO::RA0 + RegNo));
++  return MCDisassembler::Success;
++}
++
+ static DecodeStatus decodeS12Imm(MCInst &Inst, unsigned Imm,
+                                   uint64_t /*Address*/,
+                                   const MCDisassembler * /*Decoder*/) {
+diff --git a/llvm/test/MC/DADAO/immediate-range-invalid.s b/llvm/test/MC/DADAO/immediate-range-invalid.s
+index 0f1985cf396d..77d23c1d1a8e 100644
+--- a/llvm/test/MC/DADAO/immediate-range-invalid.s
++++ b/llvm/test/MC/DADAO/immediate-range-invalid.s
+@@ -42,6 +42,34 @@ trap -1, 0
+ # CHECK: :[[#@LINE+1]]:6: error: immediate must be an integer in the range [0, 63]
+ trap 64, 0
+ 
++# KL-114a: ldmo/stmo RA-bank immu6 count, and cfx2rc/escape's cfxcode6
++# (col 1) / immu6 (cfx2rc cols 2-3) operands share the same [0, 63]
++# AsmOperandClass as shlu/trap above.
++# CHECK: :[[#@LINE+1]]:21: error: immediate must be an integer in the range [0, 63]
++ldmo ra1, rb2, rd3, -1
++# CHECK: :[[#@LINE+1]]:21: error: immediate must be an integer in the range [0, 63]
++ldmo ra1, rb2, rd3, 64
++# CHECK: :[[#@LINE+1]]:8: error: immediate must be an integer in the range [0, 63]
++cfx2rc -1, 0, 0, rd0
++# CHECK: :[[#@LINE+1]]:8: error: immediate must be an integer in the range [0, 63]
++cfx2rc 64, 0, 0, rd0
++# CHECK: :[[#@LINE+1]]:11: error: immediate must be an integer in the range [0, 63]
++cfx2rc 0, -1, 0, rd0
++# CHECK: :[[#@LINE+1]]:11: error: immediate must be an integer in the range [0, 63]
++cfx2rc 0, 64, 0, rd0
++# CHECK: :[[#@LINE+1]]:14: error: immediate must be an integer in the range [0, 63]
++cfx2rc 0, 0, -1, rd0
++# CHECK: :[[#@LINE+1]]:14: error: immediate must be an integer in the range [0, 63]
++cfx2rc 0, 0, 64, rd0
++# CHECK: :[[#@LINE+1]]:8: error: immediate must be an integer in the range [0, 63]
++escape -1, 0
++# CHECK: :[[#@LINE+1]]:8: error: immediate must be an integer in the range [0, 63]
++escape 64, 0
++# CHECK: :[[#@LINE+1]]:11: error: immediate must be an integer in the range [-131072, 131071]
++escape 0, -131073
++# CHECK: :[[#@LINE+1]]:11: error: immediate must be an integer in the range [-131072, 131071]
++escape 0, 131072
++
+ # CHECK: :[[#@LINE+1]]:10: error: immediate must be an integer in the range [0, 3]
+ orw rd8, -1, 0
+ # CHECK: :[[#@LINE+1]]:10: error: immediate must be an integer in the range [0, 3]
+diff --git a/llvm/test/MC/DADAO/immediate-range-valid.s b/llvm/test/MC/DADAO/immediate-range-valid.s
+index 5d6582623c78..cccfe8c5caac 100644
+--- a/llvm/test/MC/DADAO/immediate-range-valid.s
++++ b/llvm/test/MC/DADAO/immediate-range-valid.s
+@@ -28,6 +28,19 @@ shlu rd8, rd0, 63
+ trap 0, 0
+ trap 63, 0
+ 
++# KL-114a: RA-bank ldmo/stmo count, and cfx2rc's cfxcode/cg/rc all share
++# the same unsigned six-bit field.
++ldmo ra1, rb2, rd3, 0
++ldmo ra1, rb2, rd3, 63
++stmo ra1, rb2, rd3, 0
++stmo ra1, rb2, rd3, 63
++cfx2rc 0, 0, 0, rd0
++cfx2rc 63, 63, 63, rd0
++
++# KL-114a: escape's signed 18-bit offset field.
++escape 0, -131072
++escape 0, 131071
++
+ # Signed 24-bit immediates and direct branch targets.
+ call -8388608
+ call 8388607
+-- 
+2.43.0
+
