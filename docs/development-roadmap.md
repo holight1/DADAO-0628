@@ -1795,3 +1795,22 @@ never meant to become a second kernel-boot platform.
 **Next in the K1 sequence**: LLVM MC support for `ldmo-ra`/`stmo-ra`/
 `cfx2rc`/`escape`, `cfx_smon` real guest handler (KL-103a), then MMU/TLB
 + interrupt dispatch.
+
+## K1: LLVM MC support for ldmo-ra/stmo-ra/cfx2rc/escape (2026-07-25) — see `code-agent/tasks/KL-114a-*.md`
+
+Closed the last "tooling gap" in K1's RegRAS/privilege-handoff work:
+these four instructions were previously only testable via hand-encoded
+raw instruction words. Caught and corrected two errors in the task's
+own premise before implementation (`ldmo-ra`'s real opcode is `0x67`
+not `0x63`; `ldmo-ra`/`stmo-ra` are documentation labels over the bare
+`ldmo`/`stmo` mnemonics, not real assembler tokens) by cross-checking
+QEMU's `insn.decode`/`opcodes.yaml` rather than trusting the task file.
+MC layer only (assembler/disassembler), no CodeGen/SelectionDAG
+lowering. Architect independently hand-computed the encoding for all 8
+test cases and confirmed byte-for-byte against `llvm-mc`'s actual
+output, reran the full regression suite, and replayed the 65-patch
+series to a matching tree hash.
+
+**K1 remaining**: `cfx_smon` real guest handler (KL-103a), then MMU/TLB
++ interrupt dispatch (including the gem5 port, per the bounded-scope
+decision above).
