@@ -1,0 +1,87 @@
+From 8c4c73125b357f1c5f7dcbe7fce55a565cba2883 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 12:48:36 +0800
+Subject: [PATCH] arch/dadao: implement RA multi load and store
+
+---
+ src/arch/dadao/decoder.cc | 57 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 08266226b3..c72ec5555f 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -611,6 +611,60 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+   return NoFault; }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"stm";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
++// === RA multi load/store (rrri, spec §4.9) ===
++// RA differs from RD/RB multi transfers in one important legality rule: ra0 is
++// a normal RegRAS slot, so raha==0 is legal.  Every slot is transferred as an
++// opaque 64-bit value, including its high 16-bit reference-count field.
++class RAMultiLoadInst : public StaticInst { RegId srcRegs[2], dstRegs[63]; int count; int idxIdx; bool illegal; public:
++RAMultiLoadInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t immu6)
++  : StaticInst("ldmo-ra", enums::MemRead), count(immu6),
++    illegal(immu6==0 || ha+immu6>64) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);
++  idxIdx = -1;
++  if (hc) { srcRegs[_numSrcRegs] = intRegId(RD_BASE + hc); idxIdx = _numSrcRegs++; }
++  if (!illegal)
++    for (int i = 0; i < count; i++)
++      dstRegs[_numDestRegs++] = intRegId(RA_BASE + ha + i); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (illegal) RET_ILLI;
++  uint64_t base = xc->getRegOperand(this, 0) & MASK48;
++  uint64_t idx = (idxIdx < 0) ? 0 : (xc->getRegOperand(this, idxIdx) & MASK48);
++  for (int i = 0; i < _numDestRegs; i++) {
++    Addr ea = (base + idx + (uint64_t)i * 8) & MASK48;
++    if (!aligned(ea, 8)) RET_MALIGN;
++    uint64_t v = 0; Fault f = memReadBE(xc, this, ea, 8, v);
++    if (f != NoFault) return f;
++    xc->setRegOperand(this, i, v); }
++  return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"ldmo-ra";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++class RAMultiStoreInst : public StaticInst { RegId srcRegs[65], dstRegs[0]; int count; int idxIdx; int dataStart; bool illegal; public:
++RAMultiStoreInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t immu6)
++  : StaticInst("stmo-ra", enums::MemWrite), count(immu6),
++    illegal(immu6==0 || ha+immu6>64) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  srcRegs[_numSrcRegs++] = intRegId(RB_BASE + hb);
++  idxIdx = -1;
++  if (hc) { srcRegs[_numSrcRegs] = intRegId(RD_BASE + hc); idxIdx = _numSrcRegs++; }
++  dataStart = _numSrcRegs;
++  if (!illegal)
++    for (int i = 0; i < count; i++)
++      srcRegs[_numSrcRegs++] = intRegId(RA_BASE + ha + i); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (illegal) RET_ILLI;
++  uint64_t base = xc->getRegOperand(this, 0) & MASK48;
++  uint64_t idx = (idxIdx < 0) ? 0 : (xc->getRegOperand(this, idxIdx) & MASK48);
++  int n = _numSrcRegs - dataStart;
++  for (int i = 0; i < n; i++) {
++    Addr ea = (base + idx + (uint64_t)i * 8) & MASK48;
++    if (!aligned(ea, 8)) RET_MALIGN;
++    uint64_t val = xc->getRegOperand(this, dataStart + i);
++    Fault f = memWriteBE(xc, ea, 8, val);
++    if (f != NoFault) return f; }
++  return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"stmo-ra";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
+ // === RB wyde immediate (rwii, spec §4.6): setzw/orw/andnw into RB, full 64-bit ===
+ class SetzwRbInst : public StaticInst { RegId srcRegs[0], dstRegs[1]; int shift; uint64_t imm16; public:
+ SetzwRbInst(uint8_t d, int wyde, uint16_t imm) : StaticInst("setzw.rb", enums::No_OpClass), shift(wyde*16), imm16(imm) {
+@@ -902,6 +956,9 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     case 0x4D: return StaticInstPtr(new AndnwRbInst(ha(w), ww(w), imm16u(w)));        // andnw-rb
+     case 0x4E: return StaticInstPtr(new SetzwRbInst(ha(w), ww(w), imm16u(w)));        // setzw-rb
+     case 0x4F: return StaticInstPtr(new MultiStoreInst(ha(w), hb(w), hc(w), hd(w), 8, true)); // stmo-rb
++    // === RA multi load/store (rrri, spec §4.9) ===
++    case 0x67: return StaticInstPtr(new RAMultiLoadInst(ha(w), hb(w), hc(w), hd(w)));  // ldmo-ra
++    case 0x6F: return StaticInstPtr(new RAMultiStoreInst(ha(w), hb(w), hc(w), hd(w))); // stmo-ra
+     // Control flow (spec §5). Conditional branches (riii / rrii):
+     case 0x28: return StaticInstPtr(new BrnInst(ha(w), imm18s(w)));   // brn  §5.1
+     case 0x29: return StaticInstPtr(new BrnnInst(ha(w), imm18s(w)));  // brnn
+-- 
+2.43.0
+

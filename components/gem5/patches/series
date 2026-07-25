@@ -15,3 +15,4 @@
 0014-arch-dadao-unify-SYS_brk-base-with-ELF-heap.patch
 0015-arch-dadao-add-SYS_writev-66-cfx_smon-responder-ML-0.patch
 0016-arch-dadao-add-SYS_read-63-cfx_smon-responder-ML-025.patch
+0017-arch-dadao-implement-RA-multi-load-and-store.patch
