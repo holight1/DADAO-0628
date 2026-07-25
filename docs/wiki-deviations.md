@@ -207,3 +207,53 @@
   被删除的编造陈述）。
 - **详见**：`docs/reviews/kernel-regras-ldmo-stmo-semantics-20260725.md`；
   `docs/reviews/kernel-regras-save-restore-20260721.md`（KL-105a）
+
+### 9. `escape` 退出流程从未赋值 `inner_cfx_code`（KL-101a/KL-110a，
+   2026-07-25）
+
+- **wiki 状态**：SILENT（`escape` 的硬件语义有完整的步骤 0-4 定义，唯独
+  没有任何一步提到 `inner_cfx_code`）
+- **wiki 原文引用**：`DADAO-12-SEE-主管系统运行环境.md` 第813-845行
+  "异常退出流程"完整伪代码——步骤0（escape cfx mask 检查）、步骤1
+  （`inner_cfx_mask <= cfx_⟨cfxname⟩_excp_prev_cfx_mask`）、步骤2
+  （`inner_run_mode <= cfx_⟨cfxname⟩_excp_prev_run_mode`）、步骤3
+  （`cfx_⟨cfxname⟩_escape_num <= ... + 1`）、步骤4（跳转），**没有任何
+  一步写 `inner_cfx_code`**。对照"异常进入流程"（同文件第678-811行）
+  第8步会显式写 `inner_cfx_code <= temp_cfx_code`；`inner_run_mode`/
+  `inner_cfx_mask` 都各自有专门的 `excp_prev_run_mode`/
+  `excp_prev_cfx_mask` 寄存器（SEE §3 cg5, rc0/rc1，第357-358行）用于
+  异常退出时恢复，但**没有对应的 `excp_prev_cfx_code` 寄存器**——这不是
+  遗漏一行赋值这么简单，而是从存储结构上就没有为"恢复 `inner_cfx_code`"
+  预留位置。此项已被 `KL-101a`（`docs/reviews/
+  kernel-hypv-supv-handoff-20260721.md` 第30-36行）核实为真实 wiki 空白，
+  原话："这段伪代码里 `escape` 从未写 `inner_cfx_code`——这是架构师已核实
+  的真实 wiki 空白"；`KL-102a`（`docs/reviews/
+  kernel-cfx-state-patch-surface-20260721.md`）在给出 O1 最小语义清单
+  （§3.1）时同样只列出"恢复 mask/mode、`escape_num++`、跳转"，未包含
+  `inner_cfx_code` 的任何处理步骤，隐含的处置方向与 wiki 的沉默一致。
+- **我们的决定**：`escape` 不修改 `inner_cfx_code`——执行前是什么值，
+  执行后保持不变。已落入 `contracts/isa/spec.md §8.2`（"QEMU's O1
+  implementation therefore leaves `inner_cfx_code` unmodified by
+  `escape`, matching the wiki's silence rather than inventing a restore
+  rule"），QEMU 实现（`target/dadao/helper.c::helper_escape()`）中
+  `env->inner_cfx_code` 未被触碰，仅作为代码注释里的显式说明存在。
+- **理由**：wiki 沒有定义就不该凭空发明恢复规则；且没有配套的
+  `excp_prev_cfx_code` 存储寄存器可供恢复，"保持不变"是唯一不需要额外
+  发明存储结构的读法。这个决定对 KL-110a 的 O1 验收范围没有实际影响——
+  HBI §3 的 hypv 引导桩在执行 handoff 序列全程都没有经历过任何异常进入
+  （`inner_cfx_code` 自 reset 起一直是 `cfx_power`，未被任何 trap
+  改写过），所以 `escape` 执行前后 `inner_cfx_code` 是否被"恢复"在这个
+  具体场景下不可观察。
+- **影响范围**：K1 kernel bring-up 后续任务中，若出现真实的
+  `trap → cfx_A → trap → cfx_B → escape cfx_A` 这类多层调用链，
+  `inner_cfx_code` 在 `escape` 后到底应该是什么值，会成为一个需要独立
+  验证的开放问题（当前"保持不变"的读法在这类多层场景下是否正确未经
+  测试）；`contracts/isa/spec.md §8.2` 已经把这个决定和它的依据写清楚，
+  后续任务如果要挑战这个读法，应该先在这里更新。
+- **状态**：OPEN——技术决定本身有 wiki 文本结构（缺配套存储寄存器）支持，
+  但只在 O1（单层、无嵌套 trap）场景下被验证过，多层调用链场景仍是
+  未决语义，不能凭这次验证就断言这是唯一正确读法。
+- **详见**：`docs/reviews/kernel-hypv-supv-handoff-20260721.md`
+  （KL-101a，第30-36行发现原文）；`docs/reviews/
+  kernel-cfx-state-patch-surface-20260721.md`（KL-102a，O1/O2 范围划分）；
+  `contracts/isa/spec.md §8.2`（决定落地位置）

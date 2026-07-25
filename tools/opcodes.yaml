@@ -1317,4 +1317,30 @@
   legality:
     - "immu6 != 0"
     - "raha + immu6 <= 64"
+
+- mnemonic: cfx2rc
+  format: crrr
+  op: 0x73
+  ha: null
+  mask: 0xFF000000
+  value: 0x73000000
+  fields:
+    - {name: cfxcode, bits: "[23:18]", role: imm, bank: imm, signed: false}
+    - {name: cg, bits: "[17:12]", role: imm, bank: imm, signed: false}
+    - {name: rc, bits: "[11:6]", role: imm, bank: imm, signed: false}
+    - {name: rd, bits: "[5:0]", role: src, bank: rd, signed: null}
+  legality: []
+  wiki_cite: "SimRISC-04 §寄存器传输指令; contracts/isa/spec.md §8.1 [O1 subset: KL-110a, 2026-07-25]"
+
+- mnemonic: escape
+  format: ciii
+  op: 0x77
+  ha: null
+  mask: 0xFF000000
+  value: 0x77000000
+  fields:
+    - {name: cfxcode, bits: "[23:18]", role: imm, bank: imm, signed: false}
+    - {name: imms18, bits: "[17:0]", role: imm, bank: imm, signed: true}
+  legality: []
+  wiki_cite: "SimRISC-04 §退出指令; DADAO-12-SEE §5; contracts/isa/spec.md §8.2 [O1 subset: KL-110a, 2026-07-25]"
   wiki_cite: "SimRISC-02 §存取RA寄存器; contracts/isa/spec.md §4.9 [spec-decision: KL-107a, 2026-07-25]"

@@ -1,0 +1,305 @@
+From 72cba5f022d601a10ebee10ca6ea3799673ea067 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 15:07:27 +0800
+Subject: [PATCH] target/dadao: implement cfx2rc/escape O1 hypv->supv handoff
+ (KL-110a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds decode/translate/helper support for cfx2rc (0x73, crrr) and escape
+(0x77, ciii), scoped to the HBI §3 minimal hypv->supv handoff success
+path (O1) only:
+
+- cfx2rc: cg=3/rc=12 delegation-clear register (per-cfxcode state array,
+  bit3 hardware-forced to 1) and cfx_power's cg=5 exception frame
+  (prev_run_mode/prev_cfx_mask/cause_ip, rc0/1/3). Every other (cg, rc)
+  combination is a documented no-op (no CFXREG/reserved-cfxcode routing
+  yet -- that is O2 scope).
+- escape: restores inner_cfx_mask/inner_run_mode from cfx_power's frame
+  and jumps to cause_ip + (imms18<<2); the escape-cfx-mask permission
+  check (SEE §5 step 0) is intentionally not implemented (O2 scope).
+  inner_cfx_code is left unmodified, matching a real wiki gap (the
+  escape pseudocode never assigns it -- see docs/wiki-deviations.md #9).
+
+All prev/cause state transitions are centralized in helper_cfx2rc()/
+helper_escape() (helper.c), per the KL-102a report's carrier-point
+design. Adds CPU_LOG_INT-gated trace lines (reset mode, escape mode
+transition) for observability -- silent unless `-d int` is passed.
+
+Verified via a standalone raw-ROM probe executing the exact HBI §3
+stub (12x cfx2rc delegation-clear + prev_run_mode/prev_cfx_mask/
+cause_ip + escape cfx_power,0): PC lands at supv_entry, inner_run_mode
+hypv(3)->supv(2), and a RAM marker write+readback self-verifies via a
+distinctive exit code -- a negative control (wrong cause_ip) confirms
+the poison-gap harness actually detects a bad target (ILLI, not the
+success exit code), rather than trivially passing.
+
+python3 tools/run_differential.py: AGREE(4-way)=200, DIVERGE=0 (this
+instruction pair is not yet in the differential vector set, so the
+count is unchanged by design). check_legality_matrix.py: QEMU-BUG=0,
+opcodes-漏=0. lit tests/lit/E2E: 81/81 PASS.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ target/dadao/cpu.c       |  12 +++++
+ target/dadao/cpu.h       |   8 +++
+ target/dadao/helper.c    | 114 +++++++++++++++++++++++++++++++++++++++
+ target/dadao/helper.h    |   2 +
+ target/dadao/insn.decode |   4 ++
+ target/dadao/translate.c |  29 ++++++++++
+ 6 files changed, 169 insertions(+)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index d93c29c..948f261 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -49,6 +49,9 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+         env->rb[i] = 0;
+         env->rf[i] = 0;
+         env->ra[i] = 0;
++        /* HEE §1 cg3/rc12 init value = all-ones (all cg groups delegated
++         * to hypv only, until software clears bits via cfx2rc). */
++        env->cfx_hypv_cg_reg_deleg[i] = DADAO_CFX_MASK_ALL;
+     }
+     /* rf[0] reset = QNaN per ISA spec §1.2 (contracts/isa/spec.md) */
+     env->rf[0] = UINT64_C(0x7FF800007FC00000);
+@@ -60,6 +63,15 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+     env->cfx_power_frame.cause_ip = 0;
+     env->pc = 0x00100000;
+     cs->exception_index = -1;
++
++    /* KL-110a Oracle O1 observability: mirrors the escape-side trace in
++     * helper_escape() (only emitted with `-d int`). HBI §3 defines
++     * inner_run_mode=hypv/inner_cfx_code=cfx_power/inner_cfx_mask=all-1 at
++     * reset; env->pc here is the test-machine entry (ADR-0004), not the
++     * real cfx_power_hypv_excp_vector. */
++    qemu_log_mask(CPU_LOG_INT,
++                   "dadao: reset mode=hypv cfx_code=power(63) mask=all-1 "
++                   "pc=0x%016" PRIx64 "\n", (uint64_t)env->pc);
+ }
+ 
+ static void dadao_cpu_realize(DeviceState *dev, Error **errp)
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index 369778f..ddfcb0d 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -56,6 +56,13 @@ typedef struct DADAOCfxPowerFrame {
+     target_ulong cause_ip;
+ } DADAOCfxPowerFrame;
+ 
++/* HEE §1 cg3/rc12 "hypv cg reg delegation", one 64-bit register per cfxcode
++ * (indexed by raw cfxcode, 0-63; reserved cfxcodes are simply never
++ * touched). O1 scope (KL-110a): plain state storage only, written by
++ * cfx2rc -- no permission enforcement reads this array yet (O2 scope). */
++#define DADAO_CFX_HYPV_CG_REG_DELEG_CG 3
++#define DADAO_CFX_HYPV_CG_REG_DELEG_RC 12
++
+ typedef struct CPUArchState CPUDADAOState;
+ typedef struct ArchCPU DADAOCPU;
+ typedef struct DADAOCPUClass DADAOCPUClass;
+@@ -78,6 +85,7 @@ struct CPUArchState {
+     DADAOCfxCode inner_cfx_code;
+     target_ulong inner_cfx_mask;
+     DADAOCfxPowerFrame cfx_power_frame;
++    target_ulong cfx_hypv_cg_reg_deleg[64];
+     /* Scratch for a pending trap (cfx) syscall, passed helper -> do_interrupt.
+        Must NOT reuse rb[1]/rb[2] — rb1 is the stack pointer (ADR-0004). */
+     target_ulong trap_cfxcode;
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 5afc31d..f835683 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -1,4 +1,5 @@
+ #include "qemu/osdep.h"
++#include "qemu/log.h"
+ #include "cpu.h"
+ #include "exec/exec-all.h"
+ #include "exec/helper-proto.h"
+@@ -107,3 +108,116 @@ void helper_trap(CPUDADAOState *env, uint64_t cfxcode, uint64_t func)
+     cs->exception_index = EXCP_CFXTRAP;
+     cpu_loop_exit(cs);
+ }
++
++/* KL-110a: centralized cfx2rc state transition (HBI §3 O1 handoff subset
++ * only). All prev/cause and delegation writes for the O1 success path
++ * happen here and nowhere else in translate.c/cpu.c, per the KL-102a
++ * report's carrier-point design: add centralized cfx2rc/escape/enter/fault
++ * helpers in helper.c/.h; all prev/cause writes and restores happen only
++ * here. */
++void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
++                    uint64_t rc, uint64_t value)
++{
++    cfxcode &= 0x3F;
++    cg &= 0x3F;
++    rc &= 0x3F;
++
++    if (cg == DADAO_CFX_HYPV_CG_REG_DELEG_CG &&
++        rc == DADAO_CFX_HYPV_CG_REG_DELEG_RC) {
++        /* HEE §1 cg3/rc12 "hypv cg reg delegation": bit=0 delegates that
++         * cg's registers to supv. O1 scope only records the state bit (no
++         * permission enforcement reads it yet -- that is O2 scope, KL-102a
++         * report §3.2/§4); bit3 (the hypv group itself) is hardware-forced
++         * to 1 regardless of the write value ("bit3 is fixed to 1", HEE §1
++         * cg3/rc12 description). */
++        env->cfx_hypv_cg_reg_deleg[cfxcode] = value | (1ULL << 3);
++        return;
++    }
++
++    if (cfxcode == DADAO_CFX_CODE_POWER && cg == 5) {
++        /* SEE §3 cg5 exception-frame registers. O1 scope only implements
++         * the three fields the HBI §3 handoff stub writes for cfx_power
++         * (rc0=prev_run_mode, rc1=prev_cfx_mask, rc3=cause_ip); other cg5
++         * rc values (cause_id/cause_info/nonmaskable are HW-only or unused
++         * by the stub) and non-power cfxcodes have no frame storage yet --
++         * KL-102b only added the cfx_power slot (KL-102a report §3.1). */
++        switch (rc) {
++        case 0:
++            env->cfx_power_frame.prev_run_mode = value & 0x3;
++            return;
++        case 1:
++            env->cfx_power_frame.prev_cfx_mask = value;
++            return;
++        case 3:
++            env->cfx_power_frame.cause_ip = value & 0x0000FFFFFFFFFFFFULL;
++            return;
++        default:
++            return;
++        }
++    }
++
++    /* Every other (cg, rc) combination -- full CFXREG fault semantics,
++     * per-cfx cg0/cg1/cg2/cg4/cg6/cg7 register maps, reserved-cfxcode
++     * routing to ILLI -- is out of O1 scope (KL-102a report §3.1/§4).
++     * Treated as a silent no-op rather than fabricating state that has no
++     * backing storage; not reachable by the HBI §3 handoff stub. */
++}
++
++/* KL-110a: centralized escape state transition (HBI §3 O1 handoff subset
++ * only — cfx_power self-escape). See helper_cfx2rc's comment for the
++ * centralization rationale. */
++void helper_escape(CPUDADAOState *env, uint64_t cfxcode, uint64_t imms18)
++{
++    target_ulong prev_run_mode;
++    target_ulong prev_cfx_mask;
++    target_ulong cause_ip;
++    int64_t offset;
++    DADAORunMode mode_before;
++
++    cfxcode &= 0x3F;
++    mode_before = env->inner_run_mode;
++
++    /* SEE §5 exception-exit flow step 0 (escape-cfx-mask permission check)
++     * is O2 scope and intentionally not implemented -- see KL-102a report
++     * §3.2. Only cfx_power's exception frame exists (KL-102b); escaping
++     * any other cfxcode has no frame to restore from and falls back to a
++     * zeroed frame instead of fabricating per-cfx state that was never
++     * written. */
++    if (cfxcode == DADAO_CFX_CODE_POWER) {
++        prev_run_mode = env->cfx_power_frame.prev_run_mode;
++        prev_cfx_mask = env->cfx_power_frame.prev_cfx_mask;
++        cause_ip = env->cfx_power_frame.cause_ip;
++    } else {
++        prev_run_mode = DADAO_RUN_MODE_USER;
++        prev_cfx_mask = 0;
++        cause_ip = 0;
++    }
++
++    /* SEE §5 exception-exit flow steps 1-2: restore mask then mode. */
++    env->inner_cfx_mask = prev_cfx_mask;
++    env->inner_run_mode = (DADAORunMode)(prev_run_mode & 0x3);
++
++    /* contracts/isa/spec.md §8 / docs/wiki-deviations.md #9: the wiki's
++     * escape pseudocode never assigns inner_cfx_code (no
++     * cfx_<name>_excp_prev_cfx_code register exists to restore it from) --
++     * left unmodified here, matching that silence rather than inventing a
++     * restore rule. Step 3 (escape_num++, a cg4 per-cfx counter) is not
++     * modeled: no cg4 counter infrastructure exists yet for any cfx in
++     * this QEMU target, and O1's acceptance criteria do not observe it. */
++
++    /* SEE §5 exception-exit flow step 4: target = cause_ip + (imms18 << 2).
++     * imms18 arrives already sign-extended by the ciii/riii decode (§2.4
++     * imms18). */
++    offset = ((int64_t)imms18) * 4;
++    env->pc = (cause_ip + (target_ulong)offset) & 0x0000FFFFFFFFFFFFULL;
++
++    /* KL-110a Oracle O1 observability: log the mode transition this
++     * instruction just performed (only emitted when the caller passes
++     * `-d int`; silent by default, same convention other QEMU targets use
++     * to trace privilege-mode switches). */
++    qemu_log_mask(CPU_LOG_INT,
++                   "dadao: escape cfx=%" PRIu64 " mode %d->%d "
++                   "mask=0x%016" PRIx64 " pc=0x%016" PRIx64 "\n",
++                   cfxcode, (int)mode_before, (int)env->inner_run_mode,
++                   (uint64_t)env->inner_cfx_mask, (uint64_t)env->pc);
++}
+diff --git a/target/dadao/helper.h b/target/dadao/helper.h
+index 6b2b111..7ee77e5 100644
+--- a/target/dadao/helper.h
++++ b/target/dadao/helper.h
+@@ -3,3 +3,5 @@ DEF_HELPER_2(exit, noreturn, env, i64)
+ DEF_HELPER_2(ras_push, void, env, i64)
+ DEF_HELPER_1(ras_pop, i64, env)
+ DEF_HELPER_3(trap, noreturn, env, i64, i64)
++DEF_HELPER_5(cfx2rc, void, env, i64, i64, i64, i64)
++DEF_HELPER_3(escape, void, env, i64, i64)
+diff --git a/target/dadao/insn.decode b/target/dadao/insn.decode
+index 0aab976..7b0d6a5 100644
+--- a/target/dadao/insn.decode
++++ b/target/dadao/insn.decode
+@@ -167,8 +167,12 @@ ret        01101110 ...... ...... ...... ...... @riii
+ stmo_ra    01101111 ...... ...... ...... ...... @rrri
+ 
+ # *** System / cfx instructions (SimRISC §系统类指令) ***
++# op=0x73: cfx2rc-crrr — cfx2rc cfx_<cfxname>, cghb, rchc, rdhd
++cfx2rc     01110011 ...... ...... ...... ...... @rrrr
+ # op=0x76: trap-ciii — trap cfxcode, immu18
+ trap       01110110 ...... ...... ...... ...... @riii
++# op=0x77: escape-ciii — escape cfx_<cfxname>, imms18
++escape     01110111 ...... ...... ...... ...... @riii
+ 
+ # *** MISC-Norm (op=0x10, sub-decode by ha[5:0]) ***
+ # ha is encoded in the fixed pattern, not extracted as a field
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index b9c3846..457942a 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -463,6 +463,35 @@ static bool trans_trap(DisasContext *ctx, arg_riii *a)
+     return true;
+ }
+ 
++/* === §8 System / CFX Instructions (crrr / ciii, KL-110a O1 subset) ===
++ * cfx2rc/escape state transitions are centralized in helper_cfx2rc()/
++ * helper_escape() (helper.c) -- these trans_ functions only extract
++ * operands and dispatch, matching the KL-102a report's carrier-point
++ * design for this pair of instructions. */
++
++static bool trans_cfx2rc(DisasContext *ctx, arg_cfx2rc *a)
++{
++    TCGv_i64 cfxcode = tcg_constant_i64(a->ha & 0x3F);
++    TCGv_i64 cg = tcg_constant_i64(a->hb & 0x3F);
++    TCGv_i64 rc = tcg_constant_i64(a->hc & 0x3F);
++    TCGv_i64 value = load_rd(ctx, a->hd);
++    gen_helper_cfx2rc(tcg_env, cfxcode, cg, rc, value);
++    return true;
++}
++
++static bool trans_escape(DisasContext *ctx, arg_escape *a)
++{
++    TCGv_i64 cfxcode = tcg_constant_i64(a->ha & 0x3F);
++    TCGv_i64 imms18 = tcg_constant_i64(a->imm18);
++    gen_helper_escape(tcg_env, cfxcode, imms18);
++    /* helper_escape writes env->pc directly (mirrors trans_jump_r/ret);
++     * unlike trap this is not noreturn -- escape returns to normal
++     * control flow at the restored PC, so end the TB with DISAS_JUMP and
++     * let the translator loop's lookup-and-goto find the target TB. */
++    ctx->base.is_jmp = DISAS_JUMP;
++    return true;
++}
++
+ /* === §3.16 RD Load/Store — Multi (rrri) === */
+ 
+ static bool do_ldm(DisasContext *ctx, int ha, int hb, int hc, int hd,
+-- 
+2.43.0
+

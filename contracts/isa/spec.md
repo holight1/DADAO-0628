@@ -289,6 +289,8 @@ Row-by-row reference. Entries not listed are reserved (UNDI) or excluded (§7). 
 | 01101     | 101       | call-rrii                             | rrii     |
 | 01101     | 110       | ret-riii                              | riii     |
 | 01101     | 111       | stmo-ra-rrri                          | rrri     |
+| 01110     | 011       | cfx2rc-crrr                           | crrr     |
+| 01110     | 111       | escape-ciii                           | ciii     |
 
 #### 2.8.1 MISC-Norm Subtable (op[7:3]=00010, op[2:0]=000)
 
@@ -987,8 +989,76 @@ no-op). The exact test-machine observable protocol is defined in ADR-0004.
 |------|----------------------|------------------|
 | RF execution | All MISC-RF subtable (op 01010–01011); csn-rf, csz-rf, csp-rf, csp1, csnp1; rd2rf, rf2rd, rf2rf; ldt-rf, ldo-rf, ldmt-rf, ldmo-rf; stt-rf, sto-rf, stmt-rf, stmo-rf; ftmadd, fomadd; setw | §Floating-point |
 | Atomics | fence; lro_nn/nr/an/ar; sco_nn/nr/an/ar | §Atomics |
-| System cfx | trap, escape; cfx2rd, cfx2rc; cfxld, cfxst | §SBI/HBI |
+| System cfx | trap; cfx2rd; cfxld, cfxst | §SBI/HBI |
 | RA register move | rd2ra, ra2rd | Excluded (M1 scope decision, 2026-06-29; ISA semantics clear per SimRISC-02 §RA↔RD; not needed for non-variadic scalar ABI) |
+
+---
+
+## §8 System / CFX Instructions (crrr / ciii)
+
+[wiki §SimRISC-04-系统类指令.md §特权指令; §DADAO-12-SEE-主管系统运行环境.md §5 异常进入与异常退出; §DADAO-23-HBI-超管系统二进制接口.md §3]
+
+This section formalizes `cfx2rc` and `escape` per the wiki's full
+architectural semantics. **QEMU's current implementation only covers the
+subset needed for the HBI §3 hypv→supv handoff success path (O1)** —
+`cfx2rc` restricted to the `cg=3/rc=12` delegation register and
+`cfx_power`'s `cg=5` exception frame, and `escape` restricted to
+`cfx_power` self-escape with no permission check. Permission
+enforcement (masks, delegation gating, **CFXREG**/reserved-cfxcode
+routing) and the remaining `cg0/cg1/cg2/cg4/cg6/cg7` register maps are
+**Excluded (M1 scope decision, KL-110a, 2026-07-25; O1/O2 split per
+`docs/reviews/kernel-cfx-state-patch-surface-20260721.md` §3 — O2's
+unauthorized/masked negative paths are a follow-up task, not this one)**.
+
+### 8.1 `cfx2rc` / `cfx2rd` Register Transfer (crrr)
+
+```
+cfx2rd    cfx_<cfxname>, cghb, rchc, rdhd  ; cfx_<cfxname>_cghb_rchc → rdhd
+cfx2rc    cfx_<cfxname>, cghb, rchc, rdhd  ; rdhd → cfx_<cfxname>_cghb_rchc
+```
+
+Encoding: §2.8 row 0111-0xxx col 011 (`cfx2rc`, `0x73`); `cfx2rd` is `0x72` (col 010) and remains M1-excluded per §7 (this task covers only `cfx2rc`). Format `crrr`.
+`ha`=cfxcode; `hb`=cg; `hc`=rc; `hd`=rd (the RD-bank register holding the transferred value). [wiki §SimRISC-00 §指令设计 L51–L54; §SimRISC-04 §寄存器传输指令 L76–L91]
+
+Semantic: `cfx2rc` writes `rdhd`'s value into the `(cg, rc)`-addressed register of core-feature-extension `cfxcode`; `cfx2rd` is the inverse read. [wiki §SimRISC-04 §寄存器传输指令 L83–L85]
+
+Named-register syntax: `cfx2rc cfx_<cfxname>_<regname>, rdhd` expands to the standard 4-operand form by looking up `(cg, rc)` from the SEE/HEE register tables; this is an assembler convenience, not a distinct encoding. [wiki §SimRISC-04 L91–L103]
+
+Full semantics (wiki, not implemented by QEMU's O1 subset — see the scope note above):
+- Reserved `cfxcode` (7–14, 19–61) → **ILLI**, rerouted to the current mode's monitor. [wiki §DADAO-12-SEE §5 L712–L720]
+- Undefined `(cg, rc)` combination for the addressed `cfxcode`, or a read/write permission mismatch → **CFXREG**. [wiki §SimRISC-04 L87]
+- The data path only connects to the RD bank; RB/RF values must be staged through `setrd` first. [wiki §SimRISC-04 L89]
+
+### 8.2 `trap` / `escape` (ciii)
+
+```
+trap      cfx_<cfxname>, immu18   ; call into cfx_<cfxname> (M1-excluded, §7)
+escape    cfx_<cfxname>, imms18   ; return from the current cfx frame
+```
+
+Encoding: §2.8 row 0111-0xxx col 110 (`trap`, `0x76`, M1-excluded per §7) / col 111 (`escape`, `0x77`). Format `ciii`.
+`ha`=cfxcode; `hb:hc:hd`=the 18-bit immediate (unsigned `immu18` for `trap`, signed `imms18` for `escape`). [wiki §SimRISC-00 §指令设计 L51–L53; §SimRISC-04 §陷入指令 L48–L58; §SimRISC-04 §退出指令 L60–L70]
+
+`escape` semantics (SEE §5 exception-exit flow — full wiki pseudocode; see the O1-subset note above for what QEMU currently executes):
+
+0. If `cfxcode` (the escape operand) differs from the executing cfx (`inner_cfx_code`) and `cfx_⟨cfxname⟩_<mode>_escape_cfx_mask` bit `cfxcode` is set → **ILLI**, rerouted to the current mode's monitor. [wiki §DADAO-12-SEE §5 L824–L835]
+1. `inner_cfx_mask ← cfx_⟨cfxname⟩_excp_prev_cfx_mask`. [wiki §DADAO-12-SEE §5 L838]
+2. `inner_run_mode ← cfx_⟨cfxname⟩_excp_prev_run_mode`. [wiki §DADAO-12-SEE §5 L840]
+3. `cfx_⟨cfxname⟩_escape_num += 1`. [wiki §DADAO-12-SEE §5 L842]
+4. `inner_inst_pointer ← cfx_⟨cfxname⟩_excp_cause_ip + (imms18 << 2)`. [wiki §DADAO-12-SEE §5 L844]
+
+`⟨cfxname⟩` in steps 1–4 is `inner_cfx_code` (the cfx executing `escape`), per the wiki's own definition. [wiki §DADAO-12-SEE §5 L815]
+For a self-escape (the `escape` operand equals `inner_cfx_code`, as in the HBI §3 handoff stub), step 0's cross-cfx mask check does not apply.
+
+**wiki gap** (see `docs/wiki-deviations.md` #9 for the full record): the `escape` pseudocode above never assigns `inner_cfx_code` — there is no `cfx_<name>_excp_prev_cfx_code` register to restore it from, unlike `inner_run_mode`/`inner_cfx_mask` which each have a dedicated `prev_*` register. [wiki §DADAO-12-SEE §3 cg5 L357–L360]
+QEMU's O1 implementation therefore leaves `inner_cfx_code` unmodified by `escape`, matching the wiki's silence rather than inventing a restore rule [spec-decision: KL-110a, 2026-07-25].
+
+### 8.3 HBI §3 hypv→supv Handoff (worked reference)
+
+The minimal hypv→supv handoff sequence — the concrete O1 vector this section formalizes against — is defined verbatim in HBI §3, not duplicated here: 12 `cfx2rc cfx_<cfxname>_hypv_cg_reg_deleg, rd2` calls (`rd2=0`, clearing delegation for umon/jmon/smon/ptw/tlb/cache/hart/llc/pmem/timer/uart/power — `hmon` is intentionally not included), followed by `cfx2rc cfx_power_excp_prev_run_mode`/`cfx_power_excp_prev_cfx_mask`/`cfx_power_excp_cause_ip`, `setrb rb16, fdt_addr`, and `escape cfx_power, 0`. [wiki §DADAO-23-HBI §3 L29–L64]
+
+The `(cg, rc)` pairs used: `cfx_<cfxname>_hypv_cg_reg_deleg` = `(3, 12)`. [wiki §DADAO-13-HEE §1 L24]
+`cfx_power_excp_prev_run_mode` / `_prev_cfx_mask` / `_cause_ip` = `(5, 0)` / `(5, 1)` / `(5, 3)`. [wiki §DADAO-12-SEE §3 cg5 L357–L360]
 
 ---
 
@@ -1149,6 +1219,16 @@ encoding oracle (`mask`/`value`).
 | 0x6D      | call     | rrii   | rbha                | rdhb  | imms12(hc) | imms12(hd) | 0xFF000000 | 0x6D000000 |
 | 0x6E      | ret      | riii   | rdha                | imms18(hb) | imms18(hc) | imms18(hd) | 0xFF000000 | 0x6E000000 |
 | 0x6F      | stmo-ra  | rrri   | raha                | rbhb  | rdhc       | immu6(hd)  | 0xFF000000 | 0x6F000000 |
+
+#### A.1.12 Row 0111-0xxx (op[7:3]=01110)
+
+| `op[7:0]` | Mnemonic | Format | ha      | hb         | hc         | hd         | mask       | value      |
+|-----------|----------|--------|---------|------------|------------|------------|------------|------------|
+| 0x73      | cfx2rc   | crrr   | cfxcode | cg         | rc         | rd         | 0xFF000000 | 0x73000000 |
+| 0x77      | escape   | ciii   | cfxcode | imms18(hb) | imms18(hc) | imms18(hd) | 0xFF000000 | 0x77000000 |
+
+`0x72` (`cfx2rd`, col 010) and `0x76` (`trap`, col 110) share this row but
+remain M1-excluded per §7; only `0x73`/`0x77` are M1-covered records.
 
 ---
 
