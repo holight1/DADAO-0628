@@ -1627,3 +1627,11 @@ Gap audit confirmed these were the only 2 missing 128-bit compiler-rt
 libcalls across all FAIL_LINK files. Closes `pr49218.c`/`pr84748.c`.
 gcc-c-torture: 1471→1473/1708 (86.3%), zero regressions. Full E2E
 unchanged; 15-patch musl series replays clean with matching tree hash.
+
+## ML-040a: declare `getSetCCResultType` for vector types (2026-07-25) — see `code-agent/tasks/ML-040a-vector-type-legalization.md` 完成区
+
+6/9 target files fixed (the other 3 turned out to be a different,
+larger-scope by-value-vector-argument CC gap, correctly split off as a
+new issue rather than forced). gcc-c-torture: 1473→1479/1708 (86.6%),
+zero regressions. Full E2E (80/80), CodeGen lit (12/12) pass; 63-patch
+LLVM series replays clean with matching tree hash.
