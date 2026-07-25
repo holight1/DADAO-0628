@@ -1734,3 +1734,26 @@ directly, not just re-running provided evidence; 17-patch gem5 series
 replays clean with matching tree hash. LLVM MC (assembler/disassembler)
 support for these two instructions remains the one outstanding piece
 before they're usable from real C/assembly source.
+
+## K1: hypv→supv privilege handoff O1 in QEMU (2026-07-25) — see `code-agent/tasks/KL-110a-*.md`
+
+Formalized `cfx2rc`/`escape` into `contracts/isa/spec.md §8` and
+implemented HBI §3's minimal handoff sequence (12× delegation-clear +
+`cfx_power` exception frame + `escape cfx_power,0`) in QEMU, scoped
+strictly to the success path (O1) — no permission checks, no gem5, no
+real `cfx_smon` guest handler, no MMU. This is a hard prerequisite for
+any kernel code to run in supv mode at all (HBI §3 mandates hardware
+reset always enters hypv). Architect independently re-verified every
+cited wiki line number, rebuilt QEMU, regenerated the positive probe
+from its generator script (byte-identical to evidence), reproduced the
+exact trace and exit code, confirmed the negative control differs by
+exactly 2 bytes and produces a genuine ILLI at the wrong address (not a
+vacuous pass), and confirmed via `git show` that the existing
+`EXCP_CFXTRAP` host-syscall shortcut is untouched. Full E2E (81/81),
+differential/manifest/issues/encoding checkers all clean; 24-patch QEMU
+series replays with matching tree hash.
+
+**Next in the K1 sequence**: O2 (unauthorized/masked negative path),
+porting O1/O2 to gem5, `cfx_smon` real guest handler (KL-103a), then
+MMU/TLB + interrupt dispatch — followed by K2 (bare-metal regression),
+K3 (real Linux 5.4 port), K4 (boot to a musl `/init`).
