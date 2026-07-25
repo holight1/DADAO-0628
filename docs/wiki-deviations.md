@@ -166,13 +166,36 @@
   文件：`pr60960.c`/`simd-6.c`/`pr70903.c`）。
 - **状态**：OPEN——待架构师/用户决定是否要投入设计。
 
----
+### 8. `ldmo-ra`/`stmo-ra` 整 bank 搬移时引用计数字段处理未定义（KL-106a/
+   KL-107a，2026-07-25）
 
-## 尚待补录
-
-以下是已知但还没来得及正式补录到本文件的类似情况，先占位，避免遗漏：
-
-- K1 阶段的 RegRAS `ldmo-ra`/`stmo-ra` 语义调研（`KL-106a`，进行中）——如果
-  调研结论是"wiki 只有排除记录、没有完整语义"，需要补一条 SILENT/待决策
-  条目；如果调研发现 wiki 其实有完整定义，则不需要补录（属于"启用既有
-  定义"而非"自定义决策"）。
+- **wiki 状态**：SILENT（编码/格式/对齐/越界规则均有完整定义，唯独"整
+  bank 搬移时 `bits[63:48]` 引用计数如何处理"这一具体行为全文未提及）
+- **wiki 原文引用**：`SimRISC-02-地址类指令.md:9-21` 的高16位行为分类表
+  逐类列出 RB/RA 相关指令（含单槽 `ra2rd`/`rd2ra`："全 64 位覆盖"；
+  `call`/`ret`："高16位做为引用计数"），**唯独没有 `ldmo-ra`/`stmo-ra`
+  （RA↔内存）这一行**——该表第一行"存取类指令"明确写的是"内存→**RB**"，
+  不含 `-ra` 变体。全文 grep `ldmo-ra`/`stmo-ra` 只有 2 处命中
+  （`SimRISC-00-指令系统设计.md:103-104` 的 opcode 表格），`§存取RA寄存器`
+  正文（`SimRISC-02-地址类指令.md:47-63`）没有补充说明；`DADAO-21/22/23-*`
+  ABI/SBI/HBI 三个文档全文搜索 RA 相关内容均无命中。
+- **我们的决定**：`ldmo-ra`/`stmo-ra` 对每个 RA 槽位做完整 64 位原样搬移；
+  `bits[63:48]` 不清零、不校验、不做任何特殊处理。此行为是 2026-07-25
+  经用户确认、由 KL-107a 落入 `contracts/isa/spec.md §4.9` 的项目
+  spec-decision，**不是 wiki 原文条款**。
+- **理由**：调研（`KL-106a`，
+  `docs/reviews/kernel-regras-ldmo-stmo-semantics-20260725.md`）发现这两条
+  指令的编码/对齐/越界/槽位顺序/原子性等 6/7 维度均可通过与已被 contracts
+  采纳的同构指令（`ldmo-rb`/`stmo-rb`、RD `ldmo`/`stmo`）类比直接确定，
+  唯独引用计数处理这一维度 wiki 从创建至今（`~/DADAO-wiki` 全部 21 次
+  相关 commit）从未覆盖，包括专门"统一高16位规则"的提交
+  （`c1c4e44`）也未把 RA↔内存这一类纳入。有类比证据（`ra2rd`/`rd2ra`
+  已定义为"全 64 位覆盖"）支持"应为全 64 位原样拷贝"这一读法；用户已在
+  KL-107a 下发前显式确认采用该立场，但该类比仍不是 wiki 显式条款。
+- **影响范围**：K1 kernel bring-up 的 RegRAS 保存/恢复机制（进程切换、
+  fork）；`contracts/isa/spec.md §4.9` 已正式启用这两条指令，QEMU/gem5/
+  LLVM 的实现与验证留给后续独立任务。
+- **状态**：SETTLED——KL-107a 已把上述 64 位原样搬移语义正式写入
+  `contracts/isa/spec.md §4.9`。
+- **详见**：`docs/reviews/kernel-regras-ldmo-stmo-semantics-20260725.md`；
+  `docs/reviews/kernel-regras-save-restore-20260721.md`（KL-105a）

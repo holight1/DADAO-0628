@@ -284,9 +284,11 @@ Row-by-row reference. Entries not listed are reserved (UNDI) or excluded (§7). 
 | 01001     | 111       | stmo-rb-rrri                          | rrri     |
 | 01100     | 100       | jump-iiii                             | iiii     |
 | 01100     | 101       | jump-rrii                             | rrii     |
+| 01100     | 111       | ldmo-ra-rrri                          | rrri     |
 | 01101     | 100       | call-iiii                             | iiii     |
 | 01101     | 101       | call-rrii                             | rrii     |
 | 01101     | 110       | ret-riii                              | riii     |
+| 01101     | 111       | stmo-ra-rrri                          | rrri     |
 
 #### 2.8.1 MISC-Norm Subtable (op[7:3]=00010, op[2:0]=000)
 
@@ -642,7 +644,7 @@ Legality: `immu6 ∈ [1,63]`; `rdhb ≠ rd0`; `rdhb + immu6 ≤ 64`;
 
 ---
 
-## §4 Address/Memory Instructions (RB)
+## §4 Address/Memory Instructions (RB and RA Memory Transfers)
 
 [wiki §SimRISC-02-地址类指令.md]
 
@@ -788,6 +790,38 @@ rbha[63:48] = unchanged                    ; preservation rule
 `rb0` = address of instruction after `rela`.
 Effective offset range: -536870912 to 536805376 (approx ±512 MB, 4KB step).
 [wiki §SimRISC-02 L159–L161; high-16 preservation per L15/L161]
+
+### 4.9 RA Multi Load/Store (rrri)
+
+```
+ldmo-ra raha, rbhb, rdhc, immu6 ; multi load to RA
+stmo-ra raha, rbhb, rdhc, immu6 ; multi store from RA
+```
+
+Encoding: §2.8 row 01100 col 111 (`0x67`) / 01101 col 111 (`0x6F`).
+Format `rrri`. `ha`=raha; `hb`=rbhb; `hc`=rdhc; `hd`=immu6.
+
+EA for element i: `(rbhb[47:0] + rdhc[47:0] + i × 8) mod 2^48`,
+where `i ∈ [0, immu6-1]`.
+
+Semantic:
+- `ldmo-ra`: copy `memory_be[ea_i : ea_i+7]` to
+  `ra[raha+i][63:0]`.
+- `stmo-ra`: copy `ra[raha+i][63:0]` to
+  `memory_be[ea_i : ea_i+7]`.
+- Each pair is processed in increasing `i` order, reading that pair's source
+  before writing its destination. [wiki §SimRISC-02 §存取RA寄存器 L47–L63]
+- Each RA slot is transferred as an opaque, unchanged 64-bit value.
+  `bits[63:48]` are not cleared, validated, or otherwise specially handled.
+  [spec-decision: KL-107a, 2026-07-25; the wiki does not define the
+  reference-count-field behavior for RA↔memory transfers; decision basis:
+  KL-106a and docs/wiki-deviations.md #8]
+
+Alignment: 8-byte per element; an unaligned element raises **MALIGN**.
+[wiki §SimRISC-02 §存取RA寄存器 L47–L63]
+
+Legality: `immu6 ∈ [1,63]`; `raha + immu6 ≤ 64`. A violation raises
+**ILLI**. [wiki §SimRISC-02 §存取RA寄存器 L47–L63]
 
 ---
 
@@ -955,7 +989,6 @@ no-op). The exact test-machine observable protocol is defined in ADR-0004.
 | RF execution | All MISC-RF subtable (op 01010–01011); csn-rf, csz-rf, csp-rf, csp1, csnp1; rd2rf, rf2rd, rf2rf; ldt-rf, ldo-rf, ldmt-rf, ldmo-rf; stt-rf, sto-rf, stmt-rf, stmo-rf; ftmadd, fomadd; setw | §Floating-point |
 | Atomics | fence; lro_nn/nr/an/ar; sco_nn/nr/an/ar | §Atomics |
 | System cfx | trap, escape; cfx2rd, cfx2rc; cfxld, cfxst | §SBI/HBI |
-| RA memory access | ldmo-ra, stmo-ra | §RegRAS-only: RA←→memory excluded |
 | RA register move | rd2ra, ra2rd | Excluded (M1 scope decision, 2026-06-29; ISA semantics clear per SimRISC-02 §RA↔RD; not needed for non-variadic scalar ABI) |
 
 ---
@@ -1107,6 +1140,7 @@ encoding oracle (`mask`/`value`).
 |-----------|----------|--------|---------------------|-------|------------|------------|------------|------------|
 | 0x64      | jump     | iiii   | imms24(ha:hb:hc:hd) | —     | —          | —          | 0xFF000000 | 0x64000000 |
 | 0x65      | jump     | rrii   | rbha                | rdhb  | imms12(hc) | imms12(hd) | 0xFF000000 | 0x65000000 |
+| 0x67      | ldmo-ra  | rrri   | raha                | rbhb  | rdhc       | immu6(hd)  | 0xFF000000 | 0x67000000 |
 
 #### A.1.11 Row 0110-1xxx (op[7:3]=01101)
 
@@ -1115,6 +1149,7 @@ encoding oracle (`mask`/`value`).
 | 0x6C      | call     | iiii   | imms24(ha:hb:hc:hd) | —     | —          | —          | 0xFF000000 | 0x6C000000 |
 | 0x6D      | call     | rrii   | rbha                | rdhb  | imms12(hc) | imms12(hd) | 0xFF000000 | 0x6D000000 |
 | 0x6E      | ret      | riii   | rdha                | imms18(hb) | imms18(hc) | imms18(hd) | 0xFF000000 | 0x6E000000 |
+| 0x6F      | stmo-ra  | rrri   | raha                | rbhb  | rdhc       | immu6(hd)  | 0xFF000000 | 0x6F000000 |
 
 ---
 

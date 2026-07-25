@@ -96,3 +96,68 @@ K1 只是"启用一条既有指令"；如果没有，K1 需要走一次新的 sp
   版本，只读）
 - `manifests/components.lock.toml`（wiki pin 具体 commit：
   `9f378f4426e131903d60a208766086ae74a53c89`）
+
+## 完成区（2026-07-25）
+
+**产出**：
+- `docs/reviews/kernel-regras-ldmo-stmo-semantics-20260725.md`（完整调研，
+  逐维度证据+行号引用+可复核命令）
+- `docs/wiki-deviations.md` 补录第 8 条（`ldmo-ra`/`stmo-ra` 引用计数处理
+  未定义），并清理了原"尚待补录"占位段落
+
+**判定：混合，不是纯 A 或纯 B**。7 个维度里 6 个是**情形 A**（wiki 已有
+完整定义或可通过与已被 `contracts/isa/spec.md` 采纳的同构指令
+`ldmo-rb`/`stmo-rb`、RD `ldmo`/`stmo` 直接类比确定，标准与 contracts 现有
+做法一致）：
+
+- 编码格式：`op=0x67`(ldmo-ra)/`0x6F`(stmo-ra)，格式 `rrri`，字段
+  `ha=raha,hb=rbhb,hc=rdhc,hd=immu6`（`SimRISC-00-指令系统设计.md:103-104`；
+  `SimRISC-02-地址类指令.md:47-63`）
+- 单次访存槽位数：1-63 个/条指令（不是一次搬 64 个），覆盖全部 64 槽需
+  至少 2 条指令；`ra0` 未被专门排除
+- 槽位顺序：寄存器序号递增 ↔ 地址递增，大端序，无 RA 专属例外
+- 原子性：由 `contracts/isa/spec.md §2.7` 通用精确异常规则 + 固定 8 字节
+  步长对齐检查的数学性质保证，无需额外设计
+- 对齐/越界：8 字节对齐 MALIGN；`immu6=0`/越界 ILLI，与
+  `ldmo-rb`/`stmo-rb` 同构
+- 与既有 §1.5/§2.6.3/§2.7 RA 模型：无冲突
+
+**唯一情形 B 的维度：引用计数（`bits[63:48]`）在整 bank 搬移时如何处理**
+——`SimRISC-02-地址类指令.md:9-21` 的高16位行为分类表逐类列出了 RB/RA
+相关指令（含单槽 `ra2rd`/`rd2ra`明确"全64位覆盖"），**唯独没有 RA↔内存
+这一行**，且 wiki 从文件创建（2024-04-17）至今全部 21 次相关 commit 从未
+补上，包括专门"统一高16位规则"的提交（`c1c4e44`）。历史核查确认这不是
+回归——最初版本（`ldmra`/`stmra`，`a05261a`）连对齐/越界规则都没有，是
+逐步补齐的，但引用计数这一项始终缺失。有类比证据（`ra2rd`/`rd2ra` 已定义
+"全64位覆盖"）支持"应为全64位原样拷贝"，但这是类比不是显式条款。
+
+**这个缺口恰好是 K1 最关心的点**：KL-105a oracle #1（全槽 round-trip）
+明确要求"尤其不得丢 `bits[63:48]` 引用计数"，目前无 wiki 原文可以直接
+支撑这条要求，需要 K1 在实现前由架构师/用户显式做一次 spec decision
+（二选一：(a) 全64位原样拷贝 vs (b) 其它语义——目前无证据支持 (b)）。
+
+**给 K1 的建议（非拍板）**：编码/对齐/越界/顺序可以直接形式化进
+`contracts/isa/spec.md` 新增 §4.x（仿 §4.2 `ldmo-rb`/`stmo-rb` 写法）；
+引用计数这一点需要先决策再写入 contracts。
+
+## 审阅记录（subagent 自审）
+
+- 逐条核对了报告里引用的每一处 wiki 行号（`SimRISC-00:89,103-104`；
+  `SimRISC-02:9-21,44-46,47-63`；`SimRISC-01:12-13,63-64`；
+  `DADAO-11-AEE:167-219`）与实际文件内容一致，未凭空编造行号
+- 核对了 wiki pin：`~/DADAO-wiki` `git rev-parse HEAD` 与
+  `manifests/spec.lock.toml:6` 锁定的 commit 完全一致，`git status` 干净
+- 历史核查用了 `git log -S`/`git show` 而非猜测；发现的
+  `pushra`/`popra`（已删除的 HTML 注释）是一个真实存在但与主结论方向不同
+  的旁证，报告里明确标注它"排除了 push/pop 语义候选"而非"回答了引用计数
+  问题"，没有过度引申
+- 交叉核对了 `contracts/isa/spec.md` 现有对 `ldmo-ra`/`stmo-ra` 的两处引用
+  （§2.6.3 通用规则、§7 排除记录），确认现有 contracts 对这两条指令没有
+  正式编码记录（Appendix A 的 `0110-0xxx`/`0110-1xxx` 两行只到
+  `jump`/`call`/`ret`，没有 `0x67`/`0x6F`），没有误报"contracts 已经有
+  定义"
+- 未修改 `contracts/`、`docs/issues.yaml`、wiki 本身、QEMU/gem5/LLVM 源码；
+  只新增了 review 报告和 `docs/wiki-deviations.md` 的一条正式记录（任务
+  要求的强制交付物）；未 commit
+- 局限：引用计数缺口的"是否原样拷贝"判断留了两个选项给用户，没有代为
+  拍板（按任务要求，这不是本任务能自行决定的范围）
