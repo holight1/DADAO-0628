@@ -817,8 +817,7 @@ Semantic:
   reference-count-field behavior for RA↔memory transfers; decision basis:
   KL-106a and docs/wiki-deviations.md #8]
 
-Alignment: 8-byte per element; an unaligned element raises **MALIGN**.
-[wiki §SimRISC-02 §存取RA寄存器 L47–L63]
+Alignment: 8-byte per element; an unaligned element raises **MALIGN**. [wiki §SimRISC-02 §存取RA寄存器 L47–L63]
 
 Legality: `immu6 ∈ [1,63]`; `raha + immu6 ≤ 64`. A violation raises
 **ILLI**. [wiki §SimRISC-02 §存取RA寄存器 L47–L63]

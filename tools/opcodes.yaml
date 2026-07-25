@@ -1251,6 +1251,22 @@
   legality: []
   wiki_cite: "SimRISC-02 §无条件跳转指令"
 
+- mnemonic: ldmo-ra
+  format: rrri
+  op: 0x67
+  ha: null
+  mask: 0xFF000000
+  value: 0x67000000
+  fields:
+    - {name: raha, bits: "[23:18]", role: dst, bank: ra, signed: null}
+    - {name: rbhb, bits: "[17:12]", role: src, bank: rb, signed: null}
+    - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
+    - {name: immu6, bits: "[5:0]", role: imm, bank: imm, signed: false}
+  legality:
+    - "immu6 != 0"
+    - "raha + immu6 <= 64"
+  wiki_cite: "SimRISC-02 §存取RA寄存器; contracts/isa/spec.md §4.9 [spec-decision: KL-107a, 2026-07-25]"
+
 - mnemonic: call
   format: iiii
   op: 0x6C
@@ -1286,3 +1302,19 @@
     - {name: imms18, bits: "[17:0]", role: imm, bank: imm, signed: true}
   legality: []
   wiki_cite: "SimRISC-02 §函数返回"
+
+- mnemonic: stmo-ra
+  format: rrri
+  op: 0x6F
+  ha: null
+  mask: 0xFF000000
+  value: 0x6F000000
+  fields:
+    - {name: raha, bits: "[23:18]", role: src, bank: ra, signed: null}
+    - {name: rbhb, bits: "[17:12]", role: src, bank: rb, signed: null}
+    - {name: rdhc, bits: "[11:6]", role: src, bank: rd, signed: null}
+    - {name: immu6, bits: "[5:0]", role: imm, bank: imm, signed: false}
+  legality:
+    - "immu6 != 0"
+    - "raha + immu6 <= 64"
+  wiki_cite: "SimRISC-02 §存取RA寄存器; contracts/isa/spec.md §4.9 [spec-decision: KL-107a, 2026-07-25]"

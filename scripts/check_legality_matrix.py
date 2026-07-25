@@ -227,10 +227,16 @@ def expected_opcodes_string(rule, rec, target):
     if kind == 'immu6_zero':
         return "immu6 != 0"
     if kind == 'range_overflow':
-        first = 'rdha' if rec['format'] == 'rrri' and has_field(rec, 'rdha') \
-            else ('rbha' if rec['format'] == 'rrri' else
-                  dst_fields(rec, 'rd')[0]['name'] if dst_fields(rec, 'rd')
-                  else dst_fields(rec, 'rb')[0]['name'])
+        if rec['format'] == 'rrri':
+            if has_field(rec, 'rdha'):
+                first = 'rdha'
+            elif has_field(rec, 'raha'):
+                first = 'raha'
+            else:
+                first = 'rbha'
+        else:
+            first = dst_fields(rec, 'rd')[0]['name'] if dst_fields(rec, 'rd') \
+                else dst_fields(rec, 'rb')[0]['name']
         return f"{first} + immu6 <= 64"
     return None
 
