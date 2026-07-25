@@ -1,8 +1,0 @@
-free_addr=0x0000000080001404
-libc_free_addr=0x000000008000140c
-munmap_addr=0x0000000080002b64
-5027:5030000: system.cpu: T0 : 0x80001404 @free    : call                       : No_OpClass : 
-5028:5031000: system.cpu: T0 : 0x8000140c @__libc_free    : addi.rb                    : No_OpClass : 
-5674:5677000: system.cpu: T0 : 0x800017b0 @__libc_free+932    : call                       : No_OpClass : 
-5675:5678000: system.cpu: T0 : 0x80002b64 @munmap    : addi.rb                    : No_OpClass : 
-5685:5688000: system.cpu: T0 : 0x80002b88 @munmap+36    : trap                       : No_OpClass : 

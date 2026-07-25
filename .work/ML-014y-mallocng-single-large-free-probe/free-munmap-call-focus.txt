@@ -1,6 +1,0 @@
-/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/munmap.disassembly.txt:7:80002b64: 49 04 1f f0  	addi rb1, rb1, -16
-/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/munmap.disassembly.txt:16:80002b88: 76 08 00 00  	trap 2, 0
-/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/free-wrapper.disassembly.txt:7:80001404: 6c 00 00 01  	call 1
-/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/libc-free.disassembly.txt:7:8000140c: 49 04 1f 60  	addi rb1, rb1, -160
-/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/libc-free.disassembly.txt:240:800017b0: 6c 00 04 ec  	call 1260
-/home/holight/DADAO-0628/.work/ML-014y-mallocng-single-large-free-probe/main.disassembly.txt:67:80000200: 6c 00 04 80  	call 1152

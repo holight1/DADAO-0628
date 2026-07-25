@@ -1,5 +1,0 @@
-clang version 22.1.8 (https://github.com/llvm/llvm-project.git 1697be42b5b13cf468043ec8bf9fc612fec17a33)
-Target: unknown
-Thread model: posix
-InstalledDir: /home/holight/DADAO-0628/.work/build/llvm/bin
-Build config: +assertions

@@ -1194,7 +1194,7 @@ producing ~12 false failures unrelated to DADAO), TIMEOUT 1
 — the highest-confidence real bug candidate in the whole sweep).
 
 Deliverables: `tests/scripts/gcc_torture_sweep.py` (reusable scan tool)
-and `docs/reviews/ML-026a-gcc-c-torture-sweep-2026-07-24.md` (full
+and `docs/reviews/archive/2026-07-gcc-c-torture-milestone/ML-026a-gcc-c-torture-sweep-2026-07-24.md` (full
 classification + an 11-item prioritized follow-up list). Architect-
 verified independently: re-ran the entire sweep from scratch
 (identical counts), confirmed the `abort()`→127/`exit(0)`→0 convention,
