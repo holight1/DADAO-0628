@@ -1,0 +1,378 @@
+From 635a70bd9d74005b9e6b03d89a329b0427ec4f47 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sat, 25 Jul 2026 17:33:33 +0800
+Subject: [PATCH] arch/dadao: implement hypv->supv handoff O1 + O2
+ design1/design3 (KL-113a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Ports QEMU's already-verified cfx2rc/escape hypv<->supv handoff state
+machine (KL-110a commit 72cba5f, KL-112a commit 4d8d9fa) to gem5, field-
+for-field: CFX privilege state as plain ISA-class members (isa.hh/isa.cc,
+mirroring QEMU's CPUArchState), new CFX2RCInst/EscapeInst StaticInsts
+(decoder.cc, opcodes 0x73/0x77) for O1's delegation/power-frame writes and
+self-escape, KL-112a design 1's cross-cfx escape_cfx_mask permission check,
+and design 3's CFXREG fault (faults.hh/faults.cc) for cfx_power's reserved
+cg=8 rc>1. Design 2 (cfx2rc_cfx_mask) is deliberately not implemented, same
+as QEMU -- it contradicts the HBI §3 boot stub (docs/wiki-deviations.md
+#11 in DADAO-0628). The legacy TrapInst cfx_smon host/SE syscall shortcut
+is untouched.
+
+Verified via hand-built SE probes (gen_kl110a_o1_probe.py/
+gen_kl112a_o2_probes.py instruction streams, rebased for gem5's ELF load
+address): O1 handoff reaches supv_entry with a verified marker readback
+(exit 42), O2 design1 negative produces ILLI with zero architectural side
+effect (A/B tested: disabling the check causes a real, observably
+different mode/PC corruption and crash), O2 design3 negative produces
+CFXREG (exit 0x86) before reaching a poison halt. lit E2E 81/81 and
+run_differential.py unchanged (AGREE(3-way)=200, DIVERGE=0).
+---
+ src/arch/dadao/decoder.cc | 132 ++++++++++++++++++++++++++++++++++++++
+ src/arch/dadao/faults.hh  |  18 ++++++
+ src/arch/dadao/isa.cc     |  46 +++++++++++++
+ src/arch/dadao/isa.hh     |  56 +++++++++++++++-
+ 4 files changed, 251 insertions(+), 1 deletion(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index c72ec5555f..5e6d86940e 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -2,6 +2,7 @@
+ // Template: RegId arrays + setRegIdxArrays + getRegOperand/setRegOperand
+ #include "arch/dadao/decoder.hh"
+ #include "arch/dadao/faults.hh"
++#include "arch/dadao/isa.hh"
+ #include "arch/dadao/pcstate.hh"
+ #include "arch/dadao/process.hh"
+ #include "arch/dadao/registers.hh"
+@@ -865,6 +866,135 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+ }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"trap";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
++// KL-113a: access the per-thread CFX privilege state (isa.hh). CFX2RCInst/
++// EscapeInst below are the only StaticInsts that touch this state.
++static inline ISA *cfxIsa(ExecContext *xc) { return static_cast<ISA *>(xc->tcBase()->getIsaPtr()); }
++
++// === cfx2rc (crrr, op=0x73, KL-113a hypv<->supv handoff O1+O2 design1/3) ===
++// Centralized CFX state transition, mirroring QEMU helper_cfx2rc()
++// [.work/source/qemu/target/dadao/helper.c, KL-110a/KL-112a] field-for-
++// field: HEE §1 cg3/rc12 delegation writes, SEE §3 cg5 power-frame writes
++// (O1), KL-112a design 1's escape_cfx_mask storage, and design 3's CFXREG
++// for cfx_power's reserved cg=8 rc>1. Every other (cg,rc) combination is a
++// silent no-op (out of O1/O2 scope) -- this is QEMU's own scope boundary,
++// not a gem5-specific shortcut (see helper_cfx2rc()'s default-branch
++// comment: most of those combinations ARE wiki-defined registers this M1
++// subset simply hasn't backed with storage, so treating them as CFXREG
++// would be a false fault). ha/hb/hc are all immediate fields (cfxcode/cg/
++// rc), not register indices -- only hd (the value source) is a register,
++// matching TrapInst's cfxcode-is-immediate convention above and QEMU's
++// trans_cfx2rc().
++class CFX2RCInst : public StaticInst { RegId srcRegs[1], dstRegs[0];
++  uint8_t cfxcode_, cg_, rc_; int valIdx; public:
++CFX2RCInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t hd)
++  : StaticInst("cfx2rc", enums::No_OpClass), cfxcode_(ha & 0x3F), cg_(hb & 0x3F), rc_(hc & 0x3F), valIdx(-1) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if (hd) { srcRegs[_numSrcRegs] = intRegId(RD_BASE + hd); valIdx = _numSrcRegs++; } }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  ISA *isa = cfxIsa(xc);
++  uint64_t value = (valIdx < 0) ? 0 : xc->getRegOperand(this, valIdx);  // rd0 reads 0
++  // HEE §1 cg3/rc12 "hypv cg reg delegation": bit3 (hypv group itself) is
++  // hardware-forced to 1 regardless of the write value.
++  if (cg_ == CfxHypvCgRegDelegCg && rc_ == CfxHypvCgRegDelegRc) {
++    isa->cfxHypvCgRegDeleg[cfxcode_] = value | (1ULL << 3);
++    return NoFault;
++  }
++  // SEE §3 cg5 exception-frame registers -- O1 scope only implements the
++  // three fields the HBI §3 handoff stub writes for cfx_power.
++  if (cfxcode_ == CfxCodePower && cg_ == 5) {
++    switch (rc_) {
++    case 0: isa->cfxPowerFrame.prevRunMode = value & 0x3; return NoFault;
++    case 1: isa->cfxPowerFrame.prevCfxMask = value; return NoFault;
++    case 3: isa->cfxPowerFrame.causeIp = value & MASK48; return NoFault;
++    default: return NoFault;
++    }
++  }
++  // KL-112a design 1 storage: cfx_<name>_<mode>_escape_cfx_mask. No
++  // cfx2rc_cfx_mask (design 2) counterpart -- deliberately not
++  // implemented, see isa.hh's CfxMaskRegEscape comment.
++  if (cg_ <= 3 && rc_ == CfxMaskRegEscape) {
++    isa->cfxEscapeCfxMask[cfxcode_][cg_] = value;
++    return NoFault;
++  }
++  // KL-112a design 3: cfx_power's cg=8 defines only rc=0 (power_pending)
++  // and rc=1 (power_ctrl); every other rc is a genuinely non-existent
++  // (cg,rc) combination for cfx_power, not merely unimplemented.
++  if (cfxcode_ == CfxCodePower && cg_ == 8 && rc_ > 1)
++    return std::make_shared<CfxregFault>();
++  // Every other combination -- remaining cg0-2/cg3/cg4/cg6/cg7 register
++  // maps this M1 subset has not backed with storage, and reserved-cfxcode
++  // routing to ILLI -- is out of O1/O2 scope; silent no-op rather than
++  // fabricating state, matching QEMU's helper_cfx2rc().
++  return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"cfx2rc";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
++// === escape (ciii, op=0x77, KL-113a hypv<->supv handoff O1+O2 design1) ===
++// Centralized CFX state transition, mirroring QEMU helper_escape()
++// [.work/source/qemu/target/dadao/helper.c, KL-110a/KL-112a]: KL-112a
++// design 1's cross-cfx escape_cfx_mask check (SEE §5 exception-exit step 0)
++// runs before any state write below -- on failure this returns
++// immediately via RET_ILLI, so inner_run_mode/inner_cfx_mask/PC are
++// provably untouched (spec §2.7 precise-fault convention). This does not
++// implement the wiki's full monitor-redirect pseudocode on failure [wiki
++// §DADAO-12-SEE §5 L824-L835, "goto check_nonmaskable"] -- neither does
++// QEMU, nor does any other ILLI/UNDI/MALIGN fault in this M1 subset (there
++// is no monitor/exception-vector infrastructure built out); this fault
++// simply exits the sim loop with the ILLI code, same as every other fault
++// class here.
++class EscapeInst : public StaticInst { RegId srcRegs[0], dstRegs[0];
++  uint8_t cfxcode_; int64_t imm_; public:
++EscapeInst(uint8_t ha, int64_t imm) : StaticInst("escape", enums::No_OpClass), cfxcode_(ha & 0x3F), imm_(imm) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  ISA *isa = cfxIsa(xc);
++  RunMode modeBefore = isa->innerRunMode;
++  // KL-112a design 1 (candidate B): SEE §5 exception-exit step 0.
++  // ⟨cfxname⟩ = inner_cfx_code (the cfx executing this escape), <mode> =
++  // inner_run_mode *before* steps 1-2 restore it (i.e. the current,
++  // not-yet-restored value read here).
++  if (cfxcode_ != isa->innerCfxCode) {
++    uint64_t mask = isa->cfxEscapeCfxMask[isa->innerCfxCode][(int)isa->innerRunMode];
++    if ((mask >> cfxcode_) & 1) RET_ILLI;
++  }
++  // Only cfx_power's exception frame exists (O1 scope); escaping any other
++  // cfxcode that passed the check above has no frame to restore from and
++  // falls back to a zeroed frame instead of fabricating per-cfx state that
++  // was never written.
++  uint64_t prevRunMode, prevCfxMask, causeIp;
++  if (cfxcode_ == CfxCodePower) {
++    prevRunMode = isa->cfxPowerFrame.prevRunMode;
++    prevCfxMask = isa->cfxPowerFrame.prevCfxMask;
++    causeIp = isa->cfxPowerFrame.causeIp;
++  } else {
++    prevRunMode = RunModeUser; prevCfxMask = 0; causeIp = 0;
++  }
++  // SEE §5 exception-exit steps 1-2: restore mask then mode. Step 3
++  // (escape_num++, a cg4 per-cfx counter) and inner_cfx_code
++  // (docs/wiki-deviations.md #9 -- no cfx_<name>_excp_prev_cfx_code
++  // register exists to restore it from) are not modeled, matching QEMU's
++  // O1/O2 scope.
++  isa->innerCfxMask = prevCfxMask;
++  isa->innerRunMode = (RunMode)(prevRunMode & 0x3);
++  // SEE §5 step 4: target = cause_ip + (imms18 << 2). imm_ arrives already
++  // sign-extended (imm18s()).
++  uint64_t target = (causeIp + (uint64_t)(imm_ * 4)) & MASK48;
++  PCState pc = xc->pcState().as<PCState>(); pc.set(target); xc->pcState(pc);
++  // KL-113a observability: mirrors QEMU's CPU_LOG_INT escape trace
++  // (helper_escape(), only emitted with `-d int`). Unconditional stderr
++  // here instead -- gem5 dadao has no equivalent gated log channel wired
++  // up, and escape is a brand-new instruction no existing lit/differential
++  // vector executes, so this cannot perturb any existing test's stdout
++  // (dumpFinalState's DADAO_REGDUMP/DADAO_MEMDUMP) or exit code. Only
++  // reached past the design-1 check above, so its presence/absence is
++  // itself part of the O2 negative-probe evidence (see KL-113a task
++  // completion notes / .work/evidence).
++  std::cerr << "dadao: escape cfx=" << (unsigned)cfxcode_
++            << " mode " << (int)modeBefore << "->" << (int)isa->innerRunMode
++            << " mask=0x" << std::hex << isa->innerCfxMask
++            << " pc=0x" << target << std::dec << "\n";
++  return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"escape";} void advancePC(PCStateBase&)const override{}};
++
+ // === Decoder ===
+ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     uint32_t w = inst.inst; uint8_t op = w >> 24;
+@@ -973,7 +1103,9 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     case 0x6C: return StaticInstPtr(new CallIInst(imm24s(w)));        // call  §5.4
+     case 0x6D: return StaticInstPtr(new CallRInst(ha(w), hb(w), imm12s(w))); // call_r §5.4
+     case 0x6E: return StaticInstPtr(new RetInst(ha(w), imm18s(w)));   // ret   §5.5
++    case 0x73: return StaticInstPtr(new CFX2RCInst(ha(w), hb(w), hc(w), hd(w))); // cfx2rc §系统类指令 (KL-113a)
+     case 0x76: return StaticInstPtr(new TrapInst(ha(w)));              // trap  §系统
++    case 0x77: return StaticInstPtr(new EscapeInst(ha(w), imm18s(w))); // escape §系统类指令 (KL-113a)
+     default:   return StaticInstPtr(new UnknownInst()); // reserved major op → UNDI
+     }
+ }
+diff --git a/src/arch/dadao/faults.hh b/src/arch/dadao/faults.hh
+index 7265054d46..9c3d79cf8d 100644
+--- a/src/arch/dadao/faults.hh
++++ b/src/arch/dadao/faults.hh
+@@ -11,6 +11,10 @@ namespace DADAOISA
+ // DG-004c fault model. Each fault carries an SE exit code that the differential
+ // adapter (and run_qemu_test.py) map back to the architectural fault:
+ //   ILLI = 0x82, MALIGN = 0x81, UNDI = 0x83   (spec §2.5/§2.6/§3.1)
++//   RASOF = 0x84, RASUF = 0x85                (spec §5.6)
++//   CFXREG = 0x86 (KL-113a; matches QEMU's EXCP_CFXREG, a project
++//   convention extending 0x81-0x85 contiguously, not a wiki-defined number
++//   -- see .work/source/qemu/target/dadao/cpu.h, KL-112a)
+ // The exit codes are the single source of truth shared with the harness
+ // FAULT_CODES; invoke() exits the sim loop carrying the code (no register or
+ // memory side effect — the faulting instruction returns the Fault before any
+@@ -74,6 +78,20 @@ class RasufFault : public DADAOFault
+     RasufFault() : DADAOFault("RASUF", 0x85) {}
+ };
+ 
++// KL-113a (mirrors QEMU's KL-112a design 3, candidate C): a genuinely
++// non-existent (cg,rc) combination accessed via cfx2rc for a real cfx --
++// scoped narrowly to cfx_power's cg=8 rc>1 (wiki SEE §4 cfx_power register
++// table only defines rc=0/1) — spec §8.1 design 3; wiki SimRISC-04
++// §寄存器传输指令 CFXREG trigger condition. Distinct from ILLI (illegal
++// operand of a known instruction) and UNDI (reserved opcode/encoding): this
++// is a legal instruction addressing a register slot that wiki-defines as
++// not existing for this cfx, not merely unimplemented storage.
++class CfxregFault : public DADAOFault
++{
++  public:
++    CfxregFault() : DADAOFault("CFXREG", 0x86) {}
++};
++
+ // Sentinel for opcodes DADAO gem5 has not implemented yet (register-bank block
+ // copy was G2; now implemented — this remains for any future gap). NOT an
+ // architectural fault — its private exit code lets the adapter report
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index 39a3c8d39b..91f0986fc6 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -36,6 +36,36 @@ ISA::ISA(const Params &p) : BaseISA(p, "dadao")
+     clear();
+ }
+ 
++void
++ISA::clear()
++{
++    miscRegFile.assign(NumMiscRegs, 0);
++
++    // KL-113a: CFX privilege state reset. Mirrors QEMU
++    // dadao_cpu_reset_hold() (.work/source/qemu/target/dadao/cpu.c)
++    // field-for-field: hypv/cfx_power/mask=all-1 at reset [wiki
++    // §DADAO-23-HBI §3 L25 "运行模式初始化为 hypv，inner_cfx_code 初始化为
++    // cfx_power，inner_cfx_mask 初始化为全 1"]; HEE §1 cg3/rc12 delegation
++    // defaults to all-ones [wiki §DADAO-13-HEE §1 L24]; KL-112a design 1's
++    // escape_cfx_mask also defaults to all-ones for every (cfxcode, mode)
++    // pair [wiki §DADAO-13-HEE §1 L19; §DADAO-12-SEE §3 L281/L305/L325].
++    // gem5 SE mode has no bare-metal reset vector -- this runs once per
++    // thread at ThreadContext construction (SimpleThread::clearArchRegs(),
++    // before the ELF entry PC is set), which is the closest analogue this
++    // arch has to QEMU's CPU reset for observing "post-reset" CFX state.
++    innerRunMode = RunModeHypv;
++    innerCfxCode = CfxCodePower;
++    innerCfxMask = ~0ULL;
++    cfxPowerFrame.prevRunMode = RunModeHypv;
++    cfxPowerFrame.prevCfxMask = ~0ULL;
++    cfxPowerFrame.causeIp = 0;
++    for (int i = 0; i < 64; i++) {
++        cfxHypvCgRegDeleg[i] = ~0ULL;
++        for (int m = 0; m < 4; m++)
++            cfxEscapeCfxMask[i][m] = ~0ULL;
++    }
++}
++
+ void
+ ISA::copyRegsFrom(ThreadContext *src)
+ {
+@@ -44,6 +74,22 @@ ISA::copyRegsFrom(ThreadContext *src)
+     for (auto &id : floatRegClass)
+         tc->setReg(id, src->getReg(id));
+     tc->pcState(src->pcState());
++
++    // KL-113a: carry CFX privilege state across the same copy (e.g. SE
++    // clone()/fork() workload switches this ISA already handles for int/
++    // float regs and PC) -- source ISA is reached the same way
++    // ThreadContext's other getReg() calls are, via its BaseISA.
++    if (auto *srcIsa = dynamic_cast<ISA *>(src->getIsaPtr())) {
++        innerRunMode = srcIsa->innerRunMode;
++        innerCfxCode = srcIsa->innerCfxCode;
++        innerCfxMask = srcIsa->innerCfxMask;
++        cfxPowerFrame = srcIsa->cfxPowerFrame;
++        for (int i = 0; i < 64; i++) {
++            cfxHypvCgRegDeleg[i] = srcIsa->cfxHypvCgRegDeleg[i];
++            for (int m = 0; m < 4; m++)
++                cfxEscapeCfxMask[i][m] = srcIsa->cfxEscapeCfxMask[i][m];
++        }
++    }
+ }
+ 
+ } // namespace DADAOISA
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+index 6a4c35bd95..91a6684e9b 100644
+--- a/src/arch/dadao/isa.hh
++++ b/src/arch/dadao/isa.hh
+@@ -1,6 +1,7 @@
+ #ifndef __ARCH_DADAO_ISA_HH__
+ #define __ARCH_DADAO_ISA_HH__
+ 
++#include <cstdint>
+ #include <vector>
+ 
+ #include "arch/dadao/pcstate.hh"
+@@ -16,6 +17,46 @@ struct DADAOISAParams;
+ namespace DADAOISA
+ {
+ 
++// KL-113a: CFX privilege state (hypv<->supv handoff). Semantics mirror QEMU
++// CPUArchState field-for-field (.work/source/qemu/target/dadao/cpu.h, added
++// by KL-110a/KL-112a commits 72cba5f/4d8d9fa) -- this project's gem5 arch is
++// a hand-written decoder (decoder.cc), not the .isa DSL, so there is no
++// generated register-state layer to hook; QEMU's already-verified
++// implementation is the semantics reference, not a fresh design.
++enum RunMode : uint8_t
++{
++    RunModeUser = 0,
++    RunModeJail = 1,
++    RunModeSupv = 2,
++    RunModeHypv = 3,
++};
++
++// cfx_power's cfxcode [wiki §DADAO-12-SEE §4 "cfx_power" L630] -- the only
++// cfx with an implemented cg5 exception frame in this O1/O2 subset.
++constexpr uint8_t CfxCodePower = 63;
++
++// HEE §1 cg3/rc12 "hypv cg reg delegation" (per-cfxcode storage)
++// [wiki §DADAO-13-HEE §1 L24].
++constexpr uint8_t CfxHypvCgRegDelegCg = 3;
++constexpr uint8_t CfxHypvCgRegDelegRc = 12;
++
++// KL-112a design 1 (candidate B) storage selector: cg0-3/rc7
++// "<mode>_escape_cfx_mask" [wiki §DADAO-13-HEE §1 L19; §DADAO-12-SEE §3
++// L281/L305/L325]. There is deliberately no cfx2rc_cfx_mask (design 2)
++// counterpart -- see docs/wiki-deviations.md #11: it contradicts the HBI §3
++// boot stub (cross-cfx cfx2rc calls that never clear that mask), the same
++// way it would in QEMU.
++constexpr uint8_t CfxMaskRegEscape = 7;
++
++// cfx_power cg5 exception frame -- only the three fields the HBI §3
++// handoff stub writes (rc0/rc1/rc3) [wiki §DADAO-12-SEE §3 L357-L360].
++struct CfxPowerFrame
++{
++    uint64_t prevRunMode = RunModeHypv;
++    uint64_t prevCfxMask = ~0ULL;
++    uint64_t causeIp = 0;
++};
++
+ class ISA : public BaseISA
+ {
+   protected:
+@@ -32,7 +73,20 @@ class ISA : public BaseISA
+         return new PCState(new_inst_addr);
+     }
+ 
+-    void clear() override { miscRegFile.assign(NumMiscRegs, 0); }
++    // KL-113a CFX privilege state. Plain ISA-class members rather than
++    // miscRegFile entries: miscRegFile (std::vector<RegVal>, NumMiscRegs=1)
++    // is designed for scalar registers, while cfxHypvCgRegDeleg[64] and
++    // cfxEscapeCfxMask[64][4] are per-cfxcode/per-mode arrays that don't fit
++    // that shape -- mirrors QEMU's CPUArchState being a plain C struct with
++    // these same fields (cpu.h).
++    RunMode innerRunMode = RunModeHypv;
++    uint8_t innerCfxCode = CfxCodePower;
++    uint64_t innerCfxMask = ~0ULL;
++    CfxPowerFrame cfxPowerFrame;
++    uint64_t cfxHypvCgRegDeleg[64];
++    uint64_t cfxEscapeCfxMask[64][4];
++
++    void clear() override;
+ 
+     RegVal
+     readMiscRegNoEffect(RegIndex idx) const override
+-- 
+2.43.0
+
