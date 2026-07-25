@@ -989,7 +989,7 @@ no-op). The exact test-machine observable protocol is defined in ADR-0004.
 |------|----------------------|------------------|
 | RF execution | All MISC-RF subtable (op 01010–01011); csn-rf, csz-rf, csp-rf, csp1, csnp1; rd2rf, rf2rd, rf2rf; ldt-rf, ldo-rf, ldmt-rf, ldmo-rf; stt-rf, sto-rf, stmt-rf, stmo-rf; ftmadd, fomadd; setw | §Floating-point |
 | Atomics | fence; lro_nn/nr/an/ar; sco_nn/nr/an/ar | §Atomics |
-| System cfx | trap; cfx2rd; cfxld, cfxst | §SBI/HBI |
+| System cfx | trap (partial -- see §8.4 for the `cfx_smon`/CFXTRAP subset KL-116a formalizes); cfx2rd; cfxld, cfxst | §SBI/HBI |
 | RA register move | rd2ra, ra2rd | Excluded (M1 scope decision, 2026-06-29; ISA semantics clear per SimRISC-02 §RA↔RD; not needed for non-variadic scalar ABI) |
 
 ---
@@ -998,25 +998,35 @@ no-op). The exact test-machine observable protocol is defined in ADR-0004.
 
 [wiki §SimRISC-04-系统类指令.md §特权指令; §DADAO-12-SEE-主管系统运行环境.md §5 异常进入与异常退出; §DADAO-23-HBI-超管系统二进制接口.md §3]
 
-This section formalizes `cfx2rc` and `escape` per the wiki's full
-architectural semantics. **QEMU's implementation covers the O1 success
-path (KL-110a) plus two of O2's negative paths (KL-112a, 2026-07-25)** —
-`cfx2rc` implements the `cg=3/rc=12` delegation register,
-`cfx_power`'s `cg=5` exception frame, and CFXREG for `cfx_power`'s
-`cg=8` reserved `rc` range (design 3 / candidate C); `escape` implements
-`cfx_power` self-escape plus the cross-cfx `escape_cfx_mask` permission
-check (SEE §5 exception-exit step 0, design 1 / candidate B). Still
-**Excluded**: reserved-cfxcode entry-flow routing (see §8.1's bullet list
-below for the wiki citation), the remaining
-`cg0/cg1/cg2/cg4/cg6/cg7` register maps, and — deliberately, not merely
-deferred — the cross-cfx `cfx2rc_cfx_mask` check ("design 2" / candidate
-B2): implementing it as a blanket check makes HBI §3's own documented
-boot stub permanently illegal (11 of its 12 delegation-clearing `cfx2rc`
-calls are cross-cfx and that mask is never cleared), a genuine wiki
-contradiction recorded as `docs/wiki-deviations.md` #11, not an
-implementation-cost tradeoff. `cg_reg_deleg`'s own access-control
-semantics (candidate A) remain unimplemented per `docs/wiki-deviations.md`
-#10 (M1 scope decision, KL-110a/KL-112a, 2026-07-25; O1/O2 split per
+This section formalizes `cfx2rc`, `escape`, and (as of KL-116a) a subset
+of `trap` per the wiki's full architectural semantics. **QEMU's
+implementation covers the O1 success path (KL-110a), two of O2's
+negative paths (KL-112a, 2026-07-25), and O3's `cfx_smon` CFXTRAP entry
+subset (KL-116a, 2026-07-25)** — `cfx2rc` implements the `cg=3/rc=12`
+delegation register, `cfx_power`'s `cg=5` exception frame, the
+`cfx_smon_supv_excp_vector` (`cg=2/rc=10`) register, and CFXREG for
+`cfx_power`'s `cg=8` reserved `rc` range (design 3 / candidate C);
+`escape` implements `cfx_power` self-escape, `cfx_smon` self-escape, and
+the cross-cfx `escape_cfx_mask` permission check (SEE §5 exception-exit
+step 0, design 1 / candidate B); `trap` implements the SEE §5 entry-flow
+steps 7-10 (save current mode/mask, mode switch, save cause, jump
+vector) for exactly one case — `cfxcode==2` (`cfx_smon`), cause=CFXTRAP —
+gated behind the default-off QEMU CPU property `cfx-smon-real` (§8.4).
+Still **Excluded**: reserved-cfxcode entry-flow routing (see §8.1's
+bullet list below for the wiki citation), the remaining
+`cg0/cg1/cg2/cg4/cg6/cg7` register maps (except `cfx_smon`'s `cg2/rc10`
+above), `trap` for every cfxcode other than `cfx_smon` (still routes to the pre-existing host/SE syscall shortcut when `cfxcode==2`, or ILLI otherwise — see §8.4) [spec-decision: KL-116a, 2026-07-25], `trap`'s
+entry-flow steps 2-6 for every other cause (§8.4 explains why CFXTRAP
+itself needs none of them), and —
+deliberately, not merely deferred — the cross-cfx `cfx2rc_cfx_mask`
+check ("design 2" / candidate B2): implementing it as a blanket check
+makes HBI §3's own documented boot stub permanently illegal (11 of its
+12 delegation-clearing `cfx2rc` calls are cross-cfx and that mask is
+never cleared), a genuine wiki contradiction recorded as
+`docs/wiki-deviations.md` #11, not an implementation-cost tradeoff.
+`cg_reg_deleg`'s own access-control semantics (candidate A) remain
+unimplemented per `docs/wiki-deviations.md` #10 (M1 scope decision,
+KL-110a/KL-112a, 2026-07-25; O1/O2 split per
 `docs/reviews/kernel-cfx-state-patch-surface-20260721.md` §3;
 `docs/reviews/kernel-hypv-supv-o2-permission-recon-20260725.md` §4).
 
@@ -1043,11 +1053,11 @@ Full semantics (wiki; see the scope note above for exactly what QEMU implements)
 ### 8.2 `trap` / `escape` (ciii)
 
 ```
-trap      cfx_<cfxname>, immu18   ; call into cfx_<cfxname> (M1-excluded, §7)
+trap      cfx_<cfxname>, immu18   ; call into cfx_<cfxname> (M1-excluded per §7, except cfx_smon/CFXTRAP -- §8.4)
 escape    cfx_<cfxname>, imms18   ; return from the current cfx frame
 ```
 
-Encoding: §2.8 row 0111-0xxx col 110 (`trap`, `0x76`, M1-excluded per §7) / col 111 (`escape`, `0x77`). Format `ciii`.
+Encoding: §2.8 row 0111-0xxx col 110 (`trap`, `0x76`, M1-excluded per §7 except the `cfx_smon` subset in §8.4) / col 111 (`escape`, `0x77`). Format `ciii`.
 `ha`=cfxcode; `hb:hc:hd`=the 18-bit immediate (unsigned `immu18` for `trap`, signed `imms18` for `escape`). [wiki §SimRISC-00 §指令设计 L51–L53; §SimRISC-04 §陷入指令 L48–L58; §SimRISC-04 §退出指令 L60–L70]
 
 `escape` semantics (SEE §5 exception-exit flow — full wiki pseudocode; see the scope note above for what QEMU implements):
@@ -1070,6 +1080,94 @@ The minimal hypv→supv handoff sequence — the concrete O1 vector this section
 
 The `(cg, rc)` pairs used: `cfx_<cfxname>_hypv_cg_reg_deleg` = `(3, 12)`. [wiki §DADAO-13-HEE §1 L24]
 `cfx_power_excp_prev_run_mode` / `_prev_cfx_mask` / `_cause_ip` = `(5, 0)` / `(5, 1)` / `(5, 3)`. [wiki §DADAO-12-SEE §3 cg5 L357–L360]
+
+### 8.4 `trap` Entry Flow — O3 Subset (`cfx_smon` CFXTRAP)
+
+Gated behind the QEMU CPU property `cfx-smon-real` (default **off**). When
+off, `trap` with `cfxcode==2` runs the pre-existing host/SE syscall
+shortcut unchanged (not ISA semantics — a QEMU/SE convenience, ADR-0014);
+`trap` with any other `cfxcode` raises **ILLI**, unchanged from before this task [spec-decision: KL-116a, 2026-07-25]. When explicitly turned on
+(`-cpu dadao-cpu,cfx-smon-real=on`, or `-global
+dadao-cpu.cfx-smon-real=on` — see the note below), `trap` with
+`cfxcode==2` instead runs the entry-flow subset formalized below, and every other `cfxcode` still raises **ILLI**, unaffected by the property [spec-decision: KL-116a, 2026-07-25]. This is a QEMU implementation-level
+fork, not an ISA concept — the wiki's `trap` semantics do not vary by any
+switch; the property exists only so the pre-existing host/SE shortcut and
+this section's real entry flow can coexist in the same binary without one
+replacing the other's test coverage. [spec-decision: KL-116a, 2026-07-25]
+
+SEE §5 entry-flow steps (full wiki pseudocode: §8's intro citation,
+[wiki §DADAO-12-SEE-主管系统运行环境.md L678–L811]), applied to exactly
+the case above (`cause=CFXTRAP`, target cfx = `cfx_smon`):
+
+1. **Determine target cfx**: `temp_cfx_code ← cfxcode` (2, `cfx_smon`). [wiki §DADAO-12-SEE §5 L729–L731]
+2-5. **Skipped, not merely omitted**: `cfx_smon`'s CFXTRAP cause bit is
+   hardware-nonmaskable — its cause table is defined identical to
+   `cfx_umon`'s [wiki §DADAO-12-SEE-主管系统运行环境.md L417–L419], whose
+   CFXTRAP row's "是否可屏蔽" column reads "否"
+   [wiki §DADAO-12-SEE-主管系统运行环境.md L402]. Entry-flow step 2's own
+   pseudocode (`check_nonmaskable`) jumps straight past steps 3-5 (`inner_cfx_mask`/`global_cfx_mask`/`excp_cause_mask` [wiki §DADAO-12-SEE-主管系统运行环境.md L693]) to step 6 whenever the
+   nonmaskable bit is set [wiki §DADAO-12-SEE-主管系统运行环境.md L763–L765].
+3. **Step 6 (trap count) excluded**: no `cg4` counter storage exists for
+   any cfx in this QEMU target (same precedent as `escape_num` in §8.2),
+   and it is not part of O3's acceptance observation.
+   [wiki §DADAO-12-SEE-主管系统运行环境.md L699, L787–L793]
+4. **Step 7 (save current mode/mask)**: `cfx_smon_excp_prev_run_mode ←
+   inner_run_mode`, `cfx_smon_excp_prev_cfx_mask ← inner_cfx_mask` —
+   into a new `cfx_smon`-only frame (`(cg,rc)=(5,0)`/`(5,1)`, same
+   register numbering as `cfx_power`'s frame, §8.3), written *before*
+   step 8 below overwrites those two variables.
+   [wiki §DADAO-12-SEE-主管系统运行环境.md L700, L796–L797]
+5. **Step 8 (mode switch)**: `inner_run_mode ←
+   cfx_smon_supv_switch_run_mode` (wiki default `2`/supv), `inner_cfx_mask
+   ← cfx_smon_supv_switch_cfx_mask` (wiki default all-1),
+   `inner_cfx_code ← cfx_smon` (2)
+   [wiki §DADAO-12-SEE-主管系统运行环境.md L701, L799–L802]. QEMU
+   hardcodes the wiki reset defaults for the first two — `(cg,rc)=(2,8)`/
+   `(2,9)` have no `cfx2rc` write support in this task's scope, so the
+   defaults are the only value they can currently hold, not an invented
+   substitute (KL-115a report §1.5: the O3 probe's minimal scenario needs
+   no other value) [spec-decision: KL-116a, 2026-07-25]. This is the
+   first time `inner_cfx_code` becomes anything other than `cfx_power`
+   since reset.
+6. **Step 9 (save cause)**: `cfx_smon_excp_cause_id ← CFXTRAP` (`1<<0`,
+   `(cg,rc)=(5,2)`) [wiki §DADAO-12-SEE-主管系统运行环境.md L402];
+   `cfx_smon_excp_cause_ip ←` the address of the `trap` instruction
+   itself (`(cg,rc)=(5,3)`, same synchronous-exception convention as
+   every other precise fault in this spec, §2.7); `cfx_smon_excp_cause_info
+   ←` the `trap` instruction's raw 32-bit encoding (`(cg,rc)=(5,4)`, per
+   the CFXTRAP cause-table row's "指令编码" column)
+   [wiki §DADAO-12-SEE-主管系统运行环境.md L703–L705, L804–L807]. Unlike
+   `cfx_power`'s frame (§8.1/§8.3), which only ever held the three fields
+   O1's software `cfx2rc` stub wrote, `cause_id`/`cause_info` here are
+   written by this real hardware entry path — the first time either
+   field has any QEMU storage for any cfx
+   [wiki §DADAO-12-SEE §3 cg5 L357–L361 for the register numbering].
+7. **Step 10 (jump vector)**: `inner_inst_pointer ←
+   cfx_smon_supv_excp_vector` (`(cg,rc)=(2,10)`, the one cg2 register
+   this task adds `cfx2rc` write support for)
+   [wiki §DADAO-12-SEE-主管系统运行环境.md L706, L809–L810]. Flat
+   physical address (ADR-0004 convention, same as O1's
+   `cause_ip`/`supv_entry`, §8.3) — SEE §2.1 never populated a
+   core-internal-address mapping for `cfx_smon` to deviate from
+   [spec-decision: KL-116a, 2026-07-25].
+
+`escape cfx_smon, N` (self-escape, `cfxcode==inner_cfx_code` after step 8
+above) restores from this same frame — `prev_run_mode`/`prev_cfx_mask`/
+`cause_ip` only, matching `cfx_power`'s existing restore convention
+(§8.2); `cause_id`/`cause_info` are HW-only fields and are not restored
+by `escape` for either cfx. [wiki §DADAO-12-SEE §3 cg5 L357–L361]
+
+**Note on the CPU property mechanism**: `-cpu
+dadao-cpu,cfx-smon-real=on` currently fails ("unable to find CPU model")
+due to a pre-existing bug in `dadao_cpu_class_by_name()`
+(`target/dadao/cpu.c`) unrelated to this task — that function's
+`g_strsplit(cpu_model, ",", 1)` was never exercised by any prior task
+(no `-cpu` invocation with CPU-model properties existed before KL-116a).
+`-global dadao-cpu.cfx-smon-real=on` (QEMU's generic per-device property
+mechanism, independent of `parse_cpu_option()`/`class_by_name`) is
+unaffected and is this task's verified invocation. Fixing
+`dadao_cpu_class_by_name()` is out of KL-116a's scope (not listed in its
+task constraints) and is left as a follow-up finding.
 
 ---
 
