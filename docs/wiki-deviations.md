@@ -257,3 +257,36 @@
   （KL-101a，第30-36行发现原文）；`docs/reviews/
   kernel-cfx-state-patch-surface-20260721.md`（KL-102a，O1/O2 范围划分）；
   `contracts/isa/spec.md §8.2`（决定落地位置）
+
+### 10. `cg_reg_deleg` 委托状态被拒绝时的异常类别与检查时机未定义（KL-111a，
+    2026-07-25）
+
+- **wiki 状态**：SILENT（寄存器语义"bit=0 时允许 supv 访问"有明确定义，
+  且有一个"委托后允许访问"的正面用例，唯独"未委托/仍被拒绝时应该产生什么
+  异常、检查发生在指令执行的哪个阶段"全文未提及）
+- **wiki 原文引用**：`DADAO-13-HEE-超管系统运行环境.md:24`（寄存器定义）；
+  `DADAO-22-SBI-主管系统二进制接口.md:701`（唯一正面用例，"因此 supv
+  可直接通过 cfx2rc/cfx2rd 操作该寄存器"，只说委托后能访问，不说委托前
+  访问会怎样）；`DADAO-23-HBI-超管系统二进制接口.md:32`（HBI 引导代码
+  注释，同样只描述"清除委托"这个动作，不描述不清除的后果）。全文 grep
+  `cg_reg_deleg`/`cg reg delegation` 只有这 3 处命中，`DADAO-12-SEE-
+  主管系统运行环境.md` 的两处正式伪代码（§5 异常进入流程
+  `:678-811`、SimRISC-04 §寄存器传输指令 `:72-103`）均未提及这个寄存器，
+  与同一文档里 `escape_cfx_mask`/`<instr>_cfx_mask` 这组"跨 cfx 执行权限"
+  机制形成对比——后者被写入了正式检查伪代码（`:721`），前者完全没有。
+- **我们的决定**：尚未决定。
+- **理由**：`KL-111a`（`docs/reviews/
+  kernel-hypv-supv-o2-permission-recon-20260725.md`）在设计 O2 负例时
+  发现，"未清 delegation 就从 supv 访问被 delegation 的 cg"这个候选无法
+  构造出一个 wiki 有依据的精确负例——SimRISC-04:87 的"读写权限不匹配→
+  CFXREG"是唯一可能相关的条款，但它与 `cg_reg_deleg` 的关系是推断，不是
+  wiki 显式陈述，且这条条款本身更可能指向寄存器"访问"列（RO/RW/HW/WO）
+  的读写方向不匹配，而不是委托状态。
+- **影响范围**：K1 O2 实现任务的候选范围——"cg0-2/cg4/cg6/cg7 的 supv
+  委托访问控制"这个候选暂不实现，O2 优先实现"跨 cfx escape/cfx2rc 权限
+  检查"和"cfx2rc 目标 (cg,rc) reserved → CFXREG"这两个已有明确 wiki
+  依据的候选（详见 KL-111a 报告 §4）。
+- **状态**：OPEN——待架构师/用户决定是否需要 wiki 团队澄清，或项目自行
+  拍板（如"deleg 拒绝统一按 CFXREG 处理，等同 SimRISC-04:87 第三分句"）。
+- **详见**：`docs/reviews/kernel-hypv-supv-o2-permission-recon-20260725.md`
+  §2.1、§3
