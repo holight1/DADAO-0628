@@ -1753,7 +1753,22 @@ vacuous pass), and confirmed via `git show` that the existing
 differential/manifest/issues/encoding checkers all clean; 24-patch QEMU
 series replays with matching tree hash.
 
-**Next in the K1 sequence**: O2 (unauthorized/masked negative path),
-porting O1/O2 to gem5, `cfx_smon` real guest handler (KL-103a), then
-MMU/TLB + interrupt dispatch — followed by K2 (bare-metal regression),
-K3 (real Linux 5.4 port), K4 (boot to a musl `/init`).
+## K1: hypv→supv privilege handoff O2 recon + implementation in QEMU (2026-07-25) — see `code-agent/tasks/KL-111a-*.md`, `code-agent/tasks/KL-112a-*.md`
+
+KL-111a (pure recon) pinned down which O2 negative paths are actually
+constructible under O1; KL-112a implemented two of them in QEMU
+(cross-cfx `escape` permission check, `cfx2rc` reserved-`(cg,rc)` →
+CFXREG) and deliberately withdrew the third after an empirical replay
+showed it would make HBI §3's own documented boot stub permanently
+illegal — recorded as a genuine wiki self-contradiction
+(`docs/wiki-deviations.md` #11), not an implementation-cost tradeoff.
+Architect independently re-verified every wiki citation, regenerated all
+probes byte-identical, rebuilt QEMU and reproduced the exact exit codes
+and traces, and replayed the full 25-patch series to a matching tree
+hash. Full E2E (81/81) and differential checks unchanged.
+
+**Next in the K1 sequence**: porting O1/O2 to gem5, LLVM MC support for
+`ldmo-ra`/`stmo-ra`/`cfx2rc`/`escape`, `cfx_smon` real guest handler
+(KL-103a), then MMU/TLB + interrupt dispatch — followed by K2
+(bare-metal regression), K3 (real Linux 5.4 port), K4 (boot to a musl
+`/init`).
