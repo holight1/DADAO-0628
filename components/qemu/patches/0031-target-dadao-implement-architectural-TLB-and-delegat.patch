@@ -1,0 +1,480 @@
+From 599efb6c19f66b2846e4be8ab8084890e5e65679 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 16:54:05 +0800
+Subject: [PATCH] target/dadao: implement architectural TLB and delegation
+ (KL-129a)
+
+---
+ target/dadao/cpu.c    | 247 +++++++++++++++++++++++++++++++++++++++++-
+ target/dadao/cpu.h    |  40 ++++++-
+ target/dadao/helper.c |  55 ++++++++++
+ 3 files changed, 337 insertions(+), 5 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index e6ccead..9b27774 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -66,6 +66,9 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+         env->cfx_ptw_ptbr[i] = 0;
+         env->cfx_ptw_pthi[i] = 0;
+         env->cfx_ptw_pahi[i] = 0;
++        for (int way = 0; way < DADAO_CFX_TLB_WAYS; way++) {
++            env->cfx_tlb[i][way] = (DADAOCfxTlbEntry) { 0 };
++        }
+         env->cfx_frame[i].prev_run_mode = DADAO_RUN_MODE_USER;
+         env->cfx_frame[i].prev_cfx_mask = 0;
+         env->cfx_frame[i].cause_id = 0;
+@@ -85,6 +88,10 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+     env->cfx_ptw_perm[DADAO_RUN_MODE_SUPV] = UINT64_MAX;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_HYPV] = UINT64_MAX;
+     env->cfx_ptw_ptbr_enable = 0;
++    env->cfx_tlb_enable = UINT64_MAX;
++    env->cfx_tlb_addr_start = 0;
++    env->cfx_tlb_addr_size = 65536;
++    env->cfx_tlb_clock = 0;
+     /* rf[0] reset = QNaN per ISA spec §1.2 (contracts/isa/spec.md) */
+     env->rf[0] = UINT64_C(0x7FF800007FC00000);
+     env->inner_run_mode = DADAO_RUN_MODE_HYPV;
+@@ -457,6 +464,19 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+             dadao_cfx_precise_trap_enter(cpu, DADAO_CFX_CODE_SMON,
+                                          DADAO_CFX_CAUSE_CFXTRAP,
+                                          raw_insn, env->pc - 4);
++        } else if (cfxcode == DADAO_CFX_CODE_PTW) {
++            /*
++             * KL-129a SBI-style functional delegation. CFXTRAP's cause_ip
++             * is the trap instruction's own address (SEE §5 step 9: "同步
++             * 异常为触发指令地址"), same convention as cfx_smon above --
++             * the handler resumes past the call with escape cfx_ptw,1
++             * (cause_ip+4), matching KL-116a's established
++             * "escape cfx_smon,1" trap-as-call pattern. E1 in the PTW
++             * frame restores the cfx_tlb caller.
++             */
++            dadao_cfx_precise_trap_enter(cpu, DADAO_CFX_CODE_PTW,
++                                         DADAO_CFX_CAUSE_CFXTRAP,
++                                         raw_insn, env->pc - 4);
+         } else {
+             /* unknown cfxcode → ILLI */
+             qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
+@@ -494,7 +514,9 @@ dadao_ptw_page_cause(MMUAccessType access_type,
+  * in tlb_fill so retaddr can first restore the faulting instruction PC. */
+ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+                          MMUAccessType access_type, hwaddr *physical,
+-                         int *prot, uint64_t *fault_cause)
++                         int *prot, uint64_t *fault_cause,
++                         uint64_t *leaf_pte_out,
++                         hwaddr *leaf_pte_addr_out)
+ {
+     DADAOCPU *cpu = DADAO_CPU(cs);
+     CPUDADAOState *env = &cpu->env;
+@@ -511,6 +533,8 @@ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+     uint64_t updated_pte;
+ 
+     *fault_cause = 0;
++    *leaf_pte_out = 0;
++    *leaf_pte_addr_out = 0;
+     if (!(env->cfx_ptw_perm[env->inner_run_mode] &
+           (UINT64_C(1) << ptbr_index))) {
+         *fault_cause = UINT64_C(1) << (8 + env->inner_run_mode);
+@@ -628,6 +652,8 @@ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+                          DADAO_CFX_PTW_CAUSE_DGPTRAP);
+         return false;
+     }
++    *leaf_pte_out = updated_pte;
++    *leaf_pte_addr_out = pte_addr;
+ 
+     qemu_log_mask(CPU_LOG_MMU,
+                   "dadao: ptw va=0x%016" PRIx64
+@@ -638,6 +664,218 @@ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+     return true;
+ }
+ 
++void dadao_cfx_tlb_invalidate_all(CPUDADAOState *env)
++{
++    for (int set = 0; set < DADAO_CFX_TLB_SETS; set++) {
++        for (int way = 0; way < DADAO_CFX_TLB_WAYS; way++) {
++            env->cfx_tlb[set][way].valid = false;
++        }
++    }
++}
++
++void dadao_cfx_tlb_invalidate_range(CPUDADAOState *env)
++{
++    uint64_t start = env->cfx_tlb_addr_start &
++                     UINT64_C(0x0000ffffffffffff);
++    unsigned int set = (start >> 42) & 0x3f;
++    uint64_t set_start = start & ((UINT64_C(1) << 42) - 1);
++    uint64_t set_limit = UINT64_C(1) << 42;
++    uint64_t end;
++
++    if (env->cfx_tlb_addr_size == 0) {
++        return;
++    }
++    if (env->cfx_tlb_addr_size > set_limit - set_start) {
++        end = set_limit;
++    } else {
++        end = set_start + env->cfx_tlb_addr_size;
++    }
++
++    for (int way = 0; way < DADAO_CFX_TLB_WAYS; way++) {
++        DADAOCfxTlbEntry *entry = &env->cfx_tlb[set][way];
++        uint64_t entry_start;
++        uint64_t entry_size;
++
++        if (!entry->valid) {
++            continue;
++        }
++        entry_start = (uint64_t)entry->l1_index << 29;
++        entry_size = UINT64_C(1) << 29;
++        if (!entry->superpage) {
++            entry_start |= (uint64_t)entry->l2_index << 16;
++            entry_size = UINT64_C(1) << 16;
++        }
++        if (entry_start < end && set_start < entry_start + entry_size) {
++            entry->valid = false;
++        }
++    }
++}
++
++static bool
++dadao_cfx_tlb_entry_matches(const DADAOCfxTlbEntry *entry, uint64_t va)
++{
++    if (!entry->valid || entry->l1_index != ((va >> 29) & 0x1fff)) {
++        return false;
++    }
++    return entry->superpage ||
++           entry->l2_index == ((va >> 16) & 0x1fff);
++}
++
++static bool
++dadao_cfx_tlb_hit_translate(CPUState *cs, DADAOCfxTlbEntry *entry,
++                            uint64_t va, MMUAccessType access_type,
++                            hwaddr *physical, int *prot,
++                            uint64_t *fault_cause)
++{
++    CPUDADAOState *env = cpu_env(cs);
++    unsigned int fragment = entry->superpage ?
++        ((va >> 26) & 7) : ((va >> 13) & 7);
++    uint64_t fragment_cause;
++    int leaf_prot = 0;
++    int required_prot;
++    uint64_t updated_pte;
++    uint64_t memory_pte;
++    MemTxResult result;
++
++    /* A matching lookup is a true-LRU use even when access checks fault. */
++    entry->last_used = ++env->cfx_tlb_clock;
++    if (!((entry->leaf_pte >> 56) & (UINT64_C(1) << fragment))) {
++        fragment_cause = entry->superpage ?
++            (access_type == MMU_INST_FETCH ?
++             DADAO_CFX_TLB_CAUSE_ISPFTRAP :
++             DADAO_CFX_TLB_CAUSE_DSPFTRAP) :
++            (access_type == MMU_INST_FETCH ?
++             DADAO_CFX_TLB_CAUSE_IGPFTRAP :
++             DADAO_CFX_TLB_CAUSE_DGPFTRAP);
++        *fault_cause = fragment_cause;
++        return false;
++    }
++    if (entry->leaf_pte & (UINT64_C(1) << 7)) {
++        leaf_prot |= PAGE_READ;
++    }
++    if (entry->leaf_pte & (UINT64_C(1) << 6)) {
++        leaf_prot |= PAGE_WRITE;
++    }
++    if (entry->leaf_pte & (UINT64_C(1) << 5)) {
++        leaf_prot |= PAGE_EXEC;
++    }
++    required_prot = access_type == MMU_INST_FETCH ? PAGE_EXEC :
++                    access_type == MMU_DATA_STORE ? PAGE_WRITE : PAGE_READ;
++    if (!(leaf_prot & required_prot)) {
++        *fault_cause = access_type == MMU_INST_FETCH ?
++            DADAO_CFX_TLB_CAUSE_NXPERM :
++            access_type == MMU_DATA_STORE ?
++            DADAO_CFX_TLB_CAUSE_NWPERM :
++            DADAO_CFX_TLB_CAUSE_NRPERM;
++        return false;
++    }
++
++    updated_pte = entry->leaf_pte | (UINT64_C(1) << 3);
++    if (access_type == MMU_DATA_STORE) {
++        updated_pte |= UINT64_C(1) << 2;
++    }
++    /*
++     * A/D remains a memory-visible hardware responsibility on a TLB hit.
++     * Permission/fragment decisions above use only the cached PTE. This
++     * separate memory RMW merges A/D into the current PTE so stale cached
++     * non-A/D fields never overwrite software updates before invalidation.
++     */
++    memory_pte = address_space_ldq_be(cs->as, entry->leaf_pte_addr,
++                                     MEMTXATTRS_UNSPECIFIED, &result);
++    if (result != MEMTX_OK) {
++        return false;
++    }
++    memory_pte |= UINT64_C(1) << 3;
++    if (access_type == MMU_DATA_STORE) {
++        memory_pte |= UINT64_C(1) << 2;
++    }
++    address_space_stq_be(cs->as, entry->leaf_pte_addr, memory_pte,
++                         MEMTXATTRS_UNSPECIFIED, &result);
++    if (result != MEMTX_OK) {
++        return false;
++    }
++    entry->leaf_pte = updated_pte;
++    *prot = leaf_prot;
++    if (access_type != MMU_DATA_STORE &&
++        !(entry->leaf_pte & (UINT64_C(1) << 2))) {
++        *prot &= ~PAGE_WRITE;
++    }
++    *physical = entry->physical_base |
++        (va & (entry->superpage ? UINT64_C(0x1fffffff) :
++                                  UINT64_C(0xffff)));
++    qemu_log_mask(CPU_LOG_MMU,
++                  "dadao: cfx_tlb hit va=0x%016" PRIx64
++                  " pa=0x%016" HWADDR_PRIx " access=%d\n",
++                  va, *physical, access_type);
++    return true;
++}
++
++static bool
++dadao_mmu_translate(CPUState *cs, vaddr address,
++                    MMUAccessType access_type, hwaddr *physical,
++                    int *prot, uint64_t *fault_cause,
++                    uint64_t *fault_cfxcode)
++{
++    CPUDADAOState *env = cpu_env(cs);
++    uint64_t va = address & UINT64_C(0x0000ffffffffffff);
++    unsigned int set = (va >> 42) & 0x3f;
++    uint64_t leaf_pte;
++    hwaddr leaf_pte_addr;
++
++    *fault_cfxcode = DADAO_CFX_CODE_PTW;
++    /*
++     * Mode permission and identity-space enable are PTW step 1 and precede
++     * the architectural TLB. Let the unchanged walker classify/bypass them.
++     */
++    if (!(env->cfx_ptw_perm[env->inner_run_mode] &
++          (UINT64_C(1) << set)) ||
++        !(env->cfx_ptw_ptbr_enable & (UINT64_C(1) << set)) ||
++        !(env->cfx_tlb_enable & (UINT64_C(1) << set))) {
++        return dadao_ptw_translate(cs, address, access_type, physical, prot,
++                                   fault_cause, &leaf_pte, &leaf_pte_addr);
++    }
++
++    for (int way = 0; way < DADAO_CFX_TLB_WAYS; way++) {
++        DADAOCfxTlbEntry *entry = &env->cfx_tlb[set][way];
++        if (dadao_cfx_tlb_entry_matches(entry, va)) {
++            *fault_cfxcode = DADAO_CFX_CODE_TLB;
++            return dadao_cfx_tlb_hit_translate(
++                cs, entry, va, access_type, physical, prot, fault_cause);
++        }
++    }
++
++    if (!dadao_ptw_translate(cs, address, access_type, physical, prot,
++                             fault_cause, &leaf_pte, &leaf_pte_addr)) {
++        return false;
++    }
++
++    int victim = 0;
++    for (int way = 0; way < DADAO_CFX_TLB_WAYS; way++) {
++        if (!env->cfx_tlb[set][way].valid) {
++            victim = way;
++            break;
++        }
++        if (env->cfx_tlb[set][way].last_used <
++            env->cfx_tlb[set][victim].last_used) {
++            victim = way;
++        }
++    }
++    DADAOCfxTlbEntry *entry = &env->cfx_tlb[set][victim];
++    entry->valid = true;
++    entry->superpage = (leaf_pte & 2) != 0;
++    entry->l1_index = (va >> 29) & 0x1fff;
++    entry->l2_index = (va >> 16) & 0x1fff;
++    entry->leaf_pte = leaf_pte;
++    entry->leaf_pte_addr = leaf_pte_addr;
++    entry->physical_base = *physical &
++        ~(entry->superpage ? UINT64_C(0x1fffffff) : UINT64_C(0xffff));
++    entry->last_used = ++env->cfx_tlb_clock;
++    qemu_log_mask(CPU_LOG_MMU,
++                  "dadao: cfx_tlb miss-fill set=%u way=%d"
++                  " va=0x%016" PRIx64 "\n", set, victim, va);
++    return true;
++}
++
+ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx,
+                         bool probe, uintptr_t retaddr)
+@@ -647,15 +885,16 @@ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+     hwaddr physical_page;
+     int prot;
+     uint64_t fault_cause;
++    uint64_t fault_cfxcode;
+ 
+-    if (!dadao_ptw_translate(cs, address, access_type, &physical, &prot,
+-                             &fault_cause)) {
++    if (!dadao_mmu_translate(cs, address, access_type, &physical, &prot,
++                             &fault_cause, &fault_cfxcode)) {
+         if (probe) {
+             return false;
+         }
+         cpu_restore_state(cs, retaddr);
+         dadao_cfx_precise_trap_enter(
+-            DADAO_CPU(cs), DADAO_CFX_CODE_PTW, fault_cause,
++            DADAO_CPU(cs), fault_cfxcode, fault_cause,
+             address & UINT64_C(0x0000ffffffffffff),
+             DADAO_CPU(cs)->env.pc);
+         cpu_loop_exit(cs);
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index cb43aae..5479388 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -52,6 +52,7 @@ typedef enum DADAORunMode {
+ typedef enum DADAOCfxCode {
+     DADAO_CFX_CODE_SMON = 2,
+     DADAO_CFX_CODE_PTW = 4,
++    DADAO_CFX_CODE_TLB = 5,
+     DADAO_CFX_CODE_POWER = 63,
+ } DADAOCfxCode;
+ 
+@@ -88,6 +89,14 @@ typedef struct DADAOCfxFrame {
+ #define DADAO_CFX_PTW_CAUSE_DSPTRAP   (1ULL << 21)
+ #define DADAO_CFX_PTW_CAUSE_DGPFTRAP  (1ULL << 22)
+ #define DADAO_CFX_PTW_CAUSE_DSPFTRAP  (1ULL << 23)
++/* cfx_tlb hit-generated causes are the permission/fragment subset. */
++#define DADAO_CFX_TLB_CAUSE_NXPERM     (1ULL << 12)
++#define DADAO_CFX_TLB_CAUSE_NWPERM     (1ULL << 13)
++#define DADAO_CFX_TLB_CAUSE_NRPERM     (1ULL << 14)
++#define DADAO_CFX_TLB_CAUSE_IGPFTRAP   (1ULL << 18)
++#define DADAO_CFX_TLB_CAUSE_ISPFTRAP   (1ULL << 19)
++#define DADAO_CFX_TLB_CAUSE_DGPFTRAP   (1ULL << 22)
++#define DADAO_CFX_TLB_CAUSE_DSPFTRAP   (1ULL << 23)
+ 
+ /* HEE §1 cg3/rc12 "hypv cg reg delegation", one 64-bit register per cfxcode
+  * (indexed by raw cfxcode, 0-63; reserved cfxcodes are simply never
+@@ -118,6 +127,26 @@ typedef struct DADAOCfxFrame {
+ #define DADAO_CFX_PTW_PTBR_CG 9
+ #define DADAO_CFX_PTW_PTHI_CG 10
+ #define DADAO_CFX_PTW_PAHI_CG 11
++#define DADAO_CFX_TLB_REG_CG 8
++#define DADAO_CFX_TLB_EXIST_RC 0
++#define DADAO_CFX_TLB_ENABLE_RC 8
++#define DADAO_CFX_TLB_CONTROL_CG 12
++#define DADAO_CFX_TLB_CONTROL_RC 0
++#define DADAO_CFX_TLB_ADDR_START_RC 2
++#define DADAO_CFX_TLB_ADDR_SIZE_RC 3
++#define DADAO_CFX_TLB_SETS 64
++#define DADAO_CFX_TLB_WAYS 16
++
++typedef struct DADAOCfxTlbEntry {
++    bool valid;
++    bool superpage;
++    uint16_t l1_index;
++    uint16_t l2_index;
++    target_ulong leaf_pte;
++    hwaddr leaf_pte_addr;
++    hwaddr physical_base;
++    uint64_t last_used;
++} DADAOCfxTlbEntry;
+ 
+ typedef struct CPUArchState CPUDADAOState;
+ typedef struct ArchCPU DADAOCPU;
+@@ -156,6 +185,12 @@ struct CPUArchState {
+     target_ulong cfx_ptw_ptbr[64];
+     uint16_t cfx_ptw_pthi[64];
+     uint16_t cfx_ptw_pahi[64];
++    /* KL-129a K1 profile: 64 independent sets, 16 true-LRU ways each. */
++    target_ulong cfx_tlb_enable;
++    target_ulong cfx_tlb_addr_start;
++    target_ulong cfx_tlb_addr_size;
++    uint64_t cfx_tlb_clock;
++    DADAOCfxTlbEntry cfx_tlb[DADAO_CFX_TLB_SETS][DADAO_CFX_TLB_WAYS];
+     /* KL-112a design 1: cfx_escape_cfx_mask[cfxcode][mode], mode indexed by
+      * DADAORunMode's numeric values (USER=0/JAIL=1/SUPV=2/HYPV=3), matching
+      * the cg0-3 register-group numbering the wiki uses for this per-mode
+@@ -206,7 +241,10 @@ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                         bool probe, uintptr_t retaddr);
+ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+                          MMUAccessType access_type, hwaddr *physical,
+-                         int *prot, uint64_t *fault_cause);
++                         int *prot, uint64_t *fault_cause,
++                         uint64_t *leaf_pte, hwaddr *leaf_pte_addr);
++void dadao_cfx_tlb_invalidate_all(CPUDADAOState *env);
++void dadao_cfx_tlb_invalidate_range(CPUDADAOState *env);
+ G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
+                                       uint32_t exception,
+                                       uintptr_t pc);
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index b72b8ae..b44d092 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -225,6 +225,42 @@ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         }
+     }
+ 
++    if (cfxcode == DADAO_CFX_CODE_TLB) {
++        if (cg == DADAO_CFX_TLB_REG_CG &&
++            rc == DADAO_CFX_TLB_EXIST_RC) {
++            /* RO, K1 profile is fixed at all 64 sets present. */
++            return;
++        }
++        if (cg == DADAO_CFX_TLB_REG_CG &&
++            rc == DADAO_CFX_TLB_ENABLE_RC) {
++            env->cfx_tlb_enable = value;
++            tlb_flush(env_cpu(env));
++            return;
++        }
++        if (cg == DADAO_CFX_TLB_CONTROL_CG &&
++            rc == DADAO_CFX_TLB_CONTROL_RC) {
++            if (value & 1) {
++                dadao_cfx_tlb_invalidate_all(env);
++            }
++            if (value & 2) {
++                dadao_cfx_tlb_invalidate_range(env);
++            }
++            tlb_flush(env_cpu(env));
++            return;
++        }
++        if (cg == DADAO_CFX_TLB_CONTROL_CG &&
++            rc == DADAO_CFX_TLB_ADDR_START_RC) {
++            env->cfx_tlb_addr_start =
++                value & UINT64_C(0x0000ffffffffffff);
++            return;
++        }
++        if (cg == DADAO_CFX_TLB_CONTROL_CG &&
++            rc == DADAO_CFX_TLB_ADDR_SIZE_RC) {
++            env->cfx_tlb_addr_size = value;
++            return;
++        }
++    }
++
+     if (cg == 5) {
+         /* KL-122a common frame carrier. rc2/rc4 are hardware-written and
+          * intentionally read-only; rc5 is project-local E1. */
+@@ -336,6 +372,25 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+             return env->cfx_ptw_pahi[rc];
+         }
+     }
++    if (cfxcode == DADAO_CFX_CODE_TLB) {
++        if (cg == DADAO_CFX_TLB_REG_CG &&
++            rc == DADAO_CFX_TLB_EXIST_RC) {
++            return UINT64_MAX;
++        }
++        if (cg == DADAO_CFX_TLB_REG_CG &&
++            rc == DADAO_CFX_TLB_ENABLE_RC) {
++            return env->cfx_tlb_enable;
++        }
++        if (cg == DADAO_CFX_TLB_CONTROL_CG &&
++            rc == DADAO_CFX_TLB_ADDR_START_RC) {
++            return env->cfx_tlb_addr_start;
++        }
++        if (cg == DADAO_CFX_TLB_CONTROL_CG &&
++            rc == DADAO_CFX_TLB_ADDR_SIZE_RC) {
++            return env->cfx_tlb_addr_size;
++        }
++        /* cg12/rc0 is write-only and reads as zero in this model. */
++    }
+     if (cg == 5) {
+         switch (rc) {
+         case 0: return env->cfx_frame[cfxcode].prev_run_mode;
+-- 
+2.43.0
+

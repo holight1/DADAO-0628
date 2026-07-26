@@ -1951,5 +1951,27 @@ sources. KL-125a 8/8, KL-126a 8/8, the KL-124a FullSystem matrix, KL-122a
 and gem5's 24-patch series replay from their manifest pins to tree hashes
 identical to the development trees.
 
-**Next**: KL-129a adds the architectural TLB cache and the bounded delegation
-mechanism. Firmware and kernel boot are not claimed here.
+## K1: dual-backend architectural TLB and bounded PTW delegation (2026-07-26) — see `code-agent/tasks/KL-129a-*.md`
+
+Added the K1 test-profile architectural TLB around the unchanged KL-127
+walker in QEMU and gem5: 64 independent sets, 16 true-LRU ways, super/normal
+tags, miss/fill/hit, enable bypass, invalidate-all/range, and all seven
+permission/fragment hit causes routed to `cfx_tlb`. Hit checks use cached
+PTE state while a separate memory RMW keeps A/D visible without overwriting
+software-updated non-A/D bits. A real SBI-style `trap cfx_ptw` path uses E1
+to return to the `cfx_tlb` handler, which repairs the PTE, invalidates the
+entry, and retries the original store through `escape cfx_tlb,0`.
+
+A shared 13-scenario guest-checking runner proves register defaults,
+normal-page stale-PTE hits, disabled bypass, both invalidation modes,
+17-entry true-LRU discrimination, 7/7 hit causes with exact frames, and the
+full nested return chain on both backends. KL-120/122/124/125/126/127,
+E2E 81/81, and the 200-case three/four-way differential remain green.
+QEMU's 31-patch and gem5's 25-patch series replay from manifest pins to
+tree hashes identical to their development trees. The wiki cause table has
+10 total entries (three generic plus seven hit-generated); only the seven
+real lookup causes are claimed here.
+
+**Next**: KL-131a connects the maskable asynchronous dispatch core. Firmware,
+full SBI/HBI, Linux paging policy, multicore shootdown, and kernel boot are
+not claimed by KL-129a.

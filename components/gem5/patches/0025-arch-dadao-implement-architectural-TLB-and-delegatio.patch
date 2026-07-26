@@ -1,0 +1,397 @@
+From 1092fa331b29b80b95bee93df9d0a09a12a7b1e5 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 16:54:05 +0800
+Subject: [PATCH] arch/dadao: implement architectural TLB and delegation
+ (KL-129a)
+
+---
+ src/arch/dadao/decoder.cc |  44 +++++++++++
+ src/arch/dadao/isa.cc     | 157 +++++++++++++++++++++++++++++++++++++-
+ src/arch/dadao/isa.hh     |  37 ++++++++-
+ src/arch/dadao/tlb.cc     |   8 +-
+ 4 files changed, 240 insertions(+), 6 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index ab3f1a01e6..e73e7de46a 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -726,6 +726,19 @@ TrapInst(uint32_t w)
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs)); }
+ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+   ISA *isa = cfxIsa(xc);
++  if (cfxcode == CfxCodePtw) {
++    PCState pc = xc->pcState().as<PCState>();
++    // CFXTRAP's cause_ip is the trap instruction's own address (SEE §5
++    // step 9: sync exceptions use the triggering instruction's address),
++    // same convention as cfx_smon below -- the handler resumes past the
++    // call with escape cfx_ptw,1 (cause_ip+4), matching KL-116a's
++    // established "escape cfx_smon,1" trap-as-call pattern. E1 in the PTW
++    // frame restores the cfx_tlb caller.
++    isa->cfxPreciseTrapEnter(
++        xc->tcBase(), CfxCodePtw, CfxCauseCfxtrap, rawInsn,
++        pc.instAddr() & MASK48, true);
++    return NoFault;
++  }
+   if (cfxcode == CfxCodeSmon && isa->cfxSmonReal) {
+     cfxPreciseTrapEnter(
+         xc, CfxCodeSmon, CfxCauseCfxtrap, rawInsn);
+@@ -966,6 +979,29 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+       return NoFault;
+     }
+   }
++  if (cfxcode_ == CfxCodeTlb) {
++    if (cg_ == 8 && rc_ == 0) {
++      // cfx_tlb_exist is read-only and fixed to all sets in the K1 profile.
++      return NoFault;
++    }
++    if (cg_ == 8 && rc_ == 8) {
++      isa->cfxTlbEnable = value;
++      return NoFault;
++    }
++    if (cg_ == 12 && rc_ == 0) {
++      if (value & 1) isa->cfxTlbInvalidateAll();
++      if (value & 2) isa->cfxTlbInvalidateRange();
++      return NoFault;
++    }
++    if (cg_ == 12 && rc_ == 2) {
++      isa->cfxTlbAddrStart = value & MASK48;
++      return NoFault;
++    }
++    if (cg_ == 12 && rc_ == 3) {
++      isa->cfxTlbAddrSize = value;
++      return NoFault;
++    }
++  }
+   // SEE §3 cg2/rc10: per-cfx supervisor exception-vector address.
+   if (cg_ == 2 && rc_ == 10) {
+     isa->cfxSupvExcpVector[cfxcode_] = value & MASK48;
+@@ -1030,6 +1066,14 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     value = isa->cfxPtwPthi[rc_];
+   } else if (cfxcode_ == CfxCodePtw && cg_ == 11) {
+     value = isa->cfxPtwPahi[rc_];
++  } else if (cfxcode_ == CfxCodeTlb && cg_ == 8 && rc_ == 0) {
++    value = ~0ULL;
++  } else if (cfxcode_ == CfxCodeTlb && cg_ == 8 && rc_ == 8) {
++    value = isa->cfxTlbEnable;
++  } else if (cfxcode_ == CfxCodeTlb && cg_ == 12 && rc_ == 2) {
++    value = isa->cfxTlbAddrStart;
++  } else if (cfxcode_ == CfxCodeTlb && cg_ == 12 && rc_ == 3) {
++    value = isa->cfxTlbAddrSize;
+   } else if (cg_ == 5) {
+     switch (rc_) {
+     case 0: value = isa->cfxFrame[cfxcode_].prevRunMode; break;
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index e66b14adc0..24fd6861fd 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -68,6 +68,10 @@ ISA::clear()
+     cfxPtwPerm[RunModeSupv] = ~0ULL;
+     cfxPtwPerm[RunModeHypv] = ~0ULL;
+     cfxPtwPtbrEnable = 0;
++    cfxTlbEnable = ~0ULL;
++    cfxTlbAddrStart = 0;
++    cfxTlbAddrSize = 65536;
++    cfxTlbClock = 0;
+     for (int i = 0; i < 64; i++) {
+         cfxHypvCgRegDeleg[i] = ~0ULL;
+         cfxFrame[i] = CfxFrame{};
+@@ -76,6 +80,8 @@ ISA::clear()
+         cfxPtwPtbr[i] = 0;
+         cfxPtwPthi[i] = 0;
+         cfxPtwPahi[i] = 0;
++        for (int way = 0; way < CfxTlbWays; way++)
++            cfxTlb[i][way] = CfxTlbEntry{};
+         for (int m = 0; m < 4; m++)
+             cfxEscapeCfxMask[i][m] = ~0ULL;
+     }
+@@ -89,12 +95,15 @@ ISA::clear()
+ 
+ bool
+ ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+-                  Addr &physicalAddr, uint64_t &faultCause) const
++                  Addr &physicalAddr, uint64_t &faultCause,
++                  uint64_t &leafPteOut, Addr &leafPteAddrOut) const
+ {
+     const uint64_t va = virtualAddr & 0x0000FFFFFFFFFFFFULL;
+     const unsigned ptbrIndex = (va >> 42) & 0x3F;
+ 
+     faultCause = 0;
++    leafPteOut = 0;
++    leafPteAddrOut = 0;
+     if (!(cfxPtwPerm[innerRunMode] & (1ULL << ptbrIndex))) {
+         faultCause = 1ULL << (8 + innerRunMode);
+         return false;
+@@ -172,6 +181,8 @@ ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+         updatedPte |= 1ULL << 2;
+     tc->getSystemPtr()->physProxy.write<uint64_t>(
+         leafPteAddr, updatedPte, ByteOrder::big);
++    leafPteOut = updatedPte;
++    leafPteAddrOut = leafPteAddr;
+ 
+     const unsigned prot =
+         ((leafPte >> 7) & 1) |
+@@ -187,6 +198,144 @@ ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+     return true;
+ }
+ 
++void
++ISA::cfxTlbInvalidateAll()
++{
++    for (auto &set : cfxTlb)
++        for (auto &entry : set)
++            entry.valid = false;
++}
++
++void
++ISA::cfxTlbInvalidateRange()
++{
++    const uint64_t start = cfxTlbAddrStart & 0x0000FFFFFFFFFFFFULL;
++    const unsigned set = (start >> 42) & 0x3F;
++    const uint64_t setStart = start & ((1ULL << 42) - 1);
++    constexpr uint64_t SetLimit = 1ULL << 42;
++
++    if (cfxTlbAddrSize == 0)
++        return;
++    const uint64_t end = cfxTlbAddrSize > SetLimit - setStart ?
++        SetLimit : setStart + cfxTlbAddrSize;
++
++    for (auto &entry : cfxTlb[set]) {
++        if (!entry.valid)
++            continue;
++        uint64_t entryStart = static_cast<uint64_t>(entry.l1Index) << 29;
++        uint64_t entrySize = 1ULL << 29;
++        if (!entry.superpage) {
++            entryStart |= static_cast<uint64_t>(entry.l2Index) << 16;
++            entrySize = 1ULL << 16;
++        }
++        if (entryStart < end && setStart < entryStart + entrySize)
++            entry.valid = false;
++    }
++}
++
++bool
++ISA::mmuTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
++                  Addr &physicalAddr, uint64_t &faultCause,
++                  uint8_t &faultCfxCode)
++{
++    const uint64_t va = virtualAddr & 0x0000FFFFFFFFFFFFULL;
++    const unsigned set = (va >> 42) & 0x3F;
++    uint64_t leafPte = 0;
++    Addr leafPteAddr = 0;
++
++    faultCfxCode = CfxCodePtw;
++    if (!(cfxPtwPerm[innerRunMode] & (1ULL << set)) ||
++        !(cfxPtwPtbrEnable & (1ULL << set)) ||
++        !(cfxTlbEnable & (1ULL << set))) {
++        return ptwTranslate(tc, virtualAddr, access, physicalAddr,
++                            faultCause, leafPte, leafPteAddr);
++    }
++
++    for (auto &entry : cfxTlb[set]) {
++        const bool match = entry.valid &&
++            entry.l1Index == ((va >> 29) & 0x1FFF) &&
++            (entry.superpage || entry.l2Index == ((va >> 16) & 0x1FFF));
++        if (!match)
++            continue;
++
++        faultCfxCode = CfxCodeTlb;
++        // A matching lookup is a true-LRU use even when checks fault.
++        entry.lastUsed = ++cfxTlbClock;
++        const unsigned fragment = entry.superpage ?
++            ((va >> 26) & 7) : ((va >> 13) & 7);
++        if (!((entry.leafPte >> 56) & (1ULL << fragment))) {
++            faultCause = entry.superpage ?
++                (access == PtwAccess::Execute ?
++                    CfxTlbCauseIspftrap : CfxTlbCauseDspftrap) :
++                (access == PtwAccess::Execute ?
++                    CfxTlbCauseIgpftrap : CfxTlbCauseDgpftrap);
++            return false;
++        }
++        const uint64_t requiredPermission =
++            access == PtwAccess::Execute ? (1ULL << 5) :
++            access == PtwAccess::Write ? (1ULL << 6) : (1ULL << 7);
++        if (!(entry.leafPte & requiredPermission)) {
++            faultCause = access == PtwAccess::Execute ?
++                CfxTlbCauseNxperm : access == PtwAccess::Write ?
++                CfxTlbCauseNwperm : CfxTlbCauseNrperm;
++            return false;
++        }
++
++        uint64_t updatedPte = entry.leafPte | (1ULL << 3);
++        if (access == PtwAccess::Write)
++            updatedPte |= 1ULL << 2;
++        // All permission/fragment decisions above use the cached PTE. This
++        // separate RMW merges only A/D into current memory, avoiding stale
++        // cached non-A/D fields overwriting software updates.
++        uint64_t memoryPte =
++            tc->getSystemPtr()->physProxy.read<uint64_t>(
++                entry.leafPteAddr, ByteOrder::big);
++        memoryPte |= 1ULL << 3;
++        if (access == PtwAccess::Write)
++            memoryPte |= 1ULL << 2;
++        tc->getSystemPtr()->physProxy.write<uint64_t>(
++            entry.leafPteAddr, memoryPte, ByteOrder::big);
++        entry.leafPte = updatedPte;
++        physicalAddr = entry.physicalBase |
++            (va & (entry.superpage ? 0x1FFFFFFFULL : 0xFFFFULL));
++        std::cerr << "dadao: cfx_tlb hit va=0x" << std::hex
++                  << std::setw(16) << std::setfill('0') << va
++                  << " pa=0x" << std::setw(16) << physicalAddr
++                  << " access=" << std::dec << static_cast<unsigned>(access)
++                  << "\n";
++        return true;
++    }
++
++    if (!ptwTranslate(tc, virtualAddr, access, physicalAddr, faultCause,
++                      leafPte, leafPteAddr)) {
++        return false;
++    }
++
++    unsigned victim = 0;
++    for (unsigned way = 0; way < CfxTlbWays; way++) {
++        if (!cfxTlb[set][way].valid) {
++            victim = way;
++            break;
++        }
++        if (cfxTlb[set][way].lastUsed < cfxTlb[set][victim].lastUsed)
++            victim = way;
++    }
++    CfxTlbEntry &entry = cfxTlb[set][victim];
++    entry.valid = true;
++    entry.superpage = (leafPte & 2) != 0;
++    entry.l1Index = (va >> 29) & 0x1FFF;
++    entry.l2Index = (va >> 16) & 0x1FFF;
++    entry.leafPte = leafPte;
++    entry.leafPteAddr = leafPteAddr;
++    entry.physicalBase = physicalAddr &
++        ~(entry.superpage ? 0x1FFFFFFFULL : 0xFFFFULL);
++    entry.lastUsed = ++cfxTlbClock;
++    std::cerr << "dadao: cfx_tlb miss-fill set=" << set
++              << " way=" << victim << " va=0x" << std::hex << va
++              << std::dec << "\n";
++    return true;
++}
++
+ void
+ ISA::cfxPreciseTrapEnter(ThreadContext *tc, uint8_t targetCfxCode,
+                          uint64_t causeId, uint64_t causeInfo,
+@@ -247,6 +396,10 @@ ISA::copyRegsFrom(ThreadContext *src)
+         for (int m = 0; m < 4; m++)
+             cfxPtwPerm[m] = srcIsa->cfxPtwPerm[m];
+         cfxPtwPtbrEnable = srcIsa->cfxPtwPtbrEnable;
++        cfxTlbEnable = srcIsa->cfxTlbEnable;
++        cfxTlbAddrStart = srcIsa->cfxTlbAddrStart;
++        cfxTlbAddrSize = srcIsa->cfxTlbAddrSize;
++        cfxTlbClock = srcIsa->cfxTlbClock;
+         for (int i = 0; i < 64; i++) {
+             cfxHypvCgRegDeleg[i] = srcIsa->cfxHypvCgRegDeleg[i];
+             cfxFrame[i] = srcIsa->cfxFrame[i];
+@@ -255,6 +408,8 @@ ISA::copyRegsFrom(ThreadContext *src)
+             cfxPtwPtbr[i] = srcIsa->cfxPtwPtbr[i];
+             cfxPtwPthi[i] = srcIsa->cfxPtwPthi[i];
+             cfxPtwPahi[i] = srcIsa->cfxPtwPahi[i];
++            for (int way = 0; way < CfxTlbWays; way++)
++                cfxTlb[i][way] = srcIsa->cfxTlb[i][way];
+             for (int m = 0; m < 4; m++)
+                 cfxEscapeCfxMask[i][m] = srcIsa->cfxEscapeCfxMask[i][m];
+         }
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+index c1c7512e54..8c0bd989ca 100644
+--- a/src/arch/dadao/isa.hh
++++ b/src/arch/dadao/isa.hh
+@@ -34,6 +34,7 @@ enum RunMode : uint8_t
+ // cfx_smon and cfx_power cfxcodes [wiki §DADAO-12-SEE].
+ constexpr uint8_t CfxCodeSmon = 2;
+ constexpr uint8_t CfxCodePtw = 4;
++constexpr uint8_t CfxCodeTlb = 5;
+ constexpr uint8_t CfxCodePower = 63;
+ 
+ // cfx_smon's architecturally non-maskable CFXTRAP cause.
+@@ -53,6 +54,15 @@ constexpr uint64_t CfxPtwCauseDgptrap = 1ULL << 20;
+ constexpr uint64_t CfxPtwCauseDsptrap = 1ULL << 21;
+ constexpr uint64_t CfxPtwCauseDgpftrap = 1ULL << 22;
+ constexpr uint64_t CfxPtwCauseDspftrap = 1ULL << 23;
++constexpr uint64_t CfxTlbCauseNxperm = 1ULL << 12;
++constexpr uint64_t CfxTlbCauseNwperm = 1ULL << 13;
++constexpr uint64_t CfxTlbCauseNrperm = 1ULL << 14;
++constexpr uint64_t CfxTlbCauseIgpftrap = 1ULL << 18;
++constexpr uint64_t CfxTlbCauseIspftrap = 1ULL << 19;
++constexpr uint64_t CfxTlbCauseDgpftrap = 1ULL << 22;
++constexpr uint64_t CfxTlbCauseDspftrap = 1ULL << 23;
++constexpr unsigned CfxTlbSets = 64;
++constexpr unsigned CfxTlbWays = 16;
+ 
+ // HEE §1 cg3/rc12 "hypv cg reg delegation" (per-cfxcode storage)
+ // [wiki §DADAO-13-HEE §1 L24].
+@@ -80,6 +90,18 @@ struct CfxFrame
+     uint64_t prevCfxCode = 0;
+ };
+ 
++struct CfxTlbEntry
++{
++    bool valid = false;
++    bool superpage = false;
++    uint16_t l1Index = 0;
++    uint16_t l2Index = 0;
++    uint64_t leafPte = 0;
++    Addr leafPteAddr = 0;
++    Addr physicalBase = 0;
++    uint64_t lastUsed = 0;
++};
++
+ class ISA : public BaseISA
+ {
+   protected:
+@@ -126,6 +148,11 @@ class ISA : public BaseISA
+     uint64_t cfxPtwPtbr[64];
+     uint16_t cfxPtwPthi[64];
+     uint16_t cfxPtwPahi[64];
++    uint64_t cfxTlbEnable;
++    uint64_t cfxTlbAddrStart;
++    uint64_t cfxTlbAddrSize;
++    uint64_t cfxTlbClock;
++    CfxTlbEntry cfxTlb[CfxTlbSets][CfxTlbWays];
+ 
+     void clear() override;
+ 
+@@ -136,9 +163,15 @@ class ISA : public BaseISA
+         Execute = 2,
+     };
+ 
+-    // KL-126a/KL-127a PTW path. No architectural TLB is populated.
++    // KL-126a/KL-127a PTW path, reused unchanged on KL-129a misses.
+     bool ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+-                      Addr &physicalAddr, uint64_t &faultCause) const;
++                      Addr &physicalAddr, uint64_t &faultCause,
++                      uint64_t &leafPte, Addr &leafPteAddr) const;
++    bool mmuTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
++                      Addr &physicalAddr, uint64_t &faultCause,
++                      uint8_t &faultCfxCode);
++    void cfxTlbInvalidateAll();
++    void cfxTlbInvalidateRange();
+ 
+     void cfxPreciseTrapEnter(ThreadContext *tc, uint8_t targetCfxCode,
+                              uint64_t causeId, uint64_t causeInfo,
+diff --git a/src/arch/dadao/tlb.cc b/src/arch/dadao/tlb.cc
+index 3c59c6b124..b4af1758cb 100644
+--- a/src/arch/dadao/tlb.cc
++++ b/src/arch/dadao/tlb.cc
+@@ -24,10 +24,12 @@ translateFullSystem(const RequestPtr &req, ThreadContext *tc,
+         ISA::PtwAccess::Read;
+     Addr physical;
+     uint64_t faultCause;
+-    if (!isa->ptwTranslate(
+-            tc, req->getVaddr(), access, physical, faultCause)) {
++    uint8_t faultCfxCode;
++    if (!isa->mmuTranslate(
++            tc, req->getVaddr(), access, physical, faultCause,
++            faultCfxCode)) {
+         isa->cfxPreciseTrapEnter(
+-            tc, CfxCodePtw, faultCause, req->getVaddr(),
++            tc, faultCfxCode, faultCause, req->getVaddr(),
+             tc->pcState().instAddr(), false);
+         return std::make_shared<ReExec>();
+     }
+-- 
+2.43.0
+
