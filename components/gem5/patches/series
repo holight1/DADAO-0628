@@ -19,3 +19,4 @@
 0018-arch-dadao-implement-hypv-supv-handoff-O1-O2-design1.patch
 0019-arch-dadao-implement-real-cfx_smon-trap-entry-KL-117.patch
 0020-arch-dadao-add-cfx-carrier-and-nested-return-KL-120a.patch
+0021-arch-dadao-generalize-precise-CFX-carrier-KL-122a.patch

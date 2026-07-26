@@ -1003,23 +1003,23 @@ This section formalizes `cfx2rc`, the storage-backed subset of `cfx2rd`,
 architectural semantics. **QEMU and gem5's
 implementation covers the O1 success path (KL-110a), two of O2's
 negative paths (KL-112a, 2026-07-25), and O3's `cfx_smon` CFXTRAP entry
-subset (KL-116a/KL-117a, 2026-07-25), plus KL-120a's register carrier
-(2026-07-26)** — `cfx2rc` implements the `cg=3/rc=12`
-delegation register, `cfx_power`'s `cg=5` exception frame, the
-`cfx_smon` `cg=5` exception frame, the common pending register
-(`cg=4/rc=7`), `cfx_smon_supv_excp_vector` (`cg=2/rc=10`), and CFXREG for
+subset (KL-116a/KL-117a, 2026-07-25), KL-120a's register carrier, and
+KL-122a's generic precise-carrier refactor (2026-07-26)** — `cfx2rc`
+implements the `cg=3/rc=12` delegation register, every cfxcode's common
+`cg=5` exception frame, the common pending register (`cg=4/rc=7`), every
+cfxcode's `supv_excp_vector` (`cg=2/rc=10`), and CFXREG for
 `cfx_power`'s `cg=8` reserved `rc` range (design 3 / candidate C);
 `cfx2rd` reads exactly these storage-backed registers plus
 `escape_cfx_mask`, returning zero for every unbacked/reserved combination;
-`escape` implements `cfx_power` self-escape, `cfx_smon` self-escape, and
+`escape` restores from the addressed cfx's generic frame and implements
 the cross-cfx `escape_cfx_mask` permission check (SEE §5 exception-exit
-step 0, design 1 / candidate B); `trap` implements the SEE §5 entry-flow
-steps 7-10 (save current mode/mask/cfx code, mode switch, save cause, jump
-vector) for exactly one case — `cfxcode==2` (`cfx_smon`), cause=CFXTRAP —
-gated behind the default-off QEMU CPU property `cfx-smon-real` (§8.4).
+step 0, design 1 / candidate B). The shared precise-entry carrier implements
+SEE §5 steps 7-10 for any non-maskable synchronous cause, but the only
+connected source remains `cfxcode==2` (`cfx_smon`), cause=CFXTRAP, gated
+behind the default-off QEMU CPU property `cfx-smon-real` (§8.4).
 Still **Excluded**: reserved-cfxcode entry-flow routing (see §8.1's
 bullet list below for the wiki citation), the remaining
-`cg0/cg1/cg2/cg4/cg6/cg7` register maps (except `cfx_smon`'s `cg2/rc10`
+`cg0/cg1/cg2/cg4/cg6/cg7` register maps (except generic `cg2/rc10`
 above), `trap` for every cfxcode other than `cfx_smon` (still routes to the pre-existing host/SE syscall shortcut when `cfxcode==2`, or ILLI otherwise — see §8.4) [spec-decision: KL-116a, 2026-07-25], `trap`'s
 entry-flow steps 2-6 for every other cause (§8.4 explains why CFXTRAP
 itself needs none of them), and —

@@ -1,0 +1,462 @@
+From ae8afe05900c7c92300d08722c9b054703b6a1e3 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 09:46:18 +0800
+Subject: [PATCH] target/dadao: generalize precise CFX carrier (KL-122a)
+
+---
+ target/dadao/cpu.c    | 110 ++++++++++++++++++-------------------
+ target/dadao/cpu.h    |  33 +++--------
+ target/dadao/helper.c | 125 ++++++++++--------------------------------
+ 3 files changed, 93 insertions(+), 175 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index f95a89e..c2cd44b 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -53,6 +53,13 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+          * to hypv only, until software clears bits via cfx2rc). */
+         env->cfx_hypv_cg_reg_deleg[i] = DADAO_CFX_MASK_ALL;
+         env->cfx_common_pending[i] = 0;
++        env->cfx_frame[i].prev_run_mode = DADAO_RUN_MODE_USER;
++        env->cfx_frame[i].prev_cfx_mask = 0;
++        env->cfx_frame[i].cause_id = 0;
++        env->cfx_frame[i].cause_ip = 0;
++        env->cfx_frame[i].cause_info = 0;
++        env->cfx_frame[i].prev_cfx_code = 0;
++        env->cfx_supv_excp_vector[i] = 0;
+         /* KL-112a design 1: escape_cfx_mask reset value = all-ones for
+          * every (cfxcode, mode) pair [wiki §DADAO-13-HEE §1 L19;
+          * §DADAO-12-SEE §3 L281/L305/L325]. */
+@@ -65,28 +72,14 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+     env->inner_run_mode = DADAO_RUN_MODE_HYPV;
+     env->inner_cfx_code = DADAO_CFX_CODE_POWER;
+     env->inner_cfx_mask = DADAO_CFX_MASK_ALL;
+-    env->cfx_power_frame.prev_run_mode = DADAO_RUN_MODE_HYPV;
+-    env->cfx_power_frame.prev_cfx_mask = DADAO_CFX_MASK_ALL;
+-    env->cfx_power_frame.cause_ip = 0;
++    env->cfx_frame[DADAO_CFX_CODE_POWER].prev_run_mode =
++        DADAO_RUN_MODE_HYPV;
++    env->cfx_frame[DADAO_CFX_CODE_POWER].prev_cfx_mask =
++        DADAO_CFX_MASK_ALL;
+     /* Preserve the pre-E1 O1 handoff result when software does not
+      * explicitly populate the new rc5 carrier. */
+-    env->cfx_power_frame.prev_cfx_code = DADAO_CFX_CODE_POWER;
+-    /* KL-116a Oracle O3: cfx_smon frame + its cg2/rc10 excp vector reset to
+-     * the wiki's literal reset values (all 0, [wiki §DADAO-12-SEE §3 cg5
+-     * L357-361, cg2 L328]) -- unlike cfx_power_frame above, this frame has
+-     * no O1-era precedent of a different reset choice; nothing has ever
+-     * had a reason to deviate from the wiki default here. When the
+-     * cfx_smon_real profile is off (default) this frame is never written by
+-     * anything else either, so it stays all-zero for the CPU's entire
+-     * lifetime -- identical to the pre-existing zeroed fallback
+-     * helper_escape() already used for any non-cfx_power cfxcode. */
+-    env->cfx_smon_frame.prev_run_mode = DADAO_RUN_MODE_USER;
+-    env->cfx_smon_frame.prev_cfx_mask = 0;
+-    env->cfx_smon_frame.cause_id = 0;
+-    env->cfx_smon_frame.cause_ip = 0;
+-    env->cfx_smon_frame.cause_info = 0;
+-    env->cfx_smon_frame.prev_cfx_code = 0;
+-    env->cfx_smon_supv_excp_vector = 0;
++    env->cfx_frame[DADAO_CFX_CODE_POWER].prev_cfx_code =
++        DADAO_CFX_CODE_POWER;
+     /* Test harness injection happens after architectural reset so a probe
+      * can exercise W0C from a non-zero raw latch. Default seed=0 is inert. */
+     if (cpu->cfx_common_pending_test_seed != 0) {
+@@ -161,26 +154,19 @@ void dadao_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+     cpu_loop_exit(cs);
+ }
+ 
+-/* KL-116a Oracle O3: SEE §5 "异常进入流程" (entry flow) steps 7-10, scoped
+- * to the one case the cfx_smon_real profile actually reaches: `trap`
+- * with cfxcode==2 (cfx_smon), cause=CFXTRAP. Steps 2-6 are not implemented
+- * here -- not simplified away, but genuinely skipped per wiki step 2 itself
+- * (`check_nonmaskable`, [wiki §DADAO-12-SEE-主管系统运行环境.md L763-765]):
+- * CFXTRAP is hardware-nonmaskable for cfx_smon (its cause table is defined
+- * as identical to cfx_umon's, [wiki L417-419], whose CFXTRAP row's "是否可
+- * 屏蔽" column reads "否", [wiki L402]) -- wiki step 2's own control flow
+- * jumps straight past steps 3-5 (inner_cfx_mask / global_cfx_mask /
+- * excp_cause_mask, none of which exist in cfx_smon's cause table anyway,
+- * [wiki L693]) to step 6. Step 6 (trap-count, cg4/rc2) is excluded per
+- * KL-115a report §1.4: no cg4 counter storage exists for any cfx in this
+- * QEMU target (same precedent as escape_num in helper_escape()), and it is
+- * not part of any O3 acceptance observation. [wiki §DADAO-12-SEE-主管系统
+- * 运行环境.md L678-811 for the full 10-step flow this function formalizes
+- * the tail of] */
+-static void dadao_cfx_smon_trap_enter(DADAOCPU *cpu, uint64_t raw_insn)
++/* KL-122a: shared SEE §5 precise-entry carrier for non-maskable synchronous
++ * causes. It implements steps 7-10 only; mask/pending/priority and actual
++ * source routing remain later tasks. */
++static void dadao_cfx_precise_trap_enter(DADAOCPU *cpu,
++                                         uint64_t target_cfxcode,
++                                         uint64_t cause_id,
++                                         uint64_t raw_insn)
+ {
+     CPUDADAOState *env = &cpu->env;
++    DADAOCfxFrame *frame;
+ 
++    target_cfxcode &= 0x3F;
++    frame = &env->cfx_frame[target_cfxcode];
+     /* trans_trap (translate.c) unconditionally stores pc_next+4 (the
+      * address of the instruction *after* trap) into env->pc before calling
+      * helper_trap, for every trap regardless of cfxcode or profile -- this
+@@ -193,12 +179,12 @@ static void dadao_cfx_smon_trap_enter(DADAOCPU *cpu, uint64_t raw_insn)
+     target_ulong cause_ip = (env->pc - 4) & 0x0000FFFFFFFFFFFFULL;
+     DADAORunMode mode_before = env->inner_run_mode;
+ 
+-    /* Step 7: save current mode/mask/cfx code into the cfx_smon frame -- BEFORE
++    /* Step 7: save current mode/mask/cfx code into the target frame -- BEFORE
+      * step 8 overwrites inner_run_mode/inner_cfx_mask below. [wiki L700,
+      * L796-797] */
+-    env->cfx_smon_frame.prev_run_mode = env->inner_run_mode;
+-    env->cfx_smon_frame.prev_cfx_mask = env->inner_cfx_mask;
+-    env->cfx_smon_frame.prev_cfx_code = env->inner_cfx_code;
++    frame->prev_run_mode = env->inner_run_mode;
++    frame->prev_cfx_mask = env->inner_cfx_mask;
++    frame->prev_cfx_code = env->inner_cfx_code;
+ 
+     /* Step 8: mode switch. cfx_smon_supv_switch_run_mode (cg2/rc8, wiki
+      * default 2=supv) / cfx_smon_supv_switch_cfx_mask (cg2/rc9, wiki
+@@ -211,14 +197,14 @@ static void dadao_cfx_smon_trap_enter(DADAOCPU *cpu, uint64_t raw_insn)
+      * L799-802] */
+     env->inner_run_mode = DADAO_RUN_MODE_SUPV;
+     env->inner_cfx_mask = DADAO_CFX_MASK_ALL;
+-    env->inner_cfx_code = DADAO_CFX_CODE_SMON;
++    env->inner_cfx_code = target_cfxcode;
+ 
+     /* Step 9: save exception info. cause_info is the raw 32-bit encoding of
+      * the trap instruction itself, per the cause table's CFXTRAP row
+      * ("excp cause info" = "指令编码"). [wiki L402, L703-705, L804-807] */
+-    env->cfx_smon_frame.cause_id = DADAO_CFX_CAUSE_CFXTRAP;
+-    env->cfx_smon_frame.cause_ip = cause_ip;
+-    env->cfx_smon_frame.cause_info = raw_insn;
++    frame->cause_id = cause_id;
++    frame->cause_ip = cause_ip;
++    frame->cause_info = raw_insn;
+ 
+     /* Step 10: jump to the excp vector. Flat physical address (ADR-0004
+      * convention, same as O1's cause_ip/supv_entry) rather than the wiki's
+@@ -226,16 +212,29 @@ static void dadao_cfx_smon_trap_enter(DADAOCPU *cpu, uint64_t raw_insn)
+      * address range for cfx_smon, so there is no wiki mapping to deviate
+      * from here; this machine has no SEE/PTBR at all (ADR-0004 D2). [wiki
+      * L706, L809-810] */
+-    env->pc = env->cfx_smon_supv_excp_vector;
++    env->pc = env->cfx_supv_excp_vector[target_cfxcode];
+ 
+     /* Observability, mirrors the O1/escape trace convention: only emitted
+      * with `-d int`, silent by default. */
+-    qemu_log_mask(CPU_LOG_INT,
+-                   "dadao: trap cfx_smon real-entry mode %d->supv "
+-                   "cause_id=0x%" PRIx64 " cause_ip=0x%016" PRIx64
+-                   " vector=0x%016" PRIx64 "\n",
+-                   (int)mode_before, (uint64_t)env->cfx_smon_frame.cause_id,
+-                   (uint64_t)cause_ip, (uint64_t)env->pc);
++    if (target_cfxcode == DADAO_CFX_CODE_SMON &&
++        cause_id == DADAO_CFX_CAUSE_CFXTRAP) {
++        /* Preserve KL-116a's established O3 trace byte-for-byte. */
++        qemu_log_mask(CPU_LOG_INT,
++                      "dadao: trap cfx_smon real-entry mode %d->supv "
++                      "cause_id=0x%" PRIx64 " cause_ip=0x%016" PRIx64
++                      " vector=0x%016" PRIx64 "\n",
++                      (int)mode_before, (uint64_t)frame->cause_id,
++                      (uint64_t)cause_ip, (uint64_t)env->pc);
++    } else {
++        qemu_log_mask(CPU_LOG_INT,
++                      "dadao: trap cfx=%" PRIu64
++                      " real-entry mode %d->supv cause_id=0x%" PRIx64
++                      " cause_ip=0x%016" PRIx64 " vector=0x%016" PRIx64
++                      "\n",
++                      target_cfxcode, (int)mode_before,
++                      (uint64_t)frame->cause_id, (uint64_t)cause_ip,
++                      (uint64_t)env->pc);
++    }
+ }
+ 
+ void dadao_cpu_do_interrupt(CPUState *cs)
+@@ -443,9 +442,10 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+             env->rd[31] = ret;
+         } else if (cfxcode == 2 && cpu->cfx_smon_real) {
+             /* KL-116a Oracle O3: real SEE §5 entry-flow subset, cfx_smon
+-             * target. See dadao_cfx_smon_trap_enter()'s own comment for the
+-             * step-by-step wiki mapping. */
+-            dadao_cfx_smon_trap_enter(cpu, raw_insn);
++             * target, now routed through KL-122a's shared precise carrier. */
++            dadao_cfx_precise_trap_enter(cpu, DADAO_CFX_CODE_SMON,
++                                         DADAO_CFX_CAUSE_CFXTRAP,
++                                         raw_insn);
+         } else {
+             /* unknown cfxcode → ILLI */
+             qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index af28f48..91acb21 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -56,28 +56,17 @@ typedef enum DADAOCfxCode {
+ 
+ #define DADAO_CFX_MASK_ALL UINT64_MAX
+ 
+-typedef struct DADAOCfxPowerFrame {
+-    target_ulong prev_run_mode;
+-    target_ulong prev_cfx_mask;
+-    target_ulong cause_ip;
+-    target_ulong prev_cfx_code;
+-} DADAOCfxPowerFrame;
+-
+-/* KL-116a Oracle O3: cfx_smon exception-frame (SEE §3 cg5 table,
+- * [wiki §DADAO-12-SEE-主管系统运行环境.md L357-361]). Unlike
+- * DADAOCfxPowerFrame (which is software-populated by O1 and has no real
+- * hardware trap entry), this frame is
+- * written by dadao_cfx_smon_trap_enter() (cpu.c) -- a real trap-entry state
+- * machine -- and therefore also carries the two HW-only fields
+- * (cause_id/cause_info) cfx_power's frame never needed. */
+-typedef struct DADAOCfxSmonFrame {
++/* KL-122a: common SEE §3 cg5 exception-frame carrier. Every cfxcode owns
++ * one slot; software writes rc0/1/3/5 while precise trap entry owns the
++ * hardware cause fields rc2/4. */
++typedef struct DADAOCfxFrame {
+     target_ulong prev_run_mode;
+     target_ulong prev_cfx_mask;
+     target_ulong cause_id;
+     target_ulong cause_ip;
+     target_ulong cause_info;
+     target_ulong prev_cfx_code;
+-} DADAOCfxSmonFrame;
++} DADAOCfxFrame;
+ 
+ /* SEE §3 cg5 cause id for CFXTRAP: bit 0, one-hot.
+  * [wiki §DADAO-12-SEE-主管系统运行环境.md L402] */
+@@ -129,8 +118,10 @@ struct CPUArchState {
+     DADAORunMode inner_run_mode;
+     DADAOCfxCode inner_cfx_code;
+     target_ulong inner_cfx_mask;
+-    DADAOCfxPowerFrame cfx_power_frame;
+     target_ulong cfx_hypv_cg_reg_deleg[64];
++    DADAOCfxFrame cfx_frame[64];
++    /* SEE §3 cg2/rc10 supervisor exception vector, one per cfxcode. */
++    target_ulong cfx_supv_excp_vector[64];
+     /* KL-120a: project-local K1 common cause-pending register, cg4/rc7.
+      * One slot per raw cfxcode keeps the generic carrier shape; reserved
+      * codes and cfxes without maskable causes always read zero. */
+@@ -151,12 +142,6 @@ struct CPUArchState {
+      * cfx_smon_real profile's entry state machine (excp_cause_info, SEE §5
+      * step 9); the always-on host/SE syscall shortcut never reads it. */
+     target_ulong trap_insn;
+-    /* KL-116a Oracle O3: cfx_smon exception frame + its supv-mode excp
+-     * vector (SEE §3 cg2/rc10, [wiki §DADAO-12-SEE §3 L328]). Written by
+-     * dadao_cfx_smon_trap_enter() / read back by cfx2rc's rc=10 branch and
+-     * by helper_escape()'s new DADAO_CFX_CODE_SMON restore branch. */
+-    DADAOCfxSmonFrame cfx_smon_frame;
+-    target_ulong cfx_smon_supv_excp_vector;
+ };
+ 
+ struct ArchCPU {
+@@ -167,7 +152,7 @@ struct ArchCPU {
+      * (host/SE syscall shortcut, cpu.c EXCP_CFXTRAP case) -- byte-identical
+      * to every pre-KL-116a build. When explicitly enabled, the same
+      * cfxcode==2 case instead runs the real SEE §5 entry-flow subset
+-     * (dadao_cfx_smon_trap_enter()). See KL-115a report §4.4 option A. */
++     * through dadao_cfx_precise_trap_enter(). See KL-115a report §4.4. */
+     bool cfx_smon_real;
+     /* KL-120a test-harness-only raw common-pending injection. Both
+      * properties default to inert; normal architectural reset remains zero.
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index c239ab0..20c05f8 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -106,8 +106,8 @@ void helper_trap(CPUDADAOState *env, uint64_t cfxcode, uint64_t func,
+        instruction by trans_trap, so do not advance it here. */
+     env->trap_cfxcode = cfxcode;
+     env->trap_func = func;
+-    /* KL-116a: raw instruction word, only consumed by the cfx_smon_real
+-     * profile's entry state machine (dadao_cfx_smon_trap_enter(), cpu.c) --
++    /* KL-116a: raw instruction word, currently consumed by the cfx_smon_real
++     * route into dadao_cfx_precise_trap_enter() (cpu.c) --
+      * see cpu.h's CPUArchState.trap_insn comment. Always stored (mirrors
+      * trap_cfxcode/trap_func above); the default-off host/SE syscall
+      * shortcut never reads it. */
+@@ -194,64 +194,32 @@ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         return;
+     }
+ 
+-    if (cfxcode == DADAO_CFX_CODE_POWER && cg == 5) {
+-        /* SEE §3 cg5 software-writable exception-frame fields used by O1,
+-         * plus KL-119a/user E1's project-local rc5 caller-cfx carrier.
+-         * cause_id/cause_info/nonmaskable remain hardware-only/unbacked for
+-         * cfx_power. */
++    if (cg == 5) {
++        /* KL-122a common frame carrier. rc2/rc4 are hardware-written and
++         * intentionally read-only; rc5 is project-local E1. */
+         switch (rc) {
+         case 0:
+-            env->cfx_power_frame.prev_run_mode = value & 0x3;
++            env->cfx_frame[cfxcode].prev_run_mode = value & 0x3;
+             return;
+         case 1:
+-            env->cfx_power_frame.prev_cfx_mask = value;
++            env->cfx_frame[cfxcode].prev_cfx_mask = value;
+             return;
+         case 3:
+-            env->cfx_power_frame.cause_ip = value & 0x0000FFFFFFFFFFFFULL;
+-            return;
+-        case 5:
+-            env->cfx_power_frame.prev_cfx_code = value & 0x3F;
+-            return;
+-        default:
+-            return;
+-        }
+-    }
+-
+-    if (cfxcode == DADAO_CFX_CODE_SMON && cg == 5) {
+-        /* Keep wiki HW-only rc2/rc4 read-only; rc5 is the E1 extension. */
+-        switch (rc) {
+-        case 0:
+-            env->cfx_smon_frame.prev_run_mode = value & 0x3;
+-            return;
+-        case 1:
+-            env->cfx_smon_frame.prev_cfx_mask = value;
+-            return;
+-        case 3:
+-            env->cfx_smon_frame.cause_ip =
++            env->cfx_frame[cfxcode].cause_ip =
+                 value & 0x0000FFFFFFFFFFFFULL;
+             return;
+         case 5:
+-            env->cfx_smon_frame.prev_cfx_code = value & 0x3F;
++            env->cfx_frame[cfxcode].prev_cfx_code = value & 0x3F;
+             return;
+         default:
+             return;
+         }
+     }
+ 
+-    if (cfxcode == DADAO_CFX_CODE_SMON && cg == 2 && rc == 10) {
+-        /* KL-116a Oracle O3: SEE §3 cg2/rc10 "supv excp vector"
+-         * (cfx_smon_supv_excp_vector) -- the entry state machine's step 10
+-         * jump target (dadao_cfx_smon_trap_enter(), cpu.c). This is the
+-         * only cg2 register KL-116a's scope backs with cfx2rc write
+-         * support: switch_run_mode (rc8) / switch_cfx_mask (rc9) keep their
+-         * wiki reset defaults with no write path (KL-115a report §1.5
+-         * confirms the defaults satisfy this task's minimal scenario).
+-         * Same ADR-0004 flat-physical-address convention as O1's
+-         * cause_ip/supv_entry (§2.1's core-internal-address mapping for
+-         * cfx_smon was never populated by SEE §2.1's table, ADR-0004
+-         * already established the precedent of not inventing one). [wiki
+-         * §DADAO-12-SEE-主管系统运行环境.md §3 cg2 L328] */
+-        env->cfx_smon_supv_excp_vector = value & 0x0000FFFFFFFFFFFFULL;
++    if (cg == 2 && rc == 10) {
++        /* SEE §3 cg2/rc10 supv exception vector, common to every cfx. */
++        env->cfx_supv_excp_vector[cfxcode] =
++            value & 0x0000FFFFFFFFFFFFULL;
+         return;
+     }
+ 
+@@ -319,28 +287,19 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+                       " value=0x%016" PRIx64 "\n", cfxcode, value);
+         return value;
+     }
+-    if (cfxcode == DADAO_CFX_CODE_POWER && cg == 5) {
+-        switch (rc) {
+-        case 0: return env->cfx_power_frame.prev_run_mode;
+-        case 1: return env->cfx_power_frame.prev_cfx_mask;
+-        case 3: return env->cfx_power_frame.cause_ip;
+-        case 5: return env->cfx_power_frame.prev_cfx_code;
+-        default: return 0;
+-        }
+-    }
+-    if (cfxcode == DADAO_CFX_CODE_SMON && cg == 5) {
++    if (cg == 5) {
+         switch (rc) {
+-        case 0: return env->cfx_smon_frame.prev_run_mode;
+-        case 1: return env->cfx_smon_frame.prev_cfx_mask;
+-        case 2: return env->cfx_smon_frame.cause_id;
+-        case 3: return env->cfx_smon_frame.cause_ip;
+-        case 4: return env->cfx_smon_frame.cause_info;
+-        case 5: return env->cfx_smon_frame.prev_cfx_code;
++        case 0: return env->cfx_frame[cfxcode].prev_run_mode;
++        case 1: return env->cfx_frame[cfxcode].prev_cfx_mask;
++        case 2: return env->cfx_frame[cfxcode].cause_id;
++        case 3: return env->cfx_frame[cfxcode].cause_ip;
++        case 4: return env->cfx_frame[cfxcode].cause_info;
++        case 5: return env->cfx_frame[cfxcode].prev_cfx_code;
+         default: return 0;
+         }
+     }
+-    if (cfxcode == DADAO_CFX_CODE_SMON && cg == 2 && rc == 10) {
+-        return env->cfx_smon_supv_excp_vector;
++    if (cg == 2 && rc == 10) {
++        return env->cfx_supv_excp_vector[cfxcode];
+     }
+     if (cg <= 3 && rc == DADAO_CFX_MASK_REG_ESCAPE) {
+         return env->cfx_escape_cfx_mask[cfxcode][cg];
+@@ -358,15 +317,13 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+  * unimplemented -- see the scope note this replaces, below. */
+ void helper_escape(CPUDADAOState *env, uint64_t cfxcode, uint64_t imms18)
+ {
+-    target_ulong prev_run_mode;
+-    target_ulong prev_cfx_mask;
+-    target_ulong cause_ip;
+-    target_ulong prev_cfx_code = env->inner_cfx_code;
++    DADAOCfxFrame *frame;
+     int64_t offset;
+     DADAORunMode mode_before;
+     bool self_escape;
+ 
+     cfxcode &= 0x3F;
++    frame = &env->cfx_frame[cfxcode];
+     mode_before = env->inner_run_mode;
+     self_escape = cfxcode == env->inner_cfx_code;
+ 
+@@ -388,46 +345,22 @@ void helper_escape(CPUDADAOState *env, uint64_t cfxcode, uint64_t imms18)
+         }
+     }
+ 
+-    /* cfx_power's exception frame (KL-102b) and, as of KL-116a, cfx_smon's
+-     * (DADAOCfxSmonFrame, written by the cfx_smon_real profile's entry
+-     * state machine, dadao_cfx_smon_trap_enter() in cpu.c) are the only two
+-     * frames that exist. Escaping any other cfxcode that passed the check
+-     * above has no frame to restore from and falls back to a zeroed frame
+-     * instead of fabricating per-cfx state that was never written
+-     * (unchanged from O1 -- KL-102a report §3.2). cause_id/cause_info are
+-     * HW-only fields (SEE §3 cg5) and are not part of the escape restore
+-     * set for either frame, matching the existing cfx_power convention. */
+-    if (cfxcode == DADAO_CFX_CODE_POWER) {
+-        prev_run_mode = env->cfx_power_frame.prev_run_mode;
+-        prev_cfx_mask = env->cfx_power_frame.prev_cfx_mask;
+-        cause_ip = env->cfx_power_frame.cause_ip;
+-        prev_cfx_code = env->cfx_power_frame.prev_cfx_code;
+-    } else if (cfxcode == DADAO_CFX_CODE_SMON) {
+-        prev_run_mode = env->cfx_smon_frame.prev_run_mode;
+-        prev_cfx_mask = env->cfx_smon_frame.prev_cfx_mask;
+-        cause_ip = env->cfx_smon_frame.cause_ip;
+-        prev_cfx_code = env->cfx_smon_frame.prev_cfx_code;
+-    } else {
+-        prev_run_mode = DADAO_RUN_MODE_USER;
+-        prev_cfx_mask = 0;
+-        cause_ip = 0;
+-    }
+-
+     /* SEE §5 exception-exit flow steps 1-2: restore mask then mode. */
+-    env->inner_cfx_mask = prev_cfx_mask;
+-    env->inner_run_mode = (DADAORunMode)(prev_run_mode & 0x3);
++    env->inner_cfx_mask = frame->prev_cfx_mask;
++    env->inner_run_mode = (DADAORunMode)(frame->prev_run_mode & 0x3);
+ 
+     /* KL-119a/user E1: a self-escape restores its frame's caller cfx.
+      * Cross-cfx shortcut behavior remains a K1 non-claim. */
+     if (self_escape) {
+-        env->inner_cfx_code = prev_cfx_code & 0x3F;
++        env->inner_cfx_code = frame->prev_cfx_code & 0x3F;
+     }
+ 
+     /* SEE §5 exception-exit flow step 4: target = cause_ip + (imms18 << 2).
+      * imms18 arrives already sign-extended by the ciii/riii decode (§2.4
+      * imms18). */
+     offset = ((int64_t)imms18) * 4;
+-    env->pc = (cause_ip + (target_ulong)offset) & 0x0000FFFFFFFFFFFFULL;
++    env->pc = (frame->cause_ip + (target_ulong)offset) &
++              0x0000FFFFFFFFFFFFULL;
+ 
+     /* KL-110a Oracle O1 observability: log the mode transition this
+      * instruction just performed (only emitted when the caller passes
+-- 
+2.43.0
+

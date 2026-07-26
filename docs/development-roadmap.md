@@ -1875,3 +1875,19 @@ tree hashes identical to the development trees.
 **K1 remaining**: connect real pending sources and interrupt dispatch,
 then timer0/PTW/TLB/external-source behavior according to §8.5; KL-120a
 does not claim those mechanisms.
+
+## K1: generic precise CFX carrier in QEMU/gem5 (2026-07-26) — see `code-agent/tasks/KL-122a-*.md`
+
+Merged the originally separate KL-122a QEMU and KL-123a gem5 work into one
+dual-backend refactor. The two named power/smon frames and smon-only vector
+became `cfx_frame[64]`/`cfx_supv_excp_vector[64]`; `cfx2rc`, `cfx2rd`, and
+`escape` now use the indexed carrier, while O3's connected source calls a
+shared non-maskable synchronous steps-7-10 entry helper. No mask/pending/
+priority logic or new PTW/TLB/timer/UART source was added. A cfx_ptw
+round-trip plus generic-frame escape probe passes `46/46` on QEMU/gem5;
+KL-120a and all O1/O2/O3 probes retain their prior results. Full E2E remains
+81/81 and four-way differential remains 200 with zero divergence. QEMU's
+28-patch and gem5's 21-patch series replay to matching development trees.
+
+**Next**: KL-124a FullSystem carrier for gem5, then KL-125a QEMU PTW
+success path.
