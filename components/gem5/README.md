@@ -9,8 +9,9 @@ agreement is meaningful. See ADR-0010.
 
 Primary scope: functional ISA correctness in **SE mode** (AtomicSimpleCPU);
 timing / microarchitecture is out of scope. KL-124a adds a minimal
-FullSystem flat-image carrier for bare-metal semantic probes; it is still
-identity-mapped, interrupt-free, and does not claim OS bring-up.
+FullSystem flat-image carrier for bare-metal semantic probes; KL-126a adds
+the successful PTW path while PTW faults, A/D updates, an architectural TLB,
+interrupts, and OS bring-up remain out of scope.
 
 ## Baseline
 
@@ -31,9 +32,11 @@ an instruction" live in the applied tree at `docs/gem5-arch-notes.md`.
 | 0006 | dadao-faults           | ILLI 0x82 / MALIGN 0x81 / UNDI 0x83 + legality + div-by-zero | 162 |
 | 0007 | dadao-controlflow-ras  | branches / jump_r / call / ret + RegRAS + block-copy | **198** |
 | 0022 | FullSystem bare-metal carrier | flat image at 0x00100000, identity TLB, no-op interrupts | SE baseline unchanged |
+| 0023 | PTW successful path | cfx_ptw registers, super/normal-page walk, X/R/W | SE baseline unchanged |
 
 Current result: interp/QEMU/gem5 AGREE(3-way)=200, gem5-SKIP=2,
-DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix is also green.
+DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix and KL-126a's eight
+PTW successful-path probes are also green.
 
 ## Build & run (after `make fetch` + `apply_series`)
 

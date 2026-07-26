@@ -1916,6 +1916,18 @@ KL-122a, 81 E2E tests, and the 200-case differential remain green. The
 29-patch QEMU series replays from the manifest pin to the development tree
 hash.
 
-**Next**: KL-126a ports this success path to gem5 FullSystem; KL-127a later
-adds PTW failure routing and A/D updates. This milestone does not claim an
-architectural TLB, fault path, firmware, or kernel boot.
+## K1: gem5 PTW success path (2026-07-26) — see `code-agent/tasks/KL-126a-*.md`
+
+Ported the same successful walker semantics to gem5 FullSystem without
+changing the SE path: cfx_ptw private registers, permission/enable handling,
+big-endian L1/L2 PTE reads, super/normal-page address assembly, SPF/GPF, and
+distinct X/R/W checks. The gem5-only probe values deliberately differ from
+KL-125a (PTBR 3/4, L1 9/11, L2 13, fragments 5/6); two real mapped aliases
+make PTHI=3 and PAHI=4 observably distinct. All eight probes return 42,
+the KL-124a FullSystem matrix and KL-122a 46/46 remain green, E2E is 81/81,
+and differential is 200 agreements with zero divergence. The 23-patch gem5
+series replays from the manifest pin to the development tree hash.
+
+**Next**: KL-127a/KL-128a add QEMU/gem5 PTW failure routing and A/D updates.
+This milestone does not claim failure semantics, A/D writes, an architectural
+TLB, firmware, or kernel boot.

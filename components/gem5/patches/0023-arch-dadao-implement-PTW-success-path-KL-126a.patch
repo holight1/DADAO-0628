@@ -1,0 +1,429 @@
+From c845a02eb2bc4a2d27dba7f4b974862e65c9eb02 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 14:58:35 +0800
+Subject: [PATCH] arch/dadao: implement PTW success path (KL-126a)
+
+---
+ src/arch/dadao/DADAOBareMetal.py |  3 ++
+ src/arch/dadao/bare_metal.cc     | 14 ++++-
+ src/arch/dadao/bare_metal.hh     |  2 +
+ src/arch/dadao/decoder.cc        | 32 ++++++++++++
+ src/arch/dadao/isa.cc            | 90 ++++++++++++++++++++++++++++++++
+ src/arch/dadao/isa.hh            | 21 ++++++++
+ src/arch/dadao/tlb.cc            | 21 +++++++-
+ tests/dadao/dadao_fs.py          | 34 ++++++++++--
+ 8 files changed, 210 insertions(+), 7 deletions(-)
+
+diff --git a/src/arch/dadao/DADAOBareMetal.py b/src/arch/dadao/DADAOBareMetal.py
+index f0d23e11cf..391e4e8999 100644
+--- a/src/arch/dadao/DADAOBareMetal.py
++++ b/src/arch/dadao/DADAOBareMetal.py
+@@ -9,3 +9,6 @@ class DADAOBareMetal(Workload):
+ 
+     image = Param.String("Raw bare-metal image")
+     load_addr = Param.Addr(0x00100000, "Raw image load and reset address")
++    data_image = Param.String("", "Optional raw data image")
++    data_load_addr = Param.Addr(
++        0x80000000, "Optional raw data image load address")
+diff --git a/src/arch/dadao/bare_metal.cc b/src/arch/dadao/bare_metal.cc
+index 11a66b08cd..e150137755 100644
+--- a/src/arch/dadao/bare_metal.cc
++++ b/src/arch/dadao/bare_metal.cc
+@@ -13,14 +13,19 @@ namespace DADAOISA
+ 
+ BareMetal::BareMetal(const Params &p)
+     : Workload(p), image(loader::createObjectFile(p.image, true)),
+-      loadAddr(p.load_addr)
++      dataImage(p.data_image.empty() ? nullptr :
++          loader::createObjectFile(p.data_image, true)),
++      loadAddr(p.load_addr), dataLoadAddr(p.data_load_addr)
+ {
+     fatal_if(!image, "Could not load raw bare-metal image %s.", p.image);
++    fatal_if(!p.data_image.empty() && !dataImage,
++             "Could not load raw bare-metal data image %s.", p.data_image);
+ }
+ 
+ BareMetal::~BareMetal()
+ {
+     delete image;
++    delete dataImage;
+ }
+ 
+ void
+@@ -32,6 +37,13 @@ BareMetal::initState()
+     memoryImage.offset(loadAddr);
+     fatal_if(!memoryImage.write(system->physProxy),
+              "Could not load bare-metal image at %#x.", loadAddr);
++    if (dataImage) {
++        auto dataMemoryImage = dataImage->buildImage();
++        dataMemoryImage.offset(dataLoadAddr);
++        fatal_if(!dataMemoryImage.write(system->physProxy),
++                 "Could not load bare-metal data image at %#x.",
++                 dataLoadAddr);
++    }
+ 
+     for (auto *tc : system->threads) {
+         tc->clearArchRegs();
+diff --git a/src/arch/dadao/bare_metal.hh b/src/arch/dadao/bare_metal.hh
+index 15f2f25f70..8bcc6e010f 100644
+--- a/src/arch/dadao/bare_metal.hh
++++ b/src/arch/dadao/bare_metal.hh
+@@ -15,8 +15,10 @@ class BareMetal : public Workload
+ {
+   private:
+     loader::ObjectFile *image;
++    loader::ObjectFile *dataImage;
+     loader::SymbolTable symbols;
+     const Addr loadAddr;
++    const Addr dataLoadAddr;
+ 
+   public:
+     PARAMS(DADAOBareMetal);
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 92bca9957d..14665d388c 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -975,6 +975,28 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+       value & cfxCommonPendingMask(cfxcode_);
+     return NoFault;
+   }
++  if (cfxcode_ == CfxCodePtw) {
++    if (cg_ == 8 && rc_ < 4) {
++      isa->cfxPtwPerm[rc_] = value;
++      return NoFault;
++    }
++    if (cg_ == 8 && rc_ == 8) {
++      isa->cfxPtwPtbrEnable = value;
++      return NoFault;
++    }
++    if (cg_ == 9) {
++      isa->cfxPtwPtbr[rc_] = value & MASK48;
++      return NoFault;
++    }
++    if (cg_ == 10) {
++      isa->cfxPtwPthi[rc_] = value & 0xFFFF;
++      return NoFault;
++    }
++    if (cg_ == 11) {
++      isa->cfxPtwPahi[rc_] = value & 0xFFFF;
++      return NoFault;
++    }
++  }
+   // SEE §3 cg2/rc10: per-cfx supervisor exception-vector address.
+   if (cg_ == 2 && rc_ == 10) {
+     isa->cfxSupvExcpVector[cfxcode_] = value & MASK48;
+@@ -1029,6 +1051,16 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+   } else if (cg_ == CfxCommonPendingCg && rc_ == CfxCommonPendingRc) {
+     value = isa->cfxCommonPending[cfxcode_] &
+       cfxCommonPendingMask(cfxcode_);
++  } else if (cfxcode_ == CfxCodePtw && cg_ == 8 && rc_ < 4) {
++    value = isa->cfxPtwPerm[rc_];
++  } else if (cfxcode_ == CfxCodePtw && cg_ == 8 && rc_ == 8) {
++    value = isa->cfxPtwPtbrEnable;
++  } else if (cfxcode_ == CfxCodePtw && cg_ == 9) {
++    value = isa->cfxPtwPtbr[rc_];
++  } else if (cfxcode_ == CfxCodePtw && cg_ == 10) {
++    value = isa->cfxPtwPthi[rc_];
++  } else if (cfxcode_ == CfxCodePtw && cg_ == 11) {
++    value = isa->cfxPtwPahi[rc_];
+   } else if (cg_ == 5) {
+     switch (rc_) {
+     case 0: value = isa->cfxFrame[cfxcode_].prevRunMode; break;
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index f41eb66630..2f1701a49a 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -5,6 +5,10 @@
+ #include "debug/IntRegs.hh"
+ #include "debug/MatRegs.hh"
+ #include "params/DADAOISA.hh"
++#include "sim/system.hh"
++
++#include <iomanip>
++#include <iostream>
+ 
+ namespace gem5
+ {
+@@ -59,11 +63,19 @@ ISA::clear()
+     innerRunMode = RunModeHypv;
+     innerCfxCode = CfxCodePower;
+     innerCfxMask = ~0ULL;
++    cfxPtwPerm[RunModeUser] = 0;
++    cfxPtwPerm[RunModeJail] = 0;
++    cfxPtwPerm[RunModeSupv] = ~0ULL;
++    cfxPtwPerm[RunModeHypv] = ~0ULL;
++    cfxPtwPtbrEnable = 0;
+     for (int i = 0; i < 64; i++) {
+         cfxHypvCgRegDeleg[i] = ~0ULL;
+         cfxFrame[i] = CfxFrame{};
+         cfxSupvExcpVector[i] = 0;
+         cfxCommonPending[i] = 0;
++        cfxPtwPtbr[i] = 0;
++        cfxPtwPthi[i] = 0;
++        cfxPtwPahi[i] = 0;
+         for (int m = 0; m < 4; m++)
+             cfxEscapeCfxMask[i][m] = ~0ULL;
+     }
+@@ -75,6 +87,78 @@ ISA::clear()
+             cfxCommonPendingTestSeed;
+ }
+ 
++bool
++ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
++                  Addr &physicalAddr) const
++{
++    const uint64_t va = virtualAddr & 0x0000FFFFFFFFFFFFULL;
++    const unsigned ptbrIndex = (va >> 42) & 0x3F;
++
++    if (!(cfxPtwPerm[innerRunMode] & (1ULL << ptbrIndex)))
++        return false;
++
++    if (!(cfxPtwPtbrEnable & (1ULL << ptbrIndex))) {
++        physicalAddr = va;
++        return true;
++    }
++
++    const uint64_t l1Base =
++        (cfxPtwPtbr[ptbrIndex] & 0x0000FFFFFFFFFFFFULL) << 16;
++    uint64_t leafPteAddr =
++        l1Base + (((va >> 29) & 0x1FFF) * sizeof(uint64_t));
++    const uint64_t l1Pte = tc->getSystemPtr()->physProxy.read<uint64_t>(
++        leafPteAddr, ByteOrder::big);
++    if (!(l1Pte & 1))
++        return false;
++
++    uint64_t leafPte;
++    unsigned fragment;
++    if (l1Pte & 2) {
++        leafPte = l1Pte;
++        fragment = (va >> 26) & 7;
++        if (!((leafPte >> 56) & (1ULL << fragment)))
++            return false;
++        physicalAddr = (static_cast<uint64_t>(cfxPtwPahi[ptbrIndex]) << 48) |
++            (leafPte & 0x0000FFFFE0000000ULL) |
++            (va & 0x1FFFFFFFULL);
++    } else {
++        const uint64_t l2Base =
++            (static_cast<uint64_t>(cfxPtwPthi[ptbrIndex]) << 48) |
++            (l1Pte & 0x0000FFFFFFFF0000ULL);
++        leafPteAddr =
++            l2Base + (((va >> 16) & 0x1FFF) * sizeof(uint64_t));
++        leafPte = tc->getSystemPtr()->physProxy.read<uint64_t>(
++            leafPteAddr, ByteOrder::big);
++        if (!(leafPte & 1))
++            return false;
++        fragment = (va >> 13) & 7;
++        if (!((leafPte >> 56) & (1ULL << fragment)))
++            return false;
++        physicalAddr = (static_cast<uint64_t>(cfxPtwPahi[ptbrIndex]) << 48) |
++            (leafPte & 0x0000FFFFFFFF0000ULL) |
++            (va & 0xFFFF);
++    }
++
++    const uint64_t requiredPermission =
++        access == PtwAccess::Execute ? (1ULL << 5) :
++        access == PtwAccess::Write ? (1ULL << 6) : (1ULL << 7);
++    if (!(leafPte & requiredPermission))
++        return false;
++
++    const unsigned prot =
++        ((leafPte >> 7) & 1) |
++        (((leafPte >> 6) & 1) << 1) |
++        (((leafPte >> 5) & 1) << 2);
++    std::cerr << "dadao: ptw va=0x" << std::hex << std::setfill('0')
++              << std::setw(16) << va
++              << " leaf_pte_addr=0x" << std::setw(16) << leafPteAddr
++              << " l1=0x" << std::setw(16) << l1Pte
++              << " pa=0x" << std::setw(16) << physicalAddr
++              << " access=" << std::dec << static_cast<unsigned>(access)
++              << " prot=0x" << std::hex << prot << std::dec << "\n";
++    return true;
++}
++
+ void
+ ISA::copyRegsFrom(ThreadContext *src)
+ {
+@@ -92,11 +176,17 @@ ISA::copyRegsFrom(ThreadContext *src)
+         innerRunMode = srcIsa->innerRunMode;
+         innerCfxCode = srcIsa->innerCfxCode;
+         innerCfxMask = srcIsa->innerCfxMask;
++        for (int m = 0; m < 4; m++)
++            cfxPtwPerm[m] = srcIsa->cfxPtwPerm[m];
++        cfxPtwPtbrEnable = srcIsa->cfxPtwPtbrEnable;
+         for (int i = 0; i < 64; i++) {
+             cfxHypvCgRegDeleg[i] = srcIsa->cfxHypvCgRegDeleg[i];
+             cfxFrame[i] = srcIsa->cfxFrame[i];
+             cfxSupvExcpVector[i] = srcIsa->cfxSupvExcpVector[i];
+             cfxCommonPending[i] = srcIsa->cfxCommonPending[i];
++            cfxPtwPtbr[i] = srcIsa->cfxPtwPtbr[i];
++            cfxPtwPthi[i] = srcIsa->cfxPtwPthi[i];
++            cfxPtwPahi[i] = srcIsa->cfxPtwPahi[i];
+             for (int m = 0; m < 4; m++)
+                 cfxEscapeCfxMask[i][m] = srcIsa->cfxEscapeCfxMask[i][m];
+         }
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+index 3e965af778..feb6c489d4 100644
+--- a/src/arch/dadao/isa.hh
++++ b/src/arch/dadao/isa.hh
+@@ -33,6 +33,7 @@ enum RunMode : uint8_t
+ 
+ // cfx_smon and cfx_power cfxcodes [wiki §DADAO-12-SEE].
+ constexpr uint8_t CfxCodeSmon = 2;
++constexpr uint8_t CfxCodePtw = 4;
+ constexpr uint8_t CfxCodePower = 63;
+ 
+ // cfx_smon's architecturally non-maskable CFXTRAP cause.
+@@ -102,9 +103,29 @@ class ISA : public BaseISA
+     uint64_t cfxHypvCgRegDeleg[64];
+     uint64_t cfxCommonPending[64];
+     uint64_t cfxEscapeCfxMask[64][4];
++    // KL-126a: cfx_ptw private storage. PTBR stores PA[63:16], while PTHI
++    // and PAHI provide the distinct high 16 bits for page-table structures
++    // and final data addresses respectively.
++    uint64_t cfxPtwPerm[4];
++    uint64_t cfxPtwPtbrEnable;
++    uint64_t cfxPtwPtbr[64];
++    uint16_t cfxPtwPthi[64];
++    uint16_t cfxPtwPahi[64];
+ 
+     void clear() override;
+ 
++    enum class PtwAccess : uint8_t
++    {
++        Read = 0,
++        Write = 1,
++        Execute = 2,
++    };
++
++    // Successful PTW path only. Failure routing and A/D updates are deferred
++    // to KL-128a; no architectural TLB is populated by this helper.
++    bool ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
++                      Addr &physicalAddr) const;
++
+     RegVal
+     readMiscRegNoEffect(RegIndex idx) const override
+     {
+diff --git a/src/arch/dadao/tlb.cc b/src/arch/dadao/tlb.cc
+index 2704fa16b0..d85f3010c9 100644
+--- a/src/arch/dadao/tlb.cc
++++ b/src/arch/dadao/tlb.cc
+@@ -1,5 +1,6 @@
+ #include "arch/dadao/tlb.hh"
+ 
++#include "arch/dadao/isa.hh"
+ #include "base/logging.hh"
+ #include "cpu/thread_context.hh"
+ #include "mem/page_table.hh"
+@@ -16,7 +17,15 @@ TLB::translateAtomic(const RequestPtr &req, ThreadContext *tc,
+                      BaseMMU::Mode mode)
+ {
+     if (FullSystem) {
+-        req->setPaddr(req->getVaddr());
++        auto *isa = static_cast<ISA *>(tc->getIsaPtr());
++        const ISA::PtwAccess access =
++            mode == BaseMMU::Execute ? ISA::PtwAccess::Execute :
++            mode == BaseMMU::Write ? ISA::PtwAccess::Write :
++            ISA::PtwAccess::Read;
++        Addr physical;
++        panic_if(!isa->ptwTranslate(tc, req->getVaddr(), access, physical),
++                 "DADAO PTW failure handling is not implemented");
++        req->setPaddr(physical);
+         return NoFault;
+     }
+     return tc->getProcessPtr()->pTable->translate(req);
+@@ -27,7 +36,15 @@ TLB::translateFunctional(const RequestPtr &req, ThreadContext *tc,
+                          BaseMMU::Mode mode)
+ {
+     if (FullSystem) {
+-        req->setPaddr(req->getVaddr());
++        auto *isa = static_cast<ISA *>(tc->getIsaPtr());
++        const ISA::PtwAccess access =
++            mode == BaseMMU::Execute ? ISA::PtwAccess::Execute :
++            mode == BaseMMU::Write ? ISA::PtwAccess::Write :
++            ISA::PtwAccess::Read;
++        Addr physical;
++        panic_if(!isa->ptwTranslate(tc, req->getVaddr(), access, physical),
++                 "DADAO PTW failure handling is not implemented");
++        req->setPaddr(physical);
+         return NoFault;
+     }
+     return tc->getProcessPtr()->pTable->translate(req);
+diff --git a/tests/dadao/dadao_fs.py b/tests/dadao/dadao_fs.py
+index ae536cda72..3c72f9b10f 100644
+--- a/tests/dadao/dadao_fs.py
++++ b/tests/dadao/dadao_fs.py
+@@ -18,6 +18,7 @@ binary = sys.argv[1]
+ cfx_smon_real = False
+ cfx_pending_test_code = 18
+ cfx_pending_test_seed = 0
++data_image = ""
+ args = sys.argv[2:]
+ while args:
+     option = args.pop(0)
+@@ -26,6 +27,8 @@ while args:
+     elif option == "--cfx-pending-test" and len(args) >= 2:
+         cfx_pending_test_code = int(args.pop(0), 0)
+         cfx_pending_test_seed = int(args.pop(0), 0)
++    elif option == "--data-image" and args:
++        data_image = args.pop(0)
+     else:
+         raise SystemExit(f"unknown/incomplete option: {option}")
+ 
+@@ -35,27 +38,50 @@ system.clk_domain = SrcClockDomain(
+ system.mem_mode = "atomic"
+ # Keep the large unmapped hole out of host memory while backing both the ROM
+ # convention and the existing KL-113a/KL-117a marker pages.
+-system.mem_ranges = [
++backing_ranges = [
+     AddrRange(0x00000000, size="16MiB"),
+     AddrRange(0x80000000, size="16MiB"),
++    # KL-126a's nonzero superpage fragment lands in this sparse leaf window.
++    AddrRange(0x94030000, size="64KiB"),
+     # The architectural halt oracle reads this differential-test window
+     # before requesting simulation exit.
+     AddrRange(0x87FEF000, size="12KiB"),
+ ]
++ptw_alias_ranges = [
++    # KL-126a discriminates page-table-structure PTHI from final-data PAHI.
++    AddrRange(0x0003000085000000, size="64KiB"),
++    AddrRange(0x0004000080600000, size="64KiB"),
++]
++ptw_alias_backings = [
++    AddrRange(0x80200000, size="64KiB"),
++    AddrRange(0x80400000, size="64KiB"),
++]
++system.mem_ranges = backing_ranges + ptw_alias_ranges
+ system.cpu = DADAOAtomicSimpleCPU()
+ 
+-system.membus = SystemXBar()
++# The raw FullSystem carrier has no caches or other coherent requestors.
++# NoncoherentXBar also permits the KL-126a alias mapper to recirculate a
++# remapped low address without generating unsupported snoop traffic.
++system.membus = IOXBar()
+ system.cpu.icache_port = system.membus.cpu_side_ports
+ system.cpu.dcache_port = system.membus.cpu_side_ports
+ system.cpu.createInterruptController()
+ 
+ system.mem_ctrls = [
+     SimpleMemory(range=memory_range, port=system.membus.mem_side_ports)
+-    for memory_range in system.mem_ranges
++    for memory_range in backing_ranges
+ ]
++system.ptw_alias = RangeAddrMapper(
++    original_ranges=ptw_alias_ranges,
++    remapped_ranges=ptw_alias_backings,
++    cpu_side_port=system.membus.mem_side_ports,
++    mem_side_port=system.membus.cpu_side_ports,
++)
+ system.system_port = system.membus.cpu_side_ports
+ 
+-system.workload = DADAOBareMetal(image=binary, load_addr=0x00100000)
++system.workload = DADAOBareMetal(
++    image=binary, load_addr=0x00100000, data_image=data_image,
++    data_load_addr=0x80000000)
+ system.cpu.createThreads()
+ system.cpu.isa[0].cfx_smon_real = cfx_smon_real
+ system.cpu.isa[0].cfx_common_pending_test_code = cfx_pending_test_code
+-- 
+2.43.0
+
