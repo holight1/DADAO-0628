@@ -1,0 +1,313 @@
+From 69a025c4310b9d22cad326bda5a4ec50102feede Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 16:01:49 +0800
+Subject: [PATCH] target/dadao: implement PTW faults and A/D bits (KL-127a)
+
+---
+ target/dadao/cpu.c       | 125 +++++++++++++++++++++++++++++++--------
+ target/dadao/cpu.h       |  18 +++++-
+ target/dadao/translate.c |  13 ++++
+ 3 files changed, 130 insertions(+), 26 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index c5340dd..e6ccead 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -20,6 +20,16 @@ extern const TCGCPUOps dadao_tcg_ops;
+ void cpu_get_tb_cpu_state(CPUDADAOState *env, vaddr *pc,
+                           uint64_t *cs_base, uint32_t *pflags)
+ {
++    /*
++     * KL-127a intentionally has no architectural TLB: while PTW is enabled,
++     * every instruction boundary discards QEMU's host translation cache.
++     * dadao_translate_code() limits these TBs to one guest instruction, so
++     * data accesses and the following fetch cannot observe stale PTE/A-D
++     * state. KL-129a supplies its own architected cache above the walker.
++     */
++    if (env->cfx_ptw_ptbr_enable) {
++        tlb_flush(env_cpu(env));
++    }
+     *pc = env->pc;
+     *cs_base = 0;
+     *pflags = 0;
+@@ -168,23 +178,15 @@ void dadao_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+ static void dadao_cfx_precise_trap_enter(DADAOCPU *cpu,
+                                          uint64_t target_cfxcode,
+                                          uint64_t cause_id,
+-                                         uint64_t raw_insn)
++                                         uint64_t cause_info,
++                                         target_ulong cause_ip)
+ {
+     CPUDADAOState *env = &cpu->env;
+     DADAOCfxFrame *frame;
+ 
+     target_cfxcode &= 0x3F;
+     frame = &env->cfx_frame[target_cfxcode];
+-    /* trans_trap (translate.c) unconditionally stores pc_next+4 (the
+-     * address of the instruction *after* trap) into env->pc before calling
+-     * helper_trap, for every trap regardless of cfxcode or profile -- this
+-     * is the same store the host/SE syscall shortcut relies on to resume
+-     * execution after itself. The trap instruction's *own* address (SEE §5
+-     * step 9's excp_cause_ip, "触发异常的指令地址") is therefore pc-4;
+-     * masked to the 48-bit RB address width like every other address-typed
+-     * register in this target. [wiki §DADAO-12-SEE-主管系统运行环境.md
+-     * L703] */
+-    target_ulong cause_ip = (env->pc - 4) & 0x0000FFFFFFFFFFFFULL;
++    cause_ip &= 0x0000FFFFFFFFFFFFULL;
+     DADAORunMode mode_before = env->inner_run_mode;
+ 
+     /* Step 7: save current mode/mask/cfx code into the target frame -- BEFORE
+@@ -207,19 +209,20 @@ static void dadao_cfx_precise_trap_enter(DADAOCPU *cpu,
+     env->inner_cfx_mask = DADAO_CFX_MASK_ALL;
+     env->inner_cfx_code = target_cfxcode;
+ 
+-    /* Step 9: save exception info. cause_info is the raw 32-bit encoding of
+-     * the trap instruction itself, per the cause table's CFXTRAP row
+-     * ("excp cause info" = "指令编码"). [wiki L402, L703-705, L804-807] */
++    /* Step 9: save exception info. The caller supplies source-specific
++     * cause_info: raw instruction for CFXTRAP, original VA for PTW faults.
++     * [wiki L402, L703-705, L804-807] */
+     frame->cause_id = cause_id;
+     frame->cause_ip = cause_ip;
+-    frame->cause_info = raw_insn;
++    frame->cause_info = cause_info;
+ 
+     /* Step 10: jump to the excp vector. Flat physical address (ADR-0004
+      * convention, same as O1's cause_ip/supv_entry) rather than the wiki's
+      * core-internal-address mapping -- SEE §2.1 never populated an actual
+      * address range for cfx_smon, so there is no wiki mapping to deviate
+-     * from here; this machine has no SEE/PTBR at all (ADR-0004 D2). [wiki
+-     * L706, L809-810] */
++     * from here; this test machine has no firmware-provided SEE mapping
++     * convention beyond the explicit PTBR state modeled below. [wiki L706,
++     * L809-810] */
+     env->pc = env->cfx_supv_excp_vector[target_cfxcode];
+ 
+     /* Observability, mirrors the O1/escape trace convention: only emitted
+@@ -453,7 +456,7 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+              * target, now routed through KL-122a's shared precise carrier. */
+             dadao_cfx_precise_trap_enter(cpu, DADAO_CFX_CODE_SMON,
+                                          DADAO_CFX_CAUSE_CFXTRAP,
+-                                         raw_insn);
++                                         raw_insn, env->pc - 4);
+         } else {
+             /* unknown cfxcode → ILLI */
+             qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
+@@ -479,12 +482,19 @@ static int dadao_cpu_mmu_index(CPUState *cs, bool ifetch)
+     return 0;
+ }
+ 
+-/* KL-125a: successful page-table-walk path. Fault routing, A/D updates and
+- * an architectural TLB are deliberately deferred; a failed check returns
+- * false to the caller without fabricating a translation. */
++static uint64_t
++dadao_ptw_page_cause(MMUAccessType access_type,
++                     uint64_t instruction_cause, uint64_t data_cause)
++{
++    return access_type == MMU_INST_FETCH ? instruction_cause : data_cause;
++}
++
++/* KL-125a/KL-127a page-table walk. This helper classifies every walk failure
++ * and updates the successful leaf's A/D bits; precise carrier entry remains
++ * in tlb_fill so retaddr can first restore the faulting instruction PC. */
+ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+                          MMUAccessType access_type, hwaddr *physical,
+-                         int *prot)
++                         int *prot, uint64_t *fault_cause)
+ {
+     DADAOCPU *cpu = DADAO_CPU(cs);
+     CPUDADAOState *env = &cpu->env;
+@@ -498,9 +508,12 @@ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+     unsigned int fragment;
+     int leaf_prot = 0;
+     int required_prot;
++    uint64_t updated_pte;
+ 
++    *fault_cause = 0;
+     if (!(env->cfx_ptw_perm[env->inner_run_mode] &
+           (UINT64_C(1) << ptbr_index))) {
++        *fault_cause = UINT64_C(1) << (8 + env->inner_run_mode);
+         return false;
+     }
+ 
+@@ -515,13 +528,26 @@ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+     pte_addr = l1_base + (((va >> 29) & 0x1fff) * 8);
+     l1_pte = address_space_ldq_be(cs->as, pte_addr,
+                                   MEMTXATTRS_UNSPECIFIED, &result);
+-    if (result != MEMTX_OK || !(l1_pte & 1)) {
++    if (result != MEMTX_OK) {
++        l1_pte = 0;
++    }
++    if (!(l1_pte & 1)) {
++        *fault_cause = (l1_pte & 2) ?
++            dadao_ptw_page_cause(access_type,
++                                 DADAO_CFX_PTW_CAUSE_ISPTRAP,
++                                 DADAO_CFX_PTW_CAUSE_DSPTRAP) :
++            dadao_ptw_page_cause(access_type,
++                                 DADAO_CFX_PTW_CAUSE_IGPTRAP,
++                                 DADAO_CFX_PTW_CAUSE_DGPTRAP);
+         return false;
+     }
+ 
+     if (l1_pte & 2) {
+         fragment = (va >> 26) & 7;
+         if (!((l1_pte >> 56) & (UINT64_C(1) << fragment))) {
++            *fault_cause = dadao_ptw_page_cause(
++                access_type, DADAO_CFX_PTW_CAUSE_ISPFTRAP,
++                DADAO_CFX_PTW_CAUSE_DSPFTRAP);
+             return false;
+         }
+         leaf_pte = l1_pte;
+@@ -537,10 +563,16 @@ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+         leaf_pte = address_space_ldq_be(cs->as, pte_addr,
+                                        MEMTXATTRS_UNSPECIFIED, &result);
+         if (result != MEMTX_OK || !(leaf_pte & 1)) {
++            *fault_cause = dadao_ptw_page_cause(
++                access_type, DADAO_CFX_PTW_CAUSE_IGPTRAP,
++                DADAO_CFX_PTW_CAUSE_DGPTRAP);
+             return false;
+         }
+         fragment = (va >> 13) & 7;
+         if (!((leaf_pte >> 56) & (UINT64_C(1) << fragment))) {
++            *fault_cause = dadao_ptw_page_cause(
++                access_type, DADAO_CFX_PTW_CAUSE_IGPFTRAP,
++                DADAO_CFX_PTW_CAUSE_DGPFTRAP);
+             return false;
+         }
+         *physical = ((uint64_t)env->cfx_ptw_pahi[ptbr_index] << 48) |
+@@ -560,10 +592,43 @@ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+     required_prot = access_type == MMU_INST_FETCH ? PAGE_EXEC :
+                     access_type == MMU_DATA_STORE ? PAGE_WRITE : PAGE_READ;
+     if (!(leaf_prot & required_prot)) {
++        *fault_cause = access_type == MMU_INST_FETCH ?
++            DADAO_CFX_PTW_CAUSE_NXPERM :
++            access_type == MMU_DATA_STORE ?
++            DADAO_CFX_PTW_CAUSE_NWPERM :
++            DADAO_CFX_PTW_CAUSE_NRPERM;
+         return false;
+     }
+     *prot = leaf_prot;
+ 
++    /*
++     * QEMU's internal softmmu TLB must not let the first write bypass the
++     * architectural D-bit update. If a non-write walk observes D=0, cache
++     * the translation without PAGE_WRITE; a later write misses, walks again,
++     * sets D below, and then receives the leaf's full permissions. This is
++     * a host-side implementation detail, not KL-129a's architectural TLB.
++     */
++    if (access_type != MMU_DATA_STORE &&
++        !(leaf_pte & (UINT64_C(1) << 2))) {
++        *prot &= ~PAGE_WRITE;
++    }
++
++    updated_pte = leaf_pte | (UINT64_C(1) << 3);
++    if (access_type == MMU_DATA_STORE) {
++        updated_pte |= UINT64_C(1) << 2;
++    }
++    address_space_stq_be(cs->as, pte_addr, updated_pte,
++                         MEMTXATTRS_UNSPECIFIED, &result);
++    if (result != MEMTX_OK) {
++        *fault_cause = dadao_ptw_page_cause(
++            access_type,
++            l1_pte & 2 ? DADAO_CFX_PTW_CAUSE_ISPTRAP :
++                         DADAO_CFX_PTW_CAUSE_IGPTRAP,
++            l1_pte & 2 ? DADAO_CFX_PTW_CAUSE_DSPTRAP :
++                         DADAO_CFX_PTW_CAUSE_DGPTRAP);
++        return false;
++    }
++
+     qemu_log_mask(CPU_LOG_MMU,
+                   "dadao: ptw va=0x%016" PRIx64
+                   " leaf_pte_addr=0x%016" HWADDR_PRIx
+@@ -581,9 +646,19 @@ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+     hwaddr physical;
+     hwaddr physical_page;
+     int prot;
++    uint64_t fault_cause;
+ 
+-    if (!dadao_ptw_translate(cs, address, access_type, &physical, &prot)) {
+-        return false;
++    if (!dadao_ptw_translate(cs, address, access_type, &physical, &prot,
++                             &fault_cause)) {
++        if (probe) {
++            return false;
++        }
++        cpu_restore_state(cs, retaddr);
++        dadao_cfx_precise_trap_enter(
++            DADAO_CPU(cs), DADAO_CFX_CODE_PTW, fault_cause,
++            address & UINT64_C(0x0000ffffffffffff),
++            DADAO_CPU(cs)->env.pc);
++        cpu_loop_exit(cs);
+     }
+     physical_page = physical & TARGET_PAGE_MASK;
+     tlb_set_page_with_attrs(cs, page_addr, physical_page,
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index d8fa821..cb43aae 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -72,6 +72,22 @@ typedef struct DADAOCfxFrame {
+ /* SEE §3 cg5 cause id for CFXTRAP: bit 0, one-hot.
+  * [wiki §DADAO-12-SEE-主管系统运行环境.md L402] */
+ #define DADAO_CFX_CAUSE_CFXTRAP (1ULL << 0)
++/* cfx_ptw non-maskable fault causes [SEE §cfx_ptw]. */
++#define DADAO_CFX_PTW_CAUSE_NUPERM    (1ULL << 8)
++#define DADAO_CFX_PTW_CAUSE_NJPERM    (1ULL << 9)
++#define DADAO_CFX_PTW_CAUSE_NSPERM    (1ULL << 10)
++#define DADAO_CFX_PTW_CAUSE_NHPERM    (1ULL << 11)
++#define DADAO_CFX_PTW_CAUSE_NXPERM    (1ULL << 12)
++#define DADAO_CFX_PTW_CAUSE_NWPERM    (1ULL << 13)
++#define DADAO_CFX_PTW_CAUSE_NRPERM    (1ULL << 14)
++#define DADAO_CFX_PTW_CAUSE_IGPTRAP   (1ULL << 16)
++#define DADAO_CFX_PTW_CAUSE_ISPTRAP   (1ULL << 17)
++#define DADAO_CFX_PTW_CAUSE_IGPFTRAP  (1ULL << 18)
++#define DADAO_CFX_PTW_CAUSE_ISPFTRAP  (1ULL << 19)
++#define DADAO_CFX_PTW_CAUSE_DGPTRAP   (1ULL << 20)
++#define DADAO_CFX_PTW_CAUSE_DSPTRAP   (1ULL << 21)
++#define DADAO_CFX_PTW_CAUSE_DGPFTRAP  (1ULL << 22)
++#define DADAO_CFX_PTW_CAUSE_DSPFTRAP  (1ULL << 23)
+ 
+ /* HEE §1 cg3/rc12 "hypv cg reg delegation", one 64-bit register per cfxcode
+  * (indexed by raw cfxcode, 0-63; reserved cfxcodes are simply never
+@@ -190,7 +206,7 @@ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                         bool probe, uintptr_t retaddr);
+ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+                          MMUAccessType access_type, hwaddr *physical,
+-                         int *prot);
++                         int *prot, uint64_t *fault_cause);
+ G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
+                                       uint32_t exception,
+                                       uintptr_t pc);
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index e4197a6..dbfead5 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -499,6 +499,16 @@ static bool trans_cfx2rc(DisasContext *ctx, arg_cfx2rc *a)
+     TCGv_i64 rc = tcg_constant_i64(a->hc & 0x3F);
+     TCGv_i64 value = load_rd(ctx, a->hd);
+     gen_helper_cfx2rc(tcg_env, cfxcode, cg, rc, value);
++    if ((a->ha & 0x3F) == DADAO_CFX_CODE_PTW &&
++        (a->hb & 0x3F) == 8 && (a->hc & 0x3F) == 8) {
++        /*
++         * Enabling PTW changes the next instruction's translation profile.
++         * End this pre-enable TB so dadao_translate_code() can switch to
++         * one-instruction TBs and cpu_get_tb_cpu_state() can flush QEMU's
++         * non-architectural host cache at every boundary.
++         */
++        ctx->base.is_jmp = DISAS_TOO_MANY;
++    }
+     return true;
+ }
+ 
+@@ -1500,6 +1510,9 @@ void dadao_translate_code(CPUState *cs, TranslationBlock *tb,
+ {
+     DisasContext ctx;
+ 
++    if (cpu_env(cs)->cfx_ptw_ptbr_enable) {
++        *max_insns = MIN(*max_insns, 1);
++    }
+     translator_loop(cs, tb, max_insns, pc, host_pc, &dadao_tr_ops, &ctx.base);
+ }
+ 
+-- 
+2.43.0
+

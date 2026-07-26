@@ -1,0 +1,332 @@
+From 7eaa17d4b4bb9b2f769b1f9bb1054e73d3bf34e3 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 16:01:56 +0800
+Subject: [PATCH] arch/dadao: implement PTW faults and A/D bits (KL-127a)
+
+---
+ src/arch/dadao/decoder.cc | 35 +----------------
+ src/arch/dadao/isa.cc     | 82 +++++++++++++++++++++++++++++++++++----
+ src/arch/dadao/isa.hh     | 24 ++++++++++--
+ src/arch/dadao/tlb.cc     | 45 +++++++++++----------
+ tests/dadao/dadao_fs.py   |  2 +
+ 5 files changed, 125 insertions(+), 63 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 14665d388c..ab3f1a01e6 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -713,40 +713,9 @@ cfxPreciseTrapEnter(ExecContext *xc, uint8_t targetCfxCode,
+                     uint64_t causeId, uint32_t rawInsn)
+ {
+   ISA *isa = cfxIsa(xc);
+-  targetCfxCode &= 0x3F;
+-  CfxFrame &frame = isa->cfxFrame[targetCfxCode];
+   PCState pc = xc->pcState().as<PCState>();
+-  uint64_t causeIp = pc.instAddr();
+-  RunMode modeBefore = isa->innerRunMode;
+-
+-  frame.prevRunMode = isa->innerRunMode;
+-  frame.prevCfxMask = isa->innerCfxMask;
+-  frame.prevCfxCode = isa->innerCfxCode;
+-  isa->innerRunMode = RunModeSupv;
+-  isa->innerCfxMask = ~0ULL;
+-  isa->innerCfxCode = targetCfxCode;
+-  frame.causeId = causeId;
+-  frame.causeIp = causeIp;
+-  frame.causeInfo = rawInsn;
+-  uint64_t target = isa->cfxSupvExcpVector[targetCfxCode] & MASK48;
+-
+-  // Preserve TrapInst's sequential advancePC() contract by staging the
+-  // vector as NPC; this is required by the O3 simple/front-end behavior.
+-  pc.set(target);
+-  pc.pc(target - 4);
+-  pc.npc(target);
+-  xc->pcState(pc);
+-
+-  // Keep KL-117a's established O3 trace byte-for-byte stable.
+-  if (targetCfxCode == CfxCodeSmon && causeId == CfxCauseCfxtrap) {
+-    std::cerr << "dadao: trap cfx_smon mode " << (int)modeBefore
+-              << "->" << (int)isa->innerRunMode
+-              << " inner_cfx_code=" << (unsigned)isa->innerCfxCode
+-              << " cause_id=0x" << std::hex << frame.causeId
+-              << " cause_ip=0x" << causeIp
+-              << " cause_info=0x" << frame.causeInfo
+-              << " vector=0x" << target << std::dec << "\n";
+-  }
++  isa->cfxPreciseTrapEnter(
++      xc->tcBase(), targetCfxCode, causeId, rawInsn, pc.instAddr(), true);
+ }
+ 
+ // === trap (ciii, op=0x76, spec §系统类指令): cfx_smon(cfxcode=2) responder ===
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index 2f1701a49a..e66b14adc0 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -89,13 +89,16 @@ ISA::clear()
+ 
+ bool
+ ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+-                  Addr &physicalAddr) const
++                  Addr &physicalAddr, uint64_t &faultCause) const
+ {
+     const uint64_t va = virtualAddr & 0x0000FFFFFFFFFFFFULL;
+     const unsigned ptbrIndex = (va >> 42) & 0x3F;
+ 
+-    if (!(cfxPtwPerm[innerRunMode] & (1ULL << ptbrIndex)))
++    faultCause = 0;
++    if (!(cfxPtwPerm[innerRunMode] & (1ULL << ptbrIndex))) {
++        faultCause = 1ULL << (8 + innerRunMode);
+         return false;
++    }
+ 
+     if (!(cfxPtwPtbrEnable & (1ULL << ptbrIndex))) {
+         physicalAddr = va;
+@@ -108,16 +111,25 @@ ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+         l1Base + (((va >> 29) & 0x1FFF) * sizeof(uint64_t));
+     const uint64_t l1Pte = tc->getSystemPtr()->physProxy.read<uint64_t>(
+         leafPteAddr, ByteOrder::big);
+-    if (!(l1Pte & 1))
++    if (!(l1Pte & 1)) {
++        faultCause = l1Pte & 2 ?
++            (access == PtwAccess::Execute ?
++                CfxPtwCauseIsptrap : CfxPtwCauseDsptrap) :
++            (access == PtwAccess::Execute ?
++                CfxPtwCauseIgptrap : CfxPtwCauseDgptrap);
+         return false;
++    }
+ 
+     uint64_t leafPte;
+     unsigned fragment;
+     if (l1Pte & 2) {
+         leafPte = l1Pte;
+         fragment = (va >> 26) & 7;
+-        if (!((leafPte >> 56) & (1ULL << fragment)))
++        if (!((leafPte >> 56) & (1ULL << fragment))) {
++            faultCause = access == PtwAccess::Execute ?
++                CfxPtwCauseIspftrap : CfxPtwCauseDspftrap;
+             return false;
++        }
+         physicalAddr = (static_cast<uint64_t>(cfxPtwPahi[ptbrIndex]) << 48) |
+             (leafPte & 0x0000FFFFE0000000ULL) |
+             (va & 0x1FFFFFFFULL);
+@@ -129,11 +141,17 @@ ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+             l2Base + (((va >> 16) & 0x1FFF) * sizeof(uint64_t));
+         leafPte = tc->getSystemPtr()->physProxy.read<uint64_t>(
+             leafPteAddr, ByteOrder::big);
+-        if (!(leafPte & 1))
++        if (!(leafPte & 1)) {
++            faultCause = access == PtwAccess::Execute ?
++                CfxPtwCauseIgptrap : CfxPtwCauseDgptrap;
+             return false;
++        }
+         fragment = (va >> 13) & 7;
+-        if (!((leafPte >> 56) & (1ULL << fragment)))
++        if (!((leafPte >> 56) & (1ULL << fragment))) {
++            faultCause = access == PtwAccess::Execute ?
++                CfxPtwCauseIgpftrap : CfxPtwCauseDgpftrap;
+             return false;
++        }
+         physicalAddr = (static_cast<uint64_t>(cfxPtwPahi[ptbrIndex]) << 48) |
+             (leafPte & 0x0000FFFFFFFF0000ULL) |
+             (va & 0xFFFF);
+@@ -142,8 +160,18 @@ ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+     const uint64_t requiredPermission =
+         access == PtwAccess::Execute ? (1ULL << 5) :
+         access == PtwAccess::Write ? (1ULL << 6) : (1ULL << 7);
+-    if (!(leafPte & requiredPermission))
++    if (!(leafPte & requiredPermission)) {
++        faultCause = access == PtwAccess::Execute ? CfxPtwCauseNxperm :
++            access == PtwAccess::Write ? CfxPtwCauseNwperm :
++            CfxPtwCauseNrperm;
+         return false;
++    }
++
++    uint64_t updatedPte = leafPte | (1ULL << 3);
++    if (access == PtwAccess::Write)
++        updatedPte |= 1ULL << 2;
++    tc->getSystemPtr()->physProxy.write<uint64_t>(
++        leafPteAddr, updatedPte, ByteOrder::big);
+ 
+     const unsigned prot =
+         ((leafPte >> 7) & 1) |
+@@ -159,6 +187,46 @@ ISA::ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+     return true;
+ }
+ 
++void
++ISA::cfxPreciseTrapEnter(ThreadContext *tc, uint8_t targetCfxCode,
++                         uint64_t causeId, uint64_t causeInfo,
++                         Addr causeIp, bool stageSequentialAdvance)
++{
++    targetCfxCode &= 0x3F;
++    CfxFrame &frame = cfxFrame[targetCfxCode];
++    RunMode modeBefore = innerRunMode;
++
++    frame.prevRunMode = innerRunMode;
++    frame.prevCfxMask = innerCfxMask;
++    frame.prevCfxCode = innerCfxCode;
++    innerRunMode = RunModeSupv;
++    innerCfxMask = ~0ULL;
++    innerCfxCode = targetCfxCode;
++    frame.causeId = causeId;
++    frame.causeIp = causeIp & 0x0000FFFFFFFFFFFFULL;
++    frame.causeInfo = causeInfo;
++
++    const uint64_t target = cfxSupvExcpVector[targetCfxCode] &
++        0x0000FFFFFFFFFFFFULL;
++    PCState pc = tc->pcState().as<PCState>();
++    pc.set(target);
++    if (stageSequentialAdvance) {
++        pc.pc(target - 4);
++        pc.npc(target);
++    }
++    tc->pcState(pc);
++
++    if (targetCfxCode == CfxCodeSmon && causeId == CfxCauseCfxtrap) {
++        std::cerr << "dadao: trap cfx_smon mode " << (int)modeBefore
++                  << "->" << (int)innerRunMode
++                  << " inner_cfx_code=" << (unsigned)innerCfxCode
++                  << " cause_id=0x" << std::hex << frame.causeId
++                  << " cause_ip=0x" << frame.causeIp
++                  << " cause_info=0x" << frame.causeInfo
++                  << " vector=0x" << target << std::dec << "\n";
++    }
++}
++
+ void
+ ISA::copyRegsFrom(ThreadContext *src)
+ {
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+index feb6c489d4..c1c7512e54 100644
+--- a/src/arch/dadao/isa.hh
++++ b/src/arch/dadao/isa.hh
+@@ -38,6 +38,21 @@ constexpr uint8_t CfxCodePower = 63;
+ 
+ // cfx_smon's architecturally non-maskable CFXTRAP cause.
+ constexpr uint64_t CfxCauseCfxtrap = 1ULL << 0;
++constexpr uint64_t CfxPtwCauseNuperm = 1ULL << 8;
++constexpr uint64_t CfxPtwCauseNjperm = 1ULL << 9;
++constexpr uint64_t CfxPtwCauseNsperm = 1ULL << 10;
++constexpr uint64_t CfxPtwCauseNhperm = 1ULL << 11;
++constexpr uint64_t CfxPtwCauseNxperm = 1ULL << 12;
++constexpr uint64_t CfxPtwCauseNwperm = 1ULL << 13;
++constexpr uint64_t CfxPtwCauseNrperm = 1ULL << 14;
++constexpr uint64_t CfxPtwCauseIgptrap = 1ULL << 16;
++constexpr uint64_t CfxPtwCauseIsptrap = 1ULL << 17;
++constexpr uint64_t CfxPtwCauseIgpftrap = 1ULL << 18;
++constexpr uint64_t CfxPtwCauseIspftrap = 1ULL << 19;
++constexpr uint64_t CfxPtwCauseDgptrap = 1ULL << 20;
++constexpr uint64_t CfxPtwCauseDsptrap = 1ULL << 21;
++constexpr uint64_t CfxPtwCauseDgpftrap = 1ULL << 22;
++constexpr uint64_t CfxPtwCauseDspftrap = 1ULL << 23;
+ 
+ // HEE §1 cg3/rc12 "hypv cg reg delegation" (per-cfxcode storage)
+ // [wiki §DADAO-13-HEE §1 L24].
+@@ -121,10 +136,13 @@ class ISA : public BaseISA
+         Execute = 2,
+     };
+ 
+-    // Successful PTW path only. Failure routing and A/D updates are deferred
+-    // to KL-128a; no architectural TLB is populated by this helper.
++    // KL-126a/KL-127a PTW path. No architectural TLB is populated.
+     bool ptwTranslate(ThreadContext *tc, Addr virtualAddr, PtwAccess access,
+-                      Addr &physicalAddr) const;
++                      Addr &physicalAddr, uint64_t &faultCause) const;
++
++    void cfxPreciseTrapEnter(ThreadContext *tc, uint8_t targetCfxCode,
++                             uint64_t causeId, uint64_t causeInfo,
++                             Addr causeIp, bool stageSequentialAdvance);
+ 
+     RegVal
+     readMiscRegNoEffect(RegIndex idx) const override
+diff --git a/src/arch/dadao/tlb.cc b/src/arch/dadao/tlb.cc
+index d85f3010c9..3c59c6b124 100644
+--- a/src/arch/dadao/tlb.cc
++++ b/src/arch/dadao/tlb.cc
+@@ -5,6 +5,7 @@
+ #include "cpu/thread_context.hh"
+ #include "mem/page_table.hh"
+ #include "sim/full_system.hh"
++#include "sim/faults.hh"
+ #include "sim/process.hh"
+ 
+ namespace gem5
+@@ -12,21 +13,34 @@ namespace gem5
+ namespace DADAOISA
+ {
+ 
++static Fault
++translateFullSystem(const RequestPtr &req, ThreadContext *tc,
++                    BaseMMU::Mode mode)
++{
++    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
++    const ISA::PtwAccess access =
++        mode == BaseMMU::Execute ? ISA::PtwAccess::Execute :
++        mode == BaseMMU::Write ? ISA::PtwAccess::Write :
++        ISA::PtwAccess::Read;
++    Addr physical;
++    uint64_t faultCause;
++    if (!isa->ptwTranslate(
++            tc, req->getVaddr(), access, physical, faultCause)) {
++        isa->cfxPreciseTrapEnter(
++            tc, CfxCodePtw, faultCause, req->getVaddr(),
++            tc->pcState().instAddr(), false);
++        return std::make_shared<ReExec>();
++    }
++    req->setPaddr(physical);
++    return NoFault;
++}
++
+ Fault
+ TLB::translateAtomic(const RequestPtr &req, ThreadContext *tc,
+                      BaseMMU::Mode mode)
+ {
+     if (FullSystem) {
+-        auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+-        const ISA::PtwAccess access =
+-            mode == BaseMMU::Execute ? ISA::PtwAccess::Execute :
+-            mode == BaseMMU::Write ? ISA::PtwAccess::Write :
+-            ISA::PtwAccess::Read;
+-        Addr physical;
+-        panic_if(!isa->ptwTranslate(tc, req->getVaddr(), access, physical),
+-                 "DADAO PTW failure handling is not implemented");
+-        req->setPaddr(physical);
+-        return NoFault;
++        return translateFullSystem(req, tc, mode);
+     }
+     return tc->getProcessPtr()->pTable->translate(req);
+ }
+@@ -36,16 +50,7 @@ TLB::translateFunctional(const RequestPtr &req, ThreadContext *tc,
+                          BaseMMU::Mode mode)
+ {
+     if (FullSystem) {
+-        auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+-        const ISA::PtwAccess access =
+-            mode == BaseMMU::Execute ? ISA::PtwAccess::Execute :
+-            mode == BaseMMU::Write ? ISA::PtwAccess::Write :
+-            ISA::PtwAccess::Read;
+-        Addr physical;
+-        panic_if(!isa->ptwTranslate(tc, req->getVaddr(), access, physical),
+-                 "DADAO PTW failure handling is not implemented");
+-        req->setPaddr(physical);
+-        return NoFault;
++        return translateFullSystem(req, tc, mode);
+     }
+     return tc->getProcessPtr()->pTable->translate(req);
+ }
+diff --git a/tests/dadao/dadao_fs.py b/tests/dadao/dadao_fs.py
+index 3c72f9b10f..9ff9318b11 100644
+--- a/tests/dadao/dadao_fs.py
++++ b/tests/dadao/dadao_fs.py
+@@ -41,6 +41,8 @@ system.mem_mode = "atomic"
+ backing_ranges = [
+     AddrRange(0x00000000, size="16MiB"),
+     AddrRange(0x80000000, size="16MiB"),
++    # KL-127a's shared QEMU/gem5 superpage retry and A/D leaf window.
++    AddrRange(0x84000000, size="64KiB"),
+     # KL-126a's nonzero superpage fragment lands in this sparse leaf window.
+     AddrRange(0x94030000, size="64KiB"),
+     # The architectural halt oracle reads this differential-test window
+-- 
+2.43.0
+

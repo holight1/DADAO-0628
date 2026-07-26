@@ -1928,6 +1928,28 @@ the KL-124a FullSystem matrix and KL-122a 46/46 remain green, E2E is 81/81,
 and differential is 200 agreements with zero divergence. The 23-patch gem5
 series replays from the manifest pin to the development tree hash.
 
-**Next**: KL-127a/KL-128a add QEMU/gem5 PTW failure routing and A/D updates.
-This milestone does not claim failure semantics, A/D writes, an architectural
-TLB, firmware, or kernel boot.
+## K1: dual-backend PTW faults and A/D updates (2026-07-26) — see `code-agent/tasks/KL-127a-*.md`
+
+Extended the KL-125a/KL-126a walkers symmetrically in QEMU and gem5:
+all 15 walk-generated `cfx_ptw` causes now enter the generic precise carrier
+with the original VA and faulting IP, and successful leaves write A for every
+access plus D for writes. A single dual-backend generator covers every cause
+with two nontrivial variants (30 fault probes), both retry and skip
+self-handler returns, and super/normal read/write, same-page read-then-write,
+plus software-clear-A/D-then-reaccess memory readback (10 probes); all 40
+return 42 on both backends. Two review rounds exposed QEMU's host softmmu
+cache first bypassing the D-bit update and then preserving mappings after
+software cleared A/D. The final no-architectural-TLB model uses one-instruction
+TBs and drops host translations at each instruction boundary while PTW is
+enabled; the six sequence probes distinguish this from a stale-cache false
+green. The wiki table has 18 total
+`cfx_ptw` causes, but CFXTRAP/CFXMEM/CFXREG are not page-walker failure
+branches; the task's literal "18 walker faults" wording is therefore bounded
+to the complete 15-cause walker subset rather than fabricating unrelated
+sources. KL-125a 8/8, KL-126a 8/8, the KL-124a FullSystem matrix, KL-122a
+46/46, E2E 81/81, and differential baselines remain green. QEMU's 30-patch
+and gem5's 24-patch series replay from their manifest pins to tree hashes
+identical to the development trees.
+
+**Next**: KL-129a adds the architectural TLB cache and the bounded delegation
+mechanism. Firmware and kernel boot are not claimed here.

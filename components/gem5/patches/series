@@ -22,3 +22,4 @@
 0021-arch-dadao-generalize-precise-CFX-carrier-KL-122a.patch
 0022-arch-dadao-add-FullSystem-bare-metal-carrier-KL-124a.patch
 0023-arch-dadao-implement-PTW-success-path-KL-126a.patch
+0024-arch-dadao-implement-PTW-faults-and-A-D-bits-KL-127a.patch
