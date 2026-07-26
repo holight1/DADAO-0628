@@ -1854,3 +1854,24 @@ confirmed the KL-113a O1/O2 probes and full E2E/differential suite are
 unchanged, and replayed the 19-patch series to a matching tree hash.
 
 **K1 remaining**: MMU/TLB + interrupt dispatch (QEMU + gem5).
+
+## K1: CFX register carrier + ordinary nested return in QEMU/gem5 (2026-07-26) — see `code-agent/tasks/KL-120a-*.md`
+
+Implemented `cfx2rd` for the currently storage-backed CFX register subset,
+the common `cg4/rc7` pending carrier (reset zero, valid-cause filtering,
+W0C, no real interrupt sources), and project-local E1 `cg5/rc5`
+`excp_prev_cfx_code` in both QEMU and gem5. Real `trap cfx_smon` now saves
+the caller cfx and self-`escape` restores it, closing ordinary
+one-frame-at-a-time A→B→A return; the multi-frame escape shortcut remains
+explicitly outside scope. A shared dual-backend probe covers read/write
+round trips, reserved-read-zero, `rd0` legality, seven dynamic pending-mask
+profiles, hardware-only frame fields, and the nested return discriminator.
+O1/O2/O3 were independently rerun with QEMU exit codes
+`42/42/130/134/153/43` and matching gem5 results; full E2E is 81/81 and
+four-way differential is 200 agreements with zero divergence. QEMU's
+27-patch and gem5's 20-patch series both replay from their manifest pins to
+tree hashes identical to the development trees.
+
+**K1 remaining**: connect real pending sources and interrupt dispatch,
+then timer0/PTW/TLB/external-source behavior according to §8.5; KL-120a
+does not claim those mechanisms.

@@ -989,7 +989,7 @@ no-op). The exact test-machine observable protocol is defined in ADR-0004.
 |------|----------------------|------------------|
 | RF execution | All MISC-RF subtable (op 01010–01011); csn-rf, csz-rf, csp-rf, csp1, csnp1; rd2rf, rf2rd, rf2rf; ldt-rf, ldo-rf, ldmt-rf, ldmo-rf; stt-rf, sto-rf, stmt-rf, stmo-rf; ftmadd, fomadd; setw | §Floating-point |
 | Atomics | fence; lro_nn/nr/an/ar; sco_nn/nr/an/ar | §Atomics |
-| System cfx | trap (partial -- see §8.4 for the `cfx_smon`/CFXTRAP subset KL-116a formalizes); cfx2rd; cfxld, cfxst | §SBI/HBI |
+| System cfx | trap (partial -- see §8.4 for the `cfx_smon`/CFXTRAP subset KL-116a formalizes); cfx2rd outside the storage-backed KL-120a carrier subset; cfxld, cfxst | §SBI/HBI |
 | RA register move | rd2ra, ra2rd | Excluded (M1 scope decision, 2026-06-29; ISA semantics clear per SimRISC-02 §RA↔RD; not needed for non-variadic scalar ABI) |
 
 ---
@@ -998,18 +998,23 @@ no-op). The exact test-machine observable protocol is defined in ADR-0004.
 
 [wiki §SimRISC-04-系统类指令.md §特权指令; §DADAO-12-SEE-主管系统运行环境.md §5 异常进入与异常退出; §DADAO-23-HBI-超管系统二进制接口.md §3]
 
-This section formalizes `cfx2rc`, `escape`, and (as of KL-116a) a subset
-of `trap` per the wiki's full architectural semantics. **QEMU's
+This section formalizes `cfx2rc`, the storage-backed subset of `cfx2rd`,
+`escape`, and (as of KL-116a) a subset of `trap` per the wiki's full
+architectural semantics. **QEMU and gem5's
 implementation covers the O1 success path (KL-110a), two of O2's
 negative paths (KL-112a, 2026-07-25), and O3's `cfx_smon` CFXTRAP entry
-subset (KL-116a, 2026-07-25)** — `cfx2rc` implements the `cg=3/rc=12`
+subset (KL-116a/KL-117a, 2026-07-25), plus KL-120a's register carrier
+(2026-07-26)** — `cfx2rc` implements the `cg=3/rc=12`
 delegation register, `cfx_power`'s `cg=5` exception frame, the
-`cfx_smon_supv_excp_vector` (`cg=2/rc=10`) register, and CFXREG for
+`cfx_smon` `cg=5` exception frame, the common pending register
+(`cg=4/rc=7`), `cfx_smon_supv_excp_vector` (`cg=2/rc=10`), and CFXREG for
 `cfx_power`'s `cg=8` reserved `rc` range (design 3 / candidate C);
+`cfx2rd` reads exactly these storage-backed registers plus
+`escape_cfx_mask`, returning zero for every unbacked/reserved combination;
 `escape` implements `cfx_power` self-escape, `cfx_smon` self-escape, and
 the cross-cfx `escape_cfx_mask` permission check (SEE §5 exception-exit
 step 0, design 1 / candidate B); `trap` implements the SEE §5 entry-flow
-steps 7-10 (save current mode/mask, mode switch, save cause, jump
+steps 7-10 (save current mode/mask/cfx code, mode switch, save cause, jump
 vector) for exactly one case — `cfxcode==2` (`cfx_smon`), cause=CFXTRAP —
 gated behind the default-off QEMU CPU property `cfx-smon-real` (§8.4).
 Still **Excluded**: reserved-cfxcode entry-flow routing (see §8.1's
@@ -1037,7 +1042,7 @@ cfx2rd    cfx_<cfxname>, cghb, rchc, rdhd  ; cfx_<cfxname>_cghb_rchc → rdhd
 cfx2rc    cfx_<cfxname>, cghb, rchc, rdhd  ; rdhd → cfx_<cfxname>_cghb_rchc
 ```
 
-Encoding: §2.8 row 0111-0xxx col 011 (`cfx2rc`, `0x73`); `cfx2rd` is `0x72` (col 010) and remains M1-excluded per §7 (this task covers only `cfx2rc`). Format `crrr`.
+Encoding: §2.8 row 0111-0xxx col 011 (`cfx2rc`, `0x73`); `cfx2rd` is `0x72` (col 010). KL-120a implements `cfx2rd` only for the storage-backed carrier subset listed above; the full register map remains M1-excluded per §7. Format `crrr`. [spec-decision: KL-120a, 2026-07-26]
 `ha`=cfxcode; `hb`=cg; `hc`=rc; `hd`=rd (the RD-bank register holding the transferred value). [wiki §SimRISC-00 §指令设计 L51–L54; §SimRISC-04 §寄存器传输指令 L76–L91]
 
 Semantic: `cfx2rc` writes `rdhd`'s value into the `(cg, rc)`-addressed register of core-feature-extension `cfxcode`; `cfx2rd` is the inverse read. [wiki §SimRISC-04 §寄存器传输指令 L83–L85]
@@ -1071,8 +1076,11 @@ Encoding: §2.8 row 0111-0xxx col 110 (`trap`, `0x76`, M1-excluded per §7 excep
 `⟨cfxname⟩` in steps 1–4 is `inner_cfx_code` (the cfx executing `escape`), per the wiki's own definition. [wiki §DADAO-12-SEE §5 L815]
 For a self-escape (the `escape` operand equals `inner_cfx_code`, as in the HBI §3 handoff stub), step 0's cross-cfx mask check does not apply — this is why O1's `escape cfx_power,0` is unaffected by design 1's addition.
 
-**wiki gap** (see `docs/wiki-deviations.md` #9 for the full record): the `escape` pseudocode above never assigns `inner_cfx_code` — there is no `cfx_<name>_excp_prev_cfx_code` register to restore it from, unlike `inner_run_mode`/`inner_cfx_mask` which each have a dedicated `prev_*` register. [wiki §DADAO-12-SEE §3 cg5 L357–L360]
-QEMU's O1 implementation therefore leaves `inner_cfx_code` unmodified by `escape`, matching the wiki's silence rather than inventing a restore rule [spec-decision: KL-110a, 2026-07-25].
+**Project-local E1 extension** (see §8.5.5 and `docs/wiki-deviations.md`
+#9): a self-escape also restores `inner_cfx_code` from
+`cfx_<name>_excp_prev_cfx_code` (`cg5/rc5`). QEMU and gem5 implement this
+carrier and restore as of KL-120a; the wiki itself still lacks the register.
+[spec-decision: KL-119a/user + KL-120a, 2026-07-26]
 
 ### 8.3 HBI §3 hypv→supv Handoff (worked reference)
 
@@ -1153,9 +1161,9 @@ the case above (`cause=CFXTRAP`, target cfx = `cfx_smon`):
 
 `escape cfx_smon, N` (self-escape, `cfxcode==inner_cfx_code` after step 8
 above) restores from this same frame — `prev_run_mode`/`prev_cfx_mask`/
-`cause_ip` only, matching `cfx_power`'s existing restore convention
-(§8.2); `cause_id`/`cause_info` are HW-only fields and are not restored
-by `escape` for either cfx. [wiki §DADAO-12-SEE §3 cg5 L357–L361]
+`cause_ip`, plus project-local E1's `prev_cfx_code`; `cause_id`/
+`cause_info` are not restored. [wiki §DADAO-12-SEE §3 cg5 L357–L361]
+[spec-decision: KL-119a/user + KL-120a, 2026-07-26]
 
 **Note on the CPU property mechanism**: `-cpu
 dadao-cpu,cfx-smon-real=on` currently fails ("unable to find CPU model")
@@ -1190,6 +1198,12 @@ unallocated slot after the common cg4 register table.
 [wiki §DADAO-12-SEE-主管系统运行环境.md L337–L364;
 §DADAO-12-SEE-主管系统运行环境.md L693–L699]
 [spec-decision: KL-119a, 2026-07-26]
+
+KL-120a implements this storage, reset-zero state, valid-cause filtering,
+and W0C access through `cfx2rc`/`cfx2rd` in QEMU and gem5. It deliberately
+adds no hardware/event source; non-zero raw-latch injection exists only as
+opt-in backend test configuration and is not guest-visible architectural
+state. [spec-decision: KL-119a + KL-120a, 2026-07-26]
 
 The existing private `cfx_timer_pending` (cg10/rc0),
 `cfx_uart_pending` (cg8/rc0), and `cfx_power_pending` (cg8/rc0) registers are
@@ -1292,7 +1306,7 @@ architectural ABI.
 §DADAO-12-SEE-主管系统运行环境.md L650–L656]
 [spec-decision: KL-119a, 2026-07-26]
 
-#### 8.5.5 Nested CFX return: E1 confirmed (implementation pending)
+#### 8.5.5 Nested CFX return: E1 confirmed and implemented
 
 User confirmed (2026-07-26) adopting E1 over §8.2's existing rule that
 `escape` leaves `inner_cfx_code` unchanged. [spec-decision: KL-119a/user,
@@ -1324,10 +1338,13 @@ text -- see `docs/wiki-questions.md` #8 for the candidate-for-upstream
 -adoption record, since the wiki never defines this register.
 [spec-decision: KL-119a/user, 2026-07-26]
 
-Implementation (QEMU's `cfx_power_frame`/`cfx_smon_frame` and gem5's
-equivalents) is KL-120a's job. [spec-decision: KL-119a/user, 2026-07-26]
-
-KL-120a must re-verify O1 (KL-110a), O2 (KL-112a), and O3 (KL-116a/KL-117a)'s existing probes with zero regression before this section may say nested CFX return is closed. [spec-decision: KL-119a/user, 2026-07-26]
+KL-120a implemented the field in QEMU's `cfx_power_frame`/
+`cfx_smon_frame` and gem5's equivalents, including reset in both backends,
+gem5 context-copy, trap save, `cfx2rc`/`cfx2rd`, and self-escape restore.
+Its dual-backend
+nested probe and independently rerun O1/O2/O3 probes closed ordinary
+one-frame-at-a-time return with zero regression.
+[spec-decision: KL-119a/user + KL-120a, 2026-07-26]
 
 K1 also makes no claim for a single `escape` that skips multiple cfx frames.
 SEE's prose says the operand can select an earlier cfx and silently discard
@@ -1502,11 +1519,12 @@ encoding oracle (`mask`/`value`).
 
 | `op[7:0]` | Mnemonic | Format | ha      | hb         | hc         | hd         | mask       | value      |
 |-----------|----------|--------|---------|------------|------------|------------|------------|------------|
+| 0x72      | cfx2rd   | crrr   | cfxcode | cg         | rc         | rd         | 0xFF000000 | 0x72000000 |
 | 0x73      | cfx2rc   | crrr   | cfxcode | cg         | rc         | rd         | 0xFF000000 | 0x73000000 |
 | 0x77      | escape   | ciii   | cfxcode | imms18(hb) | imms18(hc) | imms18(hd) | 0xFF000000 | 0x77000000 |
 
-`0x72` (`cfx2rd`, col 010) and `0x76` (`trap`, col 110) share this row but
-remain M1-excluded per §7; only `0x73`/`0x77` are M1-covered records.
+`0x72` (`cfx2rd`, col 010) is covered only for KL-120a's storage-backed
+carrier subset; `0x76` (`trap`, col 110) remains excluded except for §8.4.
 
 ---
 

@@ -25,3 +25,4 @@
 0024-target-dadao-implement-cfx2rc-escape-O1-hypv-supv-ha.patch
 0025-target-dadao-implement-hypv-supv-handoff-O2-negative.patch
 0026-target-dadao-implement-O3-trap-cfx_smon-real-entry-f.patch
+0027-target-dadao-add-cfx-carrier-and-nested-return-KL-12.patch

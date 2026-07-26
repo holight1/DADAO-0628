@@ -309,10 +309,11 @@
   这个字段；改动后必须重新独立验证 O1（KL-110a）/O2（KL-112a）/O3
   （KL-116a/117a）全部既有探针零回归，不能因为"只是加个字段"跳过
   这一步。
-- **状态**：SETTLED（决定本身，2026-07-26 用户确认）——E1 是唯一
-  经过分析确认可行的方案，实现待 `KL-120a` 完成；实现完成前不得声称
-  嵌套 CFX 返回已闭环。跨多层的 escape shortcut 仍是独立 OPEN 问题，
-  不属于本次决定范围。
+- **状态**：SETTLED + IMPLEMENTED（2026-07-26）——E1 已由 `KL-120a`
+  在 QEMU/gem5 双后端完成：cg5/rc5 载体、真实 trap 保存、self-escape
+  恢复、`cfx2rc/cfx2rd` 读写、双端 reset 及 gem5 context-copy 均已覆盖；双后端
+  A→B→A 判别探针及 O1/O2/O3 既有探针零回归。跨多层的 escape shortcut
+  仍是独立 OPEN 问题，不属于本次决定范围。
 - **详见**：`docs/reviews/kernel-hypv-supv-handoff-20260721.md`
   （KL-101a，第30-36行发现原文）；`docs/reviews/
   kernel-cfx-state-patch-surface-20260721.md`（KL-102a，O1/O2 范围划分）；

@@ -1,0 +1,346 @@
+From 5012ede5d2a932e02914c18773ea7e6f5bc3debd Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 09:19:16 +0800
+Subject: [PATCH] arch/dadao: add cfx carrier and nested return (KL-120a)
+
+---
+ src/arch/dadao/DADAOISA.py |  4 ++
+ src/arch/dadao/decoder.cc  | 98 +++++++++++++++++++++++++++++++++++---
+ src/arch/dadao/isa.cc      | 11 ++++-
+ src/arch/dadao/isa.hh      | 13 ++++-
+ tests/dadao/dadao_se.py    | 20 ++++++--
+ 5 files changed, 133 insertions(+), 13 deletions(-)
+
+diff --git a/src/arch/dadao/DADAOISA.py b/src/arch/dadao/DADAOISA.py
+index 7eb639a5c3..dcc8e1a081 100644
+--- a/src/arch/dadao/DADAOISA.py
++++ b/src/arch/dadao/DADAOISA.py
+@@ -9,3 +9,7 @@ class DADAOISA(BaseISA):
+         False,
+         "Route trap cfx_smon through the guest exception vector instead of "
+         "the SE syscall shortcut")
++    cfx_common_pending_test_code = Param.UInt8(
++        18, "Test-only raw common-pending seed cfxcode")
++    cfx_common_pending_test_seed = Param.UInt64(
++        0, "Test-only raw common-pending seed; zero is disabled")
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index f23f1330ac..390273de14 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -714,6 +714,7 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     RunMode modeBefore = isa->innerRunMode;
+     isa->cfxSmonFrame.prevRunMode = isa->innerRunMode;
+     isa->cfxSmonFrame.prevCfxMask = isa->innerCfxMask;
++    isa->cfxSmonFrame.prevCfxCode = isa->innerCfxCode;
+     isa->innerRunMode = RunModeSupv;
+     isa->innerCfxMask = ~0ULL;
+     isa->innerCfxCode = CfxCodeSmon;
+@@ -903,6 +904,23 @@ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{r
+ // EscapeInst below are the only StaticInsts that touch this state.
+ static inline ISA *cfxIsa(ExecContext *xc) { return static_cast<ISA *>(xc->tcBase()->getIsaPtr()); }
+ 
++static inline uint64_t
++cfxCommonPendingMask(uint8_t cfxcode)
++{
++  switch (cfxcode & 0x3F) {
++  case 0: case 1: case CfxCodeSmon: case 3:
++    return 1ULL << 32; // monitor FPEXCP
++  case 15:
++    return 1ULL << 8;  // hart IPI
++  case 18: case CfxCodePower:
++    return 1ULL << 10; // timer TIMER / power SOFT_RESET
++  case 62:
++    return ~0ULL << 32; // UART0..31
++  default:
++    return 0;
++  }
++}
++
+ // === cfx2rc (crrr, op=0x73, KL-113a hypv<->supv handoff O1+O2 design1/3) ===
+ // Centralized CFX state transition, mirroring QEMU helper_cfx2rc()
+ // [.work/source/qemu/target/dadao/helper.c, KL-110a/KL-112a] field-for-
+@@ -932,18 +950,34 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     isa->cfxHypvCgRegDeleg[cfxcode_] = value | (1ULL << 3);
+     return NoFault;
+   }
++  if (cg_ == CfxCommonPendingCg && rc_ == CfxCommonPendingRc) {
++    // W0C: zero clears, one preserves; software cannot assert a cause.
++    isa->cfxCommonPending[cfxcode_] &=
++      value & cfxCommonPendingMask(cfxcode_);
++    return NoFault;
++  }
+   // SEE §3 cfx_smon cg2/rc10: supervisor exception-vector address.
+   if (cfxcode_ == CfxCodeSmon && cg_ == 2 && rc_ == 10) {
+     isa->cfxSmonSupvExcpVector = value & MASK48;
+     return NoFault;
+   }
+-  // SEE §3 cg5 exception-frame registers -- O1 scope only implements the
+-  // three fields the HBI §3 handoff stub writes for cfx_power.
++  // SEE §3 cg5 exception-frame registers.
+   if (cfxcode_ == CfxCodePower && cg_ == 5) {
+     switch (rc_) {
+     case 0: isa->cfxPowerFrame.prevRunMode = value & 0x3; return NoFault;
+     case 1: isa->cfxPowerFrame.prevCfxMask = value; return NoFault;
+     case 3: isa->cfxPowerFrame.causeIp = value & MASK48; return NoFault;
++    case 5: isa->cfxPowerFrame.prevCfxCode = value & 0x3F; return NoFault;
++    default: return NoFault;
++    }
++  }
++  if (cfxcode_ == CfxCodeSmon && cg_ == 5) {
++    // rc2/rc4 are hardware-written and therefore intentionally read-only.
++    switch (rc_) {
++    case 0: isa->cfxSmonFrame.prevRunMode = value & 0x3; return NoFault;
++    case 1: isa->cfxSmonFrame.prevCfxMask = value; return NoFault;
++    case 3: isa->cfxSmonFrame.causeIp = value & MASK48; return NoFault;
++    case 5: isa->cfxSmonFrame.prevCfxCode = value & 0x3F; return NoFault;
+     default: return NoFault;
+     }
+   }
+@@ -966,6 +1000,53 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+   return NoFault; }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"cfx2rc";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+ 
++// === cfx2rd (crrr, op=0x72, KL-120a register carrier) ===
++// Reads exactly the storage-backed combinations accepted by CFX2RCInst.
++// Reserved/unbacked combinations return zero; generalized CFXREG/ILLI access
++// checks remain outside this task.
++class CFX2RDInst : public StaticInst { RegId srcRegs[0], dstRegs[1];
++  uint8_t cfxcode_, cg_, rc_; bool writesDest; public:
++CFX2RDInst(uint8_t ha, uint8_t hb, uint8_t hc, uint8_t hd)
++  : StaticInst("cfx2rd", enums::No_OpClass), cfxcode_(ha & 0x3F),
++    cg_(hb & 0x3F), rc_(hc & 0x3F), writesDest(hd != 0) {
++  setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
++  if (writesDest) dstRegs[_numDestRegs++] = intRegId(RD_BASE + hd); }
++Fault execute(ExecContext *xc, trace::InstRecord*) const override {
++  if (!writesDest) RET_ILLI;
++  ISA *isa = cfxIsa(xc);
++  uint64_t value = 0;
++  if (cg_ == CfxHypvCgRegDelegCg && rc_ == CfxHypvCgRegDelegRc) {
++    value = isa->cfxHypvCgRegDeleg[cfxcode_];
++  } else if (cg_ == CfxCommonPendingCg && rc_ == CfxCommonPendingRc) {
++    value = isa->cfxCommonPending[cfxcode_] &
++      cfxCommonPendingMask(cfxcode_);
++  } else if (cfxcode_ == CfxCodePower && cg_ == 5) {
++    switch (rc_) {
++    case 0: value = isa->cfxPowerFrame.prevRunMode; break;
++    case 1: value = isa->cfxPowerFrame.prevCfxMask; break;
++    case 3: value = isa->cfxPowerFrame.causeIp; break;
++    case 5: value = isa->cfxPowerFrame.prevCfxCode; break;
++    default: break;
++    }
++  } else if (cfxcode_ == CfxCodeSmon && cg_ == 5) {
++    switch (rc_) {
++    case 0: value = isa->cfxSmonFrame.prevRunMode; break;
++    case 1: value = isa->cfxSmonFrame.prevCfxMask; break;
++    case 2: value = isa->cfxSmonFrame.causeId; break;
++    case 3: value = isa->cfxSmonFrame.causeIp; break;
++    case 4: value = isa->cfxSmonFrame.causeInfo; break;
++    case 5: value = isa->cfxSmonFrame.prevCfxCode; break;
++    default: break;
++    }
++  } else if (cfxcode_ == CfxCodeSmon && cg_ == 2 && rc_ == 10) {
++    value = isa->cfxSmonSupvExcpVector;
++  } else if (cg_ <= 3 && rc_ == CfxMaskRegEscape) {
++    value = isa->cfxEscapeCfxMask[cfxcode_][cg_];
++  }
++  if (writesDest) xc->setRegOperand(this, 0, value);
++  return NoFault; }
++std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"cfx2rd";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
++
+ // === escape (ciii, op=0x77, KL-113a hypv<->supv handoff O1+O2 design1) ===
+ // Centralized CFX state transition, mirroring QEMU helper_escape()
+ // [.work/source/qemu/target/dadao/helper.c, KL-110a/KL-112a]: KL-112a
+@@ -986,6 +1067,7 @@ EscapeInst(uint8_t ha, int64_t imm) : StaticInst("escape", enums::No_OpClass), c
+ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+   ISA *isa = cfxIsa(xc);
+   RunMode modeBefore = isa->innerRunMode;
++  bool selfEscape = cfxcode_ == isa->innerCfxCode;
+   // KL-112a design 1 (candidate B): SEE §5 exception-exit step 0.
+   // ⟨cfxname⟩ = inner_cfx_code (the cfx executing this escape), <mode> =
+   // inner_run_mode *before* steps 1-2 restore it (i.e. the current,
+@@ -998,24 +1080,27 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+   // software-populated O1 handoff frame. Other cfxcodes retain the existing
+   // zero fallback.
+   uint64_t prevRunMode, prevCfxMask, causeIp;
++  uint64_t prevCfxCode = isa->innerCfxCode;
+   if (cfxcode_ == CfxCodePower) {
+     prevRunMode = isa->cfxPowerFrame.prevRunMode;
+     prevCfxMask = isa->cfxPowerFrame.prevCfxMask;
+     causeIp = isa->cfxPowerFrame.causeIp;
++    prevCfxCode = isa->cfxPowerFrame.prevCfxCode;
+   } else if (cfxcode_ == CfxCodeSmon) {
+     prevRunMode = isa->cfxSmonFrame.prevRunMode;
+     prevCfxMask = isa->cfxSmonFrame.prevCfxMask;
+     causeIp = isa->cfxSmonFrame.causeIp;
++    prevCfxCode = isa->cfxSmonFrame.prevCfxCode;
+   } else {
+     prevRunMode = RunModeUser; prevCfxMask = 0; causeIp = 0;
+   }
+   // SEE §5 exception-exit steps 1-2: restore mask then mode. Step 3
+-  // (escape_num++, a cg4 per-cfx counter) and inner_cfx_code
+-  // (docs/wiki-deviations.md #9 -- no cfx_<name>_excp_prev_cfx_code
+-  // register exists to restore it from) are not modeled, matching QEMU's
+-  // O1/O2 scope.
++  // (escape_num++, a cg4 per-cfx counter) remains unmodeled; KL-119a/user
++  // E1 additionally restores the caller cfx for a self-escape.
+   isa->innerCfxMask = prevCfxMask;
+   isa->innerRunMode = (RunMode)(prevRunMode & 0x3);
++  if (selfEscape)
++    isa->innerCfxCode = prevCfxCode & 0x3F;
+   // SEE §5 step 4: target = cause_ip + (imms18 << 2). imm_ arrives already
+   // sign-extended (imm18s()).
+   uint64_t target = (causeIp + (uint64_t)(imm_ * 4)) & MASK48;
+@@ -1144,6 +1229,7 @@ StaticInstPtr Decoder::decode(DADAOInst inst) {
+     case 0x6C: return StaticInstPtr(new CallIInst(imm24s(w)));        // call  §5.4
+     case 0x6D: return StaticInstPtr(new CallRInst(ha(w), hb(w), imm12s(w))); // call_r §5.4
+     case 0x6E: return StaticInstPtr(new RetInst(ha(w), imm18s(w)));   // ret   §5.5
++    case 0x72: return StaticInstPtr(new CFX2RDInst(ha(w), hb(w), hc(w), hd(w))); // cfx2rd §系统类指令 (KL-120a)
+     case 0x73: return StaticInstPtr(new CFX2RCInst(ha(w), hb(w), hc(w), hd(w))); // cfx2rc §系统类指令 (KL-113a)
+     case 0x76: return StaticInstPtr(new TrapInst(w));                  // trap  §系统
+     case 0x77: return StaticInstPtr(new EscapeInst(ha(w), imm18s(w))); // escape §系统类指令 (KL-113a)
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index 321eee658d..d4df567503 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -22,7 +22,9 @@ RegClass matRegClass(MatRegClass, MatRegClassName, 0, debug::MatRegs);
+ RegClass ccRegClass(CCRegClass, CCRegClassName, 0, debug::IntRegs);
+ 
+ ISA::ISA(const Params &p)
+-    : BaseISA(p, "dadao"), cfxSmonReal(p.cfx_smon_real)
++    : BaseISA(p, "dadao"), cfxSmonReal(p.cfx_smon_real),
++      cfxCommonPendingTestCode(p.cfx_common_pending_test_code),
++      cfxCommonPendingTestSeed(p.cfx_common_pending_test_seed)
+ {
+     _regClasses.push_back(&intRegClass);
+     _regClasses.push_back(&floatRegClass);
+@@ -60,17 +62,23 @@ ISA::clear()
+     cfxPowerFrame.prevRunMode = RunModeHypv;
+     cfxPowerFrame.prevCfxMask = ~0ULL;
+     cfxPowerFrame.causeIp = 0;
++    cfxPowerFrame.prevCfxCode = CfxCodePower;
+     cfxSmonFrame.prevRunMode = RunModeUser;
+     cfxSmonFrame.prevCfxMask = 0;
+     cfxSmonFrame.causeId = 0;
+     cfxSmonFrame.causeIp = 0;
+     cfxSmonFrame.causeInfo = 0;
++    cfxSmonFrame.prevCfxCode = 0;
+     cfxSmonSupvExcpVector = 0;
+     for (int i = 0; i < 64; i++) {
+         cfxHypvCgRegDeleg[i] = ~0ULL;
++        cfxCommonPending[i] = 0;
+         for (int m = 0; m < 4; m++)
+             cfxEscapeCfxMask[i][m] = ~0ULL;
+     }
++    if (cfxCommonPendingTestSeed != 0)
++        cfxCommonPending[cfxCommonPendingTestCode & 0x3F] =
++            cfxCommonPendingTestSeed;
+ }
+ 
+ void
+@@ -95,6 +103,7 @@ ISA::copyRegsFrom(ThreadContext *src)
+         cfxSmonSupvExcpVector = srcIsa->cfxSmonSupvExcpVector;
+         for (int i = 0; i < 64; i++) {
+             cfxHypvCgRegDeleg[i] = srcIsa->cfxHypvCgRegDeleg[i];
++            cfxCommonPending[i] = srcIsa->cfxCommonPending[i];
+             for (int m = 0; m < 4; m++)
+                 cfxEscapeCfxMask[i][m] = srcIsa->cfxEscapeCfxMask[i][m];
+         }
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+index 143e506721..d3ec90d105 100644
+--- a/src/arch/dadao/isa.hh
++++ b/src/arch/dadao/isa.hh
+@@ -50,14 +50,17 @@ constexpr uint8_t CfxHypvCgRegDelegRc = 12;
+ // boot stub (cross-cfx cfx2rc calls that never clear that mask), the same
+ // way it would in QEMU.
+ constexpr uint8_t CfxMaskRegEscape = 7;
++constexpr uint8_t CfxCommonPendingCg = 4;
++constexpr uint8_t CfxCommonPendingRc = 7;
+ 
+-// cfx_power cg5 exception frame -- only the three fields the HBI §3
+-// handoff stub writes (rc0/rc1/rc3) [wiki §DADAO-12-SEE §3 L357-L360].
++// cfx_power cg5 exception frame -- HBI §3's rc0/rc1/rc3 plus KL-119a/user
++// E1's project-local rc5 caller-cfx carrier.
+ struct CfxPowerFrame
+ {
+     uint64_t prevRunMode = RunModeHypv;
+     uint64_t prevCfxMask = ~0ULL;
+     uint64_t causeIp = 0;
++    uint64_t prevCfxCode = CfxCodePower;
+ };
+ 
+ // KL-117a: cfx_smon's hardware-written exception frame. Unlike the
+@@ -70,6 +73,7 @@ struct CfxSmonFrame
+     uint64_t causeId = 0;
+     uint64_t causeIp = 0;
+     uint64_t causeInfo = 0;
++    uint64_t prevCfxCode = 0;
+ };
+ 
+ class ISA : public BaseISA
+@@ -91,6 +95,10 @@ class ISA : public BaseISA
+     // KL-117a profile switch. It is immutable ISA configuration rather than
+     // architectural state, so copyRegsFrom() deliberately does not copy it.
+     const bool cfxSmonReal;
++    // KL-120a test-only raw pending injection. Defaults are inert and are
++    // configuration, not architectural state copied between contexts.
++    const uint8_t cfxCommonPendingTestCode;
++    const uint64_t cfxCommonPendingTestSeed;
+ 
+     // KL-113a/KL-117a CFX privilege state. Plain ISA-class members rather than
+     // miscRegFile entries: miscRegFile (std::vector<RegVal>, NumMiscRegs=1)
+@@ -105,6 +113,7 @@ class ISA : public BaseISA
+     CfxSmonFrame cfxSmonFrame;
+     uint64_t cfxSmonSupvExcpVector = 0;
+     uint64_t cfxHypvCgRegDeleg[64];
++    uint64_t cfxCommonPending[64];
+     uint64_t cfxEscapeCfxMask[64][4];
+ 
+     void clear() override;
+diff --git a/tests/dadao/dadao_se.py b/tests/dadao/dadao_se.py
+index bc7f523a7d..ea6acfdbc0 100755
+--- a/tests/dadao/dadao_se.py
++++ b/tests/dadao/dadao_se.py
+@@ -7,6 +7,8 @@ the exit code carried by the halting instruction (halt -> exitSimLoop(code)).
+ 
+ Usage: build/DADAO/gem5.opt tests/dadao/dadao_se.py <binary.elf>
+        build/DADAO/gem5.opt tests/dadao/dadao_se.py <binary.elf> --cfx-smon-real
++       build/DADAO/gem5.opt tests/dadao/dadao_se.py <binary.elf> \
++           --cfx-pending-test <cfxcode> <raw-seed>
+ """
+ import sys
+ 
+@@ -22,10 +24,18 @@ system.mem_mode = "atomic"
+ system.mem_ranges = [AddrRange("512MiB")]
+ system.cpu = DADAOAtomicSimpleCPU()
+ cfx_smon_real = False
+-if len(sys.argv) > 2:
+-    if sys.argv[2] != "--cfx-smon-real":
+-        raise SystemExit(f"unknown option: {sys.argv[2]}")
+-    cfx_smon_real = True
++cfx_pending_test_code = 18
++cfx_pending_test_seed = 0
++args = sys.argv[2:]
++while args:
++    option = args.pop(0)
++    if option == "--cfx-smon-real":
++        cfx_smon_real = True
++    elif option == "--cfx-pending-test" and len(args) >= 2:
++        cfx_pending_test_code = int(args.pop(0), 0)
++        cfx_pending_test_seed = int(args.pop(0), 0)
++    else:
++        raise SystemExit(f"unknown/incomplete option: {option}")
+ 
+ system.membus = SystemXBar()
+ system.cpu.icache_port = system.membus.cpu_side_ports
+@@ -47,6 +57,8 @@ process.executable = binary
+ system.cpu.workload = process
+ system.cpu.createThreads()
+ system.cpu.isa[0].cfx_smon_real = cfx_smon_real
++system.cpu.isa[0].cfx_common_pending_test_code = cfx_pending_test_code
++system.cpu.isa[0].cfx_common_pending_test_seed = cfx_pending_test_seed
+ 
+ root = Root(full_system=False, system=system)
+ m5.instantiate()
+-- 
+2.43.0
+

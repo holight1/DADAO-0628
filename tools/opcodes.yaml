@@ -1318,6 +1318,20 @@
     - "immu6 != 0"
     - "raha + immu6 <= 64"
 
+- mnemonic: cfx2rd
+  format: crrr
+  op: 0x72
+  ha: null
+  mask: 0xFF000000
+  value: 0x72000000
+  fields:
+    - {name: cfxcode, bits: "[23:18]", role: imm, bank: imm, signed: false}
+    - {name: cg, bits: "[17:12]", role: imm, bank: imm, signed: false}
+    - {name: rc, bits: "[11:6]", role: imm, bank: imm, signed: false}
+    - {name: rd, bits: "[5:0]", role: dst, bank: rd, signed: null}
+  legality: ["rd != rd0"]
+  wiki_cite: "SimRISC-04 §寄存器传输指令; contracts/isa/spec.md §8.1 [KL-120a carrier subset, 2026-07-26]"
+
 - mnemonic: cfx2rc
   format: crrr
   op: 0x73
