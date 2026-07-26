@@ -1902,5 +1902,20 @@ pass in FullSystem as `42/130/134/42`, `153/43`, and
 200 agreements with zero divergence. The 22-patch gem5 series replays from
 the manifest pin to the development tree hash.
 
-**Next**: KL-125a QEMU PTW success path, then KL-126a ports that path to
-this gem5 FullSystem carrier.
+## K1: QEMU PTW success path (2026-07-26) — see `code-agent/tasks/KL-125a-*.md`
+
+Added cfx_ptw permission/enable/PTBR/PTHI/PAHI storage and a centralized
+QEMU page walker. PTBR-disabled accesses retain 48-bit identity behavior;
+enabled accesses support 512 MiB superpages and two-level 64 KiB pages,
+including distinct X/R/W leaf permissions, SPF/GPF success checks, and
+64-bit physical-address assembly. Two narrow high-physical test-machine
+aliases make `PTHI=2` and `PAHI=1` observably distinct. Eight probes cover
+register truncation/readback, disabled identity, nonzero L1/L2/fragment
+selection, and super/normal X/R/W; all return 42. O1/O2/O3, KL-120a,
+KL-122a, 81 E2E tests, and the 200-case differential remain green. The
+29-patch QEMU series replays from the manifest pin to the development tree
+hash.
+
+**Next**: KL-126a ports this success path to gem5 FullSystem; KL-127a later
+adds PTW failure routing and A/D updates. This milestone does not claim an
+architectural TLB, fault path, firmware, or kernel boot.

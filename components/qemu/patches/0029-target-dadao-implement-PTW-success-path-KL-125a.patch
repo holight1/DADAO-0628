@@ -1,0 +1,342 @@
+From 3d0c68e3d00ed57a9df4dbfdadb446bb5b7a2bc9 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 10:23:59 +0800
+Subject: [PATCH] target/dadao: implement PTW success path (KL-125a)
+
+---
+ hw/dadao/dadao-machine.c |  20 +++++++
+ target/dadao/cpu-param.h |   2 +-
+ target/dadao/cpu.c       | 114 +++++++++++++++++++++++++++++++++++++--
+ target/dadao/cpu.h       |  17 ++++++
+ target/dadao/helper.c    |  49 +++++++++++++++++
+ 5 files changed, 197 insertions(+), 5 deletions(-)
+
+diff --git a/hw/dadao/dadao-machine.c b/hw/dadao/dadao-machine.c
+index a501a6d..2c9cbd0 100644
+--- a/hw/dadao/dadao-machine.c
++++ b/hw/dadao/dadao-machine.c
+@@ -17,6 +17,16 @@ static const uint64_t exit_base  = 0x10000000;
+ static const uint64_t exit_size  = 0x1000;  /* full page for TLB */
+ static const uint64_t ram_base   = 0x80000000;
+ static const uint64_t ram_size   = 128 * MiB;
++/* KL-125a test-machine windows for one high-physical L2 page table and one
++ * high-physical leaf. Their backings are deliberately not the numerically
++ * corresponding low addresses, allowing the PTW probes to distinguish
++ * PTHI from PAHI and to exercise PA[63:48] != 0. */
++static const uint64_t ptw_l2_alias_base = UINT64_C(0x0002000084000000);
++static const uint64_t ptw_l2_alias_size = 64 * KiB;
++static const uint64_t ptw_l2_backing_offset = 1 * MiB;
++static const uint64_t ptw_leaf_alias_base = UINT64_C(0x0001000080200000);
++static const uint64_t ptw_leaf_alias_size = 64 * KiB;
++static const uint64_t ptw_leaf_backing_offset = 3 * MiB;
+ 
+ static uint64_t exit_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+@@ -58,6 +68,8 @@ static void dadao_machine_init(MachineState *machine)
+     MemoryRegion *rom = g_new(MemoryRegion, 1);
+     MemoryRegion *exit_mmio = g_new(MemoryRegion, 1);
+     MemoryRegion *mmap_arena = g_new(MemoryRegion, 1);
++    MemoryRegion *ptw_l2_alias = g_new(MemoryRegion, 1);
++    MemoryRegion *ptw_leaf_alias = g_new(MemoryRegion, 1);
+ 
+     memory_region_init_ram(rom, NULL, "dadao.rom", rom_size, &error_fatal);
+     memory_region_set_readonly(rom, true);
+@@ -81,6 +93,14 @@ static void dadao_machine_init(MachineState *machine)
+         exit(EXIT_FAILURE);
+     }
+     memory_region_add_subregion(sys_mem, ram_base, machine->ram);
++    memory_region_init_alias(ptw_l2_alias, NULL, "dadao.ptw-l2-alias",
++                             machine->ram, ptw_l2_backing_offset,
++                             ptw_l2_alias_size);
++    memory_region_add_subregion(sys_mem, ptw_l2_alias_base, ptw_l2_alias);
++    memory_region_init_alias(ptw_leaf_alias, NULL, "dadao.ptw-leaf-alias",
++                             machine->ram, ptw_leaf_backing_offset,
++                             ptw_leaf_alias_size);
++    memory_region_add_subregion(sys_mem, ptw_leaf_alias_base, ptw_leaf_alias);
+ 
+     if (machine->firmware) {
+         load_image_targphys(machine->firmware, rom_base, rom_size);
+diff --git a/target/dadao/cpu-param.h b/target/dadao/cpu-param.h
+index e5b4a5b..50019ab 100644
+--- a/target/dadao/cpu-param.h
++++ b/target/dadao/cpu-param.h
+@@ -3,7 +3,7 @@
+ 
+ #define TARGET_LONG_BITS 64
+ #define TARGET_PAGE_BITS 12
+-#define TARGET_PHYS_ADDR_SPACE_BITS 48
++#define TARGET_PHYS_ADDR_SPACE_BITS 64
+ #define TARGET_VIRT_ADDR_SPACE_BITS 48
+ 
+ #define TCG_GUEST_DEFAULT_MO 0
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index c2cd44b..c5340dd 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -53,6 +53,9 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+          * to hypv only, until software clears bits via cfx2rc). */
+         env->cfx_hypv_cg_reg_deleg[i] = DADAO_CFX_MASK_ALL;
+         env->cfx_common_pending[i] = 0;
++        env->cfx_ptw_ptbr[i] = 0;
++        env->cfx_ptw_pthi[i] = 0;
++        env->cfx_ptw_pahi[i] = 0;
+         env->cfx_frame[i].prev_run_mode = DADAO_RUN_MODE_USER;
+         env->cfx_frame[i].prev_cfx_mask = 0;
+         env->cfx_frame[i].cause_id = 0;
+@@ -67,6 +70,11 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+             env->cfx_escape_cfx_mask[i][m] = DADAO_CFX_MASK_ALL;
+         }
+     }
++    env->cfx_ptw_perm[DADAO_RUN_MODE_USER] = 0;
++    env->cfx_ptw_perm[DADAO_RUN_MODE_JAIL] = 0;
++    env->cfx_ptw_perm[DADAO_RUN_MODE_SUPV] = UINT64_MAX;
++    env->cfx_ptw_perm[DADAO_RUN_MODE_HYPV] = UINT64_MAX;
++    env->cfx_ptw_ptbr_enable = 0;
+     /* rf[0] reset = QNaN per ISA spec §1.2 (contracts/isa/spec.md) */
+     env->rf[0] = UINT64_C(0x7FF800007FC00000);
+     env->inner_run_mode = DADAO_RUN_MODE_HYPV;
+@@ -471,16 +479,114 @@ static int dadao_cpu_mmu_index(CPUState *cs, bool ifetch)
+     return 0;
+ }
+ 
++/* KL-125a: successful page-table-walk path. Fault routing, A/D updates and
++ * an architectural TLB are deliberately deferred; a failed check returns
++ * false to the caller without fabricating a translation. */
++bool dadao_ptw_translate(CPUState *cs, vaddr address,
++                         MMUAccessType access_type, hwaddr *physical,
++                         int *prot)
++{
++    DADAOCPU *cpu = DADAO_CPU(cs);
++    CPUDADAOState *env = &cpu->env;
++    uint64_t va = address & UINT64_C(0x0000ffffffffffff);
++    unsigned int ptbr_index = (va >> 42) & 0x3f;
++    uint64_t l1_base;
++    uint64_t l1_pte;
++    uint64_t leaf_pte;
++    hwaddr pte_addr;
++    MemTxResult result;
++    unsigned int fragment;
++    int leaf_prot = 0;
++    int required_prot;
++
++    if (!(env->cfx_ptw_perm[env->inner_run_mode] &
++          (UINT64_C(1) << ptbr_index))) {
++        return false;
++    }
++
++    if (!(env->cfx_ptw_ptbr_enable & (UINT64_C(1) << ptbr_index))) {
++        *physical = va;
++        *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
++        return true;
++    }
++
++    l1_base = (env->cfx_ptw_ptbr[ptbr_index] &
++               UINT64_C(0x0000ffffffffffff)) << 16;
++    pte_addr = l1_base + (((va >> 29) & 0x1fff) * 8);
++    l1_pte = address_space_ldq_be(cs->as, pte_addr,
++                                  MEMTXATTRS_UNSPECIFIED, &result);
++    if (result != MEMTX_OK || !(l1_pte & 1)) {
++        return false;
++    }
++
++    if (l1_pte & 2) {
++        fragment = (va >> 26) & 7;
++        if (!((l1_pte >> 56) & (UINT64_C(1) << fragment))) {
++            return false;
++        }
++        leaf_pte = l1_pte;
++        *physical = ((uint64_t)env->cfx_ptw_pahi[ptbr_index] << 48) |
++                    (l1_pte & UINT64_C(0x0000ffffe0000000)) |
++                    (va & UINT64_C(0x1fffffff));
++    } else {
++        uint64_t l2_base =
++            ((uint64_t)env->cfx_ptw_pthi[ptbr_index] << 48) |
++            (l1_pte & UINT64_C(0x0000ffffffff0000));
++
++        pte_addr = l2_base + (((va >> 16) & 0x1fff) * 8);
++        leaf_pte = address_space_ldq_be(cs->as, pte_addr,
++                                       MEMTXATTRS_UNSPECIFIED, &result);
++        if (result != MEMTX_OK || !(leaf_pte & 1)) {
++            return false;
++        }
++        fragment = (va >> 13) & 7;
++        if (!((leaf_pte >> 56) & (UINT64_C(1) << fragment))) {
++            return false;
++        }
++        *physical = ((uint64_t)env->cfx_ptw_pahi[ptbr_index] << 48) |
++                    (leaf_pte & UINT64_C(0x0000ffffffff0000)) |
++                    (va & UINT64_C(0xffff));
++    }
++
++    if (leaf_pte & (UINT64_C(1) << 7)) {
++        leaf_prot |= PAGE_READ;
++    }
++    if (leaf_pte & (UINT64_C(1) << 6)) {
++        leaf_prot |= PAGE_WRITE;
++    }
++    if (leaf_pte & (UINT64_C(1) << 5)) {
++        leaf_prot |= PAGE_EXEC;
++    }
++    required_prot = access_type == MMU_INST_FETCH ? PAGE_EXEC :
++                    access_type == MMU_DATA_STORE ? PAGE_WRITE : PAGE_READ;
++    if (!(leaf_prot & required_prot)) {
++        return false;
++    }
++    *prot = leaf_prot;
++
++    qemu_log_mask(CPU_LOG_MMU,
++                  "dadao: ptw va=0x%016" PRIx64
++                  " leaf_pte_addr=0x%016" HWADDR_PRIx
++                  " l1=0x%016" PRIx64 " pa=0x%016" HWADDR_PRIx
++                  " access=%d prot=0x%x\n",
++                  va, pte_addr, l1_pte, *physical, access_type, *prot);
++    return true;
++}
++
+ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx,
+                         bool probe, uintptr_t retaddr)
+ {
+     vaddr page_addr = address & TARGET_PAGE_MASK;
+-    int prot = PAGE_READ | PAGE_WRITE;
+-    if (access_type == MMU_INST_FETCH) {
+-        prot |= PAGE_EXEC;
++    hwaddr physical;
++    hwaddr physical_page;
++    int prot;
++
++    if (!dadao_ptw_translate(cs, address, access_type, &physical, &prot)) {
++        return false;
+     }
+-    tlb_set_page_with_attrs(cs, page_addr, page_addr,
++    physical_page = physical & TARGET_PAGE_MASK;
++    tlb_set_page_with_attrs(cs, page_addr, physical_page,
+                              MEMTXATTRS_UNSPECIFIED, prot,
+                              mmu_idx, TARGET_PAGE_SIZE);
+     return true;
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index 91acb21..d8fa821 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -51,6 +51,7 @@ typedef enum DADAORunMode {
+ 
+ typedef enum DADAOCfxCode {
+     DADAO_CFX_CODE_SMON = 2,
++    DADAO_CFX_CODE_PTW = 4,
+     DADAO_CFX_CODE_POWER = 63,
+ } DADAOCfxCode;
+ 
+@@ -96,6 +97,11 @@ typedef struct DADAOCfxFrame {
+ #define DADAO_CFX_MASK_REG_ESCAPE 7
+ #define DADAO_CFX_COMMON_PENDING_CG 4
+ #define DADAO_CFX_COMMON_PENDING_RC 7
++#define DADAO_CFX_PTW_PERM_CG 8
++#define DADAO_CFX_PTW_ENABLE_RC 8
++#define DADAO_CFX_PTW_PTBR_CG 9
++#define DADAO_CFX_PTW_PTHI_CG 10
++#define DADAO_CFX_PTW_PAHI_CG 11
+ 
+ typedef struct CPUArchState CPUDADAOState;
+ typedef struct ArchCPU DADAOCPU;
+@@ -126,6 +132,14 @@ struct CPUArchState {
+      * One slot per raw cfxcode keeps the generic carrier shape; reserved
+      * codes and cfxes without maskable causes always read zero. */
+     target_ulong cfx_common_pending[64];
++    /* cfx_ptw private registers. PTBR stores PA[63:16], while PTHI and
++     * PAHI store the distinct high 16 bits used for page-table structures
++     * and final data respectively. */
++    target_ulong cfx_ptw_perm[4];
++    target_ulong cfx_ptw_ptbr_enable;
++    target_ulong cfx_ptw_ptbr[64];
++    uint16_t cfx_ptw_pthi[64];
++    uint16_t cfx_ptw_pahi[64];
+     /* KL-112a design 1: cfx_escape_cfx_mask[cfxcode][mode], mode indexed by
+      * DADAORunMode's numeric values (USER=0/JAIL=1/SUPV=2/HYPV=3), matching
+      * the cg0-3 register-group numbering the wiki uses for this per-mode
+@@ -174,6 +188,9 @@ G_NORETURN void dadao_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx,
+                         bool probe, uintptr_t retaddr);
++bool dadao_ptw_translate(CPUState *cs, vaddr address,
++                         MMUAccessType access_type, hwaddr *physical,
++                         int *prot);
+ G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
+                                       uint32_t exception,
+                                       uintptr_t pc);
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 20c05f8..b72b8ae 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -4,6 +4,7 @@
+ #include "exec/exec-all.h"
+ #include "exec/helper-proto.h"
+ #include "exec/cpu_ldst.h"
++#include "exec/cputlb.h"
+ #include "system/runstate.h"
+ 
+ G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
+@@ -194,6 +195,36 @@ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         return;
+     }
+ 
++    if (cfxcode == DADAO_CFX_CODE_PTW) {
++        if (cg == DADAO_CFX_PTW_PERM_CG && rc < 4) {
++            env->cfx_ptw_perm[rc] = value;
++            tlb_flush(env_cpu(env));
++            return;
++        }
++        if (cg == DADAO_CFX_PTW_PERM_CG &&
++            rc == DADAO_CFX_PTW_ENABLE_RC) {
++            env->cfx_ptw_ptbr_enable = value;
++            tlb_flush(env_cpu(env));
++            return;
++        }
++        if (cg == DADAO_CFX_PTW_PTBR_CG) {
++            env->cfx_ptw_ptbr[rc] =
++                value & UINT64_C(0x0000ffffffffffff);
++            tlb_flush(env_cpu(env));
++            return;
++        }
++        if (cg == DADAO_CFX_PTW_PTHI_CG) {
++            env->cfx_ptw_pthi[rc] = value & 0xffff;
++            tlb_flush(env_cpu(env));
++            return;
++        }
++        if (cg == DADAO_CFX_PTW_PAHI_CG) {
++            env->cfx_ptw_pahi[rc] = value & 0xffff;
++            tlb_flush(env_cpu(env));
++            return;
++        }
++    }
++
+     if (cg == 5) {
+         /* KL-122a common frame carrier. rc2/rc4 are hardware-written and
+          * intentionally read-only; rc5 is project-local E1. */
+@@ -287,6 +318,24 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+                       " value=0x%016" PRIx64 "\n", cfxcode, value);
+         return value;
+     }
++    if (cfxcode == DADAO_CFX_CODE_PTW) {
++        if (cg == DADAO_CFX_PTW_PERM_CG && rc < 4) {
++            return env->cfx_ptw_perm[rc];
++        }
++        if (cg == DADAO_CFX_PTW_PERM_CG &&
++            rc == DADAO_CFX_PTW_ENABLE_RC) {
++            return env->cfx_ptw_ptbr_enable;
++        }
++        if (cg == DADAO_CFX_PTW_PTBR_CG) {
++            return env->cfx_ptw_ptbr[rc];
++        }
++        if (cg == DADAO_CFX_PTW_PTHI_CG) {
++            return env->cfx_ptw_pthi[rc];
++        }
++        if (cg == DADAO_CFX_PTW_PAHI_CG) {
++            return env->cfx_ptw_pahi[rc];
++        }
++    }
+     if (cg == 5) {
+         switch (rc) {
+         case 0: return env->cfx_frame[cfxcode].prev_run_mode;
+-- 
+2.43.0
+
