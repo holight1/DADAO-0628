@@ -125,6 +125,44 @@ wiki §大端序 slot 布局明确规定**标量**窄类型在 8 字节 slot 内
 这条同样是 wiki 文本本身没有覆盖到的边界情况（不是内部矛盾，是缺失），如实记录
 以便未来 wiki 补充措辞时对照。
 
+### 8. `escape` 退出流程缺少恢复 `inner_cfx_code` 的存储与步骤（KL-115a/118a/119a，2026-07-26）
+
+wiki 异常退出流程（SEE §5 完整伪代码，`DADAO-12-SEE-主管系统运行环境.md`
+第813-845行）步骤0-4 没有任何一步写 `inner_cfx_code`；对照异常进入流程
+第8步会显式写 `inner_cfx_code <= temp_cfx_code`，退出侧却没有配套的
+`excp_prev_cfx_code` 寄存器可供恢复——cg5 现有寄存器表（第351-362行）
+只定义了 `excp_prev_run_mode`/`excp_prev_cfx_mask`/`excp_cause_id`/
+`excp_cause_ip`/`excp_cause_info`/`excp_cause_nonmaskable` 六个字段，没有
+第七个用来记录"进入前的 cfx 编号"。这**不是实现遗漏，是 wiki 设计本身没有
+为这件事预留存储和步骤**——哪怕逐字实现 wiki 给出的每一步伪代码和每一张
+寄存器表，也得不出"能恢复 inner_cfx_code"的结果。
+
+wiki 自然语言部分（第664-676行"跨 cfx escape 的安全约束"）明确讨论了
+`A→B→C` 这类嵌套调用链，承认"跨 cfx escape 时硬件不保存跳过的中间 cfx
+现场""B 的现场被静默丢弃"，并给出一个事后检测手段（比较
+`trap_num+excp_sync_num+excp_async_num` 与 `escape_num` 是否相等），但只
+说"如何检测丢失"，没有说"如何恢复"——wiki 作者显然意识到这里有信息丢失，
+但没有补上恢复机制。这个空白直接导致 SBI 文档给出的
+`cfx_tlb → cfx_ptw → cfx_tlb` 嵌套委托范例（`DADAO-22-SBI-主管系统
+二进制接口.md` 第353-372行）按字面无法正确工作：ptw 处理完自我 escape
+后，`inner_cfx_code` 停留在 ptw，tlb handler 接着执行的
+`escape cfx_tlb,N` 会被误判成跨 cfx escape，读到错误的现场。
+
+**当前处置（项目内部，KL-119a，2026-07-26 用户确认）**：新增
+`excp_prev_cfx_code` 寄存器，`(cg,rc)=(5,5)`（cg5 现有 rc0-4/rc63 已用，
+rc5 空闲）；trap 进入时把进入前的 `inner_cfx_code` 存进目标 cfx 自己的
+这个字段，`escape` 自我退出时与 mode/mask/PC 一并恢复。这只覆盖"逐层
+普通返回"（SBI 范例实际用法），不覆盖第666/676行提到的"一次 escape
+跨越多层直接恢复更早 cfx"这个 shortcut 场景——那个场景的字面语义与
+正式退出伪码互斥，仍然是独立未决问题。详见
+`docs/wiki-deviations.md` 第9条。
+
+**这条和 #5-7 性质不同**：#5-7 是"wiki 有缺口，我们在 wiki 已有词汇表内
+选一个读法"；这条是**我们往 wiki 从未定义过的寄存器空间里新增了一个
+寄存器**——性质上是提议给 wiki 做架构扩展，不是单纯的读法选择。记在这里
+是为了将来真正对接 wiki 团队时，作为"建议 wiki 正式收编"的候选项之一，
+不代表 wiki 已经认可这个寄存器。
+
 ---
 
 ## 附：已确认（Wiki 0.4.1 / commit 13a414d 已明确）

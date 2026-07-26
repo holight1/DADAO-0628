@@ -1292,17 +1292,42 @@ architectural ABI.
 §DADAO-12-SEE-主管系统运行环境.md L650–L656]
 [spec-decision: KL-119a, 2026-07-26]
 
-#### 8.5.5 Nested CFX return remains open
+#### 8.5.5 Nested CFX return: E1 confirmed (implementation pending)
 
-K1 does not yet alter §8.2's existing rule that `escape` leaves
-`inner_cfx_code` unchanged. The rule is insufficient for SBI's
-`cfx_tlb -> cfx_ptw -> cfx_tlb` nested return, but choosing the replacement
-changes the architectural exception frame and is intentionally left for
-architecture/user confirmation. No implementation task may claim nested CFX
-return closure until `docs/wiki-deviations.md` #9 is resolved.
-[wiki §DADAO-12-SEE-主管系统运行环境.md L813–L845;
-§DADAO-22-SBI-主管系统二进制接口.md L353–L372]
-[spec-decision: KL-119a, 2026-07-26]
+User confirmed (2026-07-26) adopting E1 over §8.2's existing rule that
+`escape` leaves `inner_cfx_code` unchanged. [spec-decision: KL-119a/user,
+2026-07-26]
+
+E1 adds a new per-cfx register `excp_prev_cfx_code` at `(cg,rc)=(5,5)` (cg5's rc0-4/rc63 are taken by existing fields, rc5 is free). [wiki §DADAO-12-SEE-主管系统运行环境.md L351–L364] [spec-decision: KL-119a/user, 2026-07-26]
+
+Trap entry writes the pre-entry `inner_cfx_code` into the target cfx's own
+copy of this field; a self-escape (`cfxcode==inner_cfx_code`) restores
+`inner_cfx_code` from it alongside mode/mask/PC.
+[wiki §DADAO-12-SEE-主管系统运行环境.md L813–L845]
+[spec-decision: KL-119a/user, 2026-07-26]
+
+This closes ordinary one-frame-at-a-time nested return -- exactly what
+SBI's `cfx_tlb -> cfx_ptw -> cfx_tlb` example does, since it never uses
+the multi-frame shortcut discussed below.
+[wiki §DADAO-22-SBI-主管系统二进制接口.md L353–L372]
+[spec-decision: KL-119a/user, 2026-07-26]
+
+It also incidentally fixes a latent bug already present in shipped O3
+code: after KL-116a/117a's `trap cfx_smon` / `escape cfx_smon` round trip,
+`inner_cfx_code` stays stuck at `cfx_smon` instead of reverting to its
+pre-trap value, which could silently mis-trigger KL-112a's cross-cfx
+`escape_cfx_mask` check the next time some other cfx is entered from that
+context. [spec-decision: KL-119a/user, 2026-07-26]
+
+This is a project-local ISA extension, not a reading of existing wiki
+text -- see `docs/wiki-questions.md` #8 for the candidate-for-upstream
+-adoption record, since the wiki never defines this register.
+[spec-decision: KL-119a/user, 2026-07-26]
+
+Implementation (QEMU's `cfx_power_frame`/`cfx_smon_frame` and gem5's
+equivalents) is KL-120a's job. [spec-decision: KL-119a/user, 2026-07-26]
+
+KL-120a must re-verify O1 (KL-110a), O2 (KL-112a), and O3 (KL-116a/KL-117a)'s existing probes with zero regression before this section may say nested CFX return is closed. [spec-decision: KL-119a/user, 2026-07-26]
 
 K1 also makes no claim for a single `escape` that skips multiple cfx frames.
 SEE's prose says the operand can select an earlier cfx and silently discard

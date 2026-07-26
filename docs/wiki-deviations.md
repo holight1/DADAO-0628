@@ -286,9 +286,33 @@
   架构变更建议，不是已冻结决定，须等待架构师/用户确认后才能修改本条
   “escape 不修改 inner_cfx_code”的现行决定。若还要求一次跨越多层的
   shortcut，需与 E1 分开再冻结，不应阻塞 K1 的逐层 SBI return。
-- **状态**：OPEN——技术决定本身有 wiki 文本结构（缺配套存储寄存器）支持，
-  但只在 O1（单层、无嵌套 trap）场景下被验证过，多层调用链场景仍是
-  未决语义；KL-119a 已给出 E1/E2/E3 比较并建议 E1，尚待确认。
+- **用户确认（2026-07-26）**：采用 E1。新增 `excp_prev_cfx_code`
+  寄存器，`(cg,rc)=(5,5)`（cg5 现有 rc0-4/rc63 已用，rc5 空闲）。
+  trap 进入时把进入前的 `inner_cfx_code` 存进目标 cfx 自己的这个
+  字段；`escape` 自我退出（`cfxcode==inner_cfx_code`）时，与
+  mode/mask/PC 一并从该字段恢复 `inner_cfx_code`。**这不是"选一种
+  更合理的读法"，是往 wiki 词汇表里新增一个 wiki 从未定义过的寄存器**
+  ——性质上不同于"wiki 沉默、我们按类比选一个读法"这类偏离（如
+  RegRAS refcount 决定），是在给硬件补一个 wiki 没设计的机制，理论上
+  应该有一天提交给 wiki 团队确认是否正式收编，本决定只在项目内部
+  `contracts/isa/spec.md` 生效，不代表 wiki 认可。**这次决定同时更正
+  了一个已上线的潜伏 bug**：当前 QEMU/gem5 实现（KL-110a~117a）里
+  `escape` 完全不碰 `inner_cfx_code`，O3 的 `trap cfx_smon`→
+  `escape cfx_smon` 往返结束后 `inner_cfx_code` 会一直"卡"在
+  `smon`，不会自动回到陷入前的值——这在目前只有 O1/O3 两个孤立场景时
+  不可观察，但一旦后续从 supv 侧再陷入别的 cfx（PTW/TLB/timer 等），
+  这个未归位的值会让新 cfx 的自我 escape 被误判成"跨 cfx escape"，
+  错误触发 KL-112a 的 `escape_cfx_mask` 检查——E1 顺带堵上这个洞。
+  只覆盖逐层普通返回（`escape` 跨 cfx 一次性 shortcut 那个更深的矛盾
+  继续 non-claim，不阻塞 K1）。**实现要求**：QEMU（`cfx_power_frame`/
+  `cfx_smon_frame`）和 gem5（`CfxPowerFrame`/`CfxSmonFrame`）都要加
+  这个字段；改动后必须重新独立验证 O1（KL-110a）/O2（KL-112a）/O3
+  （KL-116a/117a）全部既有探针零回归，不能因为"只是加个字段"跳过
+  这一步。
+- **状态**：SETTLED（决定本身，2026-07-26 用户确认）——E1 是唯一
+  经过分析确认可行的方案，实现待 `KL-120a` 完成；实现完成前不得声称
+  嵌套 CFX 返回已闭环。跨多层的 escape shortcut 仍是独立 OPEN 问题，
+  不属于本次决定范围。
 - **详见**：`docs/reviews/kernel-hypv-supv-handoff-20260721.md`
   （KL-101a，第30-36行发现原文）；`docs/reviews/
   kernel-cfx-state-patch-surface-20260721.md`（KL-102a，O1/O2 范围划分）；
