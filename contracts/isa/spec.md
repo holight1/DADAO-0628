@@ -1169,6 +1169,150 @@ unaffected and is this task's verified invocation. Fixing
 `dadao_cpu_class_by_name()` is out of KL-116a's scope (not listed in its
 task constraints) and is left as a follow-up finding.
 
+### 8.5 K1 MMU/interrupt contract profile (KL-119a)
+
+This section freezes the project-local K1 profile needed before the generic
+CFX, timer, TLB, and external-interrupt implementation tasks. It supplements
+wiki omissions; it does not claim that the wiki itself already defines these
+choices. [spec-decision: KL-119a, 2026-07-26]
+
+#### 8.5.1 Common pending register and priority
+
+Every non-reserved cfx has a common `cfx_<name>_pending` register at
+`(cg,rc)=(4,7)`. It is a 64-bit RW, reset-zero, write-zero-to-clear register:
+hardware/event insertion ORs a one-hot cause into it; software write data
+clears every valid pending bit whose written value is zero and leaves bits
+written as one unchanged. Bits that are not maskable causes in that cfx's
+cause table read zero and ignore writes. Cfxes with no maskable cause still
+expose the register and always read zero. This fills the missing register
+behind SEE §5's generic `cfx_<name>_pending` pseudocode; cg4/rc7 is the first
+unallocated slot after the common cg4 register table.
+[wiki §DADAO-12-SEE-主管系统运行环境.md L337–L364;
+§DADAO-12-SEE-主管系统运行环境.md L693–L699]
+[spec-decision: KL-119a, 2026-07-26]
+
+The existing private `cfx_timer_pending` (cg10/rc0),
+`cfx_uart_pending` (cg8/rc0), and `cfx_power_pending` (cg8/rc0) registers are
+device-source latches, not aliases of the common cause-level latch. A private
+source assertion/expiry, independently of every mask, sets its private pending bit and ORs the mapped
+one-hot architectural cause into cg4/rc7. Software clears the source latch and
+the common cause latch separately; this preserves multiple source channels
+behind one architectural cause (notably eight timer counters behind TIMER
+cause bit10). [wiki §DADAO-12-SEE-主管系统运行环境.md L582–L600;
+§DADAO-12-SEE-主管系统运行环境.md L602–L628;
+§DADAO-12-SEE-主管系统运行环境.md L630–L648]
+[spec-decision: KL-119a, 2026-07-26]
+
+Interrupt selection is lexicographic: choose the lowest pending eligible
+`cfxcode` first; within that cfx choose the lowest set eligible cause bit.
+Taking an interrupt does not implicitly clear the bit. Software must clear it. [spec-decision: KL-119a, 2026-07-26]
+if a level source remains asserted, hardware re-ORs the bit before the next
+instruction-boundary check. [wiki §DADAO-12-SEE-主管系统运行环境.md L650–L660]
+[spec-decision: KL-119a, 2026-07-26]
+
+For level-triggered device sources, the required acknowledgement order is:
+deassert or service the hardware source, drain every private source-pending bit
+mapped to that cause, then clear the common cause-pending bit. While any mapped
+private pending bit remains one, the common cause bit remains or is re-asserted
+regardless of a software W0C attempt. Clearing a private latch while its
+upstream level remains active permits that private bit and the common cause to
+be re-latched before the next instruction-boundary check.
+[spec-decision: KL-119a, 2026-07-26]
+
+#### 8.5.2 Timer0 profile
+
+K1 requires `cfx_timer_regs[0]` only. `SBI_TIMER_SET_TIMER(timeout)` means a
+relative delay: it writes counter0 and a same-value internal reload latch,
+selects decrement mode, and enables the timer. A non-zero timeout expires on
+the transition from one to zero after exactly `timeout` timer ticks; zero is
+already expired and becomes interrupt-eligible at the next instruction
+boundary. Counter0 expiry sets private `cfx_timer_pending` bit0 and ORs TIMER
+(`1<<10`) into the common pending latch regardless of `cfx_timer_mask`;
+delivery additionally requires private `cfx_timer_mask` bit0 and the generic
+CFX masks to permit it. [wiki §DADAO-12-SEE-主管系统运行环境.md
+L582–L600; §DADAO-22-SBI-主管系统二进制接口.md L565–L591]
+[spec-decision: KL-119a, 2026-07-26]
+
+The K1 functional timebase is shared: one timer tick is exactly one increment
+of the per-hart cycle counter, and both QEMU and gem5 advance that virtual
+cycle once per architecturally retired instruction. `cfx_hart_cycle_lo` is the
+low 64 bits and wraps modulo `2^64`; timer deadline arithmetic uses the same
+modular timebase. This is a deterministic functional-test profile, not a
+pipeline-performance claim. [spec-decision: KL-119a, 2026-07-26]
+
+In one-shot mode expiry clears `cfx_timer_ctrl.enable`. In periodic mode it
+reloads counter0 from the last value written to counter0 (the internal reload
+latch) and remains enabled. The private source-pending bit0 and common
+cause-pending bit10 are independently W0C and follow §8.5.1's acknowledgement
+order. [spec-decision: KL-119a, 2026-07-26]
+
+`SBI_TIMER_GET_TIME` returns the low 64 bits of the monotonically increasing
+per-hart cycle counter (`cfx_hart_cycle_lo`), not counter0's current
+countdown value. This resolves the SBI table's "current cycle count" wording
+in favor of a usable monotonic clock and deliberately overrides the sample
+handler line that reads `cfx_timer_regs[0]`.
+[wiki §DADAO-12-SEE-主管系统运行环境.md L515–L527;
+§DADAO-22-SBI-主管系统二进制接口.md L516–L519;
+§DADAO-22-SBI-主管系统二进制接口.md L574–L576]
+[spec-decision: KL-119a, 2026-07-26]
+
+Counters1-7 and increment mode are outside the K1 minimum profile. K1 evidence
+must report them as unsupported/non-claims. [spec-decision: KL-119a, 2026-07-26]
+It must not extrapolate a counter0 decrement-mode result to the complete timer block. [spec-decision: KL-119a, 2026-07-26]
+Their semantics
+remain a conditional follow-up before any full-timer claim.
+[spec-decision: KL-119a, 2026-07-26]
+
+#### 8.5.3 Architectural TLB test profile
+
+The K1 QEMU/gem5 functional test profile exposes all 64 logical sets
+(`cfx_tlb_exist=UINT64_MAX`), with 16 unified fully-associative entries per
+set and deterministic true-LRU replacement. `cfx_tlb_enable` therefore resets
+to all ones as required when every set exists. This capacity/organization is a
+test-profile choice, not an ISA performance or microarchitecture requirement;
+architectural claims remain limited to hit, miss followed by hardware walk
+and fill, invalidation, and fault behavior.
+[wiki §DADAO-12-SEE-主管系统运行环境.md L463–L495]
+[spec-decision: KL-119a, 2026-07-26]
+
+#### 8.5.4 Synthetic external interrupt source
+
+K1 does not freeze or claim a UART or PLIC device protocol. Its external
+interrupt acceptance source is a test-machine-only level source, `K1_EXT0`,
+routed as cfx_uart source0: source assertion sets private
+`cfx_uart_pending` bit0 and ORs UART0 cause bit32 into the common pending
+latch. Source deassertion removes the level but clears neither latch; the
+harness/guest then clears private bit0 followed by common bit32. If software
+clears either pending level before source deassertion, the still-active level
+re-latches it before the next instruction-boundary check. The stimulus
+mechanism is backend test infrastructure and is not a guest-visible
+architectural ABI.
+[wiki §DADAO-12-SEE-主管系统运行环境.md L40–L42;
+§DADAO-12-SEE-主管系统运行环境.md L602–L628;
+§DADAO-12-SEE-主管系统运行环境.md L650–L656]
+[spec-decision: KL-119a, 2026-07-26]
+
+#### 8.5.5 Nested CFX return remains open
+
+K1 does not yet alter §8.2's existing rule that `escape` leaves
+`inner_cfx_code` unchanged. The rule is insufficient for SBI's
+`cfx_tlb -> cfx_ptw -> cfx_tlb` nested return, but choosing the replacement
+changes the architectural exception frame and is intentionally left for
+architecture/user confirmation. No implementation task may claim nested CFX
+return closure until `docs/wiki-deviations.md` #9 is resolved.
+[wiki §DADAO-12-SEE-主管系统运行环境.md L813–L845;
+§DADAO-22-SBI-主管系统二进制接口.md L353–L372]
+[spec-decision: KL-119a, 2026-07-26]
+
+K1 also makes no claim for a single `escape` that skips multiple cfx frames.
+SEE's prose says the operand can select an earlier cfx and silently discard
+intermediate frames, while its normative-looking exit pseudocode selects the
+current cfx's frame and never describes that traversal. E1 only addresses
+ordinary one-frame-at-a-time return; any multi-frame shortcut requires a
+separate resolution. [wiki §DADAO-12-SEE-主管系统运行环境.md L664–L676;
+§DADAO-12-SEE-主管系统运行环境.md L813–L845]
+[spec-decision: KL-119a, 2026-07-26]
+
 ---
 
 ## Appendix A: Canonical Encoding Inventory

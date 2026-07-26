@@ -211,8 +211,10 @@
 ### 9. `escape` 退出流程从未赋值 `inner_cfx_code`（KL-101a/KL-110a，
    2026-07-25）
 
-- **wiki 状态**：SILENT（`escape` 的硬件语义有完整的步骤 0-4 定义，唯独
-  没有任何一步提到 `inner_cfx_code`）
+- **wiki 状态**：CONTRADICTS-BY-OMISSION。`escape` 的步骤0-4没有任何一步
+  提到 `inner_cfx_code`；同时指令行为说明声称 cross-cfx operand 可直接
+  跳过多层、恢复目标 cfx 的 prev frame，但退出伪码只读取当前 cfx frame，
+  没有目标 frame 选择/遍历步骤。
 - **wiki 原文引用**：`DADAO-12-SEE-主管系统运行环境.md` 第813-845行
   "异常退出流程"完整伪代码——步骤0（escape cfx mask 检查）、步骤1
   （`inner_cfx_mask <= cfx_⟨cfxname⟩_excp_prev_cfx_mask`）、步骤2
@@ -231,6 +233,10 @@
   kernel-cfx-state-patch-surface-20260721.md`）在给出 O1 最小语义清单
   （§3.1）时同样只列出"恢复 mask/mode、`escape_num++`、跳转"，未包含
   `inner_cfx_code` 的任何处理步骤，隐含的处置方向与 wiki 的沉默一致。
+  同文件第664-676行又明确描述 cross-cfx shortcut：B 中
+  `escape cfx_A` 应直接恢复 A 的 prev 现场并丢弃中间 frame；这与
+  第815行“`⟨cfxname⟩` 是当前 `inner_cfx_code`”及第837-844行只读取当前
+  frame 的伪码无法同时执行。
 - **我们的决定**：`escape` 不修改 `inner_cfx_code`——执行前是什么值，
   执行后保持不变。已落入 `contracts/isa/spec.md §8.2`（"QEMU's O1
   implementation therefore leaves `inner_cfx_code` unmodified by
@@ -250,9 +256,39 @@
   验证的开放问题（当前"保持不变"的读法在这类多层场景下是否正确未经
   测试）；`contracts/isa/spec.md §8.2` 已经把这个决定和它的依据写清楚，
   后续任务如果要挑战这个读法，应该先在这里更新。
+- **KL-119a 候选E方案比较（2026-07-26，尚未拍板）**：
+  1. **E1：新增 `excp_prev_cfx_code`（建议 `(cg,rc)=(5,5)`）**。每次
+     trap 在目标 cfx 的 frame 中保存进入前的 `inner_cfx_code`，escape
+     先锁定当前 frame owner，再与 mode/mask/PC 一起恢复 caller cfx。
+     它沿用 cg5 既有 per-cfx frame 模型；A→B→C 这类各层 cfx 不同的链
+     无需硬件栈，每个 cfx 各保存一份 caller。A→B→A 这类同 cfx 重入仍
+     按 SEE 第660行由软件先把 cg5 保存到 cg6，和现有嵌套规则一致。
+     代价是一份每-cfx 6-bit（按寄存器实现可为64-bit）状态、`cfx2rd/
+     cfx2rc` 映射、双后端 migration/copy state，以及修改 §8.2 的既有
+     “保持不变”决定。优点是 SBI 的 TLB→PTW→TLB 示例无需改写，且没有
+     隐藏栈深/溢出语义。它只闭合逐层普通返回；`escape` 一次跳过多个 cfx
+     的 shortcut 与 SEE 伪码存在独立矛盾，K1 明确 non-claim。未来若保留
+     shortcut，E1 还需增加 operand 选择目标 frame、验证目标确实在调用链、
+     丢弃中间 frame 的规则，成本不再只是一个 rc5。
+  2. **E2：硬件异常上下文栈**。trap push
+     `{cfxcode,mode,mask,cause frame}`，escape pop，cg5 显示栈顶。
+     它可原生支持同 cfx 多层重入，但必须新定义栈深、溢出异常、跨-cfx
+     shortcut 如何按 operand 查找并 pop 到目标层、软件写 cg5 修改哪一层，以及 QEMU migration/
+     gem5 ThreadContext copy。功能完整但新增状态和验证面最大。
+  3. **E3：K1 单层软件 trampoline/SBI 改写**。PTW 返回 tlb continuation
+     并由软件恢复 tlb frame。当前 ISA 没有可写 `inner_cfx_code`，因此
+     trampoline 仍运行在 ptw 身份；若再 trap tlb 会覆盖原 tlb frame，
+     仍需软件保存/恢复且最终 caller code 依旧无法恢复。除非同时新增
+     “escape operand 设置 return cfx”或可写 inner-code 机制并改写 SBI
+     示例，否则它不是闭合方案，只能作为测试捷径，**不建议**。
+- **KL-119a 建议**：选择 E1。它是唯一同时保持现有 per-cfx frame 模型、
+  不改写 SBI handler 控制流且不引入隐藏深度/溢出规则的方案；但这是
+  架构变更建议，不是已冻结决定，须等待架构师/用户确认后才能修改本条
+  “escape 不修改 inner_cfx_code”的现行决定。若还要求一次跨越多层的
+  shortcut，需与 E1 分开再冻结，不应阻塞 K1 的逐层 SBI return。
 - **状态**：OPEN——技术决定本身有 wiki 文本结构（缺配套存储寄存器）支持，
   但只在 O1（单层、无嵌套 trap）场景下被验证过，多层调用链场景仍是
-  未决语义，不能凭这次验证就断言这是唯一正确读法。
+  未决语义；KL-119a 已给出 E1/E2/E3 比较并建议 E1，尚待确认。
 - **详见**：`docs/reviews/kernel-hypv-supv-handoff-20260721.md`
   （KL-101a，第30-36行发现原文）；`docs/reviews/
   kernel-cfx-state-patch-surface-20260721.md`（KL-102a，O1/O2 范围划分）；
@@ -354,3 +390,100 @@
   KL-112a-implement-hypv-supv-handoff-o2-qemu.md`（完成区，撤回过程与
   A/B 回归重放证据）；`target/dadao/helper.c::helper_cfx2rc()`
   函数级注释（撤回决定落地位置）。
+
+### 12. 通用 pending 寄存器与同 cfx cause 优先级（KL-119a，2026-07-26）
+
+- **wiki 状态**：SILENT/CONTRADICTS-BY-OMISSION——异常流程反复使用
+  `cfx_⟨cfxname⟩_pending`，共有寄存器表却没有它；timer/UART/power 有
+  专有 pending，带可屏蔽 IPI 的 hart 和带可屏蔽 FPEXCP 的 monitor 没有。
+  同一 cfx 多 pending cause 的选择顺序也未定义。
+- **wiki 原文引用**：`DADAO-12-SEE-主管系统运行环境.md:337-364`
+  （cg4/cg5 common table）、`:588,608,636`（三个专有 pending）、
+  `:411,536,600,624-628,648`（全部可屏蔽 cause）、`:650-660,693-699,
+  763-785`（pending/优先级与 entry flow）。
+- **我们的决定**：所有非 reserved cfx 新增 common pending
+  `(cg,rc)=(4,7)`，64-bit、reset 0、RW/W0C；只有该 cfx cause 表中的
+  maskable 位有效。现有 timer/UART/power pending 是独立的 device-source
+  latch，不是 common cause latch 的 alias；source assert/expire 不受任何
+  mask 影响，先置专有 source bit，再 OR 映射后的 cause 到 common pending。
+  只要同一 cause 映射的任一 private pending 仍为1，common cause 就必须
+  保持/重新置位。选择顺序为先最低
+  cfxcode，再选该 cfx 最低 set cause bit；进入不自动清 pending。电平源
+  ack 顺序固定为 source deassert/service → drain 该 cause 的全部 private pending →
+  清 common cause pending，顺序颠倒且 level 未撤销时会重新置位。
+- **理由**：cg4/rc7 是 common table 后首个空槽，一处定义即可补齐 hart/
+  monitor 缺口；source/cause 两级区分保留 8 个 timer counter 等多个设备
+  source 汇聚到一个 cause 的能力。最低位优先与已有最低 cfxcode 方向一致
+  且可确定双后端 oracle。
+- **影响范围**：`cfx2rd/cfx2rc`、所有 cfx state、FPEXCP/IPI/timer/UART/
+  power、QEMU migration、gem5 ThreadContext copy、异步优先级测试。
+- **状态**：SETTLED（项目 K1 profile）；已落入
+  `contracts/isa/spec.md §8.5.1`。
+
+### 13. K1 timer0 语义与 `GET_TIME`（KL-119a，2026-07-26）
+
+- **wiki 状态**：CONTRADICTS-BY-OMISSION——函数表称 timeout 是“周期
+  计数值”，示例称“timeout 周期后”，伪码写 counter0 后递减；没有定义
+  到期、one-shot stop、periodic reload、pending ack。`GET_TIME` 表述为
+  当前周期数，伪码却读取会递减的 counter0。
+- **wiki 原文引用**：`DADAO-12-SEE-主管系统运行环境.md:582-600`
+  （timer registers/causes）、`DADAO-22-SBI-主管系统二进制接口.md:
+  516-519,565-596`（SBI 表、伪码和示例）、`DADAO-12-SEE-
+  主管系统运行环境.md:523-527`（per-hart cycle counter）。
+- **我们的决定**：K1 只承诺 counter0 decrement profile。
+  `SET_TIMER(timeout)` 是相对延迟，写 current counter 与内部 reload latch；
+  非零值在恰好 timeout 个 tick 后的 1→0 到期，0 在下一指令边界可触发。
+  counter0 到期无视 timer mask 先置 private timer pending bit0 和 common
+  pending bit10；private timer mask bit0 只控制交付。one-shot 到期清
+  enable，periodic 从最后写值 reload；两级 pending 按第12条顺序 W0C。
+  `GET_TIME` 返回 `cfx_hart_cycle_lo`，不返回倒计时。counters1-7 与 increment
+  mode 明确是 K1 non-claim，后续条件任务收口。K1 functional timebase
+  固定为1 timer tick = 1次 per-hart cycle counter increment；QEMU/gem5
+  均按每条架构指令退休推进一次 virtual cycle，`cycle_lo` 按 `2^64` 回绕。
+- **理由**：相对递减与 SBI 的实际 set-timer 示例一致；monotonic hart cycle
+  才能满足 `GET_TIME` 名称和 kernel clocksource 需求；共享 virtual-cycle
+  timebase 防止 QEMU/gem5 对“tick”采用不同单位；reload latch 是在不新增
+  可见寄存器时让 periodic 可确定的最小状态。该 timebase 只作功能 oracle，
+  不代表流水线性能。
+- **影响范围**：QEMU timer/event、gem5 timer/event、SBI handler、
+  kernel clockevent/clocksource、K1 timer regressions。
+- **状态**：SETTLED（K1 最小 profile）；已落入
+  `contracts/isa/spec.md §8.5.2`。完整八 counter/increment 仍为 OPEN
+  non-claim。
+
+### 14. 双后端架构 TLB 固定测试 profile（KL-119a，2026-07-26）
+
+- **wiki 状态**：SILENT（非架构阻断）——wiki 用 `tlb_exist` 暴露逻辑集合，
+  但未规定每集合容量、相联度或替换策略。
+- **wiki 原文引用**：`DADAO-12-SEE-主管系统运行环境.md:463-495`
+  （exist/enable/control、64 个逻辑集合与 fault）。
+- **我们的决定**：K1 QEMU/gem5 测试 profile 固定为 64 个集合全部存在、
+  每集合 16-entry、统一 fully-associative、deterministic true-LRU；
+  `tlb_exist=UINT64_MAX`，enable 按 wiki 复位为全1。
+- **理由**：固定容量/替换才能构造稳定 hit/miss/eviction 差分 oracle；这些
+  数值只服务功能一致性，不是 ISA 性能或硬件微架构承诺。
+- **影响范围**：QEMU/gem5 architected TLB model、失效/替换探针和测试报告
+  的 non-claim 边界。
+- **状态**：SETTLED（测试 profile，不是架构性能契约）；已落入
+  `contracts/isa/spec.md §8.5.3`。
+
+### 15. K1 外部中断采用合成 level source，不冻结 UART/PLIC（KL-119a，
+2026-07-26）
+
+- **wiki 状态**：SILENT——wiki 只给出“外设按 source 路由”和 UART cause
+  bits；UART0 的 64 个寄存器写“参照硬件协议”，没有 IRQ 拉高/撤销、
+  source clear 或 device/pending ack 顺序，全文也无 PLIC。
+- **wiki 原文引用**：`DADAO-12-SEE-主管系统运行环境.md:40-42,
+  602-628,650-656`；`DADAO-22-SBI-主管系统二进制接口.md:625-680`。
+- **我们的决定**：K1 使用 test-machine-only `K1_EXT0` level source，
+  路由为 cfx_uart source0，但不实现/宣称 UART 或 PLIC。assert 设置 private
+  `cfx_uart_pending` bit0 并映射到 common UART0 cause bit32；deassert
+  只撤销 level，随后清 private bit0，再清 common bit32。若先 clear 再
+  deassert，active level 在下一边界前重新置位。刺激机制属于 backend test
+  infrastructure，不形成 guest ABI。
+- **理由**：这能验证真实异步 source、mask/pending/unmask/re-entry 和双后端
+  路由，又不从“参照硬件协议”四个字发明 UART device model。
+- **影响范围**：KL-137a/138a 外部 IRQ probe、QEMU/gem5 test machine、
+  K1/K2 集成证据；UART/PLIC 和 kernel serial/irqchip 仍需独立契约。
+- **状态**：SETTLED（K1 test profile）；已落入
+  `contracts/isa/spec.md §8.5.4`。
