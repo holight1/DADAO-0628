@@ -1,0 +1,269 @@
+From cfa40355052e63482412cdce2c8ea66472c6031b Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Sun, 26 Jul 2026 10:08:27 +0800
+Subject: [PATCH] arch/dadao: add FullSystem bare-metal carrier (KL-124a)
+
+---
+ src/arch/dadao/DADAOBareMetal.py | 11 +++++
+ src/arch/dadao/SConscript        |  3 ++
+ src/arch/dadao/bare_metal.cc     | 44 ++++++++++++++++++++
+ src/arch/dadao/bare_metal.hh     | 48 ++++++++++++++++++++++
+ src/arch/dadao/tlb.cc            | 12 ++++--
+ tests/dadao/dadao_fs.py          | 70 ++++++++++++++++++++++++++++++++
+ 6 files changed, 184 insertions(+), 4 deletions(-)
+ create mode 100644 src/arch/dadao/DADAOBareMetal.py
+ create mode 100644 src/arch/dadao/bare_metal.cc
+ create mode 100644 src/arch/dadao/bare_metal.hh
+ create mode 100644 tests/dadao/dadao_fs.py
+
+diff --git a/src/arch/dadao/DADAOBareMetal.py b/src/arch/dadao/DADAOBareMetal.py
+new file mode 100644
+index 0000000000..f0d23e11cf
+--- /dev/null
++++ b/src/arch/dadao/DADAOBareMetal.py
+@@ -0,0 +1,11 @@
++from m5.objects.Workload import Workload
++from m5.params import Param
++
++
++class DADAOBareMetal(Workload):
++    type = "DADAOBareMetal"
++    cxx_class = "gem5::DADAOISA::BareMetal"
++    cxx_header = "arch/dadao/bare_metal.hh"
++
++    image = Param.String("Raw bare-metal image")
++    load_addr = Param.Addr(0x00100000, "Raw image load and reset address")
+diff --git a/src/arch/dadao/SConscript b/src/arch/dadao/SConscript
+index f00fc8af40..7c42a6d431 100644
+--- a/src/arch/dadao/SConscript
++++ b/src/arch/dadao/SConscript
+@@ -8,6 +8,7 @@ env.TagImplies('dadao isa', 'gem5 lib')
+ env.TagImplies('isa', 'dadao isa')
+ 
+ Source('decoder.cc', tags=['dadao isa'])
++Source('bare_metal.cc', tags=['dadao isa'])
+ Source('faults.cc', tags=['dadao isa'])
+ Source('interrupts.cc', tags=['dadao isa'])
+ Source('isa.cc', tags=['dadao isa'])
+@@ -17,6 +18,8 @@ Source('system.cc', tags=['dadao isa'])
+ Source('tlb.cc', tags=['dadao isa'])
+ 
+ SimObject('DADAOCPU.py', sim_objects=[], tags=['dadao isa'])
++SimObject('DADAOBareMetal.py', sim_objects=['DADAOBareMetal'],
++          tags=['dadao isa'])
+ SimObject('DADAODecoder.py', sim_objects=['DADAODecoder'], tags=['dadao isa'])
+ SimObject('DADAOISA.py', sim_objects=['DADAOISA'], tags=['dadao isa'])
+ SimObject('DADAOMMU.py', sim_objects=['DADAOMMU'], tags=['dadao isa'])
+diff --git a/src/arch/dadao/bare_metal.cc b/src/arch/dadao/bare_metal.cc
+new file mode 100644
+index 0000000000..11a66b08cd
+--- /dev/null
++++ b/src/arch/dadao/bare_metal.cc
+@@ -0,0 +1,44 @@
++#include "arch/dadao/bare_metal.hh"
++
++#include "arch/dadao/pcstate.hh"
++#include "base/loader/object_file.hh"
++#include "base/logging.hh"
++#include "cpu/thread_context.hh"
++#include "sim/system.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++BareMetal::BareMetal(const Params &p)
++    : Workload(p), image(loader::createObjectFile(p.image, true)),
++      loadAddr(p.load_addr)
++{
++    fatal_if(!image, "Could not load raw bare-metal image %s.", p.image);
++}
++
++BareMetal::~BareMetal()
++{
++    delete image;
++}
++
++void
++BareMetal::initState()
++{
++    Workload::initState();
++
++    auto memoryImage = image->buildImage();
++    memoryImage.offset(loadAddr);
++    fatal_if(!memoryImage.write(system->physProxy),
++             "Could not load bare-metal image at %#x.", loadAddr);
++
++    for (auto *tc : system->threads) {
++        tc->clearArchRegs();
++        tc->pcState(PCState(loadAddr));
++        tc->activate();
++    }
++}
++
++} // namespace DADAOISA
++} // namespace gem5
+diff --git a/src/arch/dadao/bare_metal.hh b/src/arch/dadao/bare_metal.hh
+new file mode 100644
+index 0000000000..15f2f25f70
+--- /dev/null
++++ b/src/arch/dadao/bare_metal.hh
+@@ -0,0 +1,48 @@
++#ifndef __ARCH_DADAO_BARE_METAL_HH__
++#define __ARCH_DADAO_BARE_METAL_HH__
++
++#include "base/loader/object_file.hh"
++#include "base/loader/symtab.hh"
++#include "params/DADAOBareMetal.hh"
++#include "sim/workload.hh"
++
++namespace gem5
++{
++namespace DADAOISA
++{
++
++class BareMetal : public Workload
++{
++  private:
++    loader::ObjectFile *image;
++    loader::SymbolTable symbols;
++    const Addr loadAddr;
++
++  public:
++    PARAMS(DADAOBareMetal);
++    BareMetal(const Params &p);
++    ~BareMetal() override;
++
++    void initState() override;
++
++    Addr getEntry() const override { return loadAddr; }
++    loader::Arch getArch() const override { return loader::Dadao; }
++    ByteOrder byteOrder() const override { return ByteOrder::big; }
++
++    const loader::SymbolTable &
++    symtab(ThreadContext *tc) override
++    {
++        return symbols;
++    }
++
++    bool
++    insertSymbol(const loader::Symbol &symbol) override
++    {
++        return symbols.insert(symbol);
++    }
++};
++
++} // namespace DADAOISA
++} // namespace gem5
++
++#endif // __ARCH_DADAO_BARE_METAL_HH__
+diff --git a/src/arch/dadao/tlb.cc b/src/arch/dadao/tlb.cc
+index 35654b0b8e..2704fa16b0 100644
+--- a/src/arch/dadao/tlb.cc
++++ b/src/arch/dadao/tlb.cc
+@@ -15,8 +15,10 @@ Fault
+ TLB::translateAtomic(const RequestPtr &req, ThreadContext *tc,
+                      BaseMMU::Mode mode)
+ {
+-    panic_if(FullSystem,
+-             "DADAO skeleton TLB does not support full-system mode.");
++    if (FullSystem) {
++        req->setPaddr(req->getVaddr());
++        return NoFault;
++    }
+     return tc->getProcessPtr()->pTable->translate(req);
+ }
+ 
+@@ -24,8 +26,10 @@ Fault
+ TLB::translateFunctional(const RequestPtr &req, ThreadContext *tc,
+                          BaseMMU::Mode mode)
+ {
+-    panic_if(FullSystem,
+-             "DADAO skeleton TLB does not support full-system mode.");
++    if (FullSystem) {
++        req->setPaddr(req->getVaddr());
++        return NoFault;
++    }
+     return tc->getProcessPtr()->pTable->translate(req);
+ }
+ 
+diff --git a/tests/dadao/dadao_fs.py b/tests/dadao/dadao_fs.py
+new file mode 100644
+index 0000000000..ae536cda72
+--- /dev/null
++++ b/tests/dadao/dadao_fs.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""Minimal DADAO FullSystem runner for a flat bare-metal image.
++
++Usage: build/DADAO/gem5.opt tests/dadao/dadao_fs.py <image.bin>
++       build/DADAO/gem5.opt tests/dadao/dadao_fs.py <image.bin> \
++           --cfx-smon-real
++       build/DADAO/gem5.opt tests/dadao/dadao_fs.py <image.bin> \
++           --cfx-pending-test <cfxcode> <raw-seed>
++"""
++
++import sys
++
++import m5
++from m5.objects import *
++
++
++binary = sys.argv[1]
++cfx_smon_real = False
++cfx_pending_test_code = 18
++cfx_pending_test_seed = 0
++args = sys.argv[2:]
++while args:
++    option = args.pop(0)
++    if option == "--cfx-smon-real":
++        cfx_smon_real = True
++    elif option == "--cfx-pending-test" and len(args) >= 2:
++        cfx_pending_test_code = int(args.pop(0), 0)
++        cfx_pending_test_seed = int(args.pop(0), 0)
++    else:
++        raise SystemExit(f"unknown/incomplete option: {option}")
++
++system = DADAOSystem()
++system.clk_domain = SrcClockDomain(
++    clock="1GHz", voltage_domain=VoltageDomain())
++system.mem_mode = "atomic"
++# Keep the large unmapped hole out of host memory while backing both the ROM
++# convention and the existing KL-113a/KL-117a marker pages.
++system.mem_ranges = [
++    AddrRange(0x00000000, size="16MiB"),
++    AddrRange(0x80000000, size="16MiB"),
++    # The architectural halt oracle reads this differential-test window
++    # before requesting simulation exit.
++    AddrRange(0x87FEF000, size="12KiB"),
++]
++system.cpu = DADAOAtomicSimpleCPU()
++
++system.membus = SystemXBar()
++system.cpu.icache_port = system.membus.cpu_side_ports
++system.cpu.dcache_port = system.membus.cpu_side_ports
++system.cpu.createInterruptController()
++
++system.mem_ctrls = [
++    SimpleMemory(range=memory_range, port=system.membus.mem_side_ports)
++    for memory_range in system.mem_ranges
++]
++system.system_port = system.membus.cpu_side_ports
++
++system.workload = DADAOBareMetal(image=binary, load_addr=0x00100000)
++system.cpu.createThreads()
++system.cpu.isa[0].cfx_smon_real = cfx_smon_real
++system.cpu.isa[0].cfx_common_pending_test_code = cfx_pending_test_code
++system.cpu.isa[0].cfx_common_pending_test_seed = cfx_pending_test_seed
++
++root = Root(full_system=True, system=system)
++m5.instantiate()
++print("SIM_START", flush=True)
++exit_event = m5.simulate()
++print(f"SIM_END: {exit_event.getCause()} code={exit_event.getCode()}",
++      flush=True)
++sys.exit(exit_event.getCode())
+-- 
+2.43.0
+

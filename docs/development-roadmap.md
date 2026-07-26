@@ -1889,5 +1889,18 @@ KL-120a and all O1/O2/O3 probes retain their prior results. Full E2E remains
 81/81 and four-way differential remains 200 with zero divergence. QEMU's
 28-patch and gem5's 21-patch series replay to matching development trees.
 
-**Next**: KL-124a FullSystem carrier for gem5, then KL-125a QEMU PTW
-success path.
+## K1: gem5 FullSystem bare-metal carrier (2026-07-26) — see `code-agent/tasks/KL-124a-*.md`
+
+Added a DADAO raw-image workload and `tests/dadao/dadao_fs.py`: flat images
+load at the QEMU-compatible `0x00100000` reset address, physical memory is
+explicitly backed in disjoint low/test windows, and FullSystem TLB behavior
+is identity mapping while interrupts remain no-op. Existing `halt`
+`exitSimLoop(code)` is the exit oracle; no firmware, MMU walk, TLB cache, or
+interrupt source was introduced. The unchanged KL-113a/117a/120a raw streams
+pass in FullSystem as `42/130/134/42`, `153/43`, and
+`44/130 + 7x45 + 43`; SE E2E remains 81/81 and the differential remains
+200 agreements with zero divergence. The 22-patch gem5 series replays from
+the manifest pin to the development tree hash.
+
+**Next**: KL-125a QEMU PTW success path, then KL-126a ports that path to
+this gem5 FullSystem carrier.

@@ -20,3 +20,4 @@
 0019-arch-dadao-implement-real-cfx_smon-trap-entry-KL-117.patch
 0020-arch-dadao-add-cfx-carrier-and-nested-return-KL-120a.patch
 0021-arch-dadao-generalize-precise-CFX-carrier-KL-122a.patch
+0022-arch-dadao-add-FullSystem-bare-metal-carrier-KL-124a.patch

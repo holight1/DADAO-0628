@@ -7,8 +7,10 @@ differential (interp / QEMU / gem5). Semantics are derived only from
 `contracts/isa/spec.md` and `tools/opcodes.yaml` — never copied from QEMU — so
 agreement is meaningful. See ADR-0010.
 
-Scope: functional ISA correctness in **SE mode** (AtomicSimpleCPU); timing /
-microarchitecture is out of scope. Full-system / OS bring-up (G4) is deferred.
+Primary scope: functional ISA correctness in **SE mode** (AtomicSimpleCPU);
+timing / microarchitecture is out of scope. KL-124a adds a minimal
+FullSystem flat-image carrier for bare-metal semantic probes; it is still
+identity-mapped, interrupt-free, and does not claim OS bring-up.
 
 ## Baseline
 
@@ -28,14 +30,17 @@ an instruction" live in the applied tree at `docs/gem5-arch-notes.md`.
 | 0005 | dadao-memory           | load/store + block-copy (big-endian) | 131 |
 | 0006 | dadao-faults           | ILLI 0x82 / MALIGN 0x81 / UNDI 0x83 + legality + div-by-zero | 162 |
 | 0007 | dadao-controlflow-ras  | branches / jump_r / call / ret + RegRAS + block-copy | **198** |
+| 0022 | FullSystem bare-metal carrier | flat image at 0x00100000, identity TLB, no-op interrupts | SE baseline unchanged |
 
-Full result: interp/QEMU/gem5 AGREE(3-way)=198, gem5-SKIP=0, DIVERGE=0, HARNESS=6.
+Current result: interp/QEMU/gem5 AGREE(3-way)=200, gem5-SKIP=2,
+DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix is also green.
 
 ## Build & run (after `make fetch` + `apply_series`)
 
 ```
 scons build/DADAO/gem5.opt -j"$(nproc)"          # in .work/source/gem5
 ./build/DADAO/gem5.opt tests/dadao/dadao_se.py <flat-binary-as-ELF>
+./build/DADAO/gem5.opt tests/dadao/dadao_fs.py <flat-image.bin>
 ```
 
 Differential is driven from this repo: `tests/scripts/run_gem5_test.py` (adapter,
