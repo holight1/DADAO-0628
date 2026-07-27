@@ -12,8 +12,12 @@ timing / microarchitecture is out of scope. KL-124a adds a minimal
 FullSystem flat-image carrier for bare-metal semantic probes; KL-126a/KL-127a
 add the PTW success path, precise walk-fault delivery, and leaf A/D updates.
 KL-129a adds the bounded K1 architectural TLB and single-layer PTW delegation
-needed by the bare-metal profile. Interrupts and OS bring-up remain out of
-scope.
+needed by the bare-metal profile. KL-131a adds SEE §5 steps 2-6 mask/pending/
+priority arbitration and the project's first real instruction-boundary
+asynchronous interrupt dispatch (`Interrupts::checkInterrupts()`/
+`getInterrupt()`, previously a stub always returning false/NoFault) --
+FullSystem-mode only, per `BaseCPU::checkInterrupts()`'s own gate. Real
+timer/UART devices and full OS bring-up remain out of scope.
 
 ## Baseline
 
@@ -37,11 +41,13 @@ an instruction" live in the applied tree at `docs/gem5-arch-notes.md`.
 | 0023 | PTW successful path | cfx_ptw registers, super/normal-page walk, X/R/W | SE baseline unchanged |
 | 0024 | PTW faults and A/D | precise cfx_ptw carrier, 15 walker causes, leaf A/D writeback | SE baseline unchanged |
 | 0025 | Architectural TLB | 64×16 true LRU, invalidate, 7 hit causes, PTW delegation | SE baseline unchanged |
+| 0026 | Maskable async dispatch core | SEE §5 steps 2-6 gate + real instruction-boundary async delivery (FullSystem) | SE baseline unchanged |
 
 Current result: interp/QEMU/gem5 AGREE(3-way)=200, gem5-SKIP=2,
-DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix and KL-126a's eight
-PTW success probes, KL-127a's 30 fault/10 A-D probes, and KL-129a's 13
-dual-backend TLB/delegation probes are also green.
+DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix, KL-126a's eight
+PTW success probes, KL-127a's 30 fault/10 A-D probes, KL-129a's 13
+dual-backend TLB/delegation probes, and KL-131a's dual-backend sync-mask +
+async-priority/electrics probes are also green.
 
 ## Build & run (after `make fetch` + `apply_series`)
 

@@ -30,3 +30,4 @@
 0029-target-dadao-implement-PTW-success-path-KL-125a.patch
 0030-target-dadao-implement-PTW-faults-and-A-D-bits-KL-12.patch
 0031-target-dadao-implement-architectural-TLB-and-delegat.patch
+0032-target-dadao-implement-maskable-async-dispatch-c.patch

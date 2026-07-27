@@ -1,0 +1,740 @@
+From fd77795e897183b7988a74b8b494576ddc65ea09 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Mon, 27 Jul 2026 08:00:11 +0800
+Subject: [PATCH] target/dadao: implement maskable async dispatch core
+ (KL-131a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds SEE §5 steps 2-6 (nonmaskable bypass, inner_cfx_mask/global_cfx_mask/
+excp_cause_mask arbitration, trap/sync/async counters) as a shared gate
+(dadao_cfx_dispatch()) in front of KL-122a's precise-entry carrier
+(dadao_cfx_precise_trap_enter(), steps 7-10). All three prior call sites
+(cfx_smon CFXTRAP, cfx_ptw CFXTRAP-as-call, cfx_ptw/cfx_tlb fault delivery)
+are nonmaskable and route through unchanged behaviorally except for the
+new trap/sync counters.
+
+New architectural registers: cg0-3/rc1 shared global_cfx_mask (one per
+mode, not per cfxcode, per the wiki's explicit "shared register" note),
+cg0-3/rc11 per-cfx/mode excp_cause_mask, cg5/rc63 RO excp_cause_nonmaskable
+(hardware-static per cfx cause table), cg4/rc2-4 HW trap_num/excp_sync_num/
+excp_async_num counters.
+
+New instruction-boundary asynchronous dispatch: dadao_cpu_exec_interrupt()
+now performs a real scan (dadao_cfx_async_step() -> dadao_cfx_async_scan())
+implementing contracts/isa/spec.md §8.5.1's frozen priority rule (lowest
+pending eligible cfxcode, then lowest eligible cause bit). CPU_INTERRUPT_HARD
+is asserted unconditionally at reset (matching gem5's always-live
+FullSystem interrupt polling) since a genuinely pending-and-newly-unmasked
+cause can arise from plain guest cfx2rc writes alone, not just a test
+source; only the max_insns=1 TB-forcing needed for true instruction-
+boundary precision stays gated behind dadao_cfx_async_active() to avoid a
+performance regression on the 99.9% case where nothing is pending.
+
+Test-only additions (never guest-visible ABI): a synchronous dispatch
+trigger (cg4/rc60) that lets a test program directly invoke the steps 2-6
+gate with an arbitrary (target, cause, is_sync=true) triple -- needed
+because M1's only real maskable synchronous cause (FPEXCP) has no
+execution path (RF excluded from M1); two independent persistent
+level-triggered async test sources (cfx-async-test-level-{a,b}-code/seed
+CPU properties) driving the new instruction-boundary delivery probes.
+
+dadao_cfx_dispatch() returns bool (entered vs blocked/pending-only) so
+callers reached from mid-TB helper code can avoid an unconditional
+cpu_loop_exit() re-fetching and re-executing the same instruction forever
+on a blocked attempt -- a real bug this task's own self-review hit and
+fixed in the TEST-ONLY trigger path.
+
+Zero regression: KL-120a/122a/124a-129a probes, 81/81 lit E2E,
+run_differential.py (AGREE(3-way)=200, AGREE(4-way)=200, zero DIVERGE),
+manifest_check.py, check_issues.py all unchanged from baseline.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ target/dadao/cpu.c       | 316 +++++++++++++++++++++++++++++++++++++--
+ target/dadao/cpu.h       |  95 ++++++++++++
+ target/dadao/helper.c    |  65 +++++++-
+ target/dadao/translate.c |  25 +++-
+ 4 files changed, 489 insertions(+), 12 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 9b27774..c608f84 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -17,6 +17,11 @@
+ #include <stdlib.h>
+ extern const TCGCPUOps dadao_tcg_ops;
+ 
++/* KL-131a: forward declaration -- used by dadao_cpu_reset_hold() below,
++ * defined further down next to the rest of the steps 2-6 arbitration logic
++ * it belongs with. */
++static uint64_t dadao_cfx_excp_cause_nonmaskable_for(uint64_t cfxcode);
++
+ void cpu_get_tb_cpu_state(CPUDADAOState *env, vaddr *pc,
+                           uint64_t *cs_base, uint32_t *pflags)
+ {
+@@ -82,7 +87,25 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+         for (int m = 0; m < 4; m++) {
+             env->cfx_escape_cfx_mask[i][m] = DADAO_CFX_MASK_ALL;
+         }
++        /* KL-131a: cg0-3/rc11 excp_cause_mask resets all-1 (blocked) per
++         * cfx/mode, mirroring escape_cfx_mask above [wiki L285/L309/L329]. */
++        for (int m = 0; m < 4; m++) {
++            env->cfx_excp_cause_mask[i][m] = DADAO_CFX_MASK_ALL;
++        }
++        env->cfx_excp_cause_nonmaskable[i] =
++            dadao_cfx_excp_cause_nonmaskable_for(i);
++        env->cfx_trap_num[i] = 0;
++        env->cfx_excp_sync_num[i] = 0;
++        env->cfx_excp_async_num[i] = 0;
++    }
++    /* KL-131a: cg0-3/rc1 global_cfx_mask is the SHARED 4-entry array (see
++     * cpu.h's DADAO_CFX_MODE_GLOBAL_MASK_RC comment); reset all-1 per mode
++     * [wiki L275/L287, L299/L311, L319/L331]. */
++    for (int m = 0; m < 4; m++) {
++        env->cfx_mode_global_cfx_mask[m] = DADAO_CFX_MASK_ALL;
+     }
++    env->cfx_async_pending_target = 0;
++    env->cfx_async_pending_cause = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_USER] = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_JAIL] = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_SUPV] = UINT64_MAX;
+@@ -116,6 +139,23 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+                       cpu->cfx_common_pending_test_code & 0x3F,
+                       cpu->cfx_common_pending_test_seed);
+     }
++    /* KL-131a: always live, matching gem5's BaseCPU::checkInterrupts()
++     * FullSystem-mode polling (called once per instruction unconditionally,
++     * not gated on whether a test source happens to be configured).
++     * dadao_cpu_exec_interrupt() -> dadao_cfx_async_step() is cheap when
++     * nothing is pending (a 64-entry scan that bails immediately on an
++     * all-zero cfx_common_pending, the overwhelmingly common case for every
++     * pre-KL-131a regression scenario), so this is safe to assert
++     * unconditionally rather than only when this task's own test-only level
++     * sources are configured. It must not be conditional: a genuinely
++     * pending-and-newly-unmasked cause can arise from plain guest cfx2rc
++     * writes alone (no test source involved -- see KL-131a's own A4 sync
++     * probe, which does exactly this), and QEMU must detect that the same
++     * way real hardware and gem5's Interrupts::checkInterrupts() both would.
++     * Only the max_insns=1 instruction-boundary-precision forcing in
++     * dadao_translate_code() stays gated on dadao_cfx_async_active() --
++     * that one IS a real per-TB performance cost, unlike this cheap scan. */
++    cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+     env->pc = 0x00100000;
+     cs->exception_index = -1;
+ 
+@@ -255,6 +295,217 @@ static void dadao_cfx_precise_trap_enter(DADAOCPU *cpu,
+     }
+ }
+ 
++/* KL-131a: SEE §3 cg5/rc63 excp_cause_nonmaskable, hardware-static per cfx's
++ * own cause table [wiki §DADAO-12-SEE-主管系统运行环境.md L362]. Common
++ * CFXTRAP/CFXMEM/CFXREG (bits 0-2) are nonmaskable in every cfx's cause
++ * table without exception -- verified against every cause table in §4
++ * (L396-648). Independently cross-checked against dadao_cfx_common_pending_
++ * mask()'s maskable set for each cfx below; every other cfx (cache/llc/pmem,
++ * every reserved cfxcode) defines no maskable cause at all, so its
++ * nonmaskable set is exactly the common three -- the switch's default arm
++ * covers all of them without needing every cfxcode enumerated. */
++static uint64_t dadao_cfx_excp_cause_nonmaskable_for(uint64_t cfxcode)
++{
++    const uint64_t common = (1ULL << 0) | (1ULL << 1) | (1ULL << 2);
++
++    switch (cfxcode & 0x3F) {
++    case 0: /* umon */
++    case 1: /* jmon */
++    case DADAO_CFX_CODE_SMON:
++    case 3: /* hmon */
++        /* [wiki L396-411]: ILLI/UNDI/RASOF/RASUF/MALIGN/IALIGN (bits 8-13)
++         * nonmaskable; only FPEXCP (bit32) is maskable. */
++        return common | (1ULL << 8) | (1ULL << 9) | (1ULL << 10) |
++               (1ULL << 11) | (1ULL << 12) | (1ULL << 13);
++    case DADAO_CFX_CODE_PTW:
++        /* [wiki L440-461]: all 18 listed causes nonmaskable. */
++        return common | (1ULL << 8) | (1ULL << 9) | (1ULL << 10) |
++               (1ULL << 11) | (1ULL << 12) | (1ULL << 13) | (1ULL << 14) |
++               (1ULL << 16) | (1ULL << 17) | (1ULL << 18) | (1ULL << 19) |
++               (1ULL << 20) | (1ULL << 21) | (1ULL << 22) | (1ULL << 23);
++    case DADAO_CFX_CODE_TLB:
++        /* [wiki L480-493]: all 10 listed causes nonmaskable (KL-131a task
++         * text's "8" undercounts the wiki table by the 2 common CFXMEM/
++         * CFXREG rows; the wiki table itself, independently re-read for
++         * this task, is authoritative and lists all 10 as nonmaskable). */
++        return common | (1ULL << 12) | (1ULL << 13) | (1ULL << 14) |
++               (1ULL << 18) | (1ULL << 19) | (1ULL << 22) | (1ULL << 23);
++    case 15: /* hart: [wiki L529-536] IPI (bit8) maskable */
++    case 18: /* timer: [wiki L593-600] TIMER (bit10) maskable */
++    case 62: /* uart: [wiki L617-628] UART0-31 (bits32-63) maskable */
++        return common;
++    case DADAO_CFX_CODE_POWER:
++        /* [wiki L639-648]: POWEROFF(8)/HARD_RESET(9) nonmaskable;
++         * SOFT_RESET(10) maskable. */
++        return common | (1ULL << 8) | (1ULL << 9);
++    default:
++        /* cache/llc/pmem and every reserved cfxcode: only CFXTRAP/CFXMEM/
++         * CFXREG are defined, all nonmaskable [wiki L507-514, L549-555,
++         * L572-578]. */
++        return common;
++    }
++}
++
++/* KL-131a: pure predicate for SEE §5 steps 2-5 -- would `cause` targeting
++ * `target_cfx` currently reach step 6 (entry), or is it blocked? No state
++ * mutation. Shared by dadao_cfx_dispatch()'s own gate and the async
++ * instruction-boundary scan's candidate-eligibility test, so both use
++ * exactly the same arbitration rule (contracts/isa/spec.md §8.5.1; wiki
++ * L680-699, L763-786). */
++static bool dadao_cfx_cause_eligible(CPUDADAOState *env, uint64_t target_cfx,
++                                     uint64_t cause)
++{
++    if (env->cfx_excp_cause_nonmaskable[target_cfx] & cause) {
++        return true;
++    }
++    if (target_cfx != env->inner_cfx_code &&
++        (env->inner_cfx_mask & (1ULL << target_cfx))) {
++        return false;
++    }
++    if (target_cfx != env->inner_cfx_code &&
++        (env->cfx_mode_global_cfx_mask[env->inner_run_mode] &
++         (1ULL << target_cfx))) {
++        return false;
++    }
++    if (env->cfx_excp_cause_mask[target_cfx][env->inner_run_mode] & cause) {
++        return false;
++    }
++    return true;
++}
++
++/* KL-131a: SEE §5 steps 2-6 -- mask/pending/priority arbitration gating the
++ * KL-122a dadao_cfx_precise_trap_enter() carrier (steps 7-10). Synchronous
++ * callers (is_sync=true) get ILLI-redirect-to-monitor on a steps 3-4 routing
++ * block (retried once; ILLI is nonmaskable at every monitor cfx, so the
++ * second pass always enters); a step 5 cause-mask block (only FPEXCP reaches
++ * this among M1's real sync causes) just ORs into pending like every async
++ * block does. [wiki L680-807] */
++bool dadao_cfx_dispatch(DADAOCPU *cpu, uint64_t target_cfx, uint64_t cause,
++                        uint64_t cause_info, target_ulong cause_ip,
++                        bool is_sync)
++{
++    CPUDADAOState *env = &cpu->env;
++
++    target_cfx &= 0x3F;
++
++    for (int pass = 0; pass < 2; pass++) {
++        if (dadao_cfx_cause_eligible(env, target_cfx, cause)) {
++            /* Step 6: trap counters. [wiki L699, L787-793] */
++            if (cause == DADAO_CFX_CAUSE_CFXTRAP) {
++                env->cfx_trap_num[target_cfx]++;
++            } else if (!is_sync) {
++                env->cfx_excp_async_num[target_cfx]++;
++            } else {
++                env->cfx_excp_sync_num[target_cfx]++;
++            }
++            dadao_cfx_precise_trap_enter(cpu, target_cfx, cause, cause_info,
++                                         cause_ip);
++            return true;
++        }
++
++        bool routing_blocked =
++            target_cfx != env->inner_cfx_code &&
++            ((env->inner_cfx_mask & (1ULL << target_cfx)) ||
++             (env->cfx_mode_global_cfx_mask[env->inner_run_mode] &
++              (1ULL << target_cfx)));
++
++        if (is_sync && routing_blocked && pass == 0) {
++            /* Steps 3-4: sync exception redirected to ILLI @ current-mode
++             * monitor, mirroring step 1's reserved-cfxcode redirect (wiki
++             * L713-728, L770/L777). DADAORunMode's numeric values already
++             * equal the monitor cfxcodes 1:1 (0=umon..3=hmon). */
++            target_cfx = (uint64_t)env->inner_run_mode;
++            cause = DADAO_CFX_MONITOR_CAUSE_ILLI;
++            continue;
++        }
++
++        /* Step 5 cause-mask block, any async block, or (defensively
++         * unreachable, per the comment above) a sync routing-mask block on
++         * pass 1: OR into pending, no entry. [wiki L697-698, L781-785] */
++        env->cfx_common_pending[target_cfx] |=
++            cause & dadao_cfx_common_pending_mask(target_cfx);
++        return false;
++    }
++    return false;
++}
++
++/* KL-131a: true while any test-only synthetic async source is configured.
++ * Gates forcing single-instruction TBs (dadao_translate_code()) so every
++ * pre-existing test/regression scenario that never touches these test-only
++ * properties keeps its normal multi-instruction TB batching -- this task's
++ * instruction-boundary precision requirement only costs anything for
++ * scenarios that actually opt into it. */
++bool dadao_cfx_async_active(CPUDADAOState *env)
++{
++    DADAOCPU *cpu = container_of(env, DADAOCPU, env);
++    /* Deliberately does NOT include cfx_common_pending_test_seed (KL-120a's
++     * unrelated one-shot register-injection mechanism, used to probe cfx2rd/
++     * cfx2rc access, not delivery) -- keeping this scoped to only KL-131a's
++     * two new level sources means every pre-existing KL-120a probe keeps its
++     * exact prior TB granularity and never enters this task's async-delivery
++     * machinery at all. */
++    return cpu->cfx_async_test_level_a_seed != 0 ||
++           cpu->cfx_async_test_level_b_seed != 0;
++}
++
++/* KL-131a: re-latch the two test-only synthetic level sources (electrics,
++ * wiki L656) and select the next async cause to deliver per contracts/isa/
++ * spec.md §8.5.1: lowest pending eligible cfxcode first, then lowest set
++ * eligible cause bit within that cfx. Returns false if nothing is eligible
++ * right now (blocked bits stay latched in cfx_common_pending). */
++static bool dadao_cfx_async_scan(DADAOCPU *cpu, uint64_t *out_target,
++                                 uint64_t *out_cause)
++{
++    CPUDADAOState *env = &cpu->env;
++
++    if (cpu->cfx_async_test_level_a_seed != 0) {
++        uint64_t target = cpu->cfx_async_test_level_a_code & 0x3F;
++        env->cfx_common_pending[target] |=
++            cpu->cfx_async_test_level_a_seed &
++            dadao_cfx_common_pending_mask(target);
++    }
++    if (cpu->cfx_async_test_level_b_seed != 0) {
++        uint64_t target = cpu->cfx_async_test_level_b_code & 0x3F;
++        env->cfx_common_pending[target] |=
++            cpu->cfx_async_test_level_b_seed &
++            dadao_cfx_common_pending_mask(target);
++    }
++
++    for (uint64_t cfx = 0; cfx < 64; cfx++) {
++        uint64_t pending = env->cfx_common_pending[cfx] &
++                           dadao_cfx_common_pending_mask(cfx);
++        while (pending != 0) {
++            uint64_t bit = pending & (-pending);
++            if (dadao_cfx_cause_eligible(env, cfx, bit)) {
++                *out_target = cfx;
++                *out_cause = bit;
++                return true;
++            }
++            pending &= ~bit;
++        }
++    }
++    return false;
++}
++
++/* KL-131a: instruction-boundary async dispatch entry, called from
++ * dadao_cpu_exec_interrupt() (translate.c) the same way any other QEMU
++ * target's cpu_exec_interrupt hook would call its own do_interrupt(). */
++bool dadao_cfx_async_step(CPUState *cs)
++{
++    DADAOCPU *cpu = DADAO_CPU(cs);
++    CPUDADAOState *env = &cpu->env;
++    uint64_t target, cause;
++
++    if (!dadao_cfx_async_scan(cpu, &target, &cause)) {
++        return false;
++    }
++    env->cfx_async_pending_target = target;
++    env->cfx_async_pending_cause = cause;
++    cs->exception_index = EXCP_CFX_ASYNC;
++    dadao_cpu_do_interrupt(cs);
++    return true;
++}
++
+ void dadao_cpu_do_interrupt(CPUState *cs)
+ {
+     DADAOCPU *cpu = DADAO_CPU(cs);
+@@ -460,10 +711,14 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+             env->rd[31] = ret;
+         } else if (cfxcode == 2 && cpu->cfx_smon_real) {
+             /* KL-116a Oracle O3: real SEE §5 entry-flow subset, cfx_smon
+-             * target, now routed through KL-122a's shared precise carrier. */
+-            dadao_cfx_precise_trap_enter(cpu, DADAO_CFX_CODE_SMON,
+-                                         DADAO_CFX_CAUSE_CFXTRAP,
+-                                         raw_insn, env->pc - 4);
++             * target, now routed through KL-131a's steps 2-6 gate in front
++             * of KL-122a's shared precise carrier. CFXTRAP is nonmaskable in
++             * every cfx's cause table, so this is behaviorally identical to
++             * the direct carrier call it replaces except for now also
++             * incrementing cfx_trap_num (step 6, previously unimplemented). */
++            dadao_cfx_dispatch(cpu, DADAO_CFX_CODE_SMON,
++                               DADAO_CFX_CAUSE_CFXTRAP, raw_insn,
++                               env->pc - 4, true);
+         } else if (cfxcode == DADAO_CFX_CODE_PTW) {
+             /*
+              * KL-129a SBI-style functional delegation. CFXTRAP's cause_ip
+@@ -472,11 +727,13 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+              * the handler resumes past the call with escape cfx_ptw,1
+              * (cause_ip+4), matching KL-116a's established
+              * "escape cfx_smon,1" trap-as-call pattern. E1 in the PTW
+-             * frame restores the cfx_tlb caller.
++             * frame restores the cfx_tlb caller. KL-131a: routed through the
++             * steps 2-6 gate; CFXTRAP is nonmaskable so behavior is
++             * unchanged except for the new cfx_trap_num counter.
+              */
+-            dadao_cfx_precise_trap_enter(cpu, DADAO_CFX_CODE_PTW,
+-                                         DADAO_CFX_CAUSE_CFXTRAP,
+-                                         raw_insn, env->pc - 4);
++            dadao_cfx_dispatch(cpu, DADAO_CFX_CODE_PTW,
++                               DADAO_CFX_CAUSE_CFXTRAP, raw_insn,
++                               env->pc - 4, true);
+         } else {
+             /* unknown cfxcode → ILLI */
+             qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x82);
+@@ -485,6 +742,22 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+         cs->exception_index = -1;
+         return;
+     }
++    case EXCP_CFX_ASYNC: {
++        /* KL-131a: dadao_cfx_async_step() already ran the full steps 2-6
++         * scan and confirmed eligibility; re-run dadao_cfx_dispatch() here
++         * (not a direct precise_trap_enter call) so a mask changed by a
++         * racing... there is no race in this single-threaded interpreter,
++         * but re-running the shared gate keeps exactly one code path
++         * responsible for step 6's counters and the steps 7-10 carrier
++         * call, matching every other cfx entry route in this switch. */
++        uint64_t target = env->cfx_async_pending_target;
++        uint64_t cause = env->cfx_async_pending_cause;
++        env->cfx_async_pending_target = 0;
++        env->cfx_async_pending_cause = 0;
++        dadao_cfx_dispatch(cpu, target, cause, 0, env->pc, false);
++        cs->exception_index = -1;
++        return;
++    }
+     case 0x84: /* RASOF */
+         qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 0x84);
+         break;
+@@ -893,10 +1166,23 @@ bool dadao_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+             return false;
+         }
+         cpu_restore_state(cs, retaddr);
+-        dadao_cfx_precise_trap_enter(
++        /* KL-131a: routed through the steps 2-6 gate; every cfx_ptw/cfx_tlb
++         * cause is nonmaskable (KL-118a, re-confirmed against the wiki cause
++         * tables for this task: dadao_cfx_excp_cause_nonmaskable_for()
++         * always sets all 18 cfx_ptw / all 10 cfx_tlb cause bits), so
++         * dadao_cfx_dispatch() is guaranteed to return true (entered) here
++         * -- the unconditional cpu_loop_exit() below is safe. A blocked/
++         * no-entry result would need more than skipping this call (physical/
++         * prot below are only valid on the entered path, and env->pc still
++         * points at the faulting access, so a bare "skip the exit" fallback
++         * would both use uninitialized state and risk the identical
++         * infinite-refault bug this task's TEST-ONLY sync trigger hit and
++         * fixed in helper_cfx2rc() -- not a defensible partial fix for a
++         * path that cannot currently be reached). */
++        dadao_cfx_dispatch(
+             DADAO_CPU(cs), fault_cfxcode, fault_cause,
+             address & UINT64_C(0x0000ffffffffffff),
+-            DADAO_CPU(cs)->env.pc);
++            DADAO_CPU(cs)->env.pc, true);
+         cpu_loop_exit(cs);
+     }
+     physical_page = physical & TARGET_PAGE_MASK;
+@@ -925,6 +1211,16 @@ static const Property dadao_cpu_properties[] = {
+                       cfx_common_pending_test_code, 18),
+     DEFINE_PROP_UINT64("cfx-common-pending-test-seed", DADAOCPU,
+                        cfx_common_pending_test_seed, 0),
++    /* KL-131a TEST-ONLY: two independent synthetic level sources. See
++     * cpu.h's ArchCPU field comment. Defaults are inert (seed=0). */
++    DEFINE_PROP_UINT8("cfx-async-test-level-a-code", DADAOCPU,
++                      cfx_async_test_level_a_code, 0),
++    DEFINE_PROP_UINT64("cfx-async-test-level-a-seed", DADAOCPU,
++                       cfx_async_test_level_a_seed, 0),
++    DEFINE_PROP_UINT8("cfx-async-test-level-b-code", DADAOCPU,
++                      cfx_async_test_level_b_code, 0),
++    DEFINE_PROP_UINT64("cfx-async-test-level-b-seed", DADAOCPU,
++                       cfx_async_test_level_b_seed, 0),
+ };
+ 
+ static void dadao_cpu_class_init(ObjectClass *oc, void *data)
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index 5479388..3ddf22d 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -16,6 +16,12 @@
+  * existing 0x81-0x85 QEMU-fault exit code scheme contiguously (ADR-0004
+  * §Summary of Exit Code Layout). */
+ #define EXCP_CFXREG 6
++/* KL-131a: QEMU-internal exception index for a delivered asynchronous cfx
++ * interrupt, routed through dadao_cpu_do_interrupt() the same way
++ * EXCP_CFXTRAP already is. Not an architectural value -- purely QEMU's own
++ * exception_index numbering, distinct from the architectural one-hot cause
++ * id carried in env->cfx_async_pending_cause. */
++#define EXCP_CFX_ASYNC 7
+ 
+ /* cfx_smon SYS_mmap (222) accounting-arena base (ML-007a). Must match the
+  * gem5 TrapInst::execute() constant exactly (components/gem5/patches) --
+@@ -73,6 +79,13 @@ typedef struct DADAOCfxFrame {
+ /* SEE §3 cg5 cause id for CFXTRAP: bit 0, one-hot.
+  * [wiki §DADAO-12-SEE-主管系统运行环境.md L402] */
+ #define DADAO_CFX_CAUSE_CFXTRAP (1ULL << 0)
++/* cfx_umon/jmon/smon/hmon ILLI cause, one-hot bit 8 -- nonmaskable in every
++ * monitor's cause table. [wiki §DADAO-12-SEE-主管系统运行环境.md L405]
++ * KL-131a uses this as the redirect target when SEE §5 steps 3-4 (routing
++ * mask) block a synchronous exception: cause becomes ILLI and temp_cfx_code
++ * becomes the current-mode monitor, mirroring step 1's reserved-cfxcode
++ * redirect. [wiki L713-728, task KL-131a §目标2] */
++#define DADAO_CFX_MONITOR_CAUSE_ILLI (1ULL << 8)
+ /* cfx_ptw non-maskable fault causes [SEE §cfx_ptw]. */
+ #define DADAO_CFX_PTW_CAUSE_NUPERM    (1ULL << 8)
+ #define DADAO_CFX_PTW_CAUSE_NJPERM    (1ULL << 9)
+@@ -137,6 +150,42 @@ typedef struct DADAOCfxFrame {
+ #define DADAO_CFX_TLB_SETS 64
+ #define DADAO_CFX_TLB_WAYS 16
+ 
++/* KL-131a: SEE §3 cg0-3/rc1 "<mode>_global_cfx_mask" is explicitly a SHARED
++ * register -- one instance per mode group (cg selects the mode), not one per
++ * cfxcode [wiki §DADAO-12-SEE-主管系统运行环境.md L275/L287 ("`<mode>
++ * global` 开头的寄存器为全局寄存器，即所有核芯功能扩展共享同一个寄存器")
++ * and L299/L311, L319/L331]. Storage is therefore cfx_mode_global_cfx_mask[4]
++ * (indexed by cg==mode only), NOT a [64][4] per-cfx array -- unlike
++ * DADAO_CFX_MASK_REG_ESCAPE's per-(cfxcode,mode) array above, which the wiki
++ * does NOT mark shared. */
++#define DADAO_CFX_MODE_GLOBAL_MASK_RC 1
++/* SEE §3 cg0-3/rc11 "<mode>_excp_cause_mask": per-cfx per-mode, reset all-1
++ * [wiki L285/L309/L329]. */
++#define DADAO_CFX_MODE_EXCP_CAUSE_MASK_RC 11
++/* SEE §3 cg5/rc63 "excp_cause_nonmaskable": RO, per-cfx, hardware-static per
++ * that cfx's own cause table [wiki L362]. */
++#define DADAO_CFX_NONMASKABLE_RC 63
++/* SEE §3 cg4/rc2-4 trap/excp_sync/excp_async counters, HW-incremented,
++ * per-cfx [wiki L345-347]. */
++#define DADAO_CFX_TRAP_NUM_RC 2
++#define DADAO_CFX_EXCP_SYNC_NUM_RC 3
++#define DADAO_CFX_EXCP_ASYNC_NUM_RC 4
++/* KL-131a TEST-ONLY synchronous dispatch trigger: cg=4/rc=60 is not a wiki
++ * register. M1's only real maskable synchronous cause is FPEXCP, which has
++ * no execution path in this project (RF excluded from M1, contracts/isa/
++ * spec.md §7), so there is no real instruction sequence that can reach SEE
++ * §5 steps 3-4's sync/ILLI-redirect branch. This write-side-effect-only
++ * register lets a test program directly invoke dadao_cfx_dispatch() with an
++ * arbitrary (target cfx, cause, is_sync=true) triple to exercise that shared
++ * gate logic path -- purely test infrastructure, never guest-visible ABI,
++ * analogous to DADAO_EXIT_PORT below. cfxcode field of the crrr instruction
++ * selects the target cfx; the written value is the cause id (one-hot). */
++#define DADAO_CFX_TEST_SYNC_DISPATCH_CG 4
++#define DADAO_CFX_TEST_SYNC_DISPATCH_RC 60
++/* Non-architectural cause_info marker stamped on synthetic sync-dispatch
++ * test entries so probes/logs can tell them apart from a real cause. */
++#define DADAO_CFX_TEST_CAUSE_INFO 0x5E1F7E5700000000ULL
++
+ typedef struct DADAOCfxTlbEntry {
+     bool valid;
+     bool superpage;
+@@ -197,6 +246,19 @@ struct CPUArchState {
+      * register. (No cfx_cfx2rc_cfx_mask storage -- design 2 is not
+      * implemented, see DADAO_CFX_MASK_REG_ESCAPE's comment above.) */
+     target_ulong cfx_escape_cfx_mask[64][4];
++    /* KL-131a: SEE §5 steps 2-6 arbitration storage. See the DADAO_CFX_*_RC
++     * constants above for the (cg,rc) addressing of each field. */
++    target_ulong cfx_mode_global_cfx_mask[4];   /* shared, cg0-3/rc1 */
++    target_ulong cfx_excp_cause_mask[64][4];    /* per-cfx/mode, cg0-3/rc11 */
++    target_ulong cfx_excp_cause_nonmaskable[64]; /* RO, cg5/rc63 */
++    target_ulong cfx_trap_num[64];              /* HW, cg4/rc2 */
++    target_ulong cfx_excp_sync_num[64];         /* HW, cg4/rc3 */
++    target_ulong cfx_excp_async_num[64];        /* HW, cg4/rc4 */
++    /* Scratch for a pending async cfx interrupt, passed
++     * dadao_cpu_exec_interrupt -> dadao_cpu_do_interrupt, mirroring
++     * trap_cfxcode/trap_func's helper->do_interrupt handoff pattern below. */
++    target_ulong cfx_async_pending_target;
++    target_ulong cfx_async_pending_cause;
+     /* Scratch for a pending trap (cfx) syscall, passed helper -> do_interrupt.
+        Must NOT reuse rb[1]/rb[2] — rb1 is the stack pointer (ADR-0004). */
+     target_ulong trap_cfxcode;
+@@ -224,6 +286,20 @@ struct ArchCPU {
+      * This is not a guest-visible source or interrupt implementation. */
+     uint8_t cfx_common_pending_test_code;
+     uint64_t cfx_common_pending_test_seed;
++    /* KL-131a TEST-ONLY: two independent synthetic *level-triggered* async
++     * sources (distinct from KL-120a's one-shot raw seed above). A nonzero
++     * seed re-ORs itself (filtered to that cfx's valid maskable causes) into
++     * cfx_common_pending at every instruction-boundary check for as long as
++     * the property stays nonzero -- i.e. for the whole guest run, since these
++     * are boot-time-fixed QOM properties, not something guest code can
++     * assert/deassert mid-run. This models wiki L656's electrics ("若一个
++     * 电平源仍然有效，硬件在下一指令边界检查前重新 OR 该位") and gives two
++     * simultaneous independent cfx sources for priority-ordering probes.
++     * Not a guest-visible source or interrupt implementation. */
++    uint8_t cfx_async_test_level_a_code;
++    uint64_t cfx_async_test_level_a_seed;
++    uint8_t cfx_async_test_level_b_code;
++    uint64_t cfx_async_test_level_b_seed;
+ };
+ 
+ struct DADAOCPUClass {
+@@ -245,6 +321,25 @@ bool dadao_ptw_translate(CPUState *cs, vaddr address,
+                          uint64_t *leaf_pte, hwaddr *leaf_pte_addr);
+ void dadao_cfx_tlb_invalidate_all(CPUDADAOState *env);
+ void dadao_cfx_tlb_invalidate_range(CPUDADAOState *env);
++/* KL-131a shared SEE §5 steps 2-6 arbitration, gating the KL-122a steps 7-10
++ * carrier. See cpu.c for the full contract comment. */
++/* Returns true if entry actually happened (PC redirected to a vector),
++ * false if the cause was blocked and only OR'd into pending (PC untouched).
++ * Callers that reach this from mid-TB helper code (as opposed to the
++ * do_interrupt() exception path, which always overwrites exception_index
++ * before returning regardless) MUST check this return value before
++ * cpu_loop_exit(): env->pc is only advanced by the entry path (via
++ * dadao_cfx_precise_trap_enter's vector jump) or by the caller's own
++ * pre-call cpu_restore_state(); on a blocked/no-entry return, PC still
++ * points at the triggering instruction itself, so an unconditional
++ * cpu_loop_exit() would re-fetch and re-execute that same instruction
++ * forever. */
++bool dadao_cfx_dispatch(DADAOCPU *cpu, uint64_t target_cfx, uint64_t cause,
++                        uint64_t cause_info, target_ulong cause_ip,
++                        bool is_sync);
++bool dadao_cfx_async_active(CPUDADAOState *env);
++bool dadao_cfx_async_step(CPUState *cs);
++uint64_t dadao_cfx_common_pending_mask(uint64_t cfxcode);
+ G_NORETURN void dadao_raise_exception(CPUDADAOState *env,
+                                       uint32_t exception,
+                                       uintptr_t pc);
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index b44d092..9e52b32 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -141,7 +141,7 @@ void helper_trap(CPUDADAOState *env, uint64_t cfxcode, uint64_t func,
+  * invent. See
+  * `docs/reviews/kernel-hypv-supv-o2-permission-recon-20260725.md` §4
+  * design 2 for the original (untested-against-O1) proposal. */
+-static uint64_t dadao_cfx_common_pending_mask(uint64_t cfxcode)
++uint64_t dadao_cfx_common_pending_mask(uint64_t cfxcode)
+ {
+     switch (cfxcode & 0x3F) {
+     case 0: /* umon */
+@@ -302,6 +302,48 @@ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         return;
+     }
+ 
++    if (cg <= 3 && rc == DADAO_CFX_MODE_GLOBAL_MASK_RC) {
++        /* KL-131a: cfx_<cfxname>_<mode>_global_cfx_mask is a SHARED
++         * register -- one per mode, not one per cfxcode [wiki L275/L287,
++         * L299/L311, L319/L331]. The cfxcode operand therefore does not
++         * select storage here (unlike every other per-(cfxcode,mode)
++         * register in this file); any cfxcode writes the same
++         * cfx_mode_global_cfx_mask[cg] slot. */
++        env->cfx_mode_global_cfx_mask[cg] = value;
++        return;
++    }
++
++    if (cg <= 3 && rc == DADAO_CFX_MODE_EXCP_CAUSE_MASK_RC) {
++        /* KL-131a: cfx_<cfxname>_<mode>_excp_cause_mask, per-(cfxcode,mode)
++         * [wiki L285/L309/L329]. */
++        env->cfx_excp_cause_mask[cfxcode][cg] = value;
++        return;
++    }
++
++    if (cg == DADAO_CFX_TEST_SYNC_DISPATCH_CG &&
++        rc == DADAO_CFX_TEST_SYNC_DISPATCH_RC) {
++        /* KL-131a TEST-ONLY: see cpu.h's DADAO_CFX_TEST_SYNC_DISPATCH_RC
++         * comment. Not real hardware; never reached by any non-test guest
++         * code. Unlike the always-nonmaskable real call sites in cpu.c, this
++         * trigger can genuinely take the blocked/no-entry path (that's the
++         * whole point -- exercising SEE §5 steps 3-5's mask-blocked branch,
++         * which no real M1 cause can reach). Only cpu_loop_exit() when entry
++         * actually happened (PC redirected to a vector); otherwise fall
++         * through and return normally so this instruction's own end-of-TB
++         * handling advances PC past it exactly like any other cfx2rc write
++         * -- an unconditional cpu_loop_exit() here would re-fetch and
++         * re-execute this same instruction forever on every blocked
++         * attempt, since a blocked dadao_cfx_dispatch() never touches
++         * env->pc. */
++        CPUState *cs = env_cpu(env);
++        cpu_restore_state(cs, GETPC());
++        if (dadao_cfx_dispatch(DADAO_CPU(cs), cfxcode, value,
++                               DADAO_CFX_TEST_CAUSE_INFO, env->pc, true)) {
++            cpu_loop_exit(cs);
++        }
++        return;
++    }
++
+     if (cfxcode == DADAO_CFX_CODE_POWER && cg == 8 && rc > 1) {
+         /* KL-112a design 3 (candidate C): cfx_power's cg=8 private register
+          * group defines exactly two registers -- rc=0 (power_pending) and
+@@ -391,6 +433,16 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         }
+         /* cg12/rc0 is write-only and reads as zero in this model. */
+     }
++    if (cg == DADAO_CFX_COMMON_PENDING_CG) {
++        /* KL-131a cg4 counters, HW-incremented by dadao_cfx_dispatch()
++         * (cpu.c). [wiki L345-347] */
++        switch (rc) {
++        case DADAO_CFX_TRAP_NUM_RC: return env->cfx_trap_num[cfxcode];
++        case DADAO_CFX_EXCP_SYNC_NUM_RC: return env->cfx_excp_sync_num[cfxcode];
++        case DADAO_CFX_EXCP_ASYNC_NUM_RC: return env->cfx_excp_async_num[cfxcode];
++        default: break;
++        }
++    }
+     if (cg == 5) {
+         switch (rc) {
+         case 0: return env->cfx_frame[cfxcode].prev_run_mode;
+@@ -399,6 +451,9 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         case 3: return env->cfx_frame[cfxcode].cause_ip;
+         case 4: return env->cfx_frame[cfxcode].cause_info;
+         case 5: return env->cfx_frame[cfxcode].prev_cfx_code;
++        case DADAO_CFX_NONMASKABLE_RC:
++            /* KL-131a: cg5/rc63, RO. [wiki L362] */
++            return env->cfx_excp_cause_nonmaskable[cfxcode];
+         default: return 0;
+         }
+     }
+@@ -408,6 +463,14 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+     if (cg <= 3 && rc == DADAO_CFX_MASK_REG_ESCAPE) {
+         return env->cfx_escape_cfx_mask[cfxcode][cg];
+     }
++    if (cg <= 3 && rc == DADAO_CFX_MODE_GLOBAL_MASK_RC) {
++        /* KL-131a: shared register, cfxcode operand does not select storage
++         * (see the write-side comment in helper_cfx2rc). */
++        return env->cfx_mode_global_cfx_mask[cg];
++    }
++    if (cg <= 3 && rc == DADAO_CFX_MODE_EXCP_CAUSE_MASK_RC) {
++        return env->cfx_excp_cause_mask[cfxcode][cg];
++    }
+     /* KL-120a deliberately keeps unsupported/reserved reads inert. */
+     return 0;
+ }
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index dbfead5..c70221d 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -1513,6 +1513,17 @@ void dadao_translate_code(CPUState *cs, TranslationBlock *tb,
+     if (cpu_env(cs)->cfx_ptw_ptbr_enable) {
+         *max_insns = MIN(*max_insns, 1);
+     }
++    /* KL-131a: force single-instruction TBs whenever a synthetic async test
++     * source is configured, so cpu_exec_interrupt() below is checked at
++     * every real instruction boundary (not just every several-instruction
++     * TB) -- required for the wiki's "trigger at the next instruction
++     * boundary, not immediately" precise-async semantics. Scoped to only
++     * fire when this task's test-only sources are active (see
++     * dadao_cfx_async_active()), so every pre-existing scenario keeps its
++     * prior TB batching/performance untouched. */
++    if (dadao_cfx_async_active(cpu_env(cs))) {
++        *max_insns = MIN(*max_insns, 1);
++    }
+     translator_loop(cs, tb, max_insns, pc, host_pc, &dadao_tr_ops, &ctx.base);
+ }
+ 
+@@ -1529,9 +1540,21 @@ static void dadao_restore_state_to_opc(CPUState *cs,
+     cpu->env.pc = data[0];
+ }
+ 
++/* KL-131a: the QEMU-core-invoked TB-boundary interrupt hook (called by
++ * accel/tcg/cpu-exec.c's cpu_handle_interrupt() whenever cs->interrupt_
++ * request is nonzero, the same generic mechanism every other QEMU target's
++ * cpu_exec_interrupt uses -- e.g. target/hppa/int_helper.c's
++ * hppa_cpu_exec_interrupt(): check pending+mask, and if runnable set
++ * cs->exception_index and call the target's do_interrupt(), returning true).
++ * dadao_cfx_async_step() (cpu.c) owns the actual SEE §5 steps 2-6 scan and
++ * priority selection; this hook only asks it whether there is anything to
++ * deliver right now. */
+ static bool dadao_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+ {
+-    return false;
++    if (!(interrupt_request & CPU_INTERRUPT_HARD)) {
++        return false;
++    }
++    return dadao_cfx_async_step(cs);
+ }
+ 
+ const TCGCPUOps dadao_tcg_ops = {
+-- 
+2.43.0
+

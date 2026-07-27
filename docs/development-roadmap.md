@@ -1975,3 +1975,14 @@ real lookup causes are claimed here.
 **Next**: KL-131a connects the maskable asynchronous dispatch core. Firmware,
 full SBI/HBI, Linux paging policy, multicore shootdown, and kernel boot are
 not claimed by KL-129a.
+
+## K1: maskable asynchronous dispatch core (2026-07-27) — see `code-agent/tasks/KL-131a-*.md`
+
+SEE §5 steps 2-6 (mask arbitration + counters) as a shared gate in front of
+the KL-122a carrier, plus the project's first real instruction-boundary
+async interrupt dispatch, QEMU+gem5. Architect review independently
+verified against wiki, zero regression. See task file 完成区 for detail.
+
+**Next**: real timer/UART interrupt sources (KL-133a/137a), hypv→supv
+`switch_run_mode`/`switch_cfx_mask` write support, and complete interrupt
+dispatch (SBI-level handler conventions) remain open before kernel boot.
