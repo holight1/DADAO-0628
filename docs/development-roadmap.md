@@ -2073,3 +2073,50 @@ This closes the K1 integration gate, not kernel bring-up.  Linux paging,
 vector-page recovery, real UART/PLIC devices, TLB performance/timing,
 disable→enable TLB entry lifetime, timer1-7/increment mode, Minor/O3/SE
 asynchronous behavior, and multi-hart routing remain explicit non-claims.
+
+## K2: bare-metal kernel-mode regression contract + structured oracle frozen (KL-140a, 2026-07-28)
+
+Frozen in `docs/reviews/k2-baremetal-regression-contract-20260728.md`: the
+three context-ownership classes (cooperative task context, preemptive trap
+context, address-space context) with one-time complete frame layouts
+(1080-byte cooperative frame including full ra0-ra63 via the
+ldmo-ra/stmo-ra contract; 1584-byte per-level trap frame covering every
+software-writable RD/RB plus RegRAS, saved by a frozen rb1-relative
+downward stack-window prologue, with the hardware cg5 frame owning
+mode/mask/cause/PC); the versioned, strictly-bounded 5704-byte guest report
+schema (magic/version/scenario/image-identity header, 11-word checkpoints
+with seq/event/task/mode/cfx/cause/saved+resume PC/digests/ptbr-asid/
+tlb-gen, FNV-1a-64 word digest, paired COOP_SAVE/COOP_RESTORE switch
+records); and the formal K2 privileged oracle
+protocol — byte-identical dual-backend images with recorded hashes, guest
+fail-closed self-judgment, an independent host oracle, per-backend
+oracle comparison before normalized cross-backend comparison, and at least
+one deliberate negative mutation per scenario class.  The reusable host
+module `tests/scripts/k2_report.py` implements the schema, codec, and
+PASS/FAIL/SKIP/HARNESS-ERROR comparisons; its self-test runner
+`tests/scripts/run_kl140a_k2_report_selftest.py` passes 70 checks x 10
+stable rounds, including structural HARNESS-ERROR cases, dual-backend
+agree-but-oracle-violating FAIL cases, and per-field mutation sensitivity.
+
+Architect second review hardened the freeze before release: guest
+final_status=PASS plus mismatch_count=0 is now a hard PASS condition with
+no oracle exemption knob (a guest FAIL can never be upgraded); SKIP exists
+only at the run scheduling layer (a pre-declared backend does not run and
+produces no report, never masking the other side, and any skipped required
+backend keeps the dual-backend gate at SKIP); and image_identity is
+the canonical SHA-256 computed with the ROM identity slot and RAM report
+area zeroed, so it can really be embedded into the image the guest runs.
+
+K2 remains single-hart, supervisor-kernel-task only: user↔supervisor
+switch, RF, Atomics/SMP, multi-hart, real UART/PLIC device protocols,
+Linux clocksource/clockevent/irqchip APIs, TLB performance/timing, gem5
+Minor/O3 behavior, and Linux paging/page-fault policy stay non-claims;
+K1 timer and the K1_EXT0 synthetic source may verify kernel software
+policy without becoming device-driver evidence.  The existing three/four-way
+`tools/run_differential.py` remains an ordinary-ISA zero-regression gate,
+not a K2 privileged oracle.  KL-139a dual-backend 3/3, E2E 81/81, the
+200-case differential, and manifest/issues/wiki checks all stay green; no
+component source changed.
+
+**Next**: KL-141a implements and verifies cooperative context switch
+against the frozen frame layout, report schema, and oracle protocol.
