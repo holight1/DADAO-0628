@@ -33,3 +33,4 @@
 0032-target-dadao-implement-maskable-async-dispatch-c.patch
 0033-target-dadao-introduce-cfx-timer-scaffolding-KL-133a.patch
 0034-target-dadao-finalize-cfx-timer-retirement-semantics.patch
+0035-target-dadao-align-TLB-range-invalidation-start-KL-1.patch

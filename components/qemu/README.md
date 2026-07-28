@@ -18,5 +18,9 @@ instruction boundary. While private timer pending remains asserted, every
 boundary re-latches the common TIMER cause independent of enable and masks.
 Patch 0034 records the main-acceptance and independent-review repairs,
 including exact retirement of successful terminal syscalls.
+KL-129b follow-up patch 0035 corrects range invalidation to use only
+`addr_start[41:16]` as its 64-KiB-aligned in-set start; zero size remains a
+no-op and oversized ranges are overflow-safely clamped to the selected
+4-TiB set.
 The remaining privileged cfx surface, complete SBI/HBI, and Linux user-mode
 remain deferred.

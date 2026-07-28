@@ -1,0 +1,27 @@
+From 46c11a492a4c34122209cf1a0e2d079d77f36aa6 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 28 Jul 2026 17:18:52 +0800
+Subject: [PATCH] target/dadao: align TLB range invalidation start (KL-129b)
+
+---
+ target/dadao/cpu.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index db33212..a685d39 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -1064,7 +1064,9 @@ void dadao_cfx_tlb_invalidate_range(CPUDADAOState *env)
+     uint64_t start = env->cfx_tlb_addr_start &
+                      UINT64_C(0x0000ffffffffffff);
+     unsigned int set = (start >> 42) & 0x3f;
+-    uint64_t set_start = start & ((UINT64_C(1) << 42) - 1);
++    /* The range start is architectural bits [41:16], in 64-KiB units. */
++    uint64_t set_start =
++        start & (((UINT64_C(1) << 42) - 1) & ~UINT64_C(0xffff));
+     uint64_t set_limit = UINT64_C(1) << 42;
+     uint64_t end;
+ 
+-- 
+2.43.0
+

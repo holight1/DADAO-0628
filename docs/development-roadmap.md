@@ -2008,3 +2008,26 @@ traps also retire exactly once before host termination.
 
 **Next**: synthetic external interrupt source K1_EXT0 (KL-137a); counters1-7 and increment
 mode remain a K1 non-claim.
+
+## K1: TLB range-invalidate review fixes (KL-129b, 2026-07-28)
+
+The KL-129a independent-review follow-up corrected a shared QEMU/gem5 error:
+range invalidation now selects the set from `addr_start[47:42]` but derives
+the in-set start only from `addr_start[41:16] << 16`, ignoring the low 16
+bits as required by the frozen contract. A zero size is still a no-op, and
+the overflow-safe end calculation clamps oversized ranges to the selected
+4-TiB set.
+
+Four new guest-decided dual-backend probes distinguish the fix: the nonzero
+low-16 counterexample invalidates page13 but preserves page14; size0 preserves
+both cached entries; an all-ones size at the last page of set6 invalidates
+that page without touching a cached set7 entry; and a permission/fragment
+fault hit updates true-LRU state before the 17th fill. All four pass on both
+backends, while KL-129a remains 13/13 and the complete K1, 81/81 E2E, and
+200-case differential baselines remain green.
+
+`cfx_tlb_enable` is frozen as a lookup gate, but the source material does not
+specify cached-entry lifetime across disable→enable. KL-129b therefore does
+not turn either backend's current preservation behavior into an architectural
+claim. QEMU 35/35 and gem5 28/28 plain-`git am` replays from manifest pins
+match their development trees.

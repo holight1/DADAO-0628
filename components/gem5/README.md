@@ -49,6 +49,7 @@ an instruction" live in the applied tree at `docs/gem5-arch-notes.md`.
 | 0025 | Architectural TLB | 64×16 true LRU, invalidate, 7 hit causes, PTW delegation | SE baseline unchanged |
 | 0026 | Maskable async dispatch core | SEE §5 steps 2-6 gate + real instruction-boundary async delivery (FullSystem) | SE baseline unchanged |
 | 0027 | cfx_hart_cycle_lo + cfx_timer counter0 | successful-retirement counter, fault exclusion, decrement/one-shot/periodic state machine, private-to-common relatch and timer-mask gate (FullSystem/AtomicSimpleCPU) | SE baseline unchanged |
+| 0028 | TLB range-invalidate review fix | ignore `addr_start[15:0]`, preserve size0 no-op, clamp oversized range to selected 4-TiB set | SE baseline unchanged |
 
 Current result: interp/QEMU/gem5 AGREE(3-way)=200, gem5-SKIP=2,
 DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix, KL-126a's eight
@@ -56,7 +57,10 @@ PTW success probes, KL-127a's 30 fault/10 A-D probes, KL-129a's 13
 dual-backend TLB/delegation probes, KL-131a's dual-backend sync-mask +
 async-priority/electrics probes, and KL-133a's dual-backend cycle_lo/
 retire-fault/one-shot/periodic/mask/private-relatch probes (10 stable loops)
-are also green.
+are also green. KL-129b adds four guest-decided dual-backend probes for the
+unaligned-start counterexample, zero size, set-end clamp, and fault-hit LRU
+touch. Disable→enable cache preservation remains a non-claim because the
+frozen contract defines lookup gating but not entry lifetime across toggles.
 
 ## Build & run (after `make fetch` + `apply_series`)
 

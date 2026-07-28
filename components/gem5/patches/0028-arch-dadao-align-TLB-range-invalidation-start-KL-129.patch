@@ -1,0 +1,27 @@
+From 04e1d85f7766de1068eb606e553bc14effa33b70 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 28 Jul 2026 17:18:52 +0800
+Subject: [PATCH] arch/dadao: align TLB range invalidation start (KL-129b)
+
+---
+ src/arch/dadao/isa.cc | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index 656c798f58..f6aca1d9ca 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -290,7 +290,9 @@ ISA::cfxTlbInvalidateRange()
+ {
+     const uint64_t start = cfxTlbAddrStart & 0x0000FFFFFFFFFFFFULL;
+     const unsigned set = (start >> 42) & 0x3F;
+-    const uint64_t setStart = start & ((1ULL << 42) - 1);
++    // The range start is architectural bits [41:16], in 64-KiB units.
++    const uint64_t setStart =
++        start & (((1ULL << 42) - 1) & ~0xFFFFULL);
+     constexpr uint64_t SetLimit = 1ULL << 42;
+ 
+     if (cfxTlbAddrSize == 0)
+-- 
+2.43.0
+
