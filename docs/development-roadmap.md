@@ -2052,3 +2052,24 @@ three/four-way differential remain green.
 This milestone does not implement or claim a UART, PLIC, cg32-63 UART device
 registers, a real board interrupt wire, Minor/O3 behavior, Linux interrupt
 drivers, or multi-hart routing.
+
+## K1→K2 single-image integration gate (KL-139a, 2026-07-28)
+
+K1's MMU and asynchronous chains now converge in one shared bare-metal
+ROM/RAM image on QEMU and gem5 FullSystem.  Without restarting or resetting
+architectural state, the guest verifies set6 PTW/TLB enable with set0 ROM
+vectors resident, normal and super translations, a walk-origin fault with
+self-handler repair/retry, TLB miss/fill/hit plus the KL-129b low16 range
+invalidate, and a real cfx_tlb→cfx_ptw→cfx_tlb E1 return.
+
+The same run then observes timer expiry while masked and a latched,
+already-deasserted K1_EXT0.  One shared unmask produces three distinct saved
+PCs proving cfx_timer(18) before cfx_uart(62), and UART0 before UART5.  Both
+backends pass the complete image 10/10; all prior K1 probes, E2E 81/81, and
+the 200-case three/four-way differential remain green.  No component change
+was needed; QEMU 36/36 and gem5 29/29 bare-pin replay trees still match.
+
+This closes the K1 integration gate, not kernel bring-up.  Linux paging,
+vector-page recovery, real UART/PLIC devices, TLB performance/timing,
+disable→enable TLB entry lifetime, timer1-7/increment mode, Minor/O3/SE
+asynchronous behavior, and multi-hart routing remain explicit non-claims.
