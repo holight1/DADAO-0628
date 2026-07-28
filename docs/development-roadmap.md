@@ -2153,3 +2153,45 @@ non-claims.
 
 **Next**: KL-142a adds the preemptive trap-context scenario without weakening
 the KL-140a ownership split or KL-141a cooperative baseline.
+
+## K2: dual-backend preemptive trap full-context (KL-142a, 2026-07-29)
+
+Implemented the frozen 198-word/0x630-byte preemptive trap frame as a real
+supervisor timer-interrupt path in one byte-identical ROM/RAM image on QEMU
+and gem5 FullSystem. A task is interrupted at the deepest point of a
+three-call RegRAS chain after all rd1-rd63 and rb1-rb63 have unique live
+values. The timer entry saves RD/RB without scratch, saves all ra0-ra63,
+copies the hardware cg5 diagnostics, moves rb1 only after the complete save,
+then runs a call/ret helper which deliberately clobbers general registers.
+The inverse epilogue restores RA, RD, rb2-rb63, rb1 last and immediately
+escapes; the task snapshots the returned state before using scratch and
+returns through its original call chain.
+
+The timer handler also exercises cross-CFX E1 after the outer frame is fully
+owned: it traps into cfx_ptw, which pushes a second disjoint frame at the new
+SP, records `owner_cfx=ptw`, `nest_level=1` and
+`prev_cfx_code=timer`, restores/escapes the inner frame, then restores/escapes
+the timer frame. Six guest-authored checkpoints (INIT, outer ENTER, inner
+ENTER/RETURN, outer RETURN, FINAL) bind both complete frame digests and the
+LIFO order to the independent KL-140a oracle.
+
+The level-triggered timer exposed a contract clarification: because private
+pending re-latches common pending, the first entry instruction must mask the
+self cause before the first store or the single per-CFX cg5 frame can be
+overwritten immediately. The allowed step is narrowly frozen as one
+non-register-clobbering `cfx2rc` using a preloaded live RD; all RD/RB/RA are
+then saved unchanged by the original sequence. A separate label-materializer
+fix also makes delayed nonzero labels select SETZW/ORW exactly like
+`load_reg`, rather than truncating `0x101028` to `0x1028`.
+
+Positive evidence is QEMU/gem5 10/10 with guest, independent oracle and
+cross-backend PASS. Separate rd17, rb41 and ra0 post-save mutations each make
+both guests fail with nonzero mismatch; restoring the positive image passes.
+KL-140a remains 70/70 x10, KL-141a remains PASS including its negative,
+KL-139a remains 3/3, E2E is 81/81, and the ordinary ISA differential remains
+200 three/four-way agreements with zero divergence. Same-CFX recursion,
+PTBR/TLB task switching, user mode, RF, SMP/multi-hart, real devices, Linux
+trap ABI, Minor/O3 and performance remain non-claims.
+
+**Next**: KL-143a binds PTBR/address-space state to tasks and proves the
+frozen explicit TLB-invalidate switch protocol on both FullSystem backends.

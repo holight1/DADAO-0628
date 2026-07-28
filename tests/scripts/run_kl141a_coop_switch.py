@@ -328,9 +328,15 @@ def write_load_patch(rom, pos, bank, reg, value):
         wyde = n_wydes - 1 - index
         chunk = (value >> (wyde * 16)) & 0xFFFF
         word = struct.unpack(">I", rom[pos + index * 4:pos + index * 4 + 4])[0]
-        op = (word >> 24) & 0xFF
-        if op not in (op_setzw, op_orw):
-            raise ValueError(f"load patch hit non-rwii op {op:#x}")
+        old_op = (word >> 24) & 0xFF
+        if old_op not in (op_setzw, op_orw):
+            raise ValueError(f"load patch hit non-rwii op {old_op:#x}")
+        # The placeholder is zero, for which load_reg emits SETZW in every
+        # slot.  A non-zero resolved label needs the same SETZW/ORW choice
+        # load_reg would have made; retaining the placeholder opcode would
+        # repeatedly clear higher wydes (e.g. 0x101028 became 0x1028).
+        op = (op_setzw if index == 0 or
+              (value >> ((wyde + 1) * 16)) == 0 else op_orw)
         struct.pack_into(
             ">I", rom, pos + index * 4,
             (op << 24) | (reg << 18) | ((wyde & 3) << 16) |

@@ -102,6 +102,13 @@ live 寄存器），而是落在**进入时刻当前栈的向下保存窗口**
 `[old_sp-0x630, old_sp)`。prologue 严格按以下顺序执行，全程不需要任何
 尚未保存的 scratch：
 
+0. 对 timer 这类 private level/pending 会在 common pending 清除前重新
+   latch 的异步源，entry 的第一条指令允许用**预先装入且本来就属于 live
+   context 的 RD 值**执行一次 `cfx2rc`，只把本 cfx 的
+   `excp_cause_mask` 设为全屏蔽。该指令不得写 RD/RB/RA、不得访存、不得
+   进入 handler body；被读取的 RD 仍由下一步原值保存。这是防止同 cfx
+   在第一条 `sto` 前覆盖唯一 cg5 frame 的 entry exclusion，不是可任意
+   插入 scratch 操作的豁免。非 level/re-latch 源不得借此扩大 prologue。
 1. 以 `rb1` 为基址、signed-12 **字节**偏移 `sto`（`contracts/isa/spec.md`
    §3.2/§4.1，EA=`rb1+sext_12(imm)`，覆盖 ±2048 字节，0x630=1584 在
    范围内）把 rd1～rd63 存入窗口；`rb1` 全程不变。
