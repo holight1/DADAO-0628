@@ -2120,3 +2120,36 @@ component source changed.
 
 **Next**: KL-141a implements and verifies cooperative context switch
 against the frozen frame layout, report schema, and oracle protocol.
+
+## K2: dual-backend cooperative context switch (KL-141a, 2026-07-29)
+
+Implemented the first K2 supervisor-kernel-task scenario as one byte-identical
+ROM/RAM image on QEMU and gem5 FullSystem. Two guarded tasks use independent
+stacks and frozen 1080-byte frames, preserving rb1-rb4, rd32-rd63,
+rb32-rb63, and all ra0-ra63 across 25 real alternating transitions. Different
+real call chains suspend at their deepest points and resume through actual
+`ret`; task A also produces a genuine RegRAS refcount-2 recursive slot.
+
+Each run emits 52 guest-authored checkpoints (INIT, 25 paired
+COOP_SAVE/COOP_RESTORE records, FINAL). After guest architectural halt,
+QEMU QMP and a minimal gem5 terminal-checkpoint transport retrieve the raw
+guest RAM report; exact run-image identity binding, guest fail-closed
+self-checks, an independently generated host oracle, and cross-backend
+comparison all pass 10/10. A separate image corrupting rd40 after transition
+7's real save fails on both backends, and restoring the positive image passes
+again.
+
+The scenario exposed and fixed a genuine stale gem5 divergence:
+`rb2rd`/`rb2rb` truncated RB source high bits despite ISA §4.7 requiring a
+full 64-bit copy. gem5 patch 0030 preserves those bits; the 30-patch series
+replays from the manifest pin to the same development tree. KL-140a remains
+70/70 x10, KL-139a remains 3/3, E2E is 81/81, and the ordinary ISA
+three/four-way differential remains 200 agreements with zero divergence.
+
+This is a hand-written single-hart cooperative switch oracle, not Linux
+`__switch_to`. Async preemption/trap frames, PTBR/TLB address-space switching,
+user mode, RF, SMP/multi-hart, real devices, Minor/O3, and performance remain
+non-claims.
+
+**Next**: KL-142a adds the preemptive trap-context scenario without weakening
+the KL-140a ownership split or KL-141a cooperative baseline.

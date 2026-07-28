@@ -55,6 +55,7 @@ an instruction" live in the applied tree at `docs/gem5-arch-notes.md`.
 | 0027 | cfx_hart_cycle_lo + cfx_timer counter0 | successful-retirement counter, fault exclusion, decrement/one-shot/periodic state machine, private-to-common relatch and timer-mask gate (FullSystem/AtomicSimpleCPU) | SE baseline unchanged |
 | 0028 | TLB range-invalidate review fix | ignore `addr_start[15:0]`, preserve size0 no-op, clamp oversized range to selected 4-TiB set | SE baseline unchanged |
 | 0029 | Synthetic external source K1_EXT0 | scheduled test-only level, cfx_uart private pending/exist, UART0 relatch through shared async dispatch | SE baseline unchanged |
+| 0030 | RB block-copy high bits | preserve all 64 bits in `rb2rd`/`rb2rb`, as required by ISA §4.7 | 200 |
 
 Current result: interp/QEMU/gem5 AGREE(3-way)=200, gem5-SKIP=2,
 DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix, KL-126a's eight
@@ -69,7 +70,9 @@ frozen contract defines lookup gating but not entry lifetime across toggles.
 KL-137a adds two guest-decided dual-backend scenarios: a 10-loop-stable
 assert/mask/relatch/delivery/deassert/ack lifecycle and TIMER-vs-K1_EXT0
 cross-CFX priority. No UART/PLIC protocol or cg32-63 device registers are
-claimed.
+claimed. KL-141a additionally closes a stale gem5-only 48-bit truncation in
+RB-source block copies that contradicted ISA §4.7; the cooperative-switch
+probe keeps non-zero RB high bits live across 25 context transitions.
 
 ## Build & run (after `make fetch` + `apply_series`)
 

@@ -1,0 +1,44 @@
+From eede9a05d03edbe8c51ea408aaf1deac27c5ff72 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 05:42:31 +0800
+Subject: [PATCH] arch/dadao: preserve RB high bits in block copies
+
+---
+ src/arch/dadao/decoder.cc | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 282d74b9dd..f89f166fad 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -158,14 +158,13 @@ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{r
+ 
+ // Register-bank block copy rd2rd/rd2rb/rb2rd/rb2rb (orri, spec §3.14/§4.7).
+ // hb=dest first reg, hc=src first reg, hd=immu6. Copy immu6 consecutive regs.
+-// Asymmetry (memory feedback): reading an RB *source* yields low 48 bits (RB is
+-// a 48-bit effective register); reading an RD source yields full 64; the copied
+-// value is written full-width to the destination. So rd2rb stores 64 bits while
+-// rb2rd/rb2rb read 48 (dest high 16 = 0). Legality (spec §2.6.3/§3.14/§4.7):
++// All four operations copy the full 64-bit register value.  RB high bits are
++// ignored only by address calculations; §4.7 explicitly preserves them in
++// register-bank moves.  Legality (spec §2.6.3/§3.14/§4.7):
+ // immu6=0 / dest reg0 / dest+immu6>64 / src+immu6>64 → ILLI.
+-class BlockCopyInst : public StaticInst { RegId srcRegs[63], dstRegs[63]; int count; bool srcRb; bool illegal; public:
++class BlockCopyInst : public StaticInst { RegId srcRegs[63], dstRegs[63]; int count; bool illegal; public:
+ BlockCopyInst(uint8_t hb, uint8_t hc, uint8_t immu6, bool destRb, bool sRb)
+-  : StaticInst("blockcopy", enums::No_OpClass), count(immu6), srcRb(sRb),
++  : StaticInst("blockcopy", enums::No_OpClass), count(immu6),
+     illegal(hb==0 || immu6==0 || hb+immu6>64 || hc+immu6>64) {
+   setRegIdxArrays(reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::srcRegs), reinterpret_cast<RegIdArrayPtr>(&std::remove_pointer_t<decltype(this)>::dstRegs));
+   RegIndex sBase = sRb ? RB_BASE : RD_BASE, dBase = destRb ? RB_BASE : RD_BASE;
+@@ -175,7 +174,6 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+   if (illegal) RET_ILLI;
+   for (int i = 0; i < _numDestRegs; i++) {           // increasing i, read-then-write (§3.14)
+     uint64_t v = xc->getRegOperand(this, i);
+-    if (srcRb) v &= MASK48;                           // RB source: 48-bit (§4.7 asymmetry)
+     xc->setRegOperand(this, i, v); }
+   return NoFault; }
+ std::string generateDisassembly(Addr,const loader::SymbolTable*)const override{return"blockcopy";} void advancePC(PCStateBase&p)const override{p.uReset();p.advance();}};
+-- 
+2.43.0
+
