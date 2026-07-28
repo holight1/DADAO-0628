@@ -1,0 +1,265 @@
+From c82f1b35fc3aa776520b6fcc1789664935421d89 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 28 Jul 2026 18:01:52 +0800
+Subject: [PATCH 29/29] arch/dadao: implement synthetic K1_EXT0 source
+ (KL-137a)
+
+Add the cfx_uart source0 private pending/exist pair and route the test-machine-only K1_EXT0 level through UART0 common pending and the existing asynchronous dispatcher. Use default-off retired-instruction schedule Params in the FullSystem harness so assert/deassert, relatch, acknowledgement, and cross-CFX priority can be tested without a guest-visible device ABI.
+---
+ src/arch/dadao/DADAOISA.py |  9 +++++++++
+ src/arch/dadao/decoder.cc  | 19 +++++++++++++++++++
+ src/arch/dadao/isa.cc      | 34 ++++++++++++++++++++++++++--------
+ src/arch/dadao/isa.hh      | 23 +++++++++++++++++++----
+ tests/dadao/dadao_fs.py    | 12 ++++++++++++
+ 5 files changed, 85 insertions(+), 12 deletions(-)
+
+diff --git a/src/arch/dadao/DADAOISA.py b/src/arch/dadao/DADAOISA.py
+index 66550180f5..6687f7c129 100644
+--- a/src/arch/dadao/DADAOISA.py
++++ b/src/arch/dadao/DADAOISA.py
+@@ -23,3 +23,12 @@ class DADAOISA(BaseISA):
+         0, "Test-only synthetic level source B target cfxcode")
+     cfx_async_test_level_b_seed = Param.UInt64(
+         0, "Test-only synthetic level source B cause mask; zero is disabled")
++    # KL-137a TEST-ONLY K1_EXT0 level schedule. These parameters are backend
++    # test infrastructure and do not create a guest-visible control ABI.
++    k1_ext0_test_enable = Param.Bool(
++        False, "Enable the test-only K1_EXT0 retirement schedule")
++    k1_ext0_assert_retired = Param.UInt64(
++        0, "Assert K1_EXT0 at this retired-instruction boundary")
++    k1_ext0_deassert_retired = Param.UInt64(
++        (1 << 64) - 1,
++        "Deassert K1_EXT0 at this retired-instruction boundary")
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 796843f03c..282d74b9dd 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -1025,6 +1025,19 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+       break; // rc9-15 (counters1-7): K1 non-claim, silent no-op.
+     }
+   }
++  if (cfxcode_ == CfxCodeUart && cg_ == CfxUartCg) {
++    switch (rc_) {
++    case CfxUartPendingRc:
++      // W0C, only K1_EXT0/source0 is implemented.
++      isa->cfxUartPending &= value & 0x1ULL;
++      return NoFault;
++    case CfxUartExistRc:
++      // RO constant; writes are silent no-ops.
++      return NoFault;
++    default:
++      break; // No cg32-63 UART device-register protocol in K1.
++    }
++  }
+   // SEE §3 cg2/rc10: per-cfx supervisor exception-vector address.
+   if (cg_ == 2 && rc_ == 10) {
+     isa->cfxSupvExcpVector[cfxcode_] = value & MASK48;
+@@ -1149,6 +1162,12 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     case CfxTimerReg0Rc: value = isa->cfxTimerReg0; break;
+     default: break; // rc9-15: K1 non-claim, reads zero.
+     }
++  } else if (cfxcode_ == CfxCodeUart && cg_ == CfxUartCg) {
++    switch (rc_) {
++    case CfxUartPendingRc: value = isa->cfxUartPending & 0x1ULL; break;
++    case CfxUartExistRc: value = 1; break;
++    default: break;
++    }
+   } else if (cg_ == 2 && rc_ == 10) {
+     value = isa->cfxSupvExcpVector[cfxcode_];
+   } else if (cg_ <= 3 && rc_ == CfxMaskRegEscape) {
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index f6aca1d9ca..a26329ebd7 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -39,7 +39,7 @@ cfxCommonPendingMask(uint8_t cfxcode)
+         return 1ULL << 8;  // hart IPI
+     case 18: case CfxCodePower:
+         return 1ULL << 10; // timer TIMER / power SOFT_RESET
+-    case 62:
++    case CfxCodeUart:
+         return ~0ULL << 32; // UART0..31
+     default:
+         return 0;
+@@ -67,7 +67,7 @@ cfxExcpCauseNonmaskableFor(uint8_t cfxcode)
+     case CfxCodeTlb:
+         return Common | (1ULL << 12) | (1ULL << 13) | (1ULL << 14) |
+                (1ULL << 18) | (1ULL << 19) | (1ULL << 22) | (1ULL << 23);
+-    case 15: case 18: case 62:
++    case 15: case 18: case CfxCodeUart:
+         return Common;
+     case CfxCodePower:
+         return Common | (1ULL << 8) | (1ULL << 9);
+@@ -83,7 +83,10 @@ ISA::ISA(const Params &p)
+       cfxAsyncTestLevelACode(p.cfx_async_test_level_a_code),
+       cfxAsyncTestLevelASeed(p.cfx_async_test_level_a_seed),
+       cfxAsyncTestLevelBCode(p.cfx_async_test_level_b_code),
+-      cfxAsyncTestLevelBSeed(p.cfx_async_test_level_b_seed)
++      cfxAsyncTestLevelBSeed(p.cfx_async_test_level_b_seed),
++      k1Ext0TestEnable(p.k1_ext0_test_enable),
++      k1Ext0AssertRetired(p.k1_ext0_assert_retired),
++      k1Ext0DeassertRetired(p.k1_ext0_deassert_retired)
+ {
+     _regClasses.push_back(&intRegClass);
+     _regClasses.push_back(&floatRegClass);
+@@ -164,6 +167,7 @@ ISA::clear()
+     cfxTimerReg0 = 0;
+     cfxTimerReloadLatch = 0;
+     cfxTimerArmPending = false;
++    cfxUartPending = 0;
+     cfxFrame[CfxCodePower].prevRunMode = RunModeHypv;
+     cfxFrame[CfxCodePower].prevCfxMask = ~0ULL;
+     cfxFrame[CfxCodePower].prevCfxCode = CfxCodePower;
+@@ -533,11 +537,11 @@ ISA::cfxDispatch(ThreadContext *tc, uint64_t targetCfx, uint64_t cause,
+     }
+ }
+ 
+-// KL-131a: re-latch the two test-only synthetic level sources (electrics,
+-// wiki L656) and select the next async cause to deliver per contracts/isa/
+-// spec.md §8.5.1: lowest pending eligible cfxcode first, then lowest set
+-// eligible cause bit within that cfx. Mirrors QEMU's dadao_cfx_async_scan()
+-// (cpu.c) exactly.
++// KL-131a/KL-137a: re-latch test-only level sources (electrics, wiki L656)
++// and private device-source latches, then select the next async cause per
++// contracts/isa/spec.md §8.5.1: lowest pending eligible cfxcode first, then
++// lowest set eligible cause bit within that cfx. Mirrors QEMU's
++// dadao_cfx_async_scan() (cpu.c) exactly.
+ bool
+ ISA::cfxAsyncScan(uint64_t &outTarget, uint64_t &outCause)
+ {
+@@ -564,6 +568,19 @@ ISA::cfxAsyncScan(uint64_t &outTarget, uint64_t &outCause)
+         cfxCommonPending[CfxCodeTimer] |= CfxTimerCauseTimer;
+     }
+ 
++    // KL-137a K1_EXT0: the immutable schedule drives only the test-machine
++    // electrical level. Assertion sets private source0; the private latch
++    // reconstructs common UART0 independently of the current level and all
++    // masks. Deasserting therefore never acknowledges architectural state.
++    if (k1Ext0TestEnable &&
++        cfxHartCycleLo >= k1Ext0AssertRetired &&
++        cfxHartCycleLo < k1Ext0DeassertRetired) {
++        cfxUartPending |= 0x1ULL;
++    }
++    if (cfxUartPending & 0x1ULL) {
++        cfxCommonPending[CfxCodeUart] |= CfxUartCauseUart0;
++    }
++
+     if (cfxAsyncTestLevelASeed != 0) {
+         uint64_t target = cfxAsyncTestLevelACode & 0x3F;
+         cfxCommonPending[target] |=
+@@ -660,6 +677,7 @@ ISA::copyRegsFrom(ThreadContext *src)
+         cfxTimerReg0 = srcIsa->cfxTimerReg0;
+         cfxTimerReloadLatch = srcIsa->cfxTimerReloadLatch;
+         cfxTimerArmPending = srcIsa->cfxTimerArmPending;
++        cfxUartPending = srcIsa->cfxUartPending;
+         for (int i = 0; i < 64; i++) {
+             cfxHypvCgRegDeleg[i] = srcIsa->cfxHypvCgRegDeleg[i];
+             cfxFrame[i] = srcIsa->cfxFrame[i];
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+index 264e7e90e3..44a32446fe 100644
+--- a/src/arch/dadao/isa.hh
++++ b/src/arch/dadao/isa.hh
+@@ -40,6 +40,7 @@ constexpr uint8_t CfxCodeTlb = 5;
+ // table].
+ constexpr uint8_t CfxCodeHart = 15;
+ constexpr uint8_t CfxCodeTimer = 18;
++constexpr uint8_t CfxCodeUart = 62;
+ constexpr uint8_t CfxCodePower = 63;
+ 
+ // cfx_smon's architecturally non-maskable CFXTRAP cause.
+@@ -146,6 +147,12 @@ constexpr uint64_t CfxTimerCtrlPeriodic = 1ULL << 1;
+ // cfx_timer's one maskable cause, TIMER (bit10) [wiki L600]. Matches
+ // cfxCommonPendingMask()'s case 18 exactly.
+ constexpr uint64_t CfxTimerCauseTimer = 1ULL << 10;
++// KL-137a: K1_EXT0 uses cfx_uart source0's private cg8 register pair and
++// UART0 common cause. No cg32-63 UART device registers/protocol are in K1.
++constexpr uint8_t CfxUartCg = 8;
++constexpr uint8_t CfxUartPendingRc = 0;
++constexpr uint8_t CfxUartExistRc = 1;
++constexpr uint64_t CfxUartCauseUart0 = 1ULL << 32;
+ 
+ // KL-131a: the per-cfx set of causes that actually exist and may be latched
+ // into cfxCommonPending. Defined in isa.cc; shared by decoder.cc's
+@@ -214,6 +221,12 @@ class ISA : public BaseISA
+     const uint64_t cfxAsyncTestLevelASeed;
+     const uint8_t cfxAsyncTestLevelBCode;
+     const uint64_t cfxAsyncTestLevelBSeed;
++    // KL-137a TEST-ONLY K1_EXT0 retirement schedule. Immutable backend
++    // configuration, not guest-visible architectural state. The electrical
++    // level is active for assertRetired <= cycleLo < deassertRetired.
++    const bool k1Ext0TestEnable;
++    const uint64_t k1Ext0AssertRetired;
++    const uint64_t k1Ext0DeassertRetired;
+ 
+     // KL-113a/KL-117a CFX privilege state. Plain ISA-class members rather than
+     // miscRegFile entries: miscRegFile (std::vector<RegVal>, NumMiscRegs=1)
+@@ -262,6 +275,8 @@ class ISA : public BaseISA
+     uint64_t cfxTimerReg0 = 0;
+     uint64_t cfxTimerReloadLatch = 0;
+     bool cfxTimerArmPending = false;
++    // KL-137a: cfx_uart cg8/rc0 private source latch; K1 implements bit0.
++    uint64_t cfxUartPending = 0;
+     // KL-126a: cfx_ptw private storage. PTBR stores PA[63:16], while PTHI
+     // and PAHI provide the distinct high 16 bits for page-table structures
+     // and final data addresses respectively.
+@@ -316,10 +331,10 @@ class ISA : public BaseISA
+                      uint64_t causeInfo, Addr causeIp, bool isSync,
+                      bool stageSequentialAdvance);
+     bool cfxCauseEligible(uint64_t targetCfx, uint64_t cause) const;
+-    // KL-131a: re-latches the two test-only synthetic level sources and
+-    // selects the next eligible async cause per contracts/isa/spec.md
+-    // §8.5.1 (lowest pending eligible cfxcode, then lowest eligible cause
+-    // bit). Returns false if nothing is eligible right now.
++    // KL-131a/KL-137a: re-latches the test-only level sources and private
++    // device-source latches, then selects the next eligible async cause per
++    // contracts/isa/spec.md §8.5.1 (lowest pending eligible cfxcode, then
++    // lowest eligible cause bit). Returns false if nothing is eligible.
+     // Unlike QEMU (which batches multiple guest instructions per
+     // translation block and therefore needs an explicit
+     // dadao_cfx_async_active()-gated max_insns=1 forcing hack to get
+diff --git a/tests/dadao/dadao_fs.py b/tests/dadao/dadao_fs.py
+index c3b6870e5f..380e0ce68c 100644
+--- a/tests/dadao/dadao_fs.py
++++ b/tests/dadao/dadao_fs.py
+@@ -10,6 +10,8 @@ Usage: build/DADAO/gem5.opt tests/dadao/dadao_fs.py <image.bin>
+            --cfx-async-level-a <cfxcode> <raw-seed>
+        build/DADAO/gem5.opt tests/dadao/dadao_fs.py <image.bin> \
+            --cfx-async-level-b <cfxcode> <raw-seed>
++       build/DADAO/gem5.opt tests/dadao/dadao_fs.py <image.bin> \
++           --k1-ext0-schedule <assert-retired> <deassert-retired>
+ """
+ 
+ import sys
+@@ -28,6 +30,9 @@ cfx_async_test_level_a_code = 0
+ cfx_async_test_level_a_seed = 0
+ cfx_async_test_level_b_code = 0
+ cfx_async_test_level_b_seed = 0
++k1_ext0_test_enable = False
++k1_ext0_assert_retired = 0
++k1_ext0_deassert_retired = (1 << 64) - 1
+ data_image = ""
+ args = sys.argv[2:]
+ while args:
+@@ -43,6 +48,10 @@ while args:
+     elif option == "--cfx-async-level-b" and len(args) >= 2:
+         cfx_async_test_level_b_code = int(args.pop(0), 0)
+         cfx_async_test_level_b_seed = int(args.pop(0), 0)
++    elif option == "--k1-ext0-schedule" and len(args) >= 2:
++        k1_ext0_test_enable = True
++        k1_ext0_assert_retired = int(args.pop(0), 0)
++        k1_ext0_deassert_retired = int(args.pop(0), 0)
+     elif option == "--data-image" and args:
+         data_image = args.pop(0)
+     else:
+@@ -108,6 +117,9 @@ system.cpu.isa[0].cfx_async_test_level_a_code = cfx_async_test_level_a_code
+ system.cpu.isa[0].cfx_async_test_level_a_seed = cfx_async_test_level_a_seed
+ system.cpu.isa[0].cfx_async_test_level_b_code = cfx_async_test_level_b_code
+ system.cpu.isa[0].cfx_async_test_level_b_seed = cfx_async_test_level_b_seed
++system.cpu.isa[0].k1_ext0_test_enable = k1_ext0_test_enable
++system.cpu.isa[0].k1_ext0_assert_retired = k1_ext0_assert_retired
++system.cpu.isa[0].k1_ext0_deassert_retired = k1_ext0_deassert_retired
+ 
+ root = Root(full_system=True, system=system)
+ m5.instantiate()
+-- 
+2.43.0
+

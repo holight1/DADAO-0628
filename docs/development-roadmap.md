@@ -2031,3 +2031,24 @@ specify cached-entry lifetime across disable→enable. KL-129b therefore does
 not turn either backend's current preservation behavior into an architectural
 claim. QEMU 35/35 and gem5 28/28 plain-`git am` replays from manifest pins
 match their development trees.
+
+## K1: synthetic external interrupt source K1_EXT0 (KL-137a, 2026-07-28)
+
+Implemented the §8.5.4 test-machine-only level source in QEMU and gem5.
+Default-off backend retirement schedules assert/deassert `K1_EXT0`; assertion
+sets cfx_uart private pending bit0 and common UART0 bit32, while private
+pending re-latches the common cause at every instruction boundary independent
+of masks. Deassertion clears only the test electrical level, leaving software
+to acknowledge private then common pending. Delivery, mask handling, and
+lexicographic priority reuse KL-131a unchanged.
+
+Two guest-self-checking scenarios pass 10/10 stable dual-backend loops. The
+first covers exist/reset, masked assertion, premature-ACK relatch, exact
+cause_ip/id/info, deassert-without-clear, and ordered ACK. The second makes
+TIMER and K1_EXT0 simultaneously eligible and proves cfx_timer(18) enters
+before cfx_uart(62). All prior K1 probes, E2E 81/81, and the 200-case
+three/four-way differential remain green.
+
+This milestone does not implement or claim a UART, PLIC, cg32-63 UART device
+registers, a real board interrupt wire, Minor/O3 behavior, Linux interrupt
+drivers, or multi-hart routing.

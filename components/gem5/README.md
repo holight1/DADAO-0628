@@ -23,7 +23,11 @@ retirement funnel, not pre-fetch `checkInterrupts()`; precise faults do not
 count, and expiry is delivered at the following boundary. An asserted private
 timer source re-latches common TIMER at every boundary until acknowledged,
 independent of enable and masks. Timer delivery is FullSystem-only. Real
-devices and full OS bring-up remain out of scope.
+devices and full OS bring-up remain out of scope. KL-137a adds the same
+test-machine-only `K1_EXT0` acceptance source: default-off retirement-schedule
+Params assert/deassert cfx_uart source0, whose private pending latch reflects
+into common UART0 and reuses KL-131a arbitration. It is not a UART or PLIC
+device implementation.
 
 ## Baseline
 
@@ -50,6 +54,7 @@ an instruction" live in the applied tree at `docs/gem5-arch-notes.md`.
 | 0026 | Maskable async dispatch core | SEE §5 steps 2-6 gate + real instruction-boundary async delivery (FullSystem) | SE baseline unchanged |
 | 0027 | cfx_hart_cycle_lo + cfx_timer counter0 | successful-retirement counter, fault exclusion, decrement/one-shot/periodic state machine, private-to-common relatch and timer-mask gate (FullSystem/AtomicSimpleCPU) | SE baseline unchanged |
 | 0028 | TLB range-invalidate review fix | ignore `addr_start[15:0]`, preserve size0 no-op, clamp oversized range to selected 4-TiB set | SE baseline unchanged |
+| 0029 | Synthetic external source K1_EXT0 | scheduled test-only level, cfx_uart private pending/exist, UART0 relatch through shared async dispatch | SE baseline unchanged |
 
 Current result: interp/QEMU/gem5 AGREE(3-way)=200, gem5-SKIP=2,
 DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix, KL-126a's eight
@@ -61,6 +66,10 @@ are also green. KL-129b adds four guest-decided dual-backend probes for the
 unaligned-start counterexample, zero size, set-end clamp, and fault-hit LRU
 touch. Disable→enable cache preservation remains a non-claim because the
 frozen contract defines lookup gating but not entry lifetime across toggles.
+KL-137a adds two guest-decided dual-backend scenarios: a 10-loop-stable
+assert/mask/relatch/delivery/deassert/ack lifecycle and TIMER-vs-K1_EXT0
+cross-CFX priority. No UART/PLIC protocol or cg32-63 device registers are
+claimed.
 
 ## Build & run (after `make fetch` + `apply_series`)
 

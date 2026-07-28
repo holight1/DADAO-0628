@@ -27,3 +27,4 @@
 0026-arch-dadao-implement-maskable-async-dispatch-cor.patch
 0027-arch-dadao-implement-cfx_hart_cycle_lo-and-cfx_timer.patch
 0028-arch-dadao-align-TLB-range-invalidation-start-KL-129.patch
+0029-arch-dadao-implement-synthetic-K1_EXT0-source-KL-137.patch

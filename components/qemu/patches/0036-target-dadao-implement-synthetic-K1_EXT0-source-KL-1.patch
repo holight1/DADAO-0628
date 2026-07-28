@@ -1,0 +1,209 @@
+From eee0933b064014f3ab305eaa275883f025223d53 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 28 Jul 2026 18:01:46 +0800
+Subject: [PATCH 36/36] target/dadao: implement synthetic K1_EXT0 source
+ (KL-137a)
+
+Add the cfx_uart source0 private pending/exist pair and route the test-machine-only K1_EXT0 level through UART0 common pending and the existing asynchronous dispatcher. Drive assert/deassert from default-off retired-instruction schedule properties so tests can exercise level relatch and acknowledgement without inventing a guest-visible device ABI.
+---
+ target/dadao/cpu.c    | 48 +++++++++++++++++++++++++++++++++++--------
+ target/dadao/cpu.h    | 20 ++++++++++++++++++
+ target/dadao/helper.c | 28 ++++++++++++++++++++++++-
+ 3 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index a685d39..219fb10 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -116,6 +116,7 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+     env->cfx_timer_regs0 = 0;
+     env->cfx_timer_reload_latch = 0;
+     env->cfx_timer_arm_pending = false;
++    env->cfx_uart_pending = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_USER] = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_JAIL] = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_SUPV] = UINT64_MAX;
+@@ -346,7 +347,8 @@ static uint64_t dadao_cfx_excp_cause_nonmaskable_for(uint64_t cfxcode)
+                (1ULL << 18) | (1ULL << 19) | (1ULL << 22) | (1ULL << 23);
+     case 15: /* hart: [wiki L529-536] IPI (bit8) maskable */
+     case 18: /* timer: [wiki L593-600] TIMER (bit10) maskable */
+-    case 62: /* uart: [wiki L617-628] UART0-31 (bits32-63) maskable */
++    case DADAO_CFX_CODE_UART:
++        /* uart: [wiki L617-628] UART0-31 (bits32-63) maskable */
+         return common;
+     case DADAO_CFX_CODE_POWER:
+         /* [wiki L639-648]: POWEROFF(8)/HARD_RESET(9) nonmaskable;
+@@ -469,10 +471,12 @@ bool dadao_cfx_async_active(CPUDADAOState *env)
+      * unrelated one-shot register-injection mechanism, used to probe cfx2rd/
+      * cfx2rc access, not delivery) -- keeping this scoped to only KL-131a's
+      * two new level sources means every pre-existing KL-120a probe keeps its
+-     * exact prior TB granularity and never enters this task's async-delivery
+-     * machinery at all. */
++     * exact prior TB granularity and never enters async delivery.  KL-131a's
++     * persistent levels and KL-137a's scheduled level are the only sources
++     * that require this single-instruction boundary mode. */
+     return cpu->cfx_async_test_level_a_seed != 0 ||
+-           cpu->cfx_async_test_level_b_seed != 0;
++           cpu->cfx_async_test_level_b_seed != 0 ||
++           cpu->k1_ext0_test_enable;
+ }
+ 
+ static void dadao_cfx_timer_expire(CPUDADAOState *env)
+@@ -525,11 +529,11 @@ void dadao_cfx_hart_retire(CPUDADAOState *env)
+     }
+ }
+ 
+-/* KL-131a: re-latch the two test-only synthetic level sources (electrics,
+- * wiki L656) and select the next async cause to deliver per contracts/isa/
+- * spec.md §8.5.1: lowest pending eligible cfxcode first, then lowest set
+- * eligible cause bit within that cfx. Returns false if nothing is eligible
+- * right now (blocked bits stay latched in cfx_common_pending). */
++/* KL-131a/KL-137a: re-latch test-only level sources (electrics, wiki L656)
++ * and private device-source latches, then select the next async cause per
++ * contracts/isa/spec.md §8.5.1: lowest pending eligible cfxcode first, then
++ * lowest set eligible cause bit within that cfx. Returns false if nothing is
++ * eligible right now (blocked bits stay latched in cfx_common_pending). */
+ static bool dadao_cfx_async_scan(DADAOCPU *cpu, uint64_t *out_target,
+                                  uint64_t *out_cause)
+ {
+@@ -557,6 +561,25 @@ static bool dadao_cfx_async_scan(DADAOCPU *cpu, uint64_t *out_target,
+             DADAO_CFX_TIMER_CAUSE_TIMER;
+     }
+ 
++    /*
++     * KL-137a K1_EXT0: derive a test-machine-only electrical level from the
++     * immutable retirement schedule.  Assertion sets the private source
++     * latch.  The private latch, independently of the live level and every
++     * mask, reconstructs the common UART0 cause before arbitration.  Thus a
++     * premature W0C while asserted re-latches on this boundary, while
++     * deassertion alone leaves both latches for software's required
++     * private-then-common acknowledgement sequence.
++     */
++    if (cpu->k1_ext0_test_enable &&
++        env->cfx_hart_cycle_lo >= cpu->k1_ext0_assert_retired &&
++        env->cfx_hart_cycle_lo < cpu->k1_ext0_deassert_retired) {
++        env->cfx_uart_pending |= 0x1ULL;
++    }
++    if (env->cfx_uart_pending & 0x1ULL) {
++        env->cfx_common_pending[DADAO_CFX_CODE_UART] |=
++            DADAO_CFX_UART_CAUSE_UART0;
++    }
++
+     if (cpu->cfx_async_test_level_a_seed != 0) {
+         uint64_t target = cpu->cfx_async_test_level_a_code & 0x3F;
+         env->cfx_common_pending[target] |=
+@@ -1336,6 +1359,13 @@ static const Property dadao_cpu_properties[] = {
+                       cfx_async_test_level_b_code, 0),
+     DEFINE_PROP_UINT64("cfx-async-test-level-b-seed", DADAOCPU,
+                        cfx_async_test_level_b_seed, 0),
++    /* KL-137a TEST-ONLY K1_EXT0 boundary schedule. Defaults are inert. */
++    DEFINE_PROP_BOOL("k1-ext0-test-enable", DADAOCPU,
++                     k1_ext0_test_enable, false),
++    DEFINE_PROP_UINT64("k1-ext0-assert-retired", DADAOCPU,
++                       k1_ext0_assert_retired, 0),
++    DEFINE_PROP_UINT64("k1-ext0-deassert-retired", DADAOCPU,
++                       k1_ext0_deassert_retired, UINT64_MAX),
+ };
+ 
+ static void dadao_cpu_class_init(ObjectClass *oc, void *data)
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index a77f9e9..bd56baf 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -216,6 +216,14 @@ typedef struct DADAOCfxFrame {
+ /* cfx_timer's one maskable cause, TIMER (bit10) [wiki L600]. Matches the
+  * existing dadao_cfx_common_pending_mask() case 18 in helper.c exactly. */
+ #define DADAO_CFX_TIMER_CAUSE_TIMER (1ULL << 10)
++/* KL-137a: K1's synthetic external-interrupt acceptance source is routed
++ * through the architecturally-defined cfx_uart private register pair.  This
++ * does not implement any cg32-63 UART device register or protocol. */
++#define DADAO_CFX_CODE_UART 62
++#define DADAO_CFX_UART_CG 8
++#define DADAO_CFX_UART_PENDING_RC 0
++#define DADAO_CFX_UART_EXIST_RC 1
++#define DADAO_CFX_UART_CAUSE_UART0 (1ULL << 32)
+ 
+ typedef struct DADAOCfxTlbEntry {
+     bool valid;
+@@ -321,6 +329,9 @@ struct CPUArchState {
+      * retirement hook.  SET_TIMER starts counting with the following
+      * retired instruction, not with the instruction that arms it. */
+     bool cfx_timer_arm_pending;
++    /* KL-137a: cfx_uart cg8/rc0 private source latch.  K1_EXT0 uses bit0;
++     * cg8/rc1 reports source existence as the constant value 1. */
++    target_ulong cfx_uart_pending;
+     /* Scratch for a pending trap (cfx) syscall, passed helper -> do_interrupt.
+        Must NOT reuse rb[1]/rb[2] — rb1 is the stack pointer (ADR-0004). */
+     target_ulong trap_cfxcode;
+@@ -365,6 +376,15 @@ struct ArchCPU {
+     uint64_t cfx_async_test_level_a_seed;
+     uint8_t cfx_async_test_level_b_code;
+     uint64_t cfx_async_test_level_b_seed;
++    /* KL-137a TEST-ONLY K1_EXT0 level schedule.  These boot-time QOM
++     * properties are backend test infrastructure, not guest-visible ISA.
++     * When enabled, the source is asserted at the first instruction boundary
++     * with cycle_lo >= assert_retired and deasserted at the first boundary
++     * with cycle_lo >= deassert_retired.  Deasserting the electrical level
++     * deliberately does not clear either architectural pending latch. */
++    bool k1_ext0_test_enable;
++    uint64_t k1_ext0_assert_retired;
++    uint64_t k1_ext0_deassert_retired;
+ };
+ 
+ struct DADAOCPUClass {
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 2cc7a7f..07d8300 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -172,7 +172,7 @@ uint64_t dadao_cfx_common_pending_mask(uint64_t cfxcode)
+     case 18: /* timer */
+     case DADAO_CFX_CODE_POWER:
+         return 1ULL << 10; /* TIMER / SOFT_RESET */
+-    case 62: /* uart */
++    case DADAO_CFX_CODE_UART:
+         return UINT64_MAX << 32;
+     default:
+         return 0;
+@@ -322,6 +322,21 @@ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         }
+     }
+ 
++    if (cfxcode == DADAO_CFX_CODE_UART && cg == DADAO_CFX_UART_CG) {
++        switch (rc) {
++        case DADAO_CFX_UART_PENDING_RC:
++            /* W0C, only K1_EXT0/source0 is implemented. */
++            env->cfx_uart_pending &= value & 0x1ULL;
++            return;
++        case DADAO_CFX_UART_EXIST_RC:
++            /* RO constant; writes are silent no-ops. */
++            return;
++        default:
++            /* No cg32-63 UART device register protocol is implemented. */
++            break;
++        }
++    }
++
+     if (cg == 5) {
+         /* KL-122a common frame carrier. rc2/rc4 are hardware-written and
+          * intentionally read-only; rc5 is project-local E1. */
+@@ -522,6 +537,17 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         }
+     }
+ 
++    if (cfxcode == DADAO_CFX_CODE_UART && cg == DADAO_CFX_UART_CG) {
++        switch (rc) {
++        case DADAO_CFX_UART_PENDING_RC:
++            return env->cfx_uart_pending & 0x1ULL;
++        case DADAO_CFX_UART_EXIST_RC:
++            return 1;
++        default:
++            break;
++        }
++    }
++
+     if (cg == 5) {
+         switch (rc) {
+         case 0: return env->cfx_frame[cfxcode].prev_run_mode;
+-- 
+2.43.0
+

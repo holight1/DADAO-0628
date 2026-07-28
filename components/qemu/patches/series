@@ -34,3 +34,4 @@
 0033-target-dadao-introduce-cfx-timer-scaffolding-KL-133a.patch
 0034-target-dadao-finalize-cfx-timer-retirement-semantics.patch
 0035-target-dadao-align-TLB-range-invalidation-start-KL-1.patch
+0036-target-dadao-implement-synthetic-K1_EXT0-source-KL-1.patch

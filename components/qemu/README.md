@@ -22,5 +22,11 @@ KL-129b follow-up patch 0035 corrects range invalidation to use only
 `addr_start[41:16]` as its 64-KiB-aligned in-set start; zero size remains a
 no-op and oversized ranges are overflow-safely clamped to the selected
 4-TiB set.
+KL-137a patch 0036 adds the K1 test-machine-only synthetic level source
+`K1_EXT0`: default-off retired-instruction schedule properties drive
+assert/deassert, cfx_uart private source0 pending relatches common UART0, and
+delivery reuses KL-131a's generic mask/priority carrier. This is external-
+interrupt acceptance evidence only; it does not implement cg32-63 UART
+device registers, UART, or PLIC.
 The remaining privileged cfx surface, complete SBI/HBI, and Linux user-mode
 remain deferred.
