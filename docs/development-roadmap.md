@@ -2228,3 +2228,35 @@ Minor/O3 and performance remain non-claims.
 **Next**: KL-144a combines timer-driven preemption, full trap context,
 cooperative task state and address-space switching in one dual-backend
 scheduler scenario.
+
+## K2: integrated timer-driven scheduler switch (KL-144a, 2026-07-29)
+
+Combined the previously isolated K2 mechanisms in one byte-identical
+QEMU/gem5 FullSystem image. Task A first fills a same-ASID virtual mapping,
+then takes a one-shot timer interrupt at the deepest point of a three-call
+RegRAS chain. The handler owns and restores the frozen 198-word trap frame,
+sets only `need_resched`, acknowledges the timer and escapes to the same task.
+Only after the original chain unwinds does the cooperative boundary save A's
+135-word task frame, consume B's ASID/PTBR binding from its descriptor, write
+the target PTBR, invalidate the complete set, advance `tlb_gen`, load B's
+distinct value at the same VA, and restore/ret into B.
+
+Eight structured checkpoints bind INIT, TIMER, TRAP_ENTER/RETURN,
+COOP_SAVE, AS_SWITCH, COOP_RESTORE and FINAL to independent frame/memory
+digests and PTBR/generation state. The positive image passes
+QEMU/gem5+oracle+cross comparison 10/10. A separate image omitting the
+invalidate makes both guests fail with nonzero mismatch; the host oracle
+independently rejects generation and memory-digest deviations, and restoring
+the positive image passes again. KL-140a remains 70/70 x10, KL-141a through
+KL-143a retain positive/negative/post-restore PASS, KL-139a remains 3/3,
+E2E remains 81/81, and ordinary ISA differential remains 200 three/four-way
+agreements with zero divergence. Independent review closed two medium and
+one low finding and finished PASS.
+
+This is still a single-hart supervisor bare-metal scheduling oracle. User
+mode, RF, atomics/SMP, real devices, Linux scheduler/trap/clockevent/pgtable
+APIs, Minor/O3 and performance remain non-claims.
+
+**Next**: KL-145a performs the K2 composition/closure audit, reruns the
+complete positive and negative matrix, freezes the K3 readiness/non-claim
+boundary, and stops before any Linux component or `arch/dadao` work.
