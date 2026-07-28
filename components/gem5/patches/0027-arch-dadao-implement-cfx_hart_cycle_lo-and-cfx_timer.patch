@@ -1,0 +1,316 @@
+From ce721cefb0b9af887bf6e5d3f41dcd8b5f57c935 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 28 Jul 2026 06:37:15 +0800
+Subject: [PATCH 27/27] arch/dadao: implement cfx_hart_cycle_lo and cfx_timer
+ counter0 (KL-133a)
+
+Implements the K1 timer minimum profile on top of KL-131a async dispatch.
+
+The default-no-op BaseISA::notifyRetiredInst hook is invoked by BaseSimpleCPU::countInst after a successful macro-instruction. DADAO advances cycle_lo and timer counter0 there, so precise faults and retries do not count. Current FullSystem evidence is bound to DADAOAtomicSimpleCPU; Minor/O3 are not claimed.
+
+Timer expiry sets private pending and common TIMER independent of masks. At every async boundary, an asserted private timer source re-latches common TIMER independent of enable and masks until software acknowledges the private source. One-shot, periodic reload, timeout-zero arm deferral, and the private timer-mask eligibility gate follow contracts/isa/spec.md section 8.5.2.
+---
+ src/arch/dadao/decoder.cc | 42 ++++++++++++++++++++
+ src/arch/dadao/isa.cc     | 82 +++++++++++++++++++++++++++++++++++++++
+ src/arch/dadao/isa.hh     | 52 +++++++++++++++++++++++++
+ src/arch/generic/isa.hh   |  6 +++
+ src/cpu/simple/base.cc    |  1 +
+ 5 files changed, 183 insertions(+)
+
+diff --git a/src/arch/dadao/decoder.cc b/src/arch/dadao/decoder.cc
+index 2ce34c80f4..796843f03c 100644
+--- a/src/arch/dadao/decoder.cc
++++ b/src/arch/dadao/decoder.cc
+@@ -994,6 +994,37 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+       return NoFault;
+     }
+   }
++  // KL-133a: cfx_hart cg8/rc2 cycle_lo is RO; cfx2rc write is a silent
++  // no-op, matching the project's established RO-register convention
++  // (e.g. cfx_tlb_exist above).
++  if (cfxcode_ == CfxCodeHart && cg_ == CfxHartCycleLoCg &&
++      rc_ == CfxHartCycleLoRc) {
++    return NoFault;
++  }
++  if (cfxcode_ == CfxCodeTimer && cg_ == CfxTimerCg) {
++    switch (rc_) {
++    case CfxTimerPendingRc:
++      // W0C, only bit0 (TIMER source) is defined.
++      isa->cfxTimerPending &= value & 0x1ULL;
++      return NoFault;
++    case CfxTimerMaskRc:
++      isa->cfxTimerMask = value;
++      return NoFault;
++    case CfxTimerCtrlRc:
++      isa->cfxTimerCtrl = value;
++      isa->cfxTimerArmPending = (value & CfxTimerCtrlEnable) != 0;
++      return NoFault;
++    case CfxTimerReg0Rc:
++      // counter0: also latches the project-local (non-architectural)
++      // reload shadow -- contracts/isa/spec.md §8.5.2's "SET_TIMER writes
++      // counter0 and a same-value internal reload latch".
++      isa->cfxTimerReg0 = value;
++      isa->cfxTimerReloadLatch = value;
++      return NoFault;
++    default:
++      break; // rc9-15 (counters1-7): K1 non-claim, silent no-op.
++    }
++  }
+   // SEE §3 cg2/rc10: per-cfx supervisor exception-vector address.
+   if (cg_ == 2 && rc_ == 10) {
+     isa->cfxSupvExcpVector[cfxcode_] = value & MASK48;
+@@ -1107,6 +1138,17 @@ Fault execute(ExecContext *xc, trace::InstRecord*) const override {
+     case CfxNonmaskableRc: value = isa->cfxExcpCauseNonmaskable[cfxcode_]; break;
+     default: break;
+     }
++  } else if (cfxcode_ == CfxCodeHart && cg_ == CfxHartCycleLoCg &&
++             rc_ == CfxHartCycleLoRc) {
++    value = isa->cfxHartCycleLo;
++  } else if (cfxcode_ == CfxCodeTimer && cg_ == CfxTimerCg) {
++    switch (rc_) {
++    case CfxTimerPendingRc: value = isa->cfxTimerPending & 0x1ULL; break;
++    case CfxTimerMaskRc: value = isa->cfxTimerMask; break;
++    case CfxTimerCtrlRc: value = isa->cfxTimerCtrl; break;
++    case CfxTimerReg0Rc: value = isa->cfxTimerReg0; break;
++    default: break; // rc9-15: K1 non-claim, reads zero.
++    }
+   } else if (cg_ == 2 && rc_ == 10) {
+     value = isa->cfxSupvExcpVector[cfxcode_];
+   } else if (cg_ <= 3 && rc_ == CfxMaskRegEscape) {
+diff --git a/src/arch/dadao/isa.cc b/src/arch/dadao/isa.cc
+index 5c276ca5d6..656c798f58 100644
+--- a/src/arch/dadao/isa.cc
++++ b/src/arch/dadao/isa.cc
+@@ -155,6 +155,15 @@ ISA::clear()
+         cfxModeGlobalCfxMask[m] = ~0ULL;
+     cfxAsyncPendingTarget = 0;
+     cfxAsyncPendingCause = 0;
++    // KL-133a: cfx_hart_cycle_lo starts at 0; cfx_timer resets disabled
++    // with mask=all-1 (blocked) per wiki L582-600.
++    cfxHartCycleLo = 0;
++    cfxTimerPending = 0;
++    cfxTimerMask = ~0ULL;
++    cfxTimerCtrl = 0;
++    cfxTimerReg0 = 0;
++    cfxTimerReloadLatch = 0;
++    cfxTimerArmPending = false;
+     cfxFrame[CfxCodePower].prevRunMode = RunModeHypv;
+     cfxFrame[CfxCodePower].prevCfxMask = ~0ULL;
+     cfxFrame[CfxCodePower].prevCfxCode = CfxCodePower;
+@@ -457,6 +466,14 @@ ISA::cfxCauseEligible(uint64_t targetCfx, uint64_t cause) const
+ {
+     if (cfxExcpCauseNonmaskable[targetCfx] & cause)
+         return true;
++    // KL-133a: cfx_timer's private mask (cg10/rc1) is a device-specific
++    // fourth gate on top of the three generic ones below -- contracts/isa/
++    // spec.md §8.5.2: "delivery additionally requires private
++    // cfx_timer_mask bit0 ... to permit it", independent of self- vs
++    // cross-target. Mirrors QEMU's dadao_cfx_cause_eligible() exactly.
++    if (targetCfx == CfxCodeTimer && (cause & CfxTimerCauseTimer) &&
++        (cfxTimerMask & 0x1ULL))
++        return false;
+     if (targetCfx != innerCfxCode && (innerCfxMask & (1ULL << targetCfx)))
+         return false;
+     if (targetCfx != innerCfxCode &&
+@@ -522,6 +539,29 @@ ISA::cfxDispatch(ThreadContext *tc, uint64_t targetCfx, uint64_t cause,
+ bool
+ ISA::cfxAsyncScan(uint64_t &outTarget, uint64_t &outCause)
+ {
++    // timeout=0 becomes eligible at the boundary after the arming
++    // instruction retires. Non-zero countdown advances only from
++    // notifyRetiredInst().
++    if ((cfxTimerCtrl & CfxTimerCtrlEnable) &&
++        !cfxTimerArmPending && cfxTimerReg0 == 0) {
++        cfxTimerPending |= 0x1ULL;
++        cfxCommonPending[CfxCodeTimer] |= CfxTimerCauseTimer;
++        if (cfxTimerCtrl & CfxTimerCtrlPeriodic) {
++            cfxTimerReg0 = cfxTimerReloadLatch;
++        } else {
++            cfxTimerCtrl &= ~CfxTimerCtrlEnable;
++        }
++    }
++
++    // cfxTimerPending is the level-like source latch. Software may clear
++    // the common TIMER bit before acknowledging the private source; while
++    // private bit0 remains asserted, reconstruct the common cause at every
++    // instruction boundary. This is independent of enable and all masks:
++    // they gate generation/delivery, not source-latch reflection.
++    if (cfxTimerPending & 0x1ULL) {
++        cfxCommonPending[CfxCodeTimer] |= CfxTimerCauseTimer;
++    }
++
+     if (cfxAsyncTestLevelASeed != 0) {
+         uint64_t target = cfxAsyncTestLevelACode & 0x3F;
+         cfxCommonPending[target] |=
+@@ -548,6 +588,41 @@ ISA::cfxAsyncScan(uint64_t &outTarget, uint64_t &outCause)
+     return false;
+ }
+ 
++// KL-133a: successful architectural retirement, called by
++// BaseSimpleCPU::countInst(). Faults and fetch retries do not reach it.
++void
++ISA::notifyRetiredInst()
++{
++    cfxHartCycleLo++;
++
++    if (!(cfxTimerCtrl & CfxTimerCtrlEnable)) {
++        cfxTimerArmPending = false;
++        return;
++    }
++    if (cfxTimerArmPending) {
++        cfxTimerArmPending = false;
++        return;
++    }
++    if (cfxTimerReg0 == 0)
++        return;
++
++    cfxTimerReg0--;
++    if (cfxTimerReg0 != 0)
++        return;
++
++    cfxTimerPending |= 0x1ULL;
++    cfxCommonPending[CfxCodeTimer] |= CfxTimerCauseTimer;
++
++    if (cfxTimerCtrl & CfxTimerCtrlPeriodic) {
++        // Periodic: reload from the last value written to counter0, keep
++        // enabled.
++        cfxTimerReg0 = cfxTimerReloadLatch;
++    } else {
++        // One-shot: auto-disable.
++        cfxTimerCtrl &= ~CfxTimerCtrlEnable;
++    }
++}
++
+ void
+ ISA::copyRegsFrom(ThreadContext *src)
+ {
+@@ -576,6 +651,13 @@ ISA::copyRegsFrom(ThreadContext *src)
+             cfxModeGlobalCfxMask[m] = srcIsa->cfxModeGlobalCfxMask[m];
+         cfxAsyncPendingTarget = srcIsa->cfxAsyncPendingTarget;
+         cfxAsyncPendingCause = srcIsa->cfxAsyncPendingCause;
++        cfxHartCycleLo = srcIsa->cfxHartCycleLo;
++        cfxTimerPending = srcIsa->cfxTimerPending;
++        cfxTimerMask = srcIsa->cfxTimerMask;
++        cfxTimerCtrl = srcIsa->cfxTimerCtrl;
++        cfxTimerReg0 = srcIsa->cfxTimerReg0;
++        cfxTimerReloadLatch = srcIsa->cfxTimerReloadLatch;
++        cfxTimerArmPending = srcIsa->cfxTimerArmPending;
+         for (int i = 0; i < 64; i++) {
+             cfxHypvCgRegDeleg[i] = srcIsa->cfxHypvCgRegDeleg[i];
+             cfxFrame[i] = srcIsa->cfxFrame[i];
+diff --git a/src/arch/dadao/isa.hh b/src/arch/dadao/isa.hh
+index a4ff65f4bf..264e7e90e3 100644
+--- a/src/arch/dadao/isa.hh
++++ b/src/arch/dadao/isa.hh
+@@ -35,6 +35,11 @@ enum RunMode : uint8_t
+ constexpr uint8_t CfxCodeSmon = 2;
+ constexpr uint8_t CfxCodePtw = 4;
+ constexpr uint8_t CfxCodeTlb = 5;
++// KL-133a: cfx_hart (hart management/local counters) and cfx_timer
++// (timer/counter) [wiki §DADAO-12-SEE-主管系统运行环境.md L20-33 cfxcode
++// table].
++constexpr uint8_t CfxCodeHart = 15;
++constexpr uint8_t CfxCodeTimer = 18;
+ constexpr uint8_t CfxCodePower = 63;
+ 
+ // cfx_smon's architecturally non-maskable CFXTRAP cause.
+@@ -119,6 +124,29 @@ constexpr uint64_t CfxTestCauseInfo = 0x5E1F7E5700000000ULL;
+ // synchronous exception.
+ constexpr uint64_t CfxMonitorCauseIlli = 1ULL << 8;
+ 
++// KL-133a: cfx_hart cg8/rc2 cycle_lo (RO, 64-bit, one increment per
++// architecturally-retired instruction, mod 2^64) [wiki §DADAO-12-SEE-主管
++//系统运行环境.md L525 cfx_hart 专有寄存器表]. cg8/rc3 cycle_hi is
++// deliberately not implemented (K1 non-claim, contracts/isa/spec.md
++// §8.5.2) -- no dispatch branch exists for it, so it falls through to the
++// existing unimplemented-register convention (write no-op / reads zero).
++constexpr uint8_t CfxHartCycleLoCg = 8;
++constexpr uint8_t CfxHartCycleLoRc = 2;
++// KL-133a: cfx_timer cg10 register group [wiki §DADAO-12-SEE-主管系统运行
++// 环境.md L582-600 cfx_timer 专有寄存器表]. Only counter0 (rc8) is in
++// scope; rc9-15 (counters1-7) are a K1 non-claim (silent no-op/reads zero).
++constexpr uint8_t CfxTimerCg = 10;
++constexpr uint8_t CfxTimerPendingRc = 0;
++constexpr uint8_t CfxTimerMaskRc = 1;
++constexpr uint8_t CfxTimerCtrlRc = 7;
++constexpr uint8_t CfxTimerReg0Rc = 8;
++// cfx_timer_ctrl bit assignments [wiki L590].
++constexpr uint64_t CfxTimerCtrlEnable = 1ULL << 0;
++constexpr uint64_t CfxTimerCtrlPeriodic = 1ULL << 1;
++// cfx_timer's one maskable cause, TIMER (bit10) [wiki L600]. Matches
++// cfxCommonPendingMask()'s case 18 exactly.
++constexpr uint64_t CfxTimerCauseTimer = 1ULL << 10;
++
+ // KL-131a: the per-cfx set of causes that actually exist and may be latched
+ // into cfxCommonPending. Defined in isa.cc; shared by decoder.cc's
+ // CFX2RCInst/CFX2RDInst (cg4/rc7) and isa.cc's cfxDispatch()/cfxAsyncScan().
+@@ -215,6 +243,25 @@ class ISA : public BaseISA
+     // analog (cfx_async_pending_target/cause) for the mirrored design.
+     uint64_t cfxAsyncPendingTarget = 0;
+     uint64_t cfxAsyncPendingCause = 0;
++    // KL-133a: cfx_hart cg8/rc2 cycle_lo -- one increment per
++    // architecturally-retired instruction, RO, mod 2^64. Shared timebase
++    // cfx_timer's decrement math is built on (contracts/isa/spec.md
++    // §8.5.2).
++    uint64_t cfxHartCycleLo = 0;
++    // KL-133a: cfx_timer private state (cg10). cfxTimerPending/Mask are
++    // only 1 bit wide architecturally (bit0=TIMER source); cfxTimerCtrl
++    // bits 0-2 are defined (enable/mode/dir), bits[63:3] stored as written.
++    // cfxTimerReg0 is the live down-counting counter0 (cg10/rc8, directly
++    // guest-readable -- NOT the GET_TIME source). cfxTimerReloadLatch is a
++    // project-local *non-architectural* shadow of "the last value written
++    // to counter0" (SET_TIMER's implicit reload latch); it has no (cg,rc)
++    // address of its own.
++    uint64_t cfxTimerPending = 0;
++    uint64_t cfxTimerMask = ~0ULL;
++    uint64_t cfxTimerCtrl = 0;
++    uint64_t cfxTimerReg0 = 0;
++    uint64_t cfxTimerReloadLatch = 0;
++    bool cfxTimerArmPending = false;
+     // KL-126a: cfx_ptw private storage. PTBR stores PA[63:16], while PTHI
+     // and PAHI provide the distinct high 16 bits for page-table structures
+     // and final data addresses respectively.
+@@ -282,6 +329,11 @@ class ISA : public BaseISA
+     // comment for why QEMU's side needs it.
+     bool cfxAsyncScan(uint64_t &outTarget, uint64_t &outCause);
+ 
++    // KL-133a: BaseSimpleCPU's successful macro-instruction retirement
++    // funnel calls this hook. Faulting/fetch-retry instructions therefore
++    // do not advance cfx_hart_cycle_lo or timer0.
++    void notifyRetiredInst() override;
++
+     RegVal
+     readMiscRegNoEffect(RegIndex idx) const override
+     {
+diff --git a/src/arch/generic/isa.hh b/src/arch/generic/isa.hh
+index 4bdc6972df..f6bbc6e03f 100644
+--- a/src/arch/generic/isa.hh
++++ b/src/arch/generic/isa.hh
+@@ -88,6 +88,12 @@ class BaseISA : public SimObject
+     virtual bool inUserMode() const = 0;
+     virtual void copyRegsFrom(ThreadContext *src) = 0;
+ 
++    /* Optional architectural notification after a macro-instruction has
++     * completed successfully.  Simple CPUs invoke this from their existing
++     * retirement-count funnel; ISAs without retirement-visible state keep
++     * the default no-op. */
++    virtual void notifyRetiredInst() {}
++
+     virtual void resetThread() { panic("Thread reset not implemented."); }
+ 
+     const RegClasses &regClasses() const { return _regClasses; }
+diff --git a/src/cpu/simple/base.cc b/src/cpu/simple/base.cc
+index e2ea96aa08..5e65184194 100644
+--- a/src/cpu/simple/base.cc
++++ b/src/cpu/simple/base.cc
+@@ -154,6 +154,7 @@ BaseSimpleCPU::countInst()
+ 
+     if (!curStaticInst->isMicroop() || curStaticInst->isLastMicroop()) {
+         t_info.numInst++;
++        t_info.thread->getIsaPtr()->notifyRetiredInst();
+     }
+     t_info.numOp++;
+ }
+-- 
+2.43.0
+

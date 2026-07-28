@@ -25,3 +25,4 @@
 0024-arch-dadao-implement-PTW-faults-and-A-D-bits-KL-127a.patch
 0025-arch-dadao-implement-architectural-TLB-and-delegatio.patch
 0026-arch-dadao-implement-maskable-async-dispatch-cor.patch
+0027-arch-dadao-implement-cfx_hart_cycle_lo-and-cfx_timer.patch

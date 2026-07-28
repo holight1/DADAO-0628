@@ -31,3 +31,5 @@
 0030-target-dadao-implement-PTW-faults-and-A-D-bits-KL-12.patch
 0031-target-dadao-implement-architectural-TLB-and-delegat.patch
 0032-target-dadao-implement-maskable-async-dispatch-c.patch
+0033-target-dadao-introduce-cfx-timer-scaffolding-KL-133a.patch
+0034-target-dadao-finalize-cfx-timer-retirement-semantics.patch

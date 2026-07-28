@@ -16,8 +16,14 @@ needed by the bare-metal profile. KL-131a adds SEE §5 steps 2-6 mask/pending/
 priority arbitration and the project's first real instruction-boundary
 asynchronous interrupt dispatch (`Interrupts::checkInterrupts()`/
 `getInterrupt()`, previously a stub always returning false/NoFault) --
-FullSystem-mode only, per `BaseCPU::checkInterrupts()`'s own gate. Real
-timer/UART devices and full OS bring-up remain out of scope.
+FullSystem-mode only, per `BaseCPU::checkInterrupts()`'s own gate. KL-133a
+adds `cfx_hart_cycle_lo` and `cfx_timer` counter0. The configured
+`DADAOAtomicSimpleCPU` advances them from the successful macro-instruction
+retirement funnel, not pre-fetch `checkInterrupts()`; precise faults do not
+count, and expiry is delivered at the following boundary. An asserted private
+timer source re-latches common TIMER at every boundary until acknowledged,
+independent of enable and masks. Timer delivery is FullSystem-only. Real
+devices and full OS bring-up remain out of scope.
 
 ## Baseline
 
@@ -42,12 +48,15 @@ an instruction" live in the applied tree at `docs/gem5-arch-notes.md`.
 | 0024 | PTW faults and A/D | precise cfx_ptw carrier, 15 walker causes, leaf A/D writeback | SE baseline unchanged |
 | 0025 | Architectural TLB | 64×16 true LRU, invalidate, 7 hit causes, PTW delegation | SE baseline unchanged |
 | 0026 | Maskable async dispatch core | SEE §5 steps 2-6 gate + real instruction-boundary async delivery (FullSystem) | SE baseline unchanged |
+| 0027 | cfx_hart_cycle_lo + cfx_timer counter0 | successful-retirement counter, fault exclusion, decrement/one-shot/periodic state machine, private-to-common relatch and timer-mask gate (FullSystem/AtomicSimpleCPU) | SE baseline unchanged |
 
 Current result: interp/QEMU/gem5 AGREE(3-way)=200, gem5-SKIP=2,
 DIVERGE=0; the FullSystem KL-113a/117a/120a raw matrix, KL-126a's eight
 PTW success probes, KL-127a's 30 fault/10 A-D probes, KL-129a's 13
-dual-backend TLB/delegation probes, and KL-131a's dual-backend sync-mask +
-async-priority/electrics probes are also green.
+dual-backend TLB/delegation probes, KL-131a's dual-backend sync-mask +
+async-priority/electrics probes, and KL-133a's dual-backend cycle_lo/
+retire-fault/one-shot/periodic/mask/private-relatch probes (10 stable loops)
+are also green.
 
 ## Build & run (after `make fetch` + `apply_series`)
 

@@ -1,0 +1,425 @@
+From be6070f4b5b509e1ebecad0ce2fa15c420b07cad Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Tue, 28 Jul 2026 06:37:01 +0800
+Subject: [PATCH 33/34] target/dadao: introduce cfx timer scaffolding (KL-133a)
+
+Introduces cfx_hart/cfx_timer register state, timer masks, counter0 one-shot/periodic mechanics, common TIMER generation, and single-instruction async boundaries.
+
+This patch preserves the initial pre-execute/TB-boundary accounting stage for audit history. The immediately following KL-133a follow-up replaces it with the frozen successful-retirement model, fault exclusion, terminal-path retirement, private-to-common level re-latching, and precise shutdown handling; the two patches are one acceptance unit.
+---
+ target/dadao/cpu.c       | 92 ++++++++++++++++++++++++++++++++++++++++
+ target/dadao/cpu.h       | 54 +++++++++++++++++++++++
+ target/dadao/helper.c    | 91 +++++++++++++++++++++++++++++++++++++++
+ target/dadao/helper.h    |  1 +
+ target/dadao/translate.c | 46 ++++++++++++++++++++
+ 5 files changed, 284 insertions(+)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index c608f84..c13c46d 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -106,6 +106,14 @@ static void dadao_cpu_reset_hold(Object *obj, ResetType type)
+     }
+     env->cfx_async_pending_target = 0;
+     env->cfx_async_pending_cause = 0;
++    /* KL-133a: cfx_hart_cycle_lo starts at 0; cfx_timer resets disabled with
++     * mask=all-1 (blocked) per wiki L582-600. */
++    env->cfx_hart_cycle_lo = 0;
++    env->cfx_timer_pending = 0;
++    env->cfx_timer_mask = DADAO_CFX_MASK_ALL;
++    env->cfx_timer_ctrl = 0;
++    env->cfx_timer_regs0 = 0;
++    env->cfx_timer_reload_latch = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_USER] = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_JAIL] = 0;
+     env->cfx_ptw_perm[DADAO_RUN_MODE_SUPV] = UINT64_MAX;
+@@ -358,6 +366,19 @@ static bool dadao_cfx_cause_eligible(CPUDADAOState *env, uint64_t target_cfx,
+     if (env->cfx_excp_cause_nonmaskable[target_cfx] & cause) {
+         return true;
+     }
++    /* KL-133a: cfx_timer's private mask (cg10/rc1) is a device-specific
++     * fourth gate on top of the three generic ones below -- contracts/isa/
++     * spec.md §8.5.2: "delivery additionally requires private
++     * cfx_timer_mask bit0 ... to permit it", independent of (and checked
++     * regardless of) whether target_cfx is a self- or cross-target. This
++     * does not touch cfx_common_pending itself (dadao_cfx_timer_tick()
++     * ORs TIMER in unconditionally of this mask, per the same spec
++     * sentence) -- only whether the async scan may ever select it. */
++    if (target_cfx == DADAO_CFX_CODE_TIMER &&
++        (cause & DADAO_CFX_TIMER_CAUSE_TIMER) &&
++        (env->cfx_timer_mask & 0x1)) {
++        return false;
++    }
+     if (target_cfx != env->inner_cfx_code &&
+         (env->inner_cfx_mask & (1ULL << target_cfx))) {
+         return false;
+@@ -448,6 +469,73 @@ bool dadao_cfx_async_active(CPUDADAOState *env)
+            cpu->cfx_async_test_level_b_seed != 0;
+ }
+ 
++/* KL-133a: cfx_timer decrement/expiry, called once per TB-boundary check
++ * from dadao_cfx_async_scan() below -- deliberately NOT from
++ * helper_dadao_tick() (the per-instruction-embedded cycle_lo counter),
++ * even though both conceptually fire "once per tick".
++ *
++ * Why the split: QEMU only checks for an asynchronous interrupt BETWEEN
++ * TBs (dadao_cpu_exec_interrupt(), translate.c), never mid-TB. While
++ * cfx_timer_ctrl is enabled, dadao_translate_code() forces single-
++ * instruction TBs specifically so that boundary check runs before every
++ * real instruction -- matching gem5's Interrupts::checkInterrupts(), which
++ * runs before every instruction unconditionally (see isa.hh's
++ * cfxHartTick() comment). If this decrement instead lived inside
++ * helper_dadao_tick() (executed as part of the SAME TB as the
++ * about-to-run instruction, i.e. AFTER that TB was already scheduled to
++ * run), an expiry discovered there would be one instruction too late to
++ * preempt that instruction -- it would already be committed to executing
++ * by the time the expiry became visible, unlike gem5 where the tick runs
++ * strictly BEFORE the corresponding instruction is even fetched. Running
++ * the decrement here instead (called immediately before the SAME
++ * eligibility scan that decides whether to redirect the *next* TB) gives
++ * QEMU byte-for-byte the same "N ticks after arming" delivery boundary as
++ * gem5. trans_cfx2rc() (translate.c) forces a TB exit right after any
++ * write to cfx_timer_ctrl, so the very first boundary check after an
++ * enabling write already sees single-instruction-TB granularity from that
++ * point on.
++ */
++static void dadao_cfx_timer_tick(DADAOCPU *cpu)
++{
++    CPUDADAOState *env = &cpu->env;
++
++    if (!(env->cfx_timer_ctrl & DADAO_CFX_TIMER_CTRL_ENABLE)) {
++        return;
++    }
++
++    bool expired;
++    if (env->cfx_timer_regs0 == 0) {
++        /* Already-expired counter (timeout=0 arm, or a periodic reload of a
++         * zero reload-latch value) -- no decrement needed, expires again
++         * this tick. */
++        expired = true;
++    } else {
++        env->cfx_timer_regs0--;
++        expired = (env->cfx_timer_regs0 == 0);
++    }
++
++    if (!expired) {
++        return;
++    }
++
++    /* Private source pending set unconditionally of cfx_timer_mask, and
++     * TIMER OR'd into the common cause latch unconditionally of every
++     * mask, per contracts/isa/spec.md §8.5.2. Delivery still goes through
++     * cfx_timer_mask + KL-131a's generic three-level check in the scan
++     * loop below -- this function never itself decides eligibility. */
++    env->cfx_timer_pending |= 0x1ULL;
++    env->cfx_common_pending[DADAO_CFX_CODE_TIMER] |= DADAO_CFX_TIMER_CAUSE_TIMER;
++
++    if (env->cfx_timer_ctrl & DADAO_CFX_TIMER_CTRL_PERIODIC) {
++        /* Periodic: reload from the last value written to counter0, keep
++         * enabled. */
++        env->cfx_timer_regs0 = env->cfx_timer_reload_latch;
++    } else {
++        /* One-shot: auto-disable. */
++        env->cfx_timer_ctrl &= ~(target_ulong)DADAO_CFX_TIMER_CTRL_ENABLE;
++    }
++}
++
+ /* KL-131a: re-latch the two test-only synthetic level sources (electrics,
+  * wiki L656) and select the next async cause to deliver per contracts/isa/
+  * spec.md §8.5.1: lowest pending eligible cfxcode first, then lowest set
+@@ -458,6 +546,10 @@ static bool dadao_cfx_async_scan(DADAOCPU *cpu, uint64_t *out_target,
+ {
+     CPUDADAOState *env = &cpu->env;
+ 
++    /* KL-133a: exactly one tick's worth of timer decrement/expiry per
++     * boundary check -- see dadao_cfx_timer_tick()'s comment above. */
++    dadao_cfx_timer_tick(cpu);
++
+     if (cpu->cfx_async_test_level_a_seed != 0) {
+         uint64_t target = cpu->cfx_async_test_level_a_code & 0x3F;
+         env->cfx_common_pending[target] |=
+diff --git a/target/dadao/cpu.h b/target/dadao/cpu.h
+index 3ddf22d..c546a1b 100644
+--- a/target/dadao/cpu.h
++++ b/target/dadao/cpu.h
+@@ -59,6 +59,11 @@ typedef enum DADAOCfxCode {
+     DADAO_CFX_CODE_SMON = 2,
+     DADAO_CFX_CODE_PTW = 4,
+     DADAO_CFX_CODE_TLB = 5,
++    /* KL-133a: cfx_hart (hart management/local counters) and cfx_timer
++     * (timer/counter). [wiki §DADAO-12-SEE-主管系统运行环境.md L20-33
++     * cfxcode table]. */
++    DADAO_CFX_CODE_HART = 15,
++    DADAO_CFX_CODE_TIMER = 18,
+     DADAO_CFX_CODE_POWER = 63,
+ } DADAOCfxCode;
+ 
+@@ -186,6 +191,32 @@ typedef struct DADAOCfxFrame {
+  * test entries so probes/logs can tell them apart from a real cause. */
+ #define DADAO_CFX_TEST_CAUSE_INFO 0x5E1F7E5700000000ULL
+ 
++/* KL-133a: cfx_hart cg8/rc2 cycle_lo (RO, 64-bit, per-hart tick counter --
++ * one increment per architecturally-retired instruction, mod 2^64). [wiki
++ * §DADAO-12-SEE-主管系统运行环境.md L525 cfx_hart 专有寄存器表]. cg8/rc3
++ * cycle_hi is deliberately not implemented (K1 non-claim, contracts/isa/
++ * spec.md §8.5.2) -- there is no (cg,rc) dispatch branch for it at all, so
++ * it falls through to the existing "unimplemented register -> silent no-op
++ * write / reads zero" convention, not a fabricated nonzero high word. */
++#define DADAO_CFX_HART_CYCLE_LO_CG 8
++#define DADAO_CFX_HART_CYCLE_LO_RC 2
++/* KL-133a: cfx_timer cg10 register group. [wiki §DADAO-12-SEE-主管系统
++ * 运行环境.md L582-600 cfx_timer 专有寄存器表]. Only counter0 (rc8) is in
++ * scope; rc9-15 (counters1-7) are a K1 non-claim per contracts/isa/spec.md
++ * §8.5.2 and have no dispatch branch (silent no-op/reads zero, same
++ * unimplemented-register convention as cycle_hi above). */
++#define DADAO_CFX_TIMER_CG 10
++#define DADAO_CFX_TIMER_PENDING_RC 0
++#define DADAO_CFX_TIMER_MASK_RC 1
++#define DADAO_CFX_TIMER_CTRL_RC 7
++#define DADAO_CFX_TIMER_REG0_RC 8
++/* cfx_timer_ctrl bit assignments [wiki L590]. */
++#define DADAO_CFX_TIMER_CTRL_ENABLE (1ULL << 0)
++#define DADAO_CFX_TIMER_CTRL_PERIODIC (1ULL << 1)
++/* cfx_timer's one maskable cause, TIMER (bit10) [wiki L600]. Matches the
++ * existing dadao_cfx_common_pending_mask() case 18 in helper.c exactly. */
++#define DADAO_CFX_TIMER_CAUSE_TIMER (1ULL << 10)
++
+ typedef struct DADAOCfxTlbEntry {
+     bool valid;
+     bool superpage;
+@@ -259,6 +290,29 @@ struct CPUArchState {
+      * trap_cfxcode/trap_func's helper->do_interrupt handoff pattern below. */
+     target_ulong cfx_async_pending_target;
+     target_ulong cfx_async_pending_cause;
++    /* KL-133a: cfx_hart cg8/rc2 cycle_lo -- one increment per
++     * architecturally-retired instruction, RO, mod 2^64. This is the shared
++     * timebase cfx_timer's decrement math is built on
++     * (contracts/isa/spec.md §8.5.2). */
++    uint64_t cfx_hart_cycle_lo;
++    /* KL-133a: cfx_timer private state (cg10). cfx_timer_pending/mask are
++     * only 1 bit wide architecturally (bit0=TIMER source), stored as
++     * target_ulong for register-width consistency with every other
++     * (cg,rc)-addressed register in this file; higher bits are always kept
++     * zero by the read/write dispatch in helper.c. cfx_timer_ctrl bits 0-2
++     * are defined (enable/mode/dir); bits[63:3] are stored as written
++     * (reserved, RW, no defined read-back masking per wiki). cfx_timer_regs0
++     * is the live down-counting counter0 (cg10/rc8, directly guest-readable
++     * -- NOT the GET_TIME source, contracts/isa/spec.md §8.5.2).
++     * cfx_timer_reload_latch is a project-local *non-architectural* shadow
++     * of "the last value written to counter0" (SET_TIMER's implicit reload
++     * latch) -- it has no (cg,rc) address of its own and is never directly
++     * guest-readable; periodic-mode expiry reloads counter0 from it. */
++    target_ulong cfx_timer_pending;
++    target_ulong cfx_timer_mask;
++    target_ulong cfx_timer_ctrl;
++    uint64_t cfx_timer_regs0;
++    uint64_t cfx_timer_reload_latch;
+     /* Scratch for a pending trap (cfx) syscall, passed helper -> do_interrupt.
+        Must NOT reuse rb[1]/rb[2] — rb1 is the stack pointer (ADR-0004). */
+     target_ulong trap_cfxcode;
+diff --git a/target/dadao/helper.c b/target/dadao/helper.c
+index 9e52b32..e82c11c 100644
+--- a/target/dadao/helper.c
++++ b/target/dadao/helper.c
+@@ -32,6 +32,26 @@ void helper_raise_exception(CPUDADAOState *env, uint32_t exception)
+     dadao_raise_exception(env, exception, GETPC());
+ }
+ 
++/* KL-133a discovery (not a regression -- a previously-unobserved property,
++ * since no register before cfx_hart_cycle_lo changed value merely from
++ * being re-read): qemu_system_shutdown_request_with_code() only *requests*
++ * a shutdown; it does not stop this vCPU's execution loop immediately.
++ * cpu_loop_exit() below unwinds to cpu_exec()'s main loop, which -- since
++ * the shutdown has not actually been serviced by the top-level loop yet --
++ * can re-enter and re-execute the *same* `halt`-containing TB one or more
++ * times (env->pc was never advanced past this TB's start, because a
++ * DISAS_NORETURN TB's epilogue never runs) before the requested shutdown
++ * actually takes effect; the exact repeat count is a host-scheduling race,
++ * observed to vary run-to-run. Every pre-existing K1 probe is unaffected
++ * because it only reads *idempotent* state (plain registers whose value is
++ * unchanged by being re-read) in this tail. A monotonic counter like
++ * cfx_hart_cycle_lo is not idempotent under this re-entry -- any read of
++ * it (or of cfx_timer's ctrl/regs0 while still enabled) MUST happen in an
++ * earlier, already-completed TB, not in the same TB as the final `halt`.
++ * tests/scripts/run_kl133a_cfx_timer_probes.py's tb_break() (a no-op
++ * `jump_i +0`, which forces a clean DISAS_JUMP TB boundary) is the
++ * work-around every KL-133a probe uses immediately before its final
++ * emit_final_halt() call. */
+ void helper_exit(CPUDADAOState *env, uint64_t code)
+ {
+     int exit_code = (int)(code & 0xff);
+@@ -161,6 +181,27 @@ uint64_t dadao_cfx_common_pending_mask(uint64_t cfxcode)
+     }
+ }
+ 
++/* KL-133a: per-instruction hart-cycle tick. Called once per translated
++ * instruction from dadao_tr_translate_insn() (translate.c), BEFORE that
++ * instruction's own semantic ops are emitted -- so at runtime this always
++ * executes exactly once per instruction that begins execution, regardless
++ * of whether that same instruction goes on to raise a noreturn exception
++ * (helper_raise_exception/helper_trap/helper_exit all longjmp via
++ * cpu_loop_exit(), which would make any *later*-emitted code in the same TB
++ * unreachable -- placing this call first is what guarantees the increment
++ * still happens for those instructions too). This is what makes
++ * cfx_hart_cycle_lo a monotonic "one tick per architecturally-visible
++ * instruction" counter rather than one that silently stalls whenever a trap
++ * fires. This is ONLY the cycle_lo increment -- see
++ * dadao_cfx_timer_tick() (cpu.c) for why the timer's own decrement/expiry
++ * math deliberately does NOT live here too (a TB-boundary-timing
++ * subtlety), even though both conceptually advance "once per tick".
++ */
++void helper_dadao_tick(CPUDADAOState *env)
++{
++    env->cfx_hart_cycle_lo++;
++}
++
+ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+                    uint64_t rc, uint64_t value)
+ {
+@@ -261,6 +302,40 @@ void helper_cfx2rc(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         }
+     }
+ 
++    if (cfxcode == DADAO_CFX_CODE_HART &&
++        cg == DADAO_CFX_HART_CYCLE_LO_CG &&
++        rc == DADAO_CFX_HART_CYCLE_LO_RC) {
++        /* RO: cfx2rc write to cycle_lo is a silent no-op, matching the
++         * project's established RO-register convention (e.g.
++         * DADAO_CFX_TLB_EXIST_RC above). */
++        return;
++    }
++
++    if (cfxcode == DADAO_CFX_CODE_TIMER && cg == DADAO_CFX_TIMER_CG) {
++        switch (rc) {
++        case DADAO_CFX_TIMER_PENDING_RC:
++            /* W0C, only bit0 (TIMER source) is defined. */
++            env->cfx_timer_pending &= value & 0x1ULL;
++            return;
++        case DADAO_CFX_TIMER_MASK_RC:
++            env->cfx_timer_mask = value;
++            return;
++        case DADAO_CFX_TIMER_CTRL_RC:
++            env->cfx_timer_ctrl = value;
++            return;
++        case DADAO_CFX_TIMER_REG0_RC:
++            /* counter0: also latches the project-local (non-architectural)
++             * reload shadow -- contracts/isa/spec.md §8.5.2's "SET_TIMER
++             * writes counter0 and a same-value internal reload latch". */
++            env->cfx_timer_regs0 = value;
++            env->cfx_timer_reload_latch = value;
++            return;
++        default:
++            /* rc9-15 (counters1-7): K1 non-claim, silent no-op. */
++            break;
++        }
++    }
++
+     if (cg == 5) {
+         /* KL-122a common frame carrier. rc2/rc4 are hardware-written and
+          * intentionally read-only; rc5 is project-local E1. */
+@@ -443,6 +518,22 @@ uint64_t helper_cfx2rd(CPUDADAOState *env, uint64_t cfxcode, uint64_t cg,
+         default: break;
+         }
+     }
++    if (cfxcode == DADAO_CFX_CODE_HART &&
++        cg == DADAO_CFX_HART_CYCLE_LO_CG &&
++        rc == DADAO_CFX_HART_CYCLE_LO_RC) {
++        return env->cfx_hart_cycle_lo;
++    }
++
++    if (cfxcode == DADAO_CFX_CODE_TIMER && cg == DADAO_CFX_TIMER_CG) {
++        switch (rc) {
++        case DADAO_CFX_TIMER_PENDING_RC: return env->cfx_timer_pending & 0x1ULL;
++        case DADAO_CFX_TIMER_MASK_RC: return env->cfx_timer_mask;
++        case DADAO_CFX_TIMER_CTRL_RC: return env->cfx_timer_ctrl;
++        case DADAO_CFX_TIMER_REG0_RC: return env->cfx_timer_regs0;
++        default: break; /* rc9-15: K1 non-claim, reads zero. */
++        }
++    }
++
+     if (cg == 5) {
+         switch (rc) {
+         case 0: return env->cfx_frame[cfxcode].prev_run_mode;
+diff --git a/target/dadao/helper.h b/target/dadao/helper.h
+index edc600b..d717ab1 100644
+--- a/target/dadao/helper.h
++++ b/target/dadao/helper.h
+@@ -6,3 +6,4 @@ DEF_HELPER_4(trap, noreturn, env, i64, i64, i64)
+ DEF_HELPER_5(cfx2rc, void, env, i64, i64, i64, i64)
+ DEF_HELPER_4(cfx2rd, i64, env, i64, i64, i64)
+ DEF_HELPER_3(escape, void, env, i64, i64)
++DEF_HELPER_1(dadao_tick, void, env)
+diff --git a/target/dadao/translate.c b/target/dadao/translate.c
+index c70221d..10e2055 100644
+--- a/target/dadao/translate.c
++++ b/target/dadao/translate.c
+@@ -509,6 +509,23 @@ static bool trans_cfx2rc(DisasContext *ctx, arg_cfx2rc *a)
+          */
+         ctx->base.is_jmp = DISAS_TOO_MANY;
+     }
++    if ((a->ha & 0x3F) == DADAO_CFX_CODE_TIMER &&
++        (a->hb & 0x3F) == DADAO_CFX_TIMER_CG &&
++        (a->hc & 0x3F) == DADAO_CFX_TIMER_CTRL_RC) {
++        /*
++         * KL-133a: same rationale as the PTW-enable case above. A write to
++         * cfx_timer_ctrl may just have transitioned enable 0->1 while THIS
++         * TB was translated under the old (pre-enable) batching profile --
++         * if a later instruction in this same already-translated TB ran
++         * without an intervening boundary check, dadao_cfx_timer_tick()
++         * would miss ticks for it. Ending the TB here unconditionally
++         * (regardless of the value written -- mirrors the PTW precedent)
++         * guarantees dadao_translate_code() re-evaluates
++         * cfx_timer_ctrl & ENABLE, and forces single-instruction TBs from
++         * the very next instruction onward whenever it is now enabled.
++         */
++        ctx->base.is_jmp = DISAS_TOO_MANY;
++    }
+     return true;
+ }
+ 
+@@ -1457,6 +1474,12 @@ static void dadao_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
+     DisasContext *ctx = container_of(dcbase, DisasContext, base);
+     CPUDADAOState *env = cpu_env(cpu);
+ 
++    /* KL-133a: hart-cycle tick, emitted BEFORE this instruction's own
++     * semantic ops -- see helper_dadao_tick()'s comment (helper.c) for why
++     * this ordering matters (guarantees the tick still happens even when
++     * this instruction itself raises a noreturn exception). */
++    gen_helper_dadao_tick(tcg_env);
++
+     decode_opc(env, ctx);
+     ctx->base.pc_next += 4;
+ 
+@@ -1524,6 +1547,29 @@ void dadao_translate_code(CPUState *cs, TranslationBlock *tb,
+     if (dadao_cfx_async_active(cpu_env(cs))) {
+         *max_insns = MIN(*max_insns, 1);
+     }
++    /* KL-133a: same rationale as the PTW/KL-131a checks above -- while
++     * cfx_timer is enabled, dadao_cpu_exec_interrupt() (this file, below)
++     * must be consulted at every real instruction boundary so a
++     * newly-expired, newly-unmasked TIMER cause is delivered precisely
++     * (not delayed until the next several-instruction TB happens to end). */
++    if (cpu_env(cs)->cfx_timer_ctrl & DADAO_CFX_TIMER_CTRL_ENABLE) {
++        *max_insns = MIN(*max_insns, 1);
++    }
++    /* KL-133a: also force it while a TIMER cause is latched-but-undelivered
++     * (e.g. expired while cfx_timer_mask still blocked it, and ctrl has
++     * since auto-disabled on a one-shot expiry -- the ENABLE check above no
++     * longer holds, but software clearing cfx_timer_mask/excp_cause_mask/
++     * inner_cfx_mask afterwards must still be observed at the very next
++     * instruction boundary, not delayed until an arbitrarily-sized TB
++     * happens to end). Without this, a TB translated *before* this bit was
++     * set could keep batching several post-expiry instructions together,
++     * and the newly-unmasking write and the instruction right after it
++     * could land in the very same TB with no intervening
++     * cpu_exec_interrupt() check between them. */
++    if (cpu_env(cs)->cfx_common_pending[DADAO_CFX_CODE_TIMER] &
++        DADAO_CFX_TIMER_CAUSE_TIMER) {
++        *max_insns = MIN(*max_insns, 1);
++    }
+     translator_loop(cs, tb, max_insns, pc, host_pc, &dadao_tr_ops, &ctx.base);
+ }
+ 
+-- 
+2.43.0
+

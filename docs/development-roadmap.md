@@ -1983,6 +1983,28 @@ the KL-122a carrier, plus the project's first real instruction-boundary
 async interrupt dispatch, QEMU+gem5. Architect review independently
 verified against wiki, zero regression. See task file 完成区 for detail.
 
-**Next**: real timer/UART interrupt sources (KL-133a/137a), hypv→supv
+**Next**: synthetic external interrupt source K1_EXT0 (KL-137a), hypv→supv
 `switch_run_mode`/`switch_cfx_mask` write support, and complete interrupt
 dispatch (SBI-level handler conventions) remain open before kernel boot.
+
+## K1: cfx_hart_cycle_lo + cfx_timer counter0 (2026-07-28) — see `code-agent/tasks/KL-133a-cfx-timer.md`
+
+New per-instruction-retired counter (`cfx_hart_cycle_lo`) and the
+`cfx_timer` counter0 decrement/one-shot/periodic state machine, QEMU+gem5,
+the first real (non-test-only) source driving KL-131a's async dispatch
+core. Main acceptance found the original periodic rc=130 and rejected the
+pre-execute counter: the final implementation advances only on successful
+retirement, excludes a real PTW fault, delivers expiry at the following
+boundary, and passes 10/10 stable dual-backend loops. QEMU 34/34 and gem5
+27/27 bare-pin replay match their development trees; all K1 probes, 81/81
+E2E and differential remain green. See the task's “主验收修订” section.
+
+Independent review then found a frozen-contract gap shared by both backends:
+clearing common TIMER while private timer pending remained asserted did not
+re-latch the common cause. The KL-133a follow-up now reconstructs common
+TIMER at every boundary, independent of enable/masks, and adds a discriminating
+guest probe for both acknowledge orders. QEMU terminal `exit`/`exit_group`
+traps also retire exactly once before host termination.
+
+**Next**: synthetic external interrupt source K1_EXT0 (KL-137a); counters1-7 and increment
+mode remain a K1 non-claim.
