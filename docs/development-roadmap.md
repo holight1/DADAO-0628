@@ -2195,3 +2195,36 @@ trap ABI, Minor/O3 and performance remain non-claims.
 
 **Next**: KL-143a binds PTBR/address-space state to tasks and proves the
 frozen explicit TLB-invalidate switch protocol on both FullSystem backends.
+
+## K2: dual-backend PTBR/address-space switching (KL-143a, 2026-07-29)
+
+Implemented the isolated address-space context protocol with two cooperative
+descriptors sharing asid 6 and one virtual address while binding different
+PTBR roots. Root A and root B map that VA to distinct physical values. Each
+of 12 alternating switches consumes w1/w2 from the target 135-word frame,
+writes PTBR[6], invalidates the complete 4 TiB set6 range, increments the
+guest-owned TLB generation, performs a real translated load, and emits an
+AS_SWITCH checkpoint binding task/frame digest/asid/root/generation.
+
+The same-ASID design is deliberate: a separate image omits switch 6's
+invalidate after changing the root, so both QEMU and gem5 hit the stale prior
+mapping and the guest reads the wrong value. The guest also enforces the
+invariant generation count, while the independent host oracle observes all
+subsequent `tlb_gen` and memory-digest fields shifted by one; backend agreement
+therefore cannot rescue the failure.
+
+The byte-identical positive image passes QEMU/gem5, guest/oracle and
+cross-backend comparison 10/10 (INIT + 12 AS_SWITCH + FINAL). The omitted
+invalidate image fails on both backends with nonzero mismatch, and restoring
+the positive image passes. KL-140a remains 70/70 x10, KL-141a and KL-142a
+retain their positive/negative/post-restore gates, KL-139a remains 3/3, E2E
+is 81/81, and the 200-case three/four-way differential has zero divergence.
+
+This task isolates PTBR/TLB protocol and does not re-claim integrated register
+context switching or asynchronous trap switching. TLB disable-enable entry
+lifetime, user mode, RF, SMP/multi-hart, Linux paging/scheduler, real devices,
+Minor/O3 and performance remain non-claims.
+
+**Next**: KL-144a combines timer-driven preemption, full trap context,
+cooperative task state and address-space switching in one dual-backend
+scheduler scenario.
