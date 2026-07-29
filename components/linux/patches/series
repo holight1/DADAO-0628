@@ -1,1 +1,2 @@
-# Deferred component. Keep empty until an ADR enables it.
+# K3 Linux 5.4 architecture port; apply in order.
+0001-dadao-add-K3-configuration-skeleton.patch

@@ -2314,3 +2314,18 @@ The incremental K3/K4 chain is:
 Each stage must retain a task Markdown record and executable evidence. QEMU is
 the first boot carrier; gem5 FullSystem parity is a required follow-on gate,
 not grounds for weakening the QEMU/Linux contract.
+
+## K3 Linux build contract and configuration skeleton (KL-147a, 2026-07-29)
+
+The first Linux component patch creates only the fresh Kconfig/Makefile/
+defconfig layer. A fail-closed runner binds the component HEAD to the
+manifest baseline plus exactly one patch, verifies the source worktree is
+clean, runs `dadao_defconfig` and two stable `olddefconfig` passes with the
+project's DADAO clang/LLD tools, and checks the resulting 64-bit, single-hart,
+MMU-on, initramfs/ELF configuration. The stable `.config` SHA256 is
+`352b07252e9da0836a067b34b051c6fc30277168bf1ca4c91168570fe97d0932`.
+
+This is deliberately configuration-only: no architecture headers, object
+files, boot entry, trap path, page tables or device implementation exist yet.
+KL-148a owns the compile-to-link substrate and must expose real compiler/
+Kbuild gaps rather than hiding them behind placeholders.

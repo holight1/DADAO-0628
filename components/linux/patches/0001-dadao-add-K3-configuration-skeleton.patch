@@ -1,0 +1,139 @@
+From 6dbd09a49be915128bb6a55360df79cf8c7c419a Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 16:55:27 +0800
+Subject: [PATCH] dadao: add K3 configuration skeleton
+
+---
+ arch/dadao/Kconfig                 | 64 ++++++++++++++++++++++++++++++
+ arch/dadao/Kconfig.debug           |  3 ++
+ arch/dadao/Makefile                | 12 ++++++
+ arch/dadao/configs/dadao_defconfig | 17 ++++++++
+ 4 files changed, 96 insertions(+)
+ create mode 100644 arch/dadao/Kconfig
+ create mode 100644 arch/dadao/Kconfig.debug
+ create mode 100644 arch/dadao/Makefile
+ create mode 100644 arch/dadao/configs/dadao_defconfig
+
+diff --git a/arch/dadao/Kconfig b/arch/dadao/Kconfig
+new file mode 100644
+index 000000000..b8f0bb656
+--- /dev/null
++++ b/arch/dadao/Kconfig
+@@ -0,0 +1,64 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config DADAO
++	def_bool y
++	select 64BIT
++	select ARCH_WANT_FRAME_POINTERS
++	select GENERIC_CALIBRATE_DELAY
++	select GENERIC_CSUM
++	select GENERIC_HWEIGHT
++	select GENERIC_IRQ_SHOW
++	select GENERIC_SMP_IDLE_THREAD
++	select HAVE_MEMBLOCK
++	select MODULES_USE_ELF_RELA if MODULES
++	select NO_IOPORT_MAP
++	help
++	  Linux architecture support for the DADAO 64-bit instruction set.
++
++config 64BIT
++	def_bool y
++
++config MMU
++	def_bool y
++
++config CPU_BIG_ENDIAN
++	def_bool y
++
++config GENERIC_BUG
++	def_bool y
++	depends on BUG
++
++config GENERIC_CLOCKEVENTS
++	def_bool y
++
++config GENERIC_CLOCKEVENTS_BROADCAST
++	def_bool y
++
++config GENERIC_IRQ_PROBE
++	def_bool y
++
++config NR_CPUS
++	int
++	default 1
++
++config PAGE_OFFSET
++	hex
++	default 0x0000000080000000
++
++menu "DADAO platform"
++
++config DADAO_M1
++	def_bool y
++	help
++	  Select the single-hart DADAO M1 virtual platform used by the K3
++	  QEMU and gem5 bring-up contract.
++
++config CMDLINE
++	string "Built-in kernel command line"
++	default "console=dadao0 init=/init panic=-1"
++	help
++	  Command line used by the firmware-free DADAO M1 boot path.
++
++source "kernel/Kconfig.hz"
++
++endmenu
+diff --git a/arch/dadao/Kconfig.debug b/arch/dadao/Kconfig.debug
+new file mode 100644
+index 000000000..e26e4b25f
+--- /dev/null
++++ b/arch/dadao/Kconfig.debug
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Architecture-specific debug options are added when their implementation
++# becomes executable. This file is required by lib/Kconfig.debug.
+diff --git a/arch/dadao/Makefile b/arch/dadao/Makefile
+new file mode 100644
+index 000000000..7ae93e8d8
+--- /dev/null
++++ b/arch/dadao/Makefile
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++KBUILD_DEFCONFIG := dadao_defconfig
++UTS_MACHINE := dadao
++
++KBUILD_CFLAGS += -D__linux__ -fno-pic -fno-pie
++KBUILD_AFLAGS += -D__linux__
++KBUILD_LDFLAGS += -m elf64dadao
++
++# KL-147a intentionally stops at Kconfig. The boot entry and architecture
++# object directories are introduced by KL-148a, once compile/link contracts
++# are executable.
+diff --git a/arch/dadao/configs/dadao_defconfig b/arch/dadao/configs/dadao_defconfig
+new file mode 100644
+index 000000000..d96841da5
+--- /dev/null
++++ b/arch/dadao/configs/dadao_defconfig
+@@ -0,0 +1,17 @@
++CONFIG_SYSVIPC=y
++CONFIG_NO_HZ_IDLE=y
++CONFIG_HIGH_RES_TIMERS=y
++CONFIG_IKCONFIG=y
++CONFIG_IKCONFIG_PROC=y
++CONFIG_BLK_DEV_INITRD=y
++CONFIG_BINFMT_ELF=y
++CONFIG_DEVTMPFS=y
++CONFIG_DEVTMPFS_MOUNT=y
++CONFIG_TTY=y
++CONFIG_PRINTK=y
++CONFIG_PRINTK_TIME=y
++CONFIG_EMBEDDED=y
++CONFIG_EXPERT=y
++# CONFIG_SMP is not set
++# CONFIG_MODULES is not set
++# CONFIG_NET is not set
+-- 
+2.43.0
+
