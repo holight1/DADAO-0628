@@ -1,2 +1,3 @@
 # K3 Linux 5.4 architecture port; apply in order.
 0001-dadao-add-K3-configuration-skeleton.patch
+0002-dadao-add-Linux-compile-substrate.patch

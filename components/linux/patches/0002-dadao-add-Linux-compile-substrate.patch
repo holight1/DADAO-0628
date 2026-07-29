@@ -1,0 +1,1055 @@
+From c06b6f93a3c33968145f001859f29702e47f3244 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 17:15:27 +0800
+Subject: [PATCH] dadao: add Linux compile substrate
+
+---
+ arch/dadao/Kconfig                        |   4 +
+ arch/dadao/Makefile                       |   4 +-
+ arch/dadao/include/asm/Kbuild             |  53 +++++++
+ arch/dadao/include/asm/atomic.h           | 147 ++++++++++++++++++++
+ arch/dadao/include/asm/cache.h            |   8 ++
+ arch/dadao/include/asm/current.h          |  24 ++++
+ arch/dadao/include/asm/elf.h              |  22 +++
+ arch/dadao/include/asm/irqflags.h         |  10 ++
+ arch/dadao/include/asm/linkage.h          |   8 ++
+ arch/dadao/include/asm/mmu.h              |  10 ++
+ arch/dadao/include/asm/page.h             |  61 ++++++++
+ arch/dadao/include/asm/pgtable-prot.h     |  55 ++++++++
+ arch/dadao/include/asm/pgtable.h          | 161 ++++++++++++++++++++++
+ arch/dadao/include/asm/processor.h        |  44 ++++++
+ arch/dadao/include/asm/ptrace.h           |  33 +++++
+ arch/dadao/include/asm/thread_info.h      |  52 +++++++
+ arch/dadao/include/asm/timex.h            |   9 ++
+ arch/dadao/include/asm/uaccess.h          |  19 +++
+ arch/dadao/include/uapi/asm/Kbuild        |   2 +
+ arch/dadao/include/uapi/asm/bitsperlong.h |   8 ++
+ arch/dadao/include/uapi/asm/byteorder.h   |   7 +
+ arch/dadao/include/uapi/asm/elf.h         |  17 +++
+ arch/dadao/include/uapi/asm/ptrace.h      |  19 +++
+ arch/dadao/include/uapi/asm/sigcontext.h  |  16 +++
+ arch/dadao/kernel/asm-offsets.c           |  12 ++
+ include/linux/kbuild.h                    |  10 ++
+ 26 files changed, 813 insertions(+), 2 deletions(-)
+ create mode 100644 arch/dadao/include/asm/Kbuild
+ create mode 100644 arch/dadao/include/asm/atomic.h
+ create mode 100644 arch/dadao/include/asm/cache.h
+ create mode 100644 arch/dadao/include/asm/current.h
+ create mode 100644 arch/dadao/include/asm/elf.h
+ create mode 100644 arch/dadao/include/asm/irqflags.h
+ create mode 100644 arch/dadao/include/asm/linkage.h
+ create mode 100644 arch/dadao/include/asm/mmu.h
+ create mode 100644 arch/dadao/include/asm/page.h
+ create mode 100644 arch/dadao/include/asm/pgtable-prot.h
+ create mode 100644 arch/dadao/include/asm/pgtable.h
+ create mode 100644 arch/dadao/include/asm/processor.h
+ create mode 100644 arch/dadao/include/asm/ptrace.h
+ create mode 100644 arch/dadao/include/asm/thread_info.h
+ create mode 100644 arch/dadao/include/asm/timex.h
+ create mode 100644 arch/dadao/include/asm/uaccess.h
+ create mode 100644 arch/dadao/include/uapi/asm/Kbuild
+ create mode 100644 arch/dadao/include/uapi/asm/bitsperlong.h
+ create mode 100644 arch/dadao/include/uapi/asm/byteorder.h
+ create mode 100644 arch/dadao/include/uapi/asm/elf.h
+ create mode 100644 arch/dadao/include/uapi/asm/ptrace.h
+ create mode 100644 arch/dadao/include/uapi/asm/sigcontext.h
+ create mode 100644 arch/dadao/kernel/asm-offsets.c
+
+diff --git a/arch/dadao/Kconfig b/arch/dadao/Kconfig
+index b8f0bb656..d4f4becd9 100644
+--- a/arch/dadao/Kconfig
++++ b/arch/dadao/Kconfig
+@@ -12,6 +12,7 @@ config DADAO
+ 	select HAVE_MEMBLOCK
+ 	select MODULES_USE_ELF_RELA if MODULES
+ 	select NO_IOPORT_MAP
++	select THREAD_INFO_IN_TASK
+ 	help
+ 	  Linux architecture support for the DADAO 64-bit instruction set.
+ 
+@@ -37,6 +38,9 @@ config GENERIC_CLOCKEVENTS_BROADCAST
+ config GENERIC_IRQ_PROBE
+ 	def_bool y
+ 
++config UACCESS_MEMCPY
++	def_bool y
++
+ config NR_CPUS
+ 	int
+ 	default 1
+diff --git a/arch/dadao/Makefile b/arch/dadao/Makefile
+index 7ae93e8d8..3529de86f 100644
+--- a/arch/dadao/Makefile
++++ b/arch/dadao/Makefile
+@@ -3,8 +3,8 @@
+ KBUILD_DEFCONFIG := dadao_defconfig
+ UTS_MACHINE := dadao
+ 
+-KBUILD_CFLAGS += -D__linux__ -fno-pic -fno-pie
+-KBUILD_AFLAGS += -D__linux__
++KBUILD_CFLAGS += -D__linux__ -fno-pic -fno-pie -integrated-as
++KBUILD_AFLAGS += -D__linux__ -integrated-as
+ KBUILD_LDFLAGS += -m elf64dadao
+ 
+ # KL-147a intentionally stops at Kconfig. The boot entry and architecture
+diff --git a/arch/dadao/include/asm/Kbuild b/arch/dadao/include/asm/Kbuild
+new file mode 100644
+index 000000000..8bafec69d
+--- /dev/null
++++ b/arch/dadao/include/asm/Kbuild
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: GPL-2.0-only
++generic-y += barrier.h
++generic-y += bitops.h
++generic-y += bug.h
++generic-y += bugs.h
++generic-y += cacheflush.h
++generic-y += checksum.h
++generic-y += cmpxchg.h
++generic-y += compat.h
++generic-y += device.h
++generic-y += delay.h
++generic-y += div64.h
++generic-y += dma.h
++generic-y += dma-mapping.h
++generic-y += emergency-restart.h
++generic-y += exec.h
++generic-y += extable.h
++generic-y += fb.h
++generic-y += ftrace.h
++generic-y += hardirq.h
++generic-y += hw_irq.h
++generic-y += io.h
++generic-y += irq.h
++generic-y += irq_regs.h
++generic-y += irq_work.h
++generic-y += kdebug.h
++generic-y += kmap_types.h
++generic-y += kprobes.h
++generic-y += kvm_para.h
++generic-y += local.h
++generic-y += local64.h
++generic-y += mcs_spinlock.h
++generic-y += mm-arch-hooks.h
++generic-y += mmiowb.h
++generic-y += module.h
++generic-y += pci.h
++generic-y += percpu.h
++generic-y += preempt.h
++generic-y += sections.h
++generic-y += serial.h
++generic-y += shmparam.h
++generic-y += spinlock.h
++generic-y += spinlock_types.h
++generic-y += string.h
++generic-y += switch_to.h
++generic-y += topology.h
++generic-y += trace_clock.h
++generic-y += unaligned.h
++generic-y += user.h
++generic-y += vga.h
++generic-y += vmlinux.lds.h
++generic-y += word-at-a-time.h
++generic-y += xor.h
+diff --git a/arch/dadao/include/asm/atomic.h b/arch/dadao/include/asm/atomic.h
+new file mode 100644
+index 000000000..29022d1e8
+--- /dev/null
++++ b/arch/dadao/include/asm/atomic.h
+@@ -0,0 +1,147 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_ATOMIC_H
++#define _ASM_DADAO_ATOMIC_H
++
++#include <linux/irqflags.h>
++#include <asm/cmpxchg.h>
++#include <asm-generic/atomic.h>
++
++/*
++ * K3 starts as a single-CPU port.  Until an LL/SC contract is introduced,
++ * masking local interrupts gives the generic kernel code a real UP atomic
++ * implementation instead of compile-only stubs.
++ */
++#define ATOMIC64_INIT(i) { (i) }
++
++static __always_inline s64 atomic64_read(const atomic64_t *v)
++{
++	return READ_ONCE(v->counter);
++}
++#define atomic64_read atomic64_read
++
++static __always_inline void atomic64_set(atomic64_t *v, s64 i)
++{
++	WRITE_ONCE(v->counter, i);
++}
++#define atomic64_set atomic64_set
++#define atomic64_set_release(v, i) atomic64_set((v), (i))
++
++#define DADAO_ATOMIC64_OP(name, op)					\
++static __always_inline void atomic64_##name(s64 i, atomic64_t *v)	\
++{									\
++	unsigned long flags;						\
++	raw_local_irq_save(flags);					\
++	v->counter op i;						\
++	raw_local_irq_restore(flags);					\
++}
++
++#define DADAO_ATOMIC64_OP_RETURN(name, op)				\
++static __always_inline s64 atomic64_##name##_return(s64 i, atomic64_t *v) \
++{									\
++	unsigned long flags;						\
++	s64 result;							\
++	raw_local_irq_save(flags);					\
++	result = (v->counter op i);					\
++	raw_local_irq_restore(flags);					\
++	return result;							\
++}
++
++#define DADAO_ATOMIC64_FETCH_OP(name, op)				\
++static __always_inline s64 atomic64_fetch_##name(s64 i, atomic64_t *v)	\
++{									\
++	unsigned long flags;						\
++	s64 old;							\
++	raw_local_irq_save(flags);					\
++	old = v->counter;						\
++	v->counter op i;						\
++	raw_local_irq_restore(flags);					\
++	return old;							\
++}
++
++DADAO_ATOMIC64_OP(add, +=)
++DADAO_ATOMIC64_OP(sub, -=)
++DADAO_ATOMIC64_OP(and, &=)
++DADAO_ATOMIC64_OP(or, |=)
++DADAO_ATOMIC64_OP(xor, ^=)
++DADAO_ATOMIC64_OP_RETURN(add, +=)
++DADAO_ATOMIC64_OP_RETURN(sub, -=)
++DADAO_ATOMIC64_FETCH_OP(add, +=)
++DADAO_ATOMIC64_FETCH_OP(sub, -=)
++DADAO_ATOMIC64_FETCH_OP(and, &=)
++DADAO_ATOMIC64_FETCH_OP(or, |=)
++DADAO_ATOMIC64_FETCH_OP(xor, ^=)
++
++#undef DADAO_ATOMIC64_FETCH_OP
++#undef DADAO_ATOMIC64_OP_RETURN
++#undef DADAO_ATOMIC64_OP
++
++#define atomic64_add atomic64_add
++#define atomic64_sub atomic64_sub
++#define atomic64_and atomic64_and
++#define atomic64_or atomic64_or
++#define atomic64_xor atomic64_xor
++#define atomic64_add_return atomic64_add_return
++#define atomic64_sub_return atomic64_sub_return
++#define atomic64_fetch_add atomic64_fetch_add
++#define atomic64_fetch_sub atomic64_fetch_sub
++#define atomic64_fetch_and atomic64_fetch_and
++#define atomic64_fetch_or atomic64_fetch_or
++#define atomic64_fetch_xor atomic64_fetch_xor
++
++static __always_inline s64 atomic64_xchg(atomic64_t *v, s64 new)
++{
++	unsigned long flags;
++	s64 old;
++
++	raw_local_irq_save(flags);
++	old = v->counter;
++	v->counter = new;
++	raw_local_irq_restore(flags);
++	return old;
++}
++#define atomic64_xchg atomic64_xchg
++
++static __always_inline s64 atomic64_cmpxchg(atomic64_t *v, s64 old, s64 new)
++{
++	unsigned long flags;
++	s64 observed;
++
++	raw_local_irq_save(flags);
++	observed = v->counter;
++	if (observed == old)
++		v->counter = new;
++	raw_local_irq_restore(flags);
++	return observed;
++}
++#define atomic64_cmpxchg atomic64_cmpxchg
++
++static __always_inline s64
++atomic64_fetch_add_unless(atomic64_t *v, s64 add, s64 unless)
++{
++	unsigned long flags;
++	s64 old;
++
++	raw_local_irq_save(flags);
++	old = v->counter;
++	if (old != unless)
++		v->counter += add;
++	raw_local_irq_restore(flags);
++	return old;
++}
++#define atomic64_fetch_add_unless atomic64_fetch_add_unless
++
++static __always_inline s64 atomic64_dec_if_positive(atomic64_t *v)
++{
++	unsigned long flags;
++	s64 result;
++
++	raw_local_irq_save(flags);
++	result = v->counter - 1;
++	if (result >= 0)
++		v->counter = result;
++	raw_local_irq_restore(flags);
++	return result;
++}
++#define atomic64_dec_if_positive atomic64_dec_if_positive
++
++#endif
+diff --git a/arch/dadao/include/asm/cache.h b/arch/dadao/include/asm/cache.h
+new file mode 100644
+index 000000000..4b6ba6e46
+--- /dev/null
++++ b/arch/dadao/include/asm/cache.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_CACHE_H
++#define _ASM_DADAO_CACHE_H
++
++#define L1_CACHE_SHIFT 6
++#define L1_CACHE_BYTES (1 << L1_CACHE_SHIFT)
++
++#endif
+diff --git a/arch/dadao/include/asm/current.h b/arch/dadao/include/asm/current.h
+new file mode 100644
+index 000000000..8f0b0245a
+--- /dev/null
++++ b/arch/dadao/include/asm/current.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_CURRENT_H
++#define _ASM_DADAO_CURRENT_H
++
++#include <linux/compiler.h>
++
++#ifndef __ASSEMBLY__
++struct task_struct;
++
++/*
++ * The K3 contract is single-CPU.  Keep current in an explicit architecture
++ * variable until SMP introduces a per-CPU register or hardware mechanism.
++ */
++extern struct task_struct *dadao_current;
++
++static __always_inline struct task_struct *get_current(void)
++{
++	return READ_ONCE(dadao_current);
++}
++
++#define current get_current()
++#endif
++
++#endif
+diff --git a/arch/dadao/include/asm/elf.h b/arch/dadao/include/asm/elf.h
+new file mode 100644
+index 000000000..e1cb54f85
+--- /dev/null
++++ b/arch/dadao/include/asm/elf.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_ELF_H
++#define _ASM_DADAO_ELF_H
++
++#include <linux/elf.h>
++#include <uapi/asm/elf.h>
++
++#ifndef EM_DADAO
++#define EM_DADAO 0x0da0
++#endif
++
++#define elf_check_arch(x) ((x)->e_machine == EM_DADAO)
++#define ELF_CLASS ELFCLASS64
++#define ELF_DATA ELFDATA2MSB
++#define ELF_ARCH EM_DADAO
++#define ELF_EXEC_PAGESIZE PAGE_SIZE
++#define ELF_ET_DYN_BASE (TASK_SIZE / 3 * 2)
++#define ELF_HWCAP 0
++#define ELF_PLATFORM NULL
++#define CORE_DUMP_USE_REGSET
++
++#endif
+diff --git a/arch/dadao/include/asm/irqflags.h b/arch/dadao/include/asm/irqflags.h
+new file mode 100644
+index 000000000..c8e5ddb11
+--- /dev/null
++++ b/arch/dadao/include/asm/irqflags.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_IRQFLAGS_H
++#define _ASM_DADAO_IRQFLAGS_H
++
++extern unsigned long arch_local_save_flags(void);
++extern void arch_local_irq_restore(unsigned long flags);
++
++#include <asm-generic/irqflags.h>
++
++#endif
+diff --git a/arch/dadao/include/asm/linkage.h b/arch/dadao/include/asm/linkage.h
+new file mode 100644
+index 000000000..b2cb37b02
+--- /dev/null
++++ b/arch/dadao/include/asm/linkage.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_LINKAGE_H
++#define _ASM_DADAO_LINKAGE_H
++
++#define __ALIGN .balign 4
++#define __ALIGN_STR ".balign 4"
++
++#endif
+diff --git a/arch/dadao/include/asm/mmu.h b/arch/dadao/include/asm/mmu.h
+new file mode 100644
+index 000000000..e1a1c711f
+--- /dev/null
++++ b/arch/dadao/include/asm/mmu.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_MMU_H
++#define _ASM_DADAO_MMU_H
++
++typedef struct {
++	unsigned long asid;
++	unsigned long ptbr;
++} mm_context_t;
++
++#endif
+diff --git a/arch/dadao/include/asm/page.h b/arch/dadao/include/asm/page.h
+new file mode 100644
+index 000000000..81dcb4cbe
+--- /dev/null
++++ b/arch/dadao/include/asm/page.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_PAGE_H
++#define _ASM_DADAO_PAGE_H
++
++#include <linux/const.h>
++#include <linux/pfn.h>
++
++#define PAGE_SHIFT 16
++#define PAGE_SIZE (_AC(1, UL) << PAGE_SHIFT)
++#define PAGE_MASK (~(PAGE_SIZE - 1))
++#define PAGE_OFFSET _AC(CONFIG_PAGE_OFFSET, UL)
++#define KERNELBASE PAGE_OFFSET
++
++#ifndef __ASSEMBLY__
++
++#define clear_page(page) memset((page), 0, PAGE_SIZE)
++#define copy_page(to, from) memcpy((to), (from), PAGE_SIZE)
++#define clear_user_page(page, vaddr, pg) clear_page(page)
++#define copy_user_page(to, from, vaddr, pg) copy_page(to, from)
++
++typedef struct { unsigned long pte; } pte_t;
++typedef struct { unsigned long pmd; } pmd_t;
++typedef struct { unsigned long pud; } pud_t;
++typedef struct { unsigned long p4d; } p4d_t;
++typedef struct { unsigned long pgd; } pgd_t;
++typedef struct { unsigned long pgprot; } pgprot_t;
++typedef struct page *pgtable_t;
++
++#define pte_val(x) ((x).pte)
++#define pmd_val(x) ((x).pmd)
++#define pud_val(x) ((x).pud)
++#define p4d_val(x) ((x).p4d)
++#define pgd_val(x) ((x).pgd)
++#define pgprot_val(x) ((x).pgprot)
++
++#define __pte(x) ((pte_t) { (x) })
++#define __pmd(x) ((pmd_t) { (x) })
++#define __pud(x) ((pud_t) { (x) })
++#define __p4d(x) ((p4d_t) { (x) })
++#define __pgd(x) ((pgd_t) { (x) })
++#define __pgprot(x) ((pgprot_t) { (x) })
++
++#define __pa(x) ((unsigned long)(x))
++#define __va(x) ((void *)((unsigned long)(x)))
++#define virt_to_pfn(addr) PFN_DOWN(__pa(addr))
++#define pfn_to_virt(pfn) __va(PFN_PHYS(pfn))
++#define virt_to_page(addr) pfn_to_page(virt_to_pfn(addr))
++#define page_to_virt(page) pfn_to_virt(page_to_pfn(page))
++#define page_to_phys(page) PFN_PHYS(page_to_pfn(page))
++#define phys_to_page(addr) pfn_to_page(PFN_DOWN(addr))
++#define virt_addr_valid(addr) pfn_valid(virt_to_pfn(addr))
++
++#endif
++
++#define VM_DATA_DEFAULT_FLAGS \
++	(VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC)
++
++#include <asm-generic/memory_model.h>
++#include <asm-generic/getorder.h>
++
++#endif
+diff --git a/arch/dadao/include/asm/pgtable-prot.h b/arch/dadao/include/asm/pgtable-prot.h
+new file mode 100644
+index 000000000..1d3f82ebc
+--- /dev/null
++++ b/arch/dadao/include/asm/pgtable-prot.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_PGTABLE_PROT_H
++#define _ASM_DADAO_PGTABLE_PROT_H
++
++#include <linux/const.h>
++
++#define DADAO_PRESENT		(_AC(1, UL) << 0)
++#define DADAO_SUPERPAGE		(_AC(1, UL) << 1)
++#define DADAO_DIRTY		(_AC(1, UL) << 2)
++#define DADAO_ACCESSED		(_AC(1, UL) << 3)
++#define DADAO_EXEC		(_AC(1, UL) << 5)
++#define DADAO_WRITE		(_AC(1, UL) << 6)
++#define DADAO_READ		(_AC(1, UL) << 7)
++#define DADAO_FRAGMENT_ALL	(_AC(0xff, UL) << 56)
++
++#define DADAO_PROT_RWX \
++	(DADAO_PRESENT | DADAO_FRAGMENT_ALL | DADAO_READ | DADAO_WRITE | \
++	 DADAO_EXEC)
++#define DADAO_PROT_RW \
++	(DADAO_PRESENT | DADAO_FRAGMENT_ALL | DADAO_READ | DADAO_WRITE)
++#define DADAO_PROT_RX \
++	(DADAO_PRESENT | DADAO_FRAGMENT_ALL | DADAO_READ | DADAO_EXEC)
++#define DADAO_PROT_R \
++	(DADAO_PRESENT | DADAO_FRAGMENT_ALL | DADAO_READ)
++
++#ifndef __ASSEMBLY__
++#include <asm/page.h>
++
++#define PAGE_KERNEL	__pgprot(DADAO_PROT_RWX)
++#define PAGE_KERNEL_RO	__pgprot(DADAO_PROT_RX)
++#define PAGE_SHARED	__pgprot(DADAO_PROT_RW)
++#define PAGE_COPY	__pgprot(DADAO_PROT_R)
++#define PAGE_READONLY	__pgprot(DADAO_PROT_R)
++#define PAGE_NONE	__pgprot(0)
++
++#define __P000 PAGE_NONE
++#define __P001 PAGE_READONLY
++#define __P010 PAGE_READONLY
++#define __P011 PAGE_READONLY
++#define __P100 PAGE_NONE
++#define __P101 PAGE_READONLY
++#define __P110 PAGE_READONLY
++#define __P111 PAGE_READONLY
++
++#define __S000 PAGE_NONE
++#define __S001 PAGE_READONLY
++#define __S010 PAGE_SHARED
++#define __S011 PAGE_SHARED
++#define __S100 PAGE_NONE
++#define __S101 PAGE_READONLY
++#define __S110 PAGE_SHARED
++#define __S111 PAGE_SHARED
++#endif
++
++#endif
+diff --git a/arch/dadao/include/asm/pgtable.h b/arch/dadao/include/asm/pgtable.h
+new file mode 100644
+index 000000000..b33c62ccf
+--- /dev/null
++++ b/arch/dadao/include/asm/pgtable.h
+@@ -0,0 +1,161 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_PGTABLE_H
++#define _ASM_DADAO_PGTABLE_H
++
++#include <asm/page.h>
++#include <asm/pgtable-prot.h>
++
++/*
++ * The hardware table geometry is fixed by the K2 PTW contract:
++ * VA[41:29] selects an L1 entry and VA[28:16] an L2 entry.
++ */
++#define PGDIR_SHIFT	29
++#define PTRS_PER_PGD	8192
++#define PTRS_PER_PTE	8192
++#define PGDIR_SIZE	(_AC(1, UL) << PGDIR_SHIFT)
++#define PGDIR_MASK	(~(PGDIR_SIZE - 1))
++#define PTE_ADDR_MASK	_AC(0x0000ffffffff0000, UL)
++
++#define PTRS_PER_P4D	1
++#define PTRS_PER_PUD	1
++#define PTRS_PER_PMD	1
++#define __PAGETABLE_P4D_FOLDED
++#define __PAGETABLE_PUD_FOLDED
++#define __PAGETABLE_PMD_FOLDED
++#define P4D_SHIFT	PGDIR_SHIFT
++#define PUD_SHIFT	PGDIR_SHIFT
++#define PMD_SHIFT	PGDIR_SHIFT
++#define P4D_SIZE	PGDIR_SIZE
++#define PUD_SIZE	PGDIR_SIZE
++#define PMD_SIZE	PGDIR_SIZE
++#define P4D_MASK	PGDIR_MASK
++#define PUD_MASK	PGDIR_MASK
++#define PMD_MASK	PGDIR_MASK
++
++#define FIRST_USER_ADDRESS	0UL
++#define VMALLOC_START		_AC(0xc0000000, UL)
++#define VMALLOC_END		_AC(0xffffffff, UL)
++
++#ifndef __ASSEMBLY__
++#include <linux/bug.h>
++#include <linux/types.h>
++
++extern pgd_t swapper_pg_dir[PTRS_PER_PGD];
++extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
++
++#define ZERO_PAGE(vaddr) virt_to_page(empty_zero_page)
++
++#define set_pgd(pgdp, pgd) WRITE_ONCE(*(pgdp), (pgd))
++#define pgd_none(x) (!pgd_val(x))
++#define pgd_bad(x) 0
++#define pgd_present(x) (pgd_val(x) != 0)
++#define pgd_clear(x) set_pgd((x), __pgd(0))
++#define pgd_index(addr) (((addr) >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1))
++#define pgd_offset(mm, addr) ((mm)->pgd + pgd_index(addr))
++#define pgd_offset_k(addr) pgd_offset(&init_mm, (addr))
++#define pgd_ERROR(pgd) do { } while (0)
++
++#define p4d_none(x) pgd_none(__pgd(p4d_val(x)))
++#define p4d_bad(x) 0
++#define p4d_present(x) (p4d_val(x) != 0)
++#define p4d_clear(x) set_pgd((pgd_t *)(x), __pgd(0))
++#define p4d_ERROR(x) do { } while (0)
++#define pud_none(x) pgd_none(__pgd(pud_val(x)))
++#define pud_bad(x) 0
++#define pud_present(x) (pud_val(x) != 0)
++#define pud_clear(x) set_pgd((pgd_t *)(x), __pgd(0))
++#define pud_ERROR(x) do { } while (0)
++#define pmd_none(x) pgd_none(__pgd(pmd_val(x)))
++#define pmd_bad(x) 0
++#define pmd_present(x) (pmd_val(x) != 0)
++#define pmd_clear(x) set_pgd((pgd_t *)(x), __pgd(0))
++#define pmd_ERROR(x) do { } while (0)
++
++#define set_p4d(p, v) WRITE_ONCE(*(p), (v))
++#define set_pud(p, v) WRITE_ONCE(*(p), (v))
++#define set_pmd(p, v) WRITE_ONCE(*(p), (v))
++#define p4d_offset(pgd, addr) ((p4d_t *)(pgd))
++#define pud_offset(p4d, addr) ((pud_t *)(p4d))
++#define pmd_offset(pud, addr) ((pmd_t *)(pud))
++#define p4d_addr_end(addr, end) (end)
++#define pud_addr_end(addr, end) (end)
++#define pmd_addr_end(addr, end) (end)
++
++#define pgd_populate(mm, pgdp, ptep) \
++	set_pgd((pgdp), __pgd(__pa(ptep) | DADAO_PRESENT))
++#define pmd_populate_kernel(mm, pmdp, ptep) \
++	pgd_populate((mm), (pgd_t *)(pmdp), (ptep))
++#define pmd_populate(mm, pmdp, ptepage) \
++	pgd_populate((mm), (pgd_t *)(pmdp), page_address(ptepage))
++#define pmd_page_vaddr(x) \
++	((unsigned long)__va(pmd_val(x) & PTE_ADDR_MASK))
++#define pmd_page(x) phys_to_page(pmd_val(x) & PTE_ADDR_MASK)
++#define pmd_pgtable(x) pmd_page(x)
++
++#define pte_present(x) (pte_val(x) & DADAO_PRESENT)
++#define pte_none(x) (!pte_val(x))
++#define set_pte(ptep, pte) WRITE_ONCE(*(ptep), (pte))
++#define set_pte_at(mm, addr, ptep, pte) set_pte((ptep), (pte))
++#define pte_clear(mm, addr, ptep) set_pte((ptep), __pte(0))
++#define pte_unmap(x) do { } while (0)
++
++#define pte_write(x) (pte_val(x) & DADAO_WRITE)
++#define pte_dirty(x) (pte_val(x) & DADAO_DIRTY)
++#define pte_young(x) (pte_val(x) & DADAO_ACCESSED)
++#define pte_special(x) 0
++#define pte_wrprotect(x) __pte(pte_val(x) & ~DADAO_WRITE)
++#define pte_mkwrite(x) __pte(pte_val(x) | DADAO_WRITE)
++#define pte_mkclean(x) __pte(pte_val(x) & ~DADAO_DIRTY)
++#define pte_mkdirty(x) __pte(pte_val(x) | DADAO_DIRTY)
++#define pte_mkold(x) __pte(pte_val(x) & ~DADAO_ACCESSED)
++#define pte_mkyoung(x) __pte(pte_val(x) | DADAO_ACCESSED)
++#define pte_mkspecial(x) (x)
++
++#define pte_pfn(x) ((pte_val(x) & PTE_ADDR_MASK) >> PAGE_SHIFT)
++#define pfn_pte(pfn, prot) \
++	__pte(((unsigned long)(pfn) << PAGE_SHIFT) | pgprot_val(prot))
++#define mk_pte(page, prot) pfn_pte(page_to_pfn(page), (prot))
++#define pte_page(x) pfn_to_page(pte_pfn(x))
++#define _PAGE_PFN_SHIFT PAGE_SHIFT
++#define _PAGE_CHG_MASK \
++	(PTE_ADDR_MASK | DADAO_ACCESSED | DADAO_DIRTY)
++
++static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
++{
++	return __pte((pte_val(pte) & _PAGE_CHG_MASK) | pgprot_val(newprot));
++}
++
++#define pte_index(addr) (((addr) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1))
++#define pte_offset_kernel(dir, addr) \
++	((pte_t *)pmd_page_vaddr(*(dir)) + pte_index(addr))
++#define pte_offset_map(dir, addr) pte_offset_kernel((dir), (addr))
++
++static inline void update_mmu_cache(struct vm_area_struct *vma,
++				    unsigned long addr, pte_t *ptep)
++{
++}
++
++#define __p4d_free_tlb(tlb, p4d, addr) do { } while (0)
++#define __pud_free_tlb(tlb, pud, addr) do { } while (0)
++#define __pmd_free_tlb(tlb, pmd, addr) do { } while (0)
++
++#define __SWP_TYPE_SHIFT 2
++#define __SWP_TYPE_BITS 5
++#define __SWP_TYPE_MASK ((1UL << __SWP_TYPE_BITS) - 1)
++#define __SWP_OFFSET_SHIFT (__SWP_TYPE_BITS + __SWP_TYPE_SHIFT)
++#define MAX_SWAPFILES_CHECK() \
++	BUILD_BUG_ON(MAX_SWAPFILES_SHIFT > __SWP_TYPE_BITS)
++#define __swp_type(x) (((x).val >> __SWP_TYPE_SHIFT) & __SWP_TYPE_MASK)
++#define __swp_offset(x) ((x).val >> __SWP_OFFSET_SHIFT)
++#define __swp_entry(type, offset) \
++	((swp_entry_t) { ((type) << __SWP_TYPE_SHIFT) | \
++			 ((offset) << __SWP_OFFSET_SHIFT) })
++#define __pte_to_swp_entry(pte) ((swp_entry_t) { pte_val(pte) })
++#define __swp_entry_to_pte(x) __pte((x).val)
++
++#define kern_addr_valid(addr) 1
++
++#include <asm-generic/pgtable.h>
++#endif
++
++#endif
+diff --git a/arch/dadao/include/asm/processor.h b/arch/dadao/include/asm/processor.h
+new file mode 100644
+index 000000000..868f931f0
+--- /dev/null
++++ b/arch/dadao/include/asm/processor.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_PROCESSOR_H
++#define _ASM_DADAO_PROCESSOR_H
++
++#include <linux/const.h>
++#include <asm/ptrace.h>
++
++#define TASK_SIZE PAGE_OFFSET
++#define TASK_UNMAPPED_BASE (TASK_SIZE / 3)
++#define STACK_TOP TASK_SIZE
++#define STACK_TOP_MAX STACK_TOP
++#define STACK_ALIGN 16
++
++#ifndef __ASSEMBLY__
++struct task_struct;
++
++struct thread_struct {
++	unsigned long kernel_sp;
++	unsigned long user_sp;
++};
++
++#define INIT_THREAD { }
++
++#define task_pt_regs(tsk)						\
++	((struct pt_regs *)(task_stack_page(tsk) + THREAD_SIZE -		\
++			    ALIGN(sizeof(struct pt_regs), STACK_ALIGN)))
++#define KSTK_EIP(tsk) instruction_pointer(task_pt_regs(tsk))
++#define KSTK_ESP(tsk) user_stack_pointer(task_pt_regs(tsk))
++
++extern void start_thread(struct pt_regs *regs, unsigned long pc,
++			 unsigned long sp);
++extern unsigned long get_wchan(struct task_struct *task);
++
++static inline void release_thread(struct task_struct *task)
++{
++}
++
++static inline void cpu_relax(void)
++{
++	barrier();
++}
++#endif
++
++#endif
+diff --git a/arch/dadao/include/asm/ptrace.h b/arch/dadao/include/asm/ptrace.h
+new file mode 100644
+index 000000000..c134ba698
+--- /dev/null
++++ b/arch/dadao/include/asm/ptrace.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_PTRACE_H
++#define _ASM_DADAO_PTRACE_H
++
++#include <uapi/asm/ptrace.h>
++
++#ifndef __ASSEMBLY__
++struct pt_regs {
++	unsigned long rd[64];
++	unsigned long rb[64];
++	unsigned long ra[64];
++	unsigned long pc;
++	unsigned long run_mode;
++	unsigned long cfx_code;
++	unsigned long cfx_mask;
++	unsigned long cause_id;
++	unsigned long cause_info;
++};
++
++#define instruction_pointer(regs) ((regs)->pc)
++#define instruction_pointer_set(regs, value) ((regs)->pc = (value))
++#define user_stack_pointer(regs) ((regs)->rb[1])
++#define user_stack_pointer_set(regs, value) ((regs)->rb[1] = (value))
++#define profile_pc(regs) instruction_pointer(regs)
++#define user_mode(regs) ((regs)->run_mode == 0)
++
++static inline long regs_return_value(struct pt_regs *regs)
++{
++	return regs->rd[31];
++}
++#endif
++
++#endif
+diff --git a/arch/dadao/include/asm/thread_info.h b/arch/dadao/include/asm/thread_info.h
+new file mode 100644
+index 000000000..e96720210
+--- /dev/null
++++ b/arch/dadao/include/asm/thread_info.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_THREAD_INFO_H
++#define _ASM_DADAO_THREAD_INFO_H
++
++#include <asm/page.h>
++#include <linux/const.h>
++
++#define THREAD_SIZE_ORDER 0
++#define THREAD_SIZE (PAGE_SIZE << THREAD_SIZE_ORDER)
++
++#ifndef __ASSEMBLY__
++typedef struct {
++	unsigned long seg;
++} mm_segment_t;
++
++struct thread_info {
++	unsigned long flags;
++	int preempt_count;
++	mm_segment_t addr_limit;
++	unsigned long kernel_sp;
++	unsigned long user_sp;
++	int cpu;
++};
++
++#define INIT_THREAD_INFO(tsk) { \
++	.flags = 0, \
++	.preempt_count = INIT_PREEMPT_COUNT, \
++	.addr_limit = KERNEL_DS, \
++}
++#endif
++
++#define TIF_SYSCALL_TRACE 0
++#define TIF_NOTIFY_RESUME 1
++#define TIF_SIGPENDING 2
++#define TIF_NEED_RESCHED 3
++#define TIF_RESTORE_SIGMASK 4
++#define TIF_MEMDIE 5
++#define TIF_SYSCALL_TRACEPOINT 6
++#define TIF_SYSCALL_AUDIT 7
++
++#define _TIF_SYSCALL_TRACE (1 << TIF_SYSCALL_TRACE)
++#define _TIF_NOTIFY_RESUME (1 << TIF_NOTIFY_RESUME)
++#define _TIF_SIGPENDING (1 << TIF_SIGPENDING)
++#define _TIF_NEED_RESCHED (1 << TIF_NEED_RESCHED)
++#define _TIF_SYSCALL_TRACEPOINT (1 << TIF_SYSCALL_TRACEPOINT)
++#define _TIF_SYSCALL_AUDIT (1 << TIF_SYSCALL_AUDIT)
++#define _TIF_WORK_MASK \
++	(_TIF_NOTIFY_RESUME | _TIF_SIGPENDING | _TIF_NEED_RESCHED)
++#define _TIF_SYSCALL_WORK \
++	(_TIF_SYSCALL_TRACE | _TIF_SYSCALL_TRACEPOINT | _TIF_SYSCALL_AUDIT)
++
++#endif
+diff --git a/arch/dadao/include/asm/timex.h b/arch/dadao/include/asm/timex.h
+new file mode 100644
+index 000000000..95a8d2a12
+--- /dev/null
++++ b/arch/dadao/include/asm/timex.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_TIMEX_H
++#define _ASM_DADAO_TIMEX_H
++
++typedef unsigned long cycles_t;
++extern cycles_t get_cycles(void);
++#define get_cycles get_cycles
++
++#endif
+diff --git a/arch/dadao/include/asm/uaccess.h b/arch/dadao/include/asm/uaccess.h
+new file mode 100644
+index 000000000..2b429b7aa
+--- /dev/null
++++ b/arch/dadao/include/asm/uaccess.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_UACCESS_H
++#define _ASM_DADAO_UACCESS_H
++
++#include <linux/thread_info.h>
++
++#define USER_DS MAKE_MM_SEG(TASK_SIZE)
++
++static inline int dadao_access_ok(unsigned long addr, unsigned long size)
++{
++	unsigned long limit = current_thread_info()->addr_limit.seg;
++
++	return size <= limit && addr <= limit - size;
++}
++
++#define __access_ok(addr, size) dadao_access_ok((addr), (size))
++#include <asm-generic/uaccess.h>
++
++#endif
+diff --git a/arch/dadao/include/uapi/asm/Kbuild b/arch/dadao/include/uapi/asm/Kbuild
+new file mode 100644
+index 000000000..6f4b3e29c
+--- /dev/null
++++ b/arch/dadao/include/uapi/asm/Kbuild
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
++generic-y += ucontext.h
+diff --git a/arch/dadao/include/uapi/asm/bitsperlong.h b/arch/dadao/include/uapi/asm/bitsperlong.h
+new file mode 100644
+index 000000000..3dbac0f84
+--- /dev/null
++++ b/arch/dadao/include/uapi/asm/bitsperlong.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_ASM_DADAO_BITSPERLONG_H
++#define _UAPI_ASM_DADAO_BITSPERLONG_H
++
++#define __BITS_PER_LONG 64
++#include <asm-generic/bitsperlong.h>
++
++#endif
+diff --git a/arch/dadao/include/uapi/asm/byteorder.h b/arch/dadao/include/uapi/asm/byteorder.h
+new file mode 100644
+index 000000000..43ff223c3
+--- /dev/null
++++ b/arch/dadao/include/uapi/asm/byteorder.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_ASM_DADAO_BYTEORDER_H
++#define _UAPI_ASM_DADAO_BYTEORDER_H
++
++#include <linux/byteorder/big_endian.h>
++
++#endif
+diff --git a/arch/dadao/include/uapi/asm/elf.h b/arch/dadao/include/uapi/asm/elf.h
+new file mode 100644
+index 000000000..99f284abe
+--- /dev/null
++++ b/arch/dadao/include/uapi/asm/elf.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_ASM_DADAO_ELF_H
++#define _UAPI_ASM_DADAO_ELF_H
++
++#include <asm/ptrace.h>
++
++typedef unsigned long elf_greg_t;
++typedef struct user_regs_struct elf_gregset_t;
++#define ELF_NGREG (sizeof(elf_gregset_t) / sizeof(elf_greg_t))
++
++typedef unsigned long elf_fpreg_t;
++typedef struct {
++	elf_fpreg_t rf[64];
++} elf_fpregset_t;
++#define ELF_NFPREG 64
++
++#endif
+diff --git a/arch/dadao/include/uapi/asm/ptrace.h b/arch/dadao/include/uapi/asm/ptrace.h
+new file mode 100644
+index 000000000..21ac56328
+--- /dev/null
++++ b/arch/dadao/include/uapi/asm/ptrace.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_ASM_DADAO_PTRACE_H
++#define _UAPI_ASM_DADAO_PTRACE_H
++
++#include <linux/types.h>
++
++struct user_regs_struct {
++	__u64 rd[64];
++	__u64 rb[64];
++	__u64 ra[64];
++	__u64 pc;
++	__u64 run_mode;
++	__u64 cfx_code;
++	__u64 cfx_mask;
++	__u64 cause_id;
++	__u64 cause_info;
++};
++
++#endif
+diff --git a/arch/dadao/include/uapi/asm/sigcontext.h b/arch/dadao/include/uapi/asm/sigcontext.h
+new file mode 100644
+index 000000000..68ffc0188
+--- /dev/null
++++ b/arch/dadao/include/uapi/asm/sigcontext.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++#ifndef _UAPI_ASM_DADAO_SIGCONTEXT_H
++#define _UAPI_ASM_DADAO_SIGCONTEXT_H
++
++#include <asm/ptrace.h>
++
++/*
++ * RF execution is excluded from the M1 contract.  The initial signal ABI
++ * therefore preserves the complete integer, address, return-address and
++ * control context represented by user_regs_struct.
++ */
++struct sigcontext {
++	struct user_regs_struct regs;
++};
++
++#endif
+diff --git a/arch/dadao/kernel/asm-offsets.c b/arch/dadao/kernel/asm-offsets.c
+new file mode 100644
+index 000000000..c2d5a3be4
+--- /dev/null
++++ b/arch/dadao/kernel/asm-offsets.c
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/kbuild.h>
++
++int main(void)
++{
++	/*
++	 * KL-148a only establishes the generic-C compile substrate.  Context
++	 * switch and trap assembly add their consumed offsets with those
++	 * implementations, so this deliberately emits no speculative ABI.
++	 */
++	return 0;
++}
+diff --git a/include/linux/kbuild.h b/include/linux/kbuild.h
+index e7be517aa..e6d6f6ba3 100644
+--- a/include/linux/kbuild.h
++++ b/include/linux/kbuild.h
+@@ -2,8 +2,18 @@
+ #ifndef __LINUX_KBUILD_H
+ #define __LINUX_KBUILD_H
+ 
++#ifdef __dadao__
++/*
++ * DADAO prefixes ordinary immediate operands with '$'.  That syntax is
++ * correct in instructions, but invalid inside the string emitted here.
++ * The generic 'c' operand modifier requests the unadorned constant.
++ */
++#define DEFINE(sym, val) \
++	asm volatile("\n.ascii \"->" #sym " %c0 " #val "\"" : : "i" (val))
++#else
+ #define DEFINE(sym, val) \
+ 	asm volatile("\n.ascii \"->" #sym " %0 " #val "\"" : : "i" (val))
++#endif
+ 
+ #define BLANK() asm volatile("\n.ascii \"->\"" : : )
+ 
+-- 
+2.43.0
+

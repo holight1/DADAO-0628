@@ -2329,3 +2329,35 @@ This is deliberately configuration-only: no architecture headers, object
 files, boot entry, trap path, page tables or device implementation exist yet.
 KL-148a owns the compile-to-link substrate and must expose real compiler/
 Kbuild gaps rather than hiding them behind placeholders.
+
+## K3 Linux compile-to-object substrate (KL-148a, 2026-07-29)
+
+The second Linux component patch adds a fresh architecture compile substrate
+and reaches the first real upstream kernel object. `make prepare` now
+completes and upstream `init/main.c` compiles into a 48,824-byte ELF64,
+big-endian, `EM_DADAO=0x0DA0` relocatable object. The gate starts from a clean
+output tree, verifies both component commits against both patch payloads by
+stable patch-id, and records full command output rather than accepting a
+stale object.
+
+The architecture layer freezes only contracts needed at this boundary:
+integer/address/return-address register context, the 64 KiB two-level
+8192-entry page-table geometry and K2 PTE bits, single-CPU interrupt-masked
+atomics, current/thread/uaccess basics, and the generic-header set. Linux
+5.4's global `-no-integrated-as` is overridden for DADAO, and its
+`kbuild.h` offset emitter uses `%c0` because ordinary DADAO immediates carry
+an instruction-only `$` prefix.
+
+Default Linux `-O2` exposed a real LLVM gap:
+`TargetInstrInfo::insertBranch` is not implemented and the Control Flow
+Optimizer asserts in `setup_command_line`. Per the existing instruction to
+prioritize the basic chain over optimization-level work, KL-148a is
+explicitly pinned to `KCFLAGS=-O0`; KL-148b records the exact compiler work
+and is deferred rather than hidden.
+
+This milestone does not claim a linked image, reset entry, console, trap,
+PTBR/TLB programming, page-fault policy, user transition, initramfs or
+default `-O2`. The next basic-chain task is KL-149a: add the minimum
+architecture objects/linker script and produce a linked image with an
+explicit reset handoff contract. KL-148b may be completed later before
+restoring the normal optimized kernel build.
