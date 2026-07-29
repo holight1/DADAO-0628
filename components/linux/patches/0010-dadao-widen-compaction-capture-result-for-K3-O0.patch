@@ -1,0 +1,47 @@
+From 8f0b11da8346dc46402974e7a6a8626cff103ed3 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 20:21:25 +0800
+Subject: [PATCH] dadao: widen compaction capture result for K3 O0
+
+---
+ mm/page_alloc.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index f169c41ad..0ea596ebc 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -826,6 +826,12 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long compaction_capture_result_t;
++#else
++typedef bool compaction_capture_result_t;
++#endif
++
+ #ifdef CONFIG_COMPACTION
+ static inline struct capture_control *task_capc(struct zone *zone)
+ {
+@@ -838,7 +844,7 @@ static inline struct capture_control *task_capc(struct zone *zone)
+ 		capc->cc->direct_compaction ? capc : NULL;
+ }
+ 
+-static inline bool
++static inline compaction_capture_result_t
+ compaction_capture(struct capture_control *capc, struct page *page,
+ 		   int order, int migratetype)
+ {
+@@ -869,7 +875,7 @@ static inline struct capture_control *task_capc(struct zone *zone)
+ 	return NULL;
+ }
+ 
+-static inline bool
++static inline compaction_capture_result_t
+ compaction_capture(struct capture_control *capc, struct page *page,
+ 		   int order, int migratetype)
+ {
+-- 
+2.43.0
+

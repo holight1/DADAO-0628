@@ -6,3 +6,6 @@
 0005-dadao-identify-KL-149a-bad-mode-path.patch
 0006-dadao-add-M1-early-console-and-boot-progress.patch
 0007-dadao-harden-K3-O0-early-boot-progress.patch
+0008-dadao-complete-K3-mem_init-progress.patch
+0009-dadao-widen-page-expected-state-result-for-K3-O0.patch
+0010-dadao-widen-compaction-capture-result-for-K3-O0.patch

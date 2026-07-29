@@ -2434,3 +2434,28 @@ first evidenced post-progress blocker is another `EXCP_MALIGN` at
 stack-slot reload. KL-151a or a focused compiler-compatibility follow-up owns
 that blocker; formal UART/cfx_uart, trap/syscall completion, timer/IRQ, TTY,
 initramfs and userspace remain open.
+
+## K3 Linux `mem_init` completion boundary (KL-151a, 2026-07-29)
+
+KL-151a closes the first `free_pcp_prepare` blocker and proves that the real
+Linux `mem_init()` returns from both `memblock_free_all()` and
+`mem_init_print_info()`. A sixth guest-authored QMP word, `KL151MID` at
+`0x87fd0028`, is written only at that final C source boundary. The positive
+and `-serial none` runs both preserve the exact ordered six-word oracle;
+console is secondary and its positive `Memory:` line is uniquely observed.
+The wrong-mode negative still writes only `KL149BAD`.
+
+Two more pre-completion instances of the frozen DADAO LLVM `-O0` bool
+stack-slot defect were exposed and repaired narrowly at
+`page_expected_state` and `compaction_capture`. Each fix is gated by
+`CONFIG_DADAO_K3_O0_LINK_COMPAT`; normal Linux types and semantics remain
+unchanged. The final fail-closed matrix passes 3/3 with `FAIL=0, SKIP=0`, and
+binds the complete ten-patch Linux queue, QEMU identity, fresh Image,
+source-order contracts, initial/final raw bytes and negative verdicts.
+
+The next evidenced blocker is post-memory:
+`EXCP_MALIGN PC=0x8027985c` at
+`mm/page_alloc.c::prepare_alloc_pages+0x1c8`, where an `rb1+71` byte return
+slot is reloaded with `ldo`. KL-152a starts from that exact evidence. This
+milestone does not claim scheduler/context-switch, Linux trap/syscall,
+timer/IRQ, user page tables, initramfs, TTY, login or userspace execution.

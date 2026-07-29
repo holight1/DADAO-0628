@@ -1,0 +1,33 @@
+From 3e83c7744f5d093eba3a46284416b8409f3d452c Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 20:18:19 +0800
+Subject: [PATCH] dadao: widen page expected-state result for K3 O0
+
+---
+ mm/page_alloc.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 50e9b6b14..f169c41ad 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1015,8 +1015,14 @@ static inline void __free_one_page(struct page *page,
+  * try and check multiple fields with one check. The caller must do a detailed
+  * check if necessary.
+  */
+-static inline bool page_expected_state(struct page *page,
+-					unsigned long check_flags)
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long page_expected_state_result_t;
++#else
++typedef bool page_expected_state_result_t;
++#endif
++
++static inline page_expected_state_result_t
++page_expected_state(struct page *page, unsigned long check_flags)
+ {
+ 	if (unlikely(atomic_read(&page->_mapcount) != -1))
+ 		return false;
+-- 
+2.43.0
+

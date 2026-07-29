@@ -1,0 +1,94 @@
+From 537c61baef6e8ca04cc3d77f6cc9da7856fd6d5e Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 20:01:01 +0800
+Subject: [PATCH] dadao: complete K3 mem_init progress
+
+---
+ arch/dadao/include/asm/dadao-m1.h |  4 +++-
+ arch/dadao/mm/init.c              |  2 ++
+ mm/page_alloc.c                   | 19 +++++++++++++------
+ 3 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/arch/dadao/include/asm/dadao-m1.h b/arch/dadao/include/asm/dadao-m1.h
+index a4adc0dc1..4dcec89e4 100644
+--- a/arch/dadao/include/asm/dadao-m1.h
++++ b/arch/dadao/include/asm/dadao-m1.h
+@@ -12,14 +12,16 @@
+  */
+ #define DADAO_M1_DEBUG_CONSOLE_TX	0x10001000UL
+ 
+-/* KL-149a owns +0x00/+0x08; KL-150a uses the next three scratch words. */
++/* KL-149a owns +0x00/+0x08; KL-150a/KL-151a use the next four words. */
+ #define DADAO_M1_PROGRESS_SETUP_ENTER	0x87fd0010UL
+ #define DADAO_M1_PROGRESS_SETUP_DONE	0x87fd0018UL
+ #define DADAO_M1_PROGRESS_MEM_INIT	0x87fd0020UL
++#define DADAO_M1_PROGRESS_MEM_INIT_DONE	0x87fd0028UL
+ 
+ #define DADAO_M1_PROGRESS_SETUP_ENTER_VALUE	0x4b4c313530534145ULL
+ #define DADAO_M1_PROGRESS_SETUP_DONE_VALUE	0x4b4c313530534144ULL
+ #define DADAO_M1_PROGRESS_MEM_INIT_VALUE		0x4b4c3135304d494eULL
++#define DADAO_M1_PROGRESS_MEM_INIT_DONE_VALUE	0x4b4c3135314d4944ULL
+ 
+ static inline void dadao_m1_progress_write(unsigned long address, u64 value)
+ {
+diff --git a/arch/dadao/mm/init.c b/arch/dadao/mm/init.c
+index 1fd7a00e5..b3b99efd2 100644
+--- a/arch/dadao/mm/init.c
++++ b/arch/dadao/mm/init.c
+@@ -27,4 +27,6 @@ void __init mem_init(void)
+ 	high_memory = __va(max_low_pfn << PAGE_SHIFT);
+ 	memblock_free_all();
+ 	mem_init_print_info(NULL);
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_MEM_INIT_DONE,
++				DADAO_M1_PROGRESS_MEM_INIT_DONE_VALUE);
+ }
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index f391c0c4e..50e9b6b14 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1125,8 +1125,14 @@ static void kernel_init_free_pages(struct page *page, int numpages)
+ 		clear_highpage(page + i);
+ }
+ 
+-static __always_inline bool free_pages_prepare(struct page *page,
+-					unsigned int order, bool check_free)
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long free_pages_result_t;
++#else
++typedef bool free_pages_result_t;
++#endif
++
++static __always_inline free_pages_result_t
++free_pages_prepare(struct page *page, unsigned int order, bool check_free)
+ {
+ 	int bad = 0;
+ 
+@@ -1219,12 +1225,12 @@ static bool bulkfree_pcp_prepare(struct page *page)
+  * debug_pagealloc enabled, they are checked also immediately when being freed
+  * to the pcp lists.
+  */
+-static bool free_pcp_prepare(struct page *page)
++static free_pages_result_t free_pcp_prepare(struct page *page)
+ {
+ 	if (debug_pagealloc_enabled())
+-		return free_pages_prepare(page, 0, true);
++		return !!free_pages_prepare(page, 0, true);
+ 	else
+-		return free_pages_prepare(page, 0, false);
++		return !!free_pages_prepare(page, 0, false);
+ }
+ 
+ static bool bulkfree_pcp_prepare(struct page *page)
+@@ -3015,7 +3021,8 @@ void mark_free_pages(struct zone *zone)
+ }
+ #endif /* CONFIG_PM */
+ 
+-static bool free_unref_page_prepare(struct page *page, unsigned long pfn)
++static free_pages_result_t
++free_unref_page_prepare(struct page *page, unsigned long pfn)
+ {
+ 	int migratetype;
+ 
+-- 
+2.43.0
+
