@@ -1,8 +1,8 @@
 # KL-148a：K3 Linux compile-to-object substrate
 
-**状态**：PASS（独立 review 因额度限制待补）  
-**日期**：2026-07-29  
-**前置**：KL-147a  
+**状态**：PASS（独立 review 完成）
+**日期**：2026-07-29
+**前置**：KL-147a
 **后续**：KL-149a（linked image + reset handoff）
 
 ## 目标
@@ -23,7 +23,8 @@ python3 tests/scripts/run_kl148a_linux_compile.py
 必须满足：
 
 - 先复跑 KL-147a；
-- Linux source clean，series/commit count = 2/2；
+- Linux source clean；冻结前两个 patch 的名称/patch-id，后续 cumulative
+  series 仍逐项验证 patch/commit identity；
 - series 中每个 patch 的 stable patch-id 与对应 component commit 一致；
 - `make prepare` 成功；
 - `make init/main.o` 成功；
@@ -96,8 +97,27 @@ python3 tests/scripts/run_kl148a_linux_compile.py
 
 ## Review
 
-独立 review 的账户 usage limit 与 KL-146a/KL-147a 相同，本轮没有重复
-启动注定失败的 agent，也没有把主控复核写成独立结论。
+独立 subagent 在 2026-07-29 完成 review。它先在精确旧提交
+`6d3dbfad` 上复现了 `atomic64_cmpxchg()` 局部变量 `current` 被同名宏
+替换、`init/version.o` 编译失败的 blocker；随后在当前
+`c06b6f93` 和 clean 临时 `O=` 目录中验证修复版 runner PASS：
+`init/main.o=48,824 bytes`、`init/version.o=2,072 bytes`，ELF64、
+big-endian、ET_REL、Machine=`0xDA0`，0001/0002 stable patch-id 均
+匹配。
+
+独立 review 另指出两个门禁问题，主控接受并修正：
+
+1. runner 原先随 series 长度动态验证，未冻结 KL-148a 自身声明的前
+   两个 patch。现固定 0001/0002 的名称和 stable patch-id，同时保留
+   对后续 cumulative series 的逐 commit 比对；
+2. `make clean` 不会移除全部 generated headers/`.config`。现改为
+   `make mrproper` 后重新执行 `dadao_defconfig`、`olddefconfig` 和
+   `prepare`，排除旧生成物假绿。
+
+Low 意见是 evidence 未保存 `V=1` 子命令、未显式断言 `-O0` 的最终
+选项顺序；独立 review 已从 `.cmd` 确认当前命令为 `-O2 ... -O0`，
+最终生效 `-O0`。该项不影响当前窄范围 correctness，留待后续统一的
+Linux build-evidence runner 整理。
 
 主控逐项复核了 patch、生成对象和 fail-closed runner，并在复核中修正：
 
@@ -117,6 +137,9 @@ python3 tests/scripts/run_kl148a_linux_compile.py
    同名宏替换。已改为 `observed`，并把 `init/version.o` 纳入 KL-148a
    门禁，确保该头文件顺序持续受测。
 
-结论：**KL-148a 在明确的 `-O0` compile-to-object 范围内 PASS**。
+独立 review 结论：旧 `6d3dbfad` FAIL；当前 `c06b6f93` 在明确的
+`-O0` compile-to-object 范围内 PASS。主控二次复核接受该结论。
+
+最终结论：**KL-148a 在明确的 `-O0` compile-to-object 范围内 PASS**。
 它不代表 vmlinux 可链接、kernel 可启动、PTBR/TLB/page fault 可用或
-默认 `-O2` 可用；独立 review 待额度恢复后补审。
+默认 `-O2` 可用。

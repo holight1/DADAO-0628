@@ -1,0 +1,114 @@
+From b5f89a803600ecbe445c3aad64fceb51d8a61140 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 18:29:38 +0800
+Subject: [PATCH 4/4] dadao: harden KL-149a mode and O0 link gates
+
+---
+ arch/dadao/include/asm/elf.h |  2 +-
+ arch/dadao/kernel/head.S     | 40 ++++++++++++++++++++++++++++++++++++
+ include/linux/huge_mm.h      | 12 +++++++++++
+ 3 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/arch/dadao/include/asm/elf.h b/arch/dadao/include/asm/elf.h
+index e1cb54f85..755bdc3e1 100644
+--- a/arch/dadao/include/asm/elf.h
++++ b/arch/dadao/include/asm/elf.h
+@@ -2,7 +2,7 @@
+ #ifndef _ASM_DADAO_ELF_H
+ #define _ASM_DADAO_ELF_H
+ 
+-#include <linux/elf.h>
++#include <uapi/linux/elf.h>
+ #include <uapi/asm/elf.h>
+ 
+ #ifndef EM_DADAO
+diff --git a/arch/dadao/kernel/head.S b/arch/dadao/kernel/head.S
+index 9bd3404a8..1e4c6a412 100644
+--- a/arch/dadao/kernel/head.S
++++ b/arch/dadao/kernel/head.S
+@@ -8,6 +8,24 @@ _start:
+ 	setzw rb1, 1, 0x87ff
+ 
+ #ifdef CONFIG_DADAO_K3_EARLY_MARKER
++	/*
++	 * A raw reachability marker is insufficient: hypv can execute the same
++	 * ordinary store.  Use a real cfx_smon precise entry to capture the
++	 * current run mode in its hardware frame, then require that saved mode
++	 * to be supervisor before authoring the marker.
++	 *
++	 * cfx2rd is not yet accepted by the DADAO integrated assembler.  The
++	 * one raw word in the handler is its frozen CRRR encoding:
++	 * cfx2rd cfx_smon(2), cg5, rc0(prev_run_mode), rd3.
++	 */
++	setzw rd2, 1, 0x8000
++	orw rd2, 0, 0x1000
++	cfx2rc 2, 2, 10, rd2
++	trap 2, 0
++	setzw rd2, 0, 2
++	xor rd3, rd3, rd2
++	brnz rd3, .Lbad_handoff
++
+ 	/* Guest-authored KL149AHE marker at reserved bring-up scratch RAM. */
+ 	setzw rd1, 3, 0x4b4c
+ 	orw rd1, 2, 0x3134
+@@ -15,9 +33,31 @@ _start:
+ 	orw rd1, 0, 0x4845
+ 	setzw rb2, 1, 0x87fd
+ 	sto rd1, rb2, 0
++
++	/*
++	 * Leave a finite QMP observation window after the marker, then continue
++	 * into start_kernel.  This is part of the disableable test-machine gate,
++	 * not a permanent firmware wait or a replacement for kernel entry.
++	 */
++	setzw rd4, 1, 0x0100
++.Lmarker_observation_window:
++	addi rd4, rd4, -1
++	brnz rd4, .Lmarker_observation_window
+ #endif
+ 
+ 	call start_kernel
+ 1:
+ 	jump 1b
++
++#ifdef CONFIG_DADAO_K3_EARLY_MARKER
++.Lbad_handoff:
++	unimp 0
++
++	/* Keep the mode-probe vector fixed and outside normal entry flow. */
++	.org 0x1000
++.Lmode_probe:
++	.4byte 0x72085003
++	escape 2, 1
++	unimp 0
++#endif
+ 	.size _start, . - _start
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index 93d5cf0bc..1f46119cb 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -282,9 +282,21 @@ static inline struct list_head *page_deferred_list(struct page *page)
+ }
+ 
+ #else /* CONFIG_TRANSPARENT_HUGEPAGE */
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++/*
++ * DADAO's temporary -O0 build cannot eliminate every constant-false THP
++ * expression before Clang diagnoses HPAGE_PMD_ORDER as negative.  One base
++ * page is the exact disabled-feature unit; the guarded compatibility object
++ * rejects both optimized builds and any enabled THP/HUGETLB configuration.
++ */
++#define HPAGE_PMD_SHIFT PAGE_SHIFT
++#define HPAGE_PMD_MASK PAGE_MASK
++#define HPAGE_PMD_SIZE PAGE_SIZE
++#else
+ #define HPAGE_PMD_SHIFT ({ BUILD_BUG(); 0; })
+ #define HPAGE_PMD_MASK ({ BUILD_BUG(); 0; })
+ #define HPAGE_PMD_SIZE ({ BUILD_BUG(); 0; })
++#endif
+ 
+ #define HPAGE_PUD_SHIFT ({ BUILD_BUG(); 0; })
+ #define HPAGE_PUD_MASK ({ BUILD_BUG(); 0; })
+-- 
+2.43.0
+

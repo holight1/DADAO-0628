@@ -14,6 +14,16 @@ OUTPUT = ROOT / ".work" / "build" / "linux"
 LLVM_BIN = ROOT / ".work" / "build" / "llvm" / "bin"
 EVIDENCE = ROOT / ".work" / "evidence" / "kl148a-linux-compile"
 SERIES = ROOT / "components" / "linux" / "patches" / "series"
+KL148_PATCHES = (
+    (
+        "0001-dadao-add-K3-configuration-skeleton.patch",
+        "14ef129f2b38c5bd058f38316bf00de9e72a13a3",
+    ),
+    (
+        "0002-dadao-add-Linux-compile-substrate.patch",
+        "728747dae1a19c159825459a485c624e403f9d6e",
+    ),
+)
 
 
 def execute(name: str, command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -81,6 +91,13 @@ def verify_patch_identity() -> None:
         for line in SERIES.read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+    if len(patches) < len(KL148_PATCHES):
+        raise SystemExit("KL-148a FAIL: required patch prefix is incomplete")
+    if tuple(patches[:2]) != tuple(name for name, _ in KL148_PATCHES):
+        raise SystemExit(
+            f"KL-148a FAIL: required patch prefix drifted: {patches[:2]}"
+        )
+
     commits = subprocess.run(
         [
             "git",
@@ -115,6 +132,13 @@ def verify_patch_identity() -> None:
                 f"KL-148a FAIL: patch payload drift {patch}: "
                 f"{payload_id} != {commit_id}"
             )
+        if len(rows) <= len(KL148_PATCHES):
+            expected_id = KL148_PATCHES[len(rows) - 1][1]
+            if payload_id != expected_id:
+                raise SystemExit(
+                    f"KL-148a FAIL: frozen patch-id drift {patch}: "
+                    f"{payload_id} != {expected_id}"
+                )
     EVIDENCE.mkdir(parents=True, exist_ok=True)
     (EVIDENCE / "patch-identity.log").write_text("\n".join(rows) + "\n")
 
@@ -126,7 +150,9 @@ def main() -> int:
     )
     verify_patch_identity()
 
-    make("clean", "clean")
+    make("mrproper", "mrproper")
+    make("defconfig", "dadao_defconfig")
+    make("olddefconfig", "olddefconfig")
     make("prepare", "prepare")
     make("init-main", "init/main.o")
     make("init-version", "init/version.o")

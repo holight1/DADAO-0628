@@ -1,0 +1,1188 @@
+From fca53b59dc8048ba9c4cd3965e488d8a11e07dbd Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 18:06:04 +0800
+Subject: [PATCH 3/3] dadao: link K3 image and add reset entry
+
+---
+ arch/dadao/Kconfig                   |  35 ++++++-
+ arch/dadao/Makefile                  |  22 +++-
+ arch/dadao/boot/Makefile             |   9 ++
+ arch/dadao/configs/dadao_defconfig   |   3 +
+ arch/dadao/include/asm/Kbuild        |   1 -
+ arch/dadao/include/asm/futex.h       |  12 +++
+ arch/dadao/include/asm/io.h          |  28 +++++
+ arch/dadao/include/asm/mmu_context.h |  48 +++++++++
+ arch/dadao/include/asm/page.h        |   4 +
+ arch/dadao/include/asm/pgalloc.h     |  30 ++++++
+ arch/dadao/include/asm/pgtable.h     |   1 +
+ arch/dadao/include/asm/ptrace.h      |   1 +
+ arch/dadao/include/asm/syscall.h     |  68 ++++++++++++
+ arch/dadao/include/asm/timex.h       |   9 +-
+ arch/dadao/include/asm/tlb.h         |   7 ++
+ arch/dadao/include/asm/tlbflush.h    |  22 ++++
+ arch/dadao/kernel/Makefile           |   5 +
+ arch/dadao/kernel/head.S             |  23 +++++
+ arch/dadao/kernel/irq.c              |  27 +++++
+ arch/dadao/kernel/process.c          |  78 ++++++++++++++
+ arch/dadao/kernel/ptrace.c           |  65 ++++++++++++
+ arch/dadao/kernel/setup.c            |  78 ++++++++++++++
+ arch/dadao/kernel/time.c             |  31 ++++++
+ arch/dadao/kernel/traps.c            |  38 +++++++
+ arch/dadao/kernel/vmlinux.lds.S      |  55 ++++++++++
+ arch/dadao/mm/Makefile               |   4 +
+ arch/dadao/mm/init.c                 |  27 +++++
+ arch/dadao/mm/o0-link-compat.c       | 149 +++++++++++++++++++++++++++
+ include/uapi/linux/audit.h           |   1 +
+ include/uapi/linux/elf-em.h          |   1 +
+ 30 files changed, 871 insertions(+), 11 deletions(-)
+ create mode 100644 arch/dadao/boot/Makefile
+ create mode 100644 arch/dadao/include/asm/futex.h
+ create mode 100644 arch/dadao/include/asm/io.h
+ create mode 100644 arch/dadao/include/asm/mmu_context.h
+ create mode 100644 arch/dadao/include/asm/pgalloc.h
+ create mode 100644 arch/dadao/include/asm/syscall.h
+ create mode 100644 arch/dadao/include/asm/tlb.h
+ create mode 100644 arch/dadao/include/asm/tlbflush.h
+ create mode 100644 arch/dadao/kernel/Makefile
+ create mode 100644 arch/dadao/kernel/head.S
+ create mode 100644 arch/dadao/kernel/irq.c
+ create mode 100644 arch/dadao/kernel/process.c
+ create mode 100644 arch/dadao/kernel/ptrace.c
+ create mode 100644 arch/dadao/kernel/setup.c
+ create mode 100644 arch/dadao/kernel/time.c
+ create mode 100644 arch/dadao/kernel/traps.c
+ create mode 100644 arch/dadao/kernel/vmlinux.lds.S
+ create mode 100644 arch/dadao/mm/Makefile
+ create mode 100644 arch/dadao/mm/init.c
+ create mode 100644 arch/dadao/mm/o0-link-compat.c
+
+diff --git a/arch/dadao/Kconfig b/arch/dadao/Kconfig
+index d4f4becd9..6c3c67691 100644
+--- a/arch/dadao/Kconfig
++++ b/arch/dadao/Kconfig
+@@ -4,10 +4,7 @@ config DADAO
+ 	def_bool y
+ 	select 64BIT
+ 	select ARCH_WANT_FRAME_POINTERS
+-	select GENERIC_CALIBRATE_DELAY
+-	select GENERIC_CSUM
+-	select GENERIC_HWEIGHT
+-	select GENERIC_IRQ_SHOW
++	select DMA_DIRECT_REMAP
+ 	select GENERIC_SMP_IDLE_THREAD
+ 	select HAVE_MEMBLOCK
+ 	select MODULES_USE_ELF_RELA if MODULES
+@@ -25,6 +22,18 @@ config MMU
+ config CPU_BIG_ENDIAN
+ 	def_bool y
+ 
++config GENERIC_CALIBRATE_DELAY
++	def_bool y
++
++config GENERIC_CSUM
++	def_bool y
++
++config GENERIC_HWEIGHT
++	def_bool y
++
++config GENERIC_IRQ_SHOW
++	def_bool y
++
+ config GENERIC_BUG
+ 	def_bool y
+ 	depends on BUG
+@@ -57,6 +66,24 @@ config DADAO_M1
+ 	  Select the single-hart DADAO M1 virtual platform used by the K3
+ 	  QEMU and gem5 bring-up contract.
+ 
++config DADAO_K3_O0_LINK_COMPAT
++	def_bool y
++	help
++	  Provide the disabled-feature fallbacks needed while the DADAO LLVM
++	  backend is restricted to KCFLAGS=-O0.  Linux normally relies on
++	  optimization to remove calls guarded by constant-false helpers.  The
++	  fallback object is rejected if any represented feature is enabled or
++	  if the architecture is built with optimization.
++
++config DADAO_K3_EARLY_MARKER
++	bool "Write the K3 linked-image marker before start_kernel"
++	depends on DADAO_M1
++	default y
++	help
++	  Write the KL-149a guest-authored marker into the reserved M1
++	  bring-up scratch window before entering start_kernel.  This is a
++	  test-machine gate and may be disabled without changing kernel entry.
++
+ config CMDLINE
+ 	string "Built-in kernel command line"
+ 	default "console=dadao0 init=/init panic=-1"
+diff --git a/arch/dadao/Makefile b/arch/dadao/Makefile
+index 3529de86f..7b701054e 100644
+--- a/arch/dadao/Makefile
++++ b/arch/dadao/Makefile
+@@ -5,8 +5,22 @@ UTS_MACHINE := dadao
+ 
+ KBUILD_CFLAGS += -D__linux__ -fno-pic -fno-pie -integrated-as
+ KBUILD_AFLAGS += -D__linux__ -integrated-as
+-KBUILD_LDFLAGS += -m elf64dadao
++# LLD identifies the DADAO target from EM_DADAO input objects.  There is no
++# GNU-compatible -m emulation name for this project-specific ELF machine.
+ 
+-# KL-147a intentionally stops at Kconfig. The boot entry and architecture
+-# object directories are introduced by KL-148a, once compile/link contracts
+-# are executable.
++head-y := arch/dadao/kernel/head.o
++core-y += arch/dadao/kernel/ arch/dadao/mm/
++
++boot := arch/dadao/boot
++
++all: Image
++
++Image: vmlinux
++	$(Q)$(MAKE) $(build)=$(boot) $(boot)/$@
++
++archclean:
++	$(Q)$(MAKE) $(clean)=$(boot)
++
++define archhelp
++  echo  '  Image        - Uncompressed DADAO M1 kernel image'
++endef
+diff --git a/arch/dadao/boot/Makefile b/arch/dadao/boot/Makefile
+new file mode 100644
+index 000000000..d3a33ffbc
+--- /dev/null
++++ b/arch/dadao/boot/Makefile
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++OBJCOPYFLAGS_Image := -O binary -R .note -R .comment -S
++
++targets := Image
++
++$(obj)/Image: vmlinux FORCE
++	$(call if_changed,objcopy)
++	@echo '  Kernel: $@ is ready'
+diff --git a/arch/dadao/configs/dadao_defconfig b/arch/dadao/configs/dadao_defconfig
+index d96841da5..f662c649d 100644
+--- a/arch/dadao/configs/dadao_defconfig
++++ b/arch/dadao/configs/dadao_defconfig
+@@ -8,10 +8,13 @@ CONFIG_BINFMT_ELF=y
+ CONFIG_DEVTMPFS=y
+ CONFIG_DEVTMPFS_MOUNT=y
+ CONFIG_TTY=y
++# CONFIG_VT is not set
+ CONFIG_PRINTK=y
+ CONFIG_PRINTK_TIME=y
+ CONFIG_EMBEDDED=y
+ CONFIG_EXPERT=y
++CONFIG_DADAO_K3_EARLY_MARKER=y
++# CONFIG_KALLSYMS is not set
+ # CONFIG_SMP is not set
+ # CONFIG_MODULES is not set
+ # CONFIG_NET is not set
+diff --git a/arch/dadao/include/asm/Kbuild b/arch/dadao/include/asm/Kbuild
+index 8bafec69d..4bf0e9146 100644
+--- a/arch/dadao/include/asm/Kbuild
++++ b/arch/dadao/include/asm/Kbuild
+@@ -19,7 +19,6 @@ generic-y += fb.h
+ generic-y += ftrace.h
+ generic-y += hardirq.h
+ generic-y += hw_irq.h
+-generic-y += io.h
+ generic-y += irq.h
+ generic-y += irq_regs.h
+ generic-y += irq_work.h
+diff --git a/arch/dadao/include/asm/futex.h b/arch/dadao/include/asm/futex.h
+new file mode 100644
+index 000000000..04fa2aef9
+--- /dev/null
++++ b/arch/dadao/include/asm/futex.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_DADAO_FUTEX_H
++#define _ASM_DADAO_FUTEX_H
++
++/*
++ * DADAO M1 is uniprocessor-only.  The generic implementation serializes
++ * user-memory updates by disabling preemption and fails closed if SMP is
++ * enabled in a future configuration.
++ */
++#include <asm-generic/futex.h>
++
++#endif /* _ASM_DADAO_FUTEX_H */
+diff --git a/arch/dadao/include/asm/io.h b/arch/dadao/include/asm/io.h
+new file mode 100644
+index 000000000..9064261e5
+--- /dev/null
++++ b/arch/dadao/include/asm/io.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_IO_H
++#define _ASM_DADAO_IO_H
++
++#include <linux/types.h>
++
++/*
++ * The DADAO M1 platform has no IOMMU and the initial kernel mapping is
++ * physical-address identity.  MMIO therefore uses the same address value.
++ */
++#define ioremap ioremap
++static inline void __iomem *ioremap(phys_addr_t offset, size_t size)
++{
++	return (void __iomem *)(unsigned long)offset;
++}
++
++#define iounmap iounmap
++static inline void iounmap(void __iomem *addr)
++{
++}
++
++#define ioremap_nocache ioremap
++#define ioremap_wc ioremap
++#define ioremap_wt ioremap
++
++#include <asm-generic/io.h>
++
++#endif /* _ASM_DADAO_IO_H */
+diff --git a/arch/dadao/include/asm/mmu_context.h b/arch/dadao/include/asm/mmu_context.h
+new file mode 100644
+index 000000000..795655f8f
+--- /dev/null
++++ b/arch/dadao/include/asm/mmu_context.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_MMU_CONTEXT_H
++#define _ASM_DADAO_MMU_CONTEXT_H
++
++#include <linux/bug.h>
++#include <linux/mm_types.h>
++#include <asm-generic/mm_hooks.h>
++
++static inline int init_new_context(struct task_struct *task,
++				   struct mm_struct *mm)
++{
++	mm->context.asid = 0;
++	mm->context.ptbr = 0;
++	return 0;
++}
++
++static inline void destroy_context(struct mm_struct *mm)
++{
++}
++
++static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
++			     struct task_struct *task)
++{
++	/*
++	 * KL-149a can schedule kernel threads sharing init_mm, but must not
++	 * silently pretend that process PTBR/TLB switching already exists.
++	 */
++	BUG_ON(prev != next);
++}
++
++#define switch_mm_irqs_off switch_mm
++
++static inline void activate_mm(struct mm_struct *prev, struct mm_struct *next)
++{
++	BUG_ON(prev != next);
++}
++
++static inline void deactivate_mm(struct task_struct *task,
++				 struct mm_struct *mm)
++{
++}
++
++static inline void enter_lazy_tlb(struct mm_struct *mm,
++				  struct task_struct *task)
++{
++}
++
++#endif
+diff --git a/arch/dadao/include/asm/page.h b/arch/dadao/include/asm/page.h
+index 81dcb4cbe..3a3d8f7e4 100644
+--- a/arch/dadao/include/asm/page.h
++++ b/arch/dadao/include/asm/page.h
+@@ -48,6 +48,10 @@ typedef struct page *pgtable_t;
+ #define page_to_virt(page) pfn_to_virt(page_to_pfn(page))
+ #define page_to_phys(page) PFN_PHYS(page_to_pfn(page))
+ #define phys_to_page(addr) pfn_to_page(PFN_DOWN(addr))
++#define ARCH_PFN_OFFSET PFN_DOWN(PAGE_OFFSET)
++#define pfn_valid(pfn) \
++	((pfn) >= ARCH_PFN_OFFSET && \
++	 ((pfn) - ARCH_PFN_OFFSET) < max_mapnr)
+ #define virt_addr_valid(addr) pfn_valid(virt_to_pfn(addr))
+ 
+ #endif
+diff --git a/arch/dadao/include/asm/pgalloc.h b/arch/dadao/include/asm/pgalloc.h
+new file mode 100644
+index 000000000..4ad4d0bcd
+--- /dev/null
++++ b/arch/dadao/include/asm/pgalloc.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_PGALLOC_H
++#define _ASM_DADAO_PGALLOC_H
++
++#include <linux/mm.h>
++#include <asm-generic/pgalloc.h>
++
++static inline pgd_t *pgd_alloc(struct mm_struct *mm)
++{
++	pgd_t *pgd = (pgd_t *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++
++	if (pgd)
++		memcpy(pgd + USER_PTRS_PER_PGD,
++		       swapper_pg_dir + USER_PTRS_PER_PGD,
++		       (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(*pgd));
++	return pgd;
++}
++
++static inline void pgd_free(struct mm_struct *mm, pgd_t *pgd)
++{
++	free_page((unsigned long)pgd);
++}
++
++#define __pte_free_tlb(tlb, pte, address)	\
++do {						\
++	pgtable_pte_page_dtor(pte);		\
++	tlb_remove_page((tlb), (pte));		\
++} while (0)
++
++#endif
+diff --git a/arch/dadao/include/asm/pgtable.h b/arch/dadao/include/asm/pgtable.h
+index b33c62ccf..d64b35a0b 100644
+--- a/arch/dadao/include/asm/pgtable.h
++++ b/arch/dadao/include/asm/pgtable.h
+@@ -33,6 +33,7 @@
+ #define PMD_MASK	PGDIR_MASK
+ 
+ #define FIRST_USER_ADDRESS	0UL
++#define USER_PTRS_PER_PGD	(TASK_SIZE / PGDIR_SIZE)
+ #define VMALLOC_START		_AC(0xc0000000, UL)
+ #define VMALLOC_END		_AC(0xffffffff, UL)
+ 
+diff --git a/arch/dadao/include/asm/ptrace.h b/arch/dadao/include/asm/ptrace.h
+index c134ba698..a24f8e07c 100644
+--- a/arch/dadao/include/asm/ptrace.h
++++ b/arch/dadao/include/asm/ptrace.h
+@@ -15,6 +15,7 @@ struct pt_regs {
+ 	unsigned long cfx_mask;
+ 	unsigned long cause_id;
+ 	unsigned long cause_info;
++	unsigned long orig_rd17;
+ };
+ 
+ #define instruction_pointer(regs) ((regs)->pc)
+diff --git a/arch/dadao/include/asm/syscall.h b/arch/dadao/include/asm/syscall.h
+new file mode 100644
+index 000000000..1ce95c334
+--- /dev/null
++++ b/arch/dadao/include/asm/syscall.h
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_SYSCALL_H
++#define _ASM_DADAO_SYSCALL_H
++
++#include <uapi/linux/audit.h>
++#include <linux/err.h>
++
++static inline int syscall_get_nr(struct task_struct *task,
++				 struct pt_regs *regs)
++{
++	return regs->rd[16];
++}
++
++static inline void syscall_set_nr(struct task_struct *task,
++				  struct pt_regs *regs, int sysno)
++{
++	regs->rd[16] = sysno;
++}
++
++static inline void syscall_rollback(struct task_struct *task,
++				    struct pt_regs *regs)
++{
++	regs->rd[17] = regs->orig_rd17;
++}
++
++static inline long syscall_get_error(struct task_struct *task,
++				     struct pt_regs *regs)
++{
++	unsigned long error = regs->rd[31];
++
++	return IS_ERR_VALUE(error) ? error : 0;
++}
++
++static inline long syscall_get_return_value(struct task_struct *task,
++					    struct pt_regs *regs)
++{
++	return regs->rd[31];
++}
++
++static inline void syscall_set_return_value(struct task_struct *task,
++					    struct pt_regs *regs,
++					    int error, long val)
++{
++	regs->rd[31] = (long)error ?: val;
++}
++
++static inline void syscall_get_arguments(struct task_struct *task,
++					 struct pt_regs *regs,
++					 unsigned long *args)
++{
++	args[0] = regs->orig_rd17;
++	memcpy(args + 1, &regs->rd[18], 5 * sizeof(args[0]));
++}
++
++static inline void syscall_set_arguments(struct task_struct *task,
++					 struct pt_regs *regs,
++					 const unsigned long *args)
++{
++	regs->orig_rd17 = args[0];
++	memcpy(&regs->rd[18], args + 1, 5 * sizeof(args[0]));
++}
++
++static inline int syscall_get_arch(struct task_struct *task)
++{
++	return AUDIT_ARCH_DADAO;
++}
++
++#endif /* _ASM_DADAO_SYSCALL_H */
+diff --git a/arch/dadao/include/asm/timex.h b/arch/dadao/include/asm/timex.h
+index 95a8d2a12..cd0fd86d9 100644
+--- a/arch/dadao/include/asm/timex.h
++++ b/arch/dadao/include/asm/timex.h
+@@ -3,7 +3,12 @@
+ #define _ASM_DADAO_TIMEX_H
+ 
+ typedef unsigned long cycles_t;
+-extern cycles_t get_cycles(void);
+-#define get_cycles get_cycles
++
++/*
++ * The M1 timer/clocksource contract follows the linked-image gate.  A macro
++ * is intentional here: the -O0 bring-up build cannot rely on an inline call
++ * being folded away by generic timekeeping code.
++ */
++#define get_cycles() ((cycles_t)0)
+ 
+ #endif
+diff --git a/arch/dadao/include/asm/tlb.h b/arch/dadao/include/asm/tlb.h
+new file mode 100644
+index 000000000..3d2953998
+--- /dev/null
++++ b/arch/dadao/include/asm/tlb.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_TLB_H
++#define _ASM_DADAO_TLB_H
++
++#include <asm-generic/tlb.h>
++
++#endif
+diff --git a/arch/dadao/include/asm/tlbflush.h b/arch/dadao/include/asm/tlbflush.h
+new file mode 100644
+index 000000000..08b79d23b
+--- /dev/null
++++ b/arch/dadao/include/asm/tlbflush.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_TLBFLUSH_H
++#define _ASM_DADAO_TLBFLUSH_H
++
++#include <linux/bug.h>
++
++/*
++ * The cfx_tlb range-invalidate sequence is a later K3 milestone.  Every
++ * accidental early caller must trap instead of observing a fake flush.
++ */
++static inline void local_flush_tlb_all(void)
++{
++	BUG();
++}
++
++#define flush_tlb_all() local_flush_tlb_all()
++#define flush_tlb_mm(mm) local_flush_tlb_all()
++#define flush_tlb_page(vma, addr) local_flush_tlb_all()
++#define flush_tlb_range(vma, start, end) local_flush_tlb_all()
++#define flush_tlb_kernel_range(start, end) local_flush_tlb_all()
++
++#endif
+diff --git a/arch/dadao/kernel/Makefile b/arch/dadao/kernel/Makefile
+new file mode 100644
+index 000000000..1a4211ac4
+--- /dev/null
++++ b/arch/dadao/kernel/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++extra-y := head.o vmlinux.lds
++
++obj-y := setup.o process.o ptrace.o traps.o irq.o time.o
+diff --git a/arch/dadao/kernel/head.S b/arch/dadao/kernel/head.S
+new file mode 100644
+index 000000000..9bd3404a8
+--- /dev/null
++++ b/arch/dadao/kernel/head.S
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++	.section ".head.text", "ax"
++	.globl _start
++	.type _start, @function
++_start:
++	/* Temporary boot stack: top of the 128 MiB dadao-m1 RAM window. */
++	setzw rb1, 1, 0x87ff
++
++#ifdef CONFIG_DADAO_K3_EARLY_MARKER
++	/* Guest-authored KL149AHE marker at reserved bring-up scratch RAM. */
++	setzw rd1, 3, 0x4b4c
++	orw rd1, 2, 0x3134
++	orw rd1, 1, 0x3941
++	orw rd1, 0, 0x4845
++	setzw rb2, 1, 0x87fd
++	sto rd1, rb2, 0
++#endif
++
++	call start_kernel
++1:
++	jump 1b
++	.size _start, . - _start
+diff --git a/arch/dadao/kernel/irq.c b/arch/dadao/kernel/irq.c
+new file mode 100644
+index 000000000..d5e3e0b9a
+--- /dev/null
++++ b/arch/dadao/kernel/irq.c
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/init.h>
++
++/*
++ * KL-149a enters supervisor mode with every asynchronous CFX source masked.
++ * Until the Linux CFX interrupt controller is installed, retain that hardware
++ * state and track the Linux local-IRQ state in software for UP critical
++ * sections.  No interrupt-delivery support is claimed by this task.
++ */
++static unsigned long dadao_irq_enabled;
++
++unsigned long arch_local_save_flags(void)
++{
++	return READ_ONCE(dadao_irq_enabled);
++}
++
++void arch_local_irq_restore(unsigned long flags)
++{
++	WRITE_ONCE(dadao_irq_enabled, !!flags);
++	barrier();
++}
++
++void __init init_IRQ(void)
++{
++	dadao_irq_enabled = 0;
++}
+diff --git a/arch/dadao/kernel/process.c b/arch/dadao/kernel/process.c
+new file mode 100644
+index 000000000..d75f9190d
+--- /dev/null
++++ b/arch/dadao/kernel/process.c
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/errno.h>
++#include <linux/init_task.h>
++#include <linux/kernel.h>
++#include <linux/reboot.h>
++#include <linux/sched.h>
++#include <linux/sched/debug.h>
++#include <linux/sched/task_stack.h>
++
++#include <asm/processor.h>
++#include <asm/ptrace.h>
++
++void start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)
++{
++	memset(regs, 0, sizeof(*regs));
++	regs->pc = pc;
++	regs->rb[1] = sp;
++	regs->run_mode = 0;
++}
++
++void flush_thread(void)
++{
++}
++
++unsigned long get_wchan(struct task_struct *task)
++{
++	return 0;
++}
++
++int copy_thread(unsigned long clone_flags, unsigned long usp,
++		unsigned long arg, struct task_struct *task)
++{
++	/*
++	 * Context creation is intentionally fail-closed until the assembly
++	 * ret_from_fork path exists; callers receive an honest error.
++	 */
++	return -ENOSYS;
++}
++
++struct task_struct *__switch_to(struct task_struct *prev,
++				struct task_struct *next)
++{
++	BUG_ON(prev != next);
++	WRITE_ONCE(dadao_current, next);
++	return prev;
++}
++
++void machine_restart(char *command)
++{
++	for (;;)
++		cpu_relax();
++}
++
++void machine_halt(void)
++{
++	for (;;)
++		cpu_relax();
++}
++
++void machine_power_off(void)
++{
++	for (;;)
++		cpu_relax();
++}
++
++void (*pm_power_off)(void) = machine_power_off;
++
++void __xchg_called_with_bad_pointer(void)
++{
++	BUG();
++}
++
++unsigned long wrong_size_cmpxchg(volatile void *ptr)
++{
++	BUG();
++	unreachable();
++}
+diff --git a/arch/dadao/kernel/ptrace.c b/arch/dadao/kernel/ptrace.c
+new file mode 100644
+index 000000000..9f40561d1
+--- /dev/null
++++ b/arch/dadao/kernel/ptrace.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/elf.h>
++#include <linux/ptrace.h>
++#include <linux/regset.h>
++#include <linux/sched.h>
++#include <linux/sched/task_stack.h>
++
++#include <asm/processor.h>
++
++static int dadao_gpr_get(struct task_struct *target,
++			 const struct user_regset *regset,
++			 unsigned int pos, unsigned int count,
++			 void *kbuf, void __user *ubuf)
++{
++	const struct pt_regs *regs = task_pt_regs(target);
++
++	return user_regset_copyout(&pos, &count, &kbuf, &ubuf, regs, 0,
++				   sizeof(struct user_regs_struct));
++}
++
++static int dadao_gpr_set(struct task_struct *target,
++			 const struct user_regset *regset,
++			 unsigned int pos, unsigned int count,
++			 const void *kbuf, const void __user *ubuf)
++{
++	struct pt_regs *regs = task_pt_regs(target);
++
++	return user_regset_copyin(&pos, &count, &kbuf, &ubuf, regs, 0,
++				  sizeof(struct user_regs_struct));
++}
++
++static const struct user_regset dadao_regsets[] = {
++	{
++		.core_note_type = NT_PRSTATUS,
++		.n = sizeof(struct user_regs_struct) / sizeof(unsigned long),
++		.size = sizeof(unsigned long),
++		.align = sizeof(unsigned long),
++		.get = dadao_gpr_get,
++		.set = dadao_gpr_set,
++	},
++};
++
++static const struct user_regset_view dadao_user_view = {
++	.name = "dadao",
++	.e_machine = ELF_ARCH,
++	.ei_osabi = ELF_OSABI,
++	.regsets = dadao_regsets,
++	.n = ARRAY_SIZE(dadao_regsets),
++};
++
++const struct user_regset_view *task_user_regset_view(struct task_struct *task)
++{
++	return &dadao_user_view;
++}
++
++void ptrace_disable(struct task_struct *child)
++{
++}
++
++long arch_ptrace(struct task_struct *child, long request,
++		 unsigned long addr, unsigned long data)
++{
++	return ptrace_request(child, request, addr, data);
++}
+diff --git a/arch/dadao/kernel/setup.c b/arch/dadao/kernel/setup.c
+new file mode 100644
+index 000000000..e014a47f6
+--- /dev/null
++++ b/arch/dadao/kernel/setup.c
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/init.h>
++#include <linux/init_task.h>
++#include <linux/kernel.h>
++#include <linux/memblock.h>
++#include <linux/mm.h>
++#include <linux/seq_file.h>
++#include <linux/string.h>
++
++#include <asm/page.h>
++#include <asm/sections.h>
++#include <asm/setup.h>
++
++#define DADAO_RAM_BASE		0x80000000UL
++#define DADAO_RAM_SIZE		0x08000000UL
++#define DADAO_BRINGUP_SCRATCH	0x87fd0000UL
++#define DADAO_BRINGUP_SIZE	0x00030000UL
++
++struct task_struct *dadao_current = &init_task;
++
++extern void paging_init(void);
++extern char _start[];
++
++void __init setup_arch(char **cmdline_p)
++{
++	unsigned long ram_end = DADAO_RAM_BASE + DADAO_RAM_SIZE;
++
++	strlcpy(boot_command_line, CONFIG_CMDLINE, COMMAND_LINE_SIZE);
++	*cmdline_p = boot_command_line;
++
++	memblock_add(DADAO_RAM_BASE, DADAO_RAM_SIZE);
++	memblock_reserve(__pa(_start), PAGE_ALIGN((unsigned long)_end -
++						  (unsigned long)_start));
++	memblock_reserve(DADAO_BRINGUP_SCRATCH, DADAO_BRINGUP_SIZE);
++
++	min_low_pfn = PFN_UP(DADAO_RAM_BASE);
++	max_low_pfn = PFN_DOWN(ram_end);
++	max_pfn = max_low_pfn;
++	max_mapnr = max_low_pfn - min_low_pfn;
++
++	init_mm.start_code = (unsigned long)_text;
++	init_mm.end_code = (unsigned long)_etext;
++	init_mm.end_data = (unsigned long)_edata;
++	init_mm.brk = (unsigned long)_end;
++
++	paging_init();
++}
++
++static void *dadao_cpuinfo_start(struct seq_file *m, loff_t *pos)
++{
++	return *pos == 0 ? (void *)1 : NULL;
++}
++
++static void *dadao_cpuinfo_next(struct seq_file *m, void *v, loff_t *pos)
++{
++	++*pos;
++	return NULL;
++}
++
++static void dadao_cpuinfo_stop(struct seq_file *m, void *v)
++{
++}
++
++static int dadao_cpuinfo_show(struct seq_file *m, void *v)
++{
++	seq_puts(m, "processor\t: 0\n"
++		    "model name\t: DADAO M1\n"
++		    "byte order\t: big endian\n");
++	return 0;
++}
++
++const struct seq_operations cpuinfo_op = {
++	.start = dadao_cpuinfo_start,
++	.next = dadao_cpuinfo_next,
++	.stop = dadao_cpuinfo_stop,
++	.show = dadao_cpuinfo_show,
++};
+diff --git a/arch/dadao/kernel/time.c b/arch/dadao/kernel/time.c
+new file mode 100644
+index 000000000..42e34fdb7
+--- /dev/null
++++ b/arch/dadao/kernel/time.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/param.h>
++
++#include <asm/processor.h>
++
++void __init time_init(void)
++{
++	/*
++	 * The CFX timer clocksource/clockevent is introduced after the linked
++	 * image gate.  Linux can still enter start_kernel with time disabled.
++	 */
++}
++
++void __delay(unsigned long loops)
++{
++	while (loops--)
++		cpu_relax();
++}
++
++void __const_udelay(unsigned long xloops)
++{
++	__delay(xloops);
++}
++
++void __udelay(unsigned long usecs)
++{
++	__delay(usecs * loops_per_jiffy / (1000000 / HZ));
++}
+diff --git a/arch/dadao/kernel/traps.c b/arch/dadao/kernel/traps.c
+new file mode 100644
+index 000000000..e1ebf2120
+--- /dev/null
++++ b/arch/dadao/kernel/traps.c
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/sched/debug.h>
++
++#include <asm/ptrace.h>
++#include <asm/sections.h>
++
++void __init trap_init(void)
++{
++	/* CFX exception vectors are installed by the later Linux trap task. */
++}
++
++void show_regs(struct pt_regs *regs)
++{
++	int i;
++
++	show_regs_print_info(KERN_DEFAULT);
++	pr_info("pc=%016lx mode=%lu cfx=%lu mask=%016lx cause=%lu/%016lx\n",
++		regs->pc, regs->run_mode, regs->cfx_code, regs->cfx_mask,
++		regs->cause_id, regs->cause_info);
++	for (i = 0; i < 64; i += 4)
++		pr_info("rd%02d=%016lx rd%02d=%016lx rd%02d=%016lx rd%02d=%016lx\n",
++			i, regs->rd[i], i + 1, regs->rd[i + 1],
++			i + 2, regs->rd[i + 2], i + 3, regs->rd[i + 3]);
++}
++
++void show_stack(struct task_struct *task, unsigned long *sp)
++{
++	pr_info("DADAO stack trace unavailable (task=%p sp=%p)\n", task, sp);
++}
++
++int is_valid_bugaddr(unsigned long addr)
++{
++	return !(addr & 3) && addr >= (unsigned long)_stext &&
++	       addr < (unsigned long)_etext;
++}
+diff --git a/arch/dadao/kernel/vmlinux.lds.S b/arch/dadao/kernel/vmlinux.lds.S
+new file mode 100644
+index 000000000..ce1cb2084
+--- /dev/null
++++ b/arch/dadao/kernel/vmlinux.lds.S
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#define LOAD_OFFSET PAGE_OFFSET
++
++#include <asm/page.h>
++#include <asm/cache.h>
++#include <asm/thread_info.h>
++#include <asm-generic/vmlinux.lds.h>
++
++ENTRY(_start)
++jiffies = jiffies_64;
++
++SECTIONS
++{
++	. = LOAD_OFFSET;
++	_start = .;
++	__init_begin = .;
++
++	HEAD_TEXT_SECTION
++	INIT_TEXT_SECTION(PAGE_SIZE)
++	INIT_DATA_SECTION(16)
++
++	.exit.text : { EXIT_TEXT }
++	.exit.data : { EXIT_DATA }
++	PERCPU_SECTION(L1_CACHE_BYTES)
++	__init_end = .;
++
++	.text : {
++		_text = .;
++		_stext = .;
++		TEXT_TEXT
++		SCHED_TEXT
++		CPUIDLE_TEXT
++		LOCK_TEXT
++		IRQENTRY_TEXT
++		SOFTIRQENTRY_TEXT
++		*(.fixup)
++		_etext = .;
++	}
++
++	_sdata = .;
++	RO_DATA_SECTION(L1_CACHE_BYTES)
++	RW_DATA_SECTION(L1_CACHE_BYTES, PAGE_SIZE, THREAD_SIZE)
++	_edata = .;
++
++	BSS_SECTION(PAGE_SIZE, PAGE_SIZE, 0)
++	EXCEPTION_TABLE(16)
++	NOTES
++
++	_end = .;
++
++	STABS_DEBUG
++	DWARF_DEBUG
++	DISCARDS
++}
+diff --git a/arch/dadao/mm/Makefile b/arch/dadao/mm/Makefile
+new file mode 100644
+index 000000000..3e7b13ea3
+--- /dev/null
++++ b/arch/dadao/mm/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++obj-y := init.o
++obj-$(CONFIG_DADAO_K3_O0_LINK_COMPAT) += o0-link-compat.o
+diff --git a/arch/dadao/mm/init.c b/arch/dadao/mm/init.c
+new file mode 100644
+index 000000000..bfd12844c
+--- /dev/null
++++ b/arch/dadao/mm/init.c
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/init.h>
++#include <linux/memblock.h>
++#include <linux/mm.h>
++
++#include <asm/page.h>
++#include <asm/pgtable.h>
++
++pgd_t swapper_pg_dir[PTRS_PER_PGD] __aligned(PAGE_SIZE);
++unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)]
++	__aligned(PAGE_SIZE);
++
++void __init paging_init(void)
++{
++	unsigned long zones_size[MAX_NR_ZONES] = { 0 };
++
++	zones_size[ZONE_NORMAL] = max_low_pfn - min_low_pfn;
++	free_area_init(zones_size);
++}
++
++void __init mem_init(void)
++{
++	high_memory = __va(max_low_pfn << PAGE_SHIFT);
++	memblock_free_all();
++	mem_init_print_info(NULL);
++}
+diff --git a/arch/dadao/mm/o0-link-compat.c b/arch/dadao/mm/o0-link-compat.c
+new file mode 100644
+index 000000000..ea4e6d9a0
+--- /dev/null
++++ b/arch/dadao/mm/o0-link-compat.c
+@@ -0,0 +1,149 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Linux assumes that constant-false feature predicates are removed by the
++ * optimizer.  The DADAO backend is temporarily restricted to KCFLAGS=-O0,
++ * so calls behind those predicates survive until link time.  Keep their
++ * disabled-feature semantics in one guarded object instead of pretending the
++ * corresponding features exist.
++ */
++
++#include <linux/dax.h>
++#include <linux/frontswap.h>
++#include <linux/huge_mm.h>
++#include <linux/irq.h>
++#include <linux/memcontrol.h>
++#include <linux/pagemap.h>
++#include <linux/pfn_t.h>
++
++#ifdef __OPTIMIZE__
++#error "DADAO_K3_O0_LINK_COMPAT is only valid for KCFLAGS=-O0"
++#endif
++
++#if defined(CONFIG_DAX) || defined(CONFIG_FRONTSWAP) || \
++	defined(CONFIG_HUGETLBFS) || defined(CONFIG_MEMCG_KMEM) || \
++	defined(CONFIG_SMP) || defined(CONFIG_TRANSPARENT_HUGEPAGE) || \
++	defined(CONFIG_ARCH_HAS_PTE_DEVMAP)
++#error "DADAO K3 -O0 fallbacks conflict with an enabled feature"
++#endif
++
++int __frontswap_store(struct page *page)
++{
++	return -1;
++}
++
++int __frontswap_load(struct page *page)
++{
++	return -1;
++}
++
++void __frontswap_invalidate_page(unsigned int type, pgoff_t offset)
++{
++}
++
++void __frontswap_invalidate_area(unsigned int type)
++{
++}
++
++vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
++{
++	return VM_FAULT_FALLBACK;
++}
++
++vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf, pmd_t orig_pmd)
++{
++	return VM_FAULT_FALLBACK;
++}
++
++int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
++		  pmd_t *dst_pmd, pmd_t *src_pmd, unsigned long addr,
++		  struct vm_area_struct *vma)
++{
++	return 0;
++}
++
++int copy_huge_pud(struct mm_struct *dst_mm, struct mm_struct *src_mm,
++		  pud_t *dst_pud, pud_t *src_pud, unsigned long addr,
++		  struct vm_area_struct *vma)
++{
++	return 0;
++}
++
++void huge_pmd_set_accessed(struct vm_fault *vmf, pmd_t orig_pmd)
++{
++}
++
++struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
++				   unsigned long addr, pmd_t *pmd,
++				   unsigned int flags)
++{
++	return NULL;
++}
++
++bool madvise_free_huge_pmd(struct mmu_gather *tlb,
++			   struct vm_area_struct *vma, pmd_t *pmd,
++			   unsigned long addr, unsigned long next)
++{
++	return false;
++}
++
++int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
++		 pmd_t *pmd, unsigned long addr)
++{
++	return 0;
++}
++
++int zap_huge_pud(struct mmu_gather *tlb, struct vm_area_struct *vma,
++		 pud_t *pud, unsigned long addr)
++{
++	return 0;
++}
++
++bool move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
++		   unsigned long new_addr, unsigned long old_end,
++		   pmd_t *old_pmd, pmd_t *new_pmd)
++{
++	return false;
++}
++
++int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
++		    unsigned long addr, pgprot_t newprot, int prot_numa)
++{
++	return 0;
++}
++
++pte_t pte_mkdevmap(pte_t pte)
++{
++	return pte;
++}
++
++pgoff_t linear_hugepage_index(struct vm_area_struct *vma,
++			      unsigned long address)
++{
++	return ((address - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
++}
++
++struct kmem_cache *memcg_kmem_get_cache(struct kmem_cache *cachep)
++{
++	return cachep;
++}
++
++void memcg_kmem_put_cache(struct kmem_cache *cachep)
++{
++}
++
++int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index)
++{
++	return 0;
++}
++
++int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
++				      pgoff_t index)
++{
++	return 0;
++}
++
++int irq_do_set_affinity(struct irq_data *data, const struct cpumask *mask,
++			bool force)
++{
++	return -EINVAL;
++}
+diff --git a/include/uapi/linux/audit.h b/include/uapi/linux/audit.h
+index c89c64959..ed645fd1c 100644
+--- a/include/uapi/linux/audit.h
++++ b/include/uapi/linux/audit.h
+@@ -388,6 +388,7 @@ enum {
+ #define AUDIT_ARCH_C6XBE	(EM_TI_C6000)
+ #define AUDIT_ARCH_CRIS		(EM_CRIS|__AUDIT_ARCH_LE)
+ #define AUDIT_ARCH_CSKY		(EM_CSKY|__AUDIT_ARCH_LE)
++#define AUDIT_ARCH_DADAO	(EM_DADAO|__AUDIT_ARCH_64BIT)
+ #define AUDIT_ARCH_FRV		(EM_FRV)
+ #define AUDIT_ARCH_H8300	(EM_H8_300)
+ #define AUDIT_ARCH_HEXAGON	(EM_HEXAGON)
+diff --git a/include/uapi/linux/elf-em.h b/include/uapi/linux/elf-em.h
+index f47e85354..7df572486 100644
+--- a/include/uapi/linux/elf-em.h
++++ b/include/uapi/linux/elf-em.h
+@@ -51,6 +51,7 @@
+ #define EM_RISCV	243	/* RISC-V */
+ #define EM_BPF		247	/* Linux BPF - in-kernel virtual machine */
+ #define EM_CSKY		252	/* C-SKY */
++#define EM_DADAO	0x0da0	/* Project-specific DADAO M1 value */
+ #define EM_FRV		0x5441	/* Fujitsu FR-V */
+ 
+ /*
+-- 
+2.43.0
+

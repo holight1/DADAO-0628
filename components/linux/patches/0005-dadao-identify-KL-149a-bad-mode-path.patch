@@ -1,0 +1,30 @@
+From f1349f6ee7858f8be8f6e91d18ea9b006f52c281 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 18:47:05 +0800
+Subject: [PATCH 5/5] dadao: identify KL-149a bad-mode path
+
+---
+ arch/dadao/kernel/head.S | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/arch/dadao/kernel/head.S b/arch/dadao/kernel/head.S
+index 1e4c6a412..e35c89c04 100644
+--- a/arch/dadao/kernel/head.S
++++ b/arch/dadao/kernel/head.S
+@@ -51,6 +51,13 @@ _start:
+ 
+ #ifdef CONFIG_DADAO_K3_EARLY_MARKER
+ .Lbad_handoff:
++	/* Preserve PASS marker=0 and identify this exact fail-closed path. */
++	setzw rd1, 3, 0x4b4c
++	orw rd1, 2, 0x3134
++	orw rd1, 1, 0x3942
++	orw rd1, 0, 0x4144
++	setzw rb2, 1, 0x87fd
++	sto rd1, rb2, 8
+ 	unimp 0
+ 
+ 	/* Keep the mode-probe vector fixed and outside normal entry flow. */
+-- 
+2.43.0
+

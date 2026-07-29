@@ -2361,3 +2361,38 @@ default `-O2`. The next basic-chain task is KL-149a: add the minimum
 architecture objects/linker script and produce a linked image with an
 explicit reset handoff contract. KL-148b may be completed later before
 restoring the normal optimized kernel build.
+
+## K3 Linux linked Image and reset handoff (KL-149a, 2026-07-29)
+
+KL-149a reaches the first linked Linux image under the explicitly retained
+`KCFLAGS=-O0` boundary. Linux component patches 0003–0005 add the real
+`_start`, linker script, minimal architecture kernel/mm objects, and flat
+`Image` target. The final `vmlinux` is ELF64 big-endian, ET_EXEC,
+`EM_DADAO=0x0DA0`, entry `0x80000000`, with no undefined symbols; the
+7,655,516-byte Image begins with the linked 4,108-byte `.head.text` and ends
+well below the reserved M1 scratch window.
+
+Reset uses the frozen HBI section 3 sequence, not a bare jump: a 132-byte ROM
+clears the twelve hypv delegation registers, restores supervisor mode and the
+all-masked CFX state, installs `0x80000000` as cause IP, then executes
+`escape cfx_power,0`. Linux `_start` independently proves the handoff mode by
+performing a real `trap cfx_smon`, reading the hardware frame's saved
+`prev_run_mode`, and authoring the PASS marker only when it equals supervisor.
+
+The fail-closed runner starts QEMU paused and proves the scratch words are
+zero before vCPU execution. The positive image must produce the guest marker
+while QEMU remains running. A frozen wrong-mode ROM that restores hypv must
+instead preserve PASS=0, write the distinct `KL149BAD` failure word from the
+mode assertion, and shut down. Linux commits/patch IDs, QEMU clean source
+HEAD/binary hash/version, ROM hashes, ELF/Image layout, scratch non-overlap,
+and forbidden O0/ELF diagnostics are all checked rather than merely logged.
+The independent review initially rejected a weaker marker-only oracle; after
+two follow-up rounds it accepted the final positive/negative matrix with no
+remaining findings.
+
+This is still an entry/link milestone, not a Linux boot-completion claim.
+Console, completed memory initialization, Linux trap/syscall handling,
+clocksource/clockevent, irqchip, context switching, MMU enable/page faults,
+initramfs and userspace remain open. KL-150a next owns early console and
+durable boot-progress evidence. Default optimized compilation remains
+separately tracked by KL-148b.

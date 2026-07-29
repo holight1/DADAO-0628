@@ -1,3 +1,6 @@
 # K3 Linux 5.4 architecture port; apply in order.
 0001-dadao-add-K3-configuration-skeleton.patch
 0002-dadao-add-Linux-compile-substrate.patch
+0003-dadao-link-K3-image-and-add-reset-entry.patch
+0004-dadao-harden-KL-149a-mode-and-O0-link-gates.patch
+0005-dadao-identify-KL-149a-bad-mode-path.patch
