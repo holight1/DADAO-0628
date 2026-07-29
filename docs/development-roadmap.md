@@ -2292,3 +2292,25 @@ written to `.work/evidence/kl145a-k2-closure/summary.json`.
 **Stop point**: K3 has not started. Linux remains `enabled=false`, no Linux
 source was fetched, no patch payload or `arch/dadao` was created, and this
 roadmap deliberately does not open a K3 implementation task.
+
+## K3 started: clean Linux 5.4 baseline (KL-146a, 2026-07-29)
+
+KL-146a opens K3 only after the complete KL-145a K2 closure. The Linux
+component is pinned to the upstream Linux 5.4 commit
+`219d54332a09e8d8741c1e1982f5eae56099de85`; the first gate requires an exact,
+clean checkout and an empty patch queue before any `arch/dadao` file is
+created. Historical architecture ports remain retrospective evidence and are
+not source inputs.
+
+The incremental K3/K4 chain is:
+
+1. reproducible kernel build contract and fresh `arch/dadao` skeleton;
+2. reset handoff, linked image, early console, memory discovery;
+3. precise trap/syscall, timer/irq and scheduler integration;
+4. Linux page tables, TLB and user-mode transition;
+5. initramfs `/init` executing a musl-linked `hello world`;
+6. console TTY and a working `login` prompt.
+
+Each stage must retain a task Markdown record and executable evidence. QEMU is
+the first boot carrier; gem5 FullSystem parity is a required follow-on gate,
+not grounds for weakening the QEMU/Linux contract.

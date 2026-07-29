@@ -54,8 +54,8 @@ role = "musl 1.2.5 (upstream tag v1.2.5) -- arch/dadao compile-time skeleton (ML
 
 [[component]]
 name = "linux"
-enabled = false
+enabled = true
 repository = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
-commit = ""
+commit = "219d54332a09e8d8741c1e1982f5eae56099de85"
 patch_series = "components/linux/patches/series"
-role = "Deferred Kernel architecture port"
+role = "Linux 5.4 baseline for the fresh DADAO K3 architecture port"
