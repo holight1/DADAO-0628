@@ -1,0 +1,29 @@
+From dfc7842229c139cc606141b82845ecf20086e657 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 19:17:00 +0800
+Subject: [PATCH] target/dadao: log precise exception state
+
+---
+ target/dadao/cpu.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/target/dadao/cpu.c b/target/dadao/cpu.c
+index 219fb10..eeb80eb 100644
+--- a/target/dadao/cpu.c
++++ b/target/dadao/cpu.c
+@@ -633,6 +633,12 @@ void dadao_cpu_do_interrupt(CPUState *cs)
+     DADAOCPU *cpu = DADAO_CPU(cs);
+     CPUDADAOState *env = &cpu->env;
+ 
++    qemu_log_mask(CPU_LOG_INT,
++                  "dadao: exception index=%d pc=0x%016" PRIx64
++                  " mode=%u cfx=%u\n",
++                  cs->exception_index, env->pc,
++                  env->inner_run_mode, env->inner_cfx_code);
++
+     switch (cs->exception_index) {
+     case EXCP_EXIT:
+         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+-- 
+2.43.0
+

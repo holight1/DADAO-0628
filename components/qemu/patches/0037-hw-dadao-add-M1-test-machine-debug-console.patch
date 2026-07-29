@@ -1,0 +1,109 @@
+From 247344a110fa99e18e66b4e2ce373e9ddb96d8f7 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 19:01:06 +0800
+Subject: [PATCH] hw/dadao: add M1 test-machine debug console
+
+---
+ hw/dadao/dadao-machine.c | 58 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/hw/dadao/dadao-machine.c b/hw/dadao/dadao-machine.c
+index 2c9cbd0..8639c50 100644
+--- a/hw/dadao/dadao-machine.c
++++ b/hw/dadao/dadao-machine.c
+@@ -2,6 +2,7 @@
+ #include "qemu/units.h"
+ #include "qemu/error-report.h"
+ #include "qapi/error.h"
++#include "chardev/char-fe.h"
+ #include "hw/boards.h"
+ #include "hw/loader.h"
+ #include "hw/qdev-properties.h"
+@@ -15,6 +16,13 @@ static const uint64_t rom_base   = 0x00100000;
+ static const uint64_t rom_size   = 64 * KiB;
+ static const uint64_t exit_base  = 0x10000000;
+ static const uint64_t exit_size  = 0x1000;  /* full page for TLB */
++/*
++ * KL-150a DADAO M1 test-machine debug console.  This is a write-only byte
++ * sink, not cfx_uart or a 16550-compatible UART.  It has no RX, status,
++ * baud-rate, FIFO, or interrupt state.
++ */
++static const uint64_t debug_console_base = 0x10001000;
++static const uint64_t debug_console_size = 0x1000;
+ static const uint64_t ram_base   = 0x80000000;
+ static const uint64_t ram_size   = 128 * MiB;
+ /* KL-125a test-machine windows for one high-physical L2 page table and one
+@@ -56,6 +64,45 @@ static const MemoryRegionOps exit_ops = {
+     },
+ };
+ 
++typedef struct DadaoM1DebugConsole {
++    MemoryRegion mmio;
++    CharBackend chr;
++} DadaoM1DebugConsole;
++
++static uint64_t debug_console_read(void *opaque, hwaddr addr,
++                                   unsigned int size)
++{
++    /* A byte read has a stable zero result; it does not expose UART status. */
++    return 0;
++}
++
++static void debug_console_write(void *opaque, hwaddr addr,
++                                uint64_t value, unsigned int size)
++{
++    DadaoM1DebugConsole *console = opaque;
++    uint8_t byte = value;
++
++    if (addr != 0 || size != 1 ||
++        !qemu_chr_fe_backend_connected(&console->chr)) {
++        return;
++    }
++    qemu_chr_fe_write_all(&console->chr, &byte, 1);
++}
++
++static const MemoryRegionOps debug_console_ops = {
++    .read = debug_console_read,
++    .write = debug_console_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 1,
++    },
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 1,
++    },
++};
++
+ static void dadao_machine_init(MachineState *machine)
+ {
+     const char *cpu_type = machine->cpu_type;
+@@ -67,6 +114,8 @@ static void dadao_machine_init(MachineState *machine)
+     MemoryRegion *sys_mem = get_system_memory();
+     MemoryRegion *rom = g_new(MemoryRegion, 1);
+     MemoryRegion *exit_mmio = g_new(MemoryRegion, 1);
++    DadaoM1DebugConsole *debug_console =
++        g_new0(DadaoM1DebugConsole, 1);
+     MemoryRegion *mmap_arena = g_new(MemoryRegion, 1);
+     MemoryRegion *ptw_l2_alias = g_new(MemoryRegion, 1);
+     MemoryRegion *ptw_leaf_alias = g_new(MemoryRegion, 1);
+@@ -79,6 +128,15 @@ static void dadao_machine_init(MachineState *machine)
+                           "dadao.exit", exit_size);
+     memory_region_add_subregion(sys_mem, exit_base, exit_mmio);
+ 
++    if (serial_hd(0)) {
++        qemu_chr_fe_init(&debug_console->chr, serial_hd(0), &error_fatal);
++    }
++    memory_region_init_io(&debug_console->mmio, NULL, &debug_console_ops,
++                          debug_console, "dadao.m1-debug-console",
++                          debug_console_size);
++    memory_region_add_subregion(sys_mem, debug_console_base,
++                                &debug_console->mmio);
++
+     /* Keep mmap at its fixed high address, in a separate host-backed RAM
+      * region. This does not alias the image RAM or alter its 128 MiB layout. */
+     memory_region_init_ram(mmap_arena, NULL, "dadao.mmap-arena",
+-- 
+2.43.0
+

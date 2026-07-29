@@ -4,3 +4,5 @@
 0003-dadao-link-K3-image-and-add-reset-entry.patch
 0004-dadao-harden-KL-149a-mode-and-O0-link-gates.patch
 0005-dadao-identify-KL-149a-bad-mode-path.patch
+0006-dadao-add-M1-early-console-and-boot-progress.patch
+0007-dadao-harden-K3-O0-early-boot-progress.patch

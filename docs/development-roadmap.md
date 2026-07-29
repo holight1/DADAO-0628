@@ -2396,3 +2396,41 @@ clocksource/clockevent, irqchip, context switching, MMU enable/page faults,
 initramfs and userspace remain open. KL-150a next owns early console and
 durable boot-progress evidence. Default optimized compilation remains
 separately tracked by KL-148b.
+
+## K3 M1 early console and durable boot progress (KL-150a, 2026-07-29)
+
+KL-150a adds a deliberately narrow `dadao-m1` debug transport at
+`0x10001000`: offset-zero byte writes go to QEMU's machine serial chardev.
+It is a write-only M1 test-machine console, not `cfx_uart`, 16550 or a UART
+ABI, and provides no RX, status, baud, FIFO or IRQ behavior. Linux registers
+the matching config-gated boot console and emits the online/Linux-version/
+setup-complete anchor sequence as a secondary observation channel.
+
+The primary verdict is guest-authored QMP memory evidence. After proving the
+40-byte KL-149/KL-150 scratch window initially zero, the runner observes the
+KL-149 handoff marker followed in order by `setup_arch` enter
+(`0x4b4c313530534145`), `setup_arch` done
+(`0x4b4c313530534144`) and `mem_init` enter
+(`0x4b4c3135304d494e`). The corresponding writes live in the responsible C
+functions; neither `head.S` nor the HBI ROM pre-fills them.
+
+The first attempts exposed a real DADAO LLVM `-O0` lowering defect: bool
+returns on the early-boot path used byte-aligned stack slots but were reloaded
+with eight-byte `ldo`, causing `EXCP_MALIGN` before later progress writes.
+The Linux K3 O0 compatibility option now uses natural-width true/false
+carriers only for the observed mandatory path; normal configurations retain
+the original bool types and semantics.
+
+The fail-closed matrix passes 4/4 with no skips: the positive console anchors
+are unique and ordered; independent console-disabled and `-serial none`
+negatives retain complete QMP progress while producing no console anchors;
+the wrong-mode HBI negative instead writes only `KL149BAD` and all KL-150a
+progress words remain zero. Evidence is recorded under
+`.work/evidence/kl150a-linux-early-console/`.
+
+This remains an early-progress milestone, not Linux boot completion. The
+first evidenced post-progress blocker is another `EXCP_MALIGN` at
+`0x80284100` in `mm/page_alloc.c::free_pcp_prepare`, again an O0 bool
+stack-slot reload. KL-151a or a focused compiler-compatibility follow-up owns
+that blocker; formal UART/cfx_uart, trap/syscall completion, timer/IRQ, TTY,
+initramfs and userspace remain open.
