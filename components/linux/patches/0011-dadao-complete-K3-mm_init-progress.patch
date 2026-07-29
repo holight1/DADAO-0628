@@ -1,0 +1,83 @@
+From 4f32b2dd26662ed48cbca155792edd88dd3e9e52 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 21:10:31 +0800
+Subject: [PATCH 11/11] dadao: complete K3 mm_init progress
+
+---
+ arch/dadao/include/asm/dadao-m1.h | 4 +++-
+ init/main.c                       | 7 +++++++
+ mm/page_alloc.c                   | 9 ++++++++-
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/arch/dadao/include/asm/dadao-m1.h b/arch/dadao/include/asm/dadao-m1.h
+index 4dcec89e4..290442673 100644
+--- a/arch/dadao/include/asm/dadao-m1.h
++++ b/arch/dadao/include/asm/dadao-m1.h
+@@ -12,16 +12,18 @@
+  */
+ #define DADAO_M1_DEBUG_CONSOLE_TX	0x10001000UL
+ 
+-/* KL-149a owns +0x00/+0x08; KL-150a/KL-151a use the next four words. */
++/* KL-149a owns +0x00/+0x08; KL-150a..KL-152a use the next five words. */
+ #define DADAO_M1_PROGRESS_SETUP_ENTER	0x87fd0010UL
+ #define DADAO_M1_PROGRESS_SETUP_DONE	0x87fd0018UL
+ #define DADAO_M1_PROGRESS_MEM_INIT	0x87fd0020UL
+ #define DADAO_M1_PROGRESS_MEM_INIT_DONE	0x87fd0028UL
++#define DADAO_M1_PROGRESS_MM_INIT_DONE	0x87fd0030UL
+ 
+ #define DADAO_M1_PROGRESS_SETUP_ENTER_VALUE	0x4b4c313530534145ULL
+ #define DADAO_M1_PROGRESS_SETUP_DONE_VALUE	0x4b4c313530534144ULL
+ #define DADAO_M1_PROGRESS_MEM_INIT_VALUE		0x4b4c3135304d494eULL
+ #define DADAO_M1_PROGRESS_MEM_INIT_DONE_VALUE	0x4b4c3135314d4944ULL
++#define DADAO_M1_PROGRESS_MM_INIT_DONE_VALUE	0x4b4c3135324d4d44ULL
+ 
+ static inline void dadao_m1_progress_write(unsigned long address, u64 value)
+ {
+diff --git a/init/main.c b/init/main.c
+index 0f7c956e8..410cc8a74 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -99,6 +99,9 @@
+ #include <asm/setup.h>
+ #include <asm/sections.h>
+ #include <asm/cacheflush.h>
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++#include <asm/dadao-m1.h>
++#endif
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/initcall.h>
+@@ -571,6 +574,10 @@ static void __init mm_init(void)
+ 	init_espfix_bsp();
+ 	/* Should be run after espfix64 is set up. */
+ 	pti_init();
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_MM_INIT_DONE,
++				DADAO_M1_PROGRESS_MM_INIT_DONE_VALUE);
++#endif
+ }
+ 
+ void __init __weak arch_call_rest_init(void)
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 0ea596ebc..4248e4821 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4690,7 +4690,14 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	return page;
+ }
+ 
+-static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long prepare_alloc_pages_result_t;
++#else
++typedef bool prepare_alloc_pages_result_t;
++#endif
++
++static inline prepare_alloc_pages_result_t
++prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
+ 		int preferred_nid, nodemask_t *nodemask,
+ 		struct alloc_context *ac, gfp_t *alloc_mask,
+ 		unsigned int *alloc_flags)
+-- 
+2.43.0
+

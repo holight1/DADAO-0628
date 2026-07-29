@@ -1,0 +1,32 @@
+From ba60ea713bbca2224acbd5332bb265ff26afb64d Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 21:20:50 +0800
+Subject: [PATCH 12/12] dadao: widen zone watermark result for K3 O0
+
+---
+ mm/page_alloc.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 4248e4821..5845a6c5f 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3503,7 +3503,14 @@ bool zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+ 					zone_page_state(z, NR_FREE_PAGES));
+ }
+ 
+-static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long zone_watermark_fast_result_t;
++#else
++typedef bool zone_watermark_fast_result_t;
++#endif
++
++static inline zone_watermark_fast_result_t
++zone_watermark_fast(struct zone *z, unsigned int order,
+ 		unsigned long mark, int classzone_idx, unsigned int alloc_flags)
+ {
+ 	long free_pages = zone_page_state(z, NR_FREE_PAGES);
+-- 
+2.43.0
+

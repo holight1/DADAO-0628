@@ -1,0 +1,32 @@
+From 1aae897eb20cad2cc856bb082cf713d186a8e1d8 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 21:22:44 +0800
+Subject: [PATCH 13/13] dadao: widen fallback-steal result for K3 O0
+
+---
+ mm/page_alloc.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 5845a6c5f..16277e7e5 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2352,7 +2352,14 @@ static void change_pageblock_range(struct page *pageblock_page,
+  * is worse than movable allocations stealing from unmovable and reclaimable
+  * pageblocks.
+  */
+-static bool can_steal_fallback(unsigned int order, int start_mt)
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long can_steal_fallback_result_t;
++#else
++typedef bool can_steal_fallback_result_t;
++#endif
++
++static can_steal_fallback_result_t
++can_steal_fallback(unsigned int order, int start_mt)
+ {
+ 	/*
+ 	 * Leaving this order check is intended, although there is
+-- 
+2.43.0
+

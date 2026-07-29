@@ -2459,3 +2459,50 @@ The next evidenced blocker is post-memory:
 slot is reloaded with `ldo`. KL-152a starts from that exact evidence. This
 milestone does not claim scheduler/context-switch, Linux trap/syscall,
 timer/IRQ, user page tables, initramfs, TTY, login or userspace execution.
+
+## K3 Linux `mm_init` completion boundary (KL-152a, 2026-07-29)
+
+KL-152a starts from the exact KL-151a frozen evidence and proves that the real
+Linux `mm_init()` reaches its final source boundary after `pti_init()`. A
+seventh guest-authored QMP word, `KL152MMD` at `0x87fd0030`, is written by
+that final C statement. The positive and same-Image `-serial none` runs both
+preserve the complete ordered seven-word oracle; the console remains
+secondary, while the wrong-mode negative still writes only `KL149BAD`.
+
+Nine observed DADAO LLVM `-O0` bool stack-slot failures were closed with nine
+narrow Linux commits and patches, covering the frozen
+`prepare_alloc_pages` site and eight further allocator/SLUB carriers reached
+before `mm_init()` completed. Every generic type change remains gated by
+`CONFIG_DADAO_K3_O0_LINK_COMPAT`; normal configurations retain their original
+bool types and semantics. The runner reconstructs every corresponding
+pre-fix detached worktree, rebuilds its Image, reproduces its exact MALIGN
+PC/slot evidence, and verifies complete worktree cleanup.
+
+An accepted independent review then separated the observation mechanism from
+the compiler workaround. `CONFIG_DADAO_M1_PROGRESS`, dependent on
+`DADAO_M1` and explicitly enabled by `dadao_defconfig`, now owns all five
+setup/memory progress writes. In particular, generic `init/main.c` no longer
+uses `CONFIG_DADAO_K3_O0_LINK_COMPAT` to expose the `mm_init` marker. The
+runner also uses an evidence-external exclusive lock and atomic current-state
+authority, so concurrent or forcibly terminated runs cannot leave an old
+PASS valid.
+
+The fail-closed matrix passes 3/3 with `FAIL=0, SKIP=0`. It binds the frozen
+KL-151a summary and 85-item manifest, all twenty Linux patches and stable
+patch-ids, unchanged QEMU identity, a fresh final Image/vmlinux, source and
+no-prefill contracts, positive/negative raw bytes, nine historical evidence
+sets, and a 223-item current artifact manifest. The final queue contains
+twenty Linux patches; summary evidence additionally binds both component
+series files and every patch payload by size and SHA256. Evidence is recorded
+under `.work/evidence/kl152a-mm-init-completion/`.
+
+The next evidenced blocker is post-`mm_init`:
+`EXCP_MALIGN PC=0x8063d868` at
+`lib/radix-tree.c::node_tag_get+0xc4`, where an `rb1+31` byte slot is read
+with `ldo`. KL-153a starts from that exact evidence, but must not add another
+Linux bool-carrier workaround. It owns the LLVM DADAO `-O0` bool/i1
+stack-slot lowering root cause: byte stores and natural-width reloads must be
+made ABI-consistent in the compiler before Linux boot progression continues.
+This milestone does not claim `sched_init()` completion, context switching,
+Linux trap/syscall, timer/IRQ, user page tables, initramfs, TTY, login or
+userspace execution.

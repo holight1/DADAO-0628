@@ -9,3 +9,13 @@
 0008-dadao-complete-K3-mem_init-progress.patch
 0009-dadao-widen-page-expected-state-result-for-K3-O0.patch
 0010-dadao-widen-compaction-capture-result-for-K3-O0.patch
+0011-dadao-complete-K3-mm_init-progress.patch
+0012-dadao-widen-zone-watermark-result-for-K3-O0.patch
+0013-dadao-widen-fallback-steal-result-for-K3-O0.patch
+0014-dadao-widen-rmqueue-fallback-result-for-K3-O0.patch
+0015-dadao-widen-new-PCP-check-result-for-K3-O0.patch
+0016-dadao-widen-SLUB-pfmemalloc-result-for-K3-O0.patch
+0017-dadao-widen-SLUB-cmpxchg-result-for-K3-O0.patch
+0018-dadao-widen-SLUB-init-on-free-result-for-K3-O0.patch
+0019-dadao-widen-SLUB-init-on-alloc-result-for-K3-O0.patch
+0020-dadao-separate-M1-progress-from-O0-compatibility.patch

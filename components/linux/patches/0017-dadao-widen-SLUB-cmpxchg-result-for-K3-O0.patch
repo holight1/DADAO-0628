@@ -1,0 +1,32 @@
+From 8d49b7e041970743bb39e9dab94091a9036faeae Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 21:35:37 +0800
+Subject: [PATCH 17/17] dadao: widen SLUB cmpxchg result for K3 O0
+
+---
+ mm/slub.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index 1d3b35182..f5cf5f142 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -362,7 +362,14 @@ static __always_inline void slab_unlock(struct page *page)
+ }
+ 
+ /* Interrupts must be disabled (for the fallback code to work right) */
+-static inline bool __cmpxchg_double_slab(struct kmem_cache *s, struct page *page,
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long cmpxchg_double_slab_result_t;
++#else
++typedef bool cmpxchg_double_slab_result_t;
++#endif
++
++static inline cmpxchg_double_slab_result_t
++__cmpxchg_double_slab(struct kmem_cache *s, struct page *page,
+ 		void *freelist_old, unsigned long counters_old,
+ 		void *freelist_new, unsigned long counters_new,
+ 		const char *n)
+-- 
+2.43.0
+

@@ -1,0 +1,138 @@
+From e054a68cc86b045881afdc26a028ee4d16c3d217 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 22:41:14 +0800
+Subject: [PATCH 20/20] dadao: separate M1 progress from O0 compatibility
+
+---
+ arch/dadao/Kconfig                 | 11 +++++++++++
+ arch/dadao/configs/dadao_defconfig |  1 +
+ arch/dadao/kernel/setup.c          |  6 ++++++
+ arch/dadao/mm/init.c               |  6 ++++++
+ init/main.c                        |  4 ++--
+ 5 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/arch/dadao/Kconfig b/arch/dadao/Kconfig
+index 296940bbf..1e12d00aa 100644
+--- a/arch/dadao/Kconfig
++++ b/arch/dadao/Kconfig
+@@ -84,6 +84,17 @@ config DADAO_K3_EARLY_MARKER
+ 	  bring-up scratch window before entering start_kernel.  This is a
+ 	  test-machine gate and may be disabled without changing kernel entry.
+ 
++config DADAO_M1_PROGRESS
++	bool "DADAO M1 test-machine boot progress words"
++	depends on DADAO_M1
++	help
++	  Enable guest-authored 64-bit K3 boot progress words in the reserved
++	  M1 bring-up scratch window.  These writes are a test-machine
++	  observation contract for setup_arch, mem_init, and mm_init source
++	  boundaries; they are not a console, device ABI, or boot-completion
++	  claim.  Disabling this option removes all of those progress writes
++	  without changing the corresponding Linux initialization work.
++
+ config DADAO_M1_DEBUG_CONSOLE
+ 	bool "DADAO M1 test-machine early debug console"
+ 	depends on DADAO_M1 && PRINTK
+diff --git a/arch/dadao/configs/dadao_defconfig b/arch/dadao/configs/dadao_defconfig
+index de2b8e824..bc90a1c28 100644
+--- a/arch/dadao/configs/dadao_defconfig
++++ b/arch/dadao/configs/dadao_defconfig
+@@ -14,6 +14,7 @@ CONFIG_PRINTK_TIME=y
+ CONFIG_EMBEDDED=y
+ CONFIG_EXPERT=y
+ CONFIG_DADAO_K3_EARLY_MARKER=y
++CONFIG_DADAO_M1_PROGRESS=y
+ CONFIG_DADAO_M1_DEBUG_CONSOLE=y
+ # CONFIG_KALLSYMS is not set
+ # CONFIG_SMP is not set
+diff --git a/arch/dadao/kernel/setup.c b/arch/dadao/kernel/setup.c
+index e96a184cf..0f42f75ef 100644
+--- a/arch/dadao/kernel/setup.c
++++ b/arch/dadao/kernel/setup.c
+@@ -8,7 +8,9 @@
+ #include <linux/seq_file.h>
+ #include <linux/string.h>
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
+ #include <asm/dadao-m1.h>
++#endif
+ #include <asm/page.h>
+ #include <asm/sections.h>
+ #include <asm/setup.h>
+@@ -32,8 +34,10 @@ void __init setup_arch(char **cmdline_p)
+ {
+ 	unsigned long ram_end = DADAO_RAM_BASE + DADAO_RAM_SIZE;
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
+ 	dadao_m1_progress_write(DADAO_M1_PROGRESS_SETUP_ENTER,
+ 				DADAO_M1_PROGRESS_SETUP_ENTER_VALUE);
++#endif
+ #ifdef CONFIG_DADAO_M1_DEBUG_CONSOLE
+ 	dadao_m1_debug_console_init();
+ #endif
+@@ -57,8 +61,10 @@ void __init setup_arch(char **cmdline_p)
+ 	init_mm.brk = (unsigned long)_end;
+ 
+ 	paging_init();
++#ifdef CONFIG_DADAO_M1_PROGRESS
+ 	dadao_m1_progress_write(DADAO_M1_PROGRESS_SETUP_DONE,
+ 				DADAO_M1_PROGRESS_SETUP_DONE_VALUE);
++#endif
+ #ifdef CONFIG_DADAO_M1_DEBUG_CONSOLE
+ 	dadao_m1_debug_console_setup_done();
+ #endif
+diff --git a/arch/dadao/mm/init.c b/arch/dadao/mm/init.c
+index b3b99efd2..e49deb65e 100644
+--- a/arch/dadao/mm/init.c
++++ b/arch/dadao/mm/init.c
+@@ -4,7 +4,9 @@
+ #include <linux/memblock.h>
+ #include <linux/mm.h>
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
+ #include <asm/dadao-m1.h>
++#endif
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ 
+@@ -22,11 +24,15 @@ void __init paging_init(void)
+ 
+ void __init mem_init(void)
+ {
++#ifdef CONFIG_DADAO_M1_PROGRESS
+ 	dadao_m1_progress_write(DADAO_M1_PROGRESS_MEM_INIT,
+ 				DADAO_M1_PROGRESS_MEM_INIT_VALUE);
++#endif
+ 	high_memory = __va(max_low_pfn << PAGE_SHIFT);
+ 	memblock_free_all();
+ 	mem_init_print_info(NULL);
++#ifdef CONFIG_DADAO_M1_PROGRESS
+ 	dadao_m1_progress_write(DADAO_M1_PROGRESS_MEM_INIT_DONE,
+ 				DADAO_M1_PROGRESS_MEM_INIT_DONE_VALUE);
++#endif
+ }
+diff --git a/init/main.c b/init/main.c
+index 410cc8a74..d7d7b28ce 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -99,7 +99,7 @@
+ #include <asm/setup.h>
+ #include <asm/sections.h>
+ #include <asm/cacheflush.h>
+-#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++#ifdef CONFIG_DADAO_M1_PROGRESS
+ #include <asm/dadao-m1.h>
+ #endif
+ 
+@@ -574,7 +574,7 @@ static void __init mm_init(void)
+ 	init_espfix_bsp();
+ 	/* Should be run after espfix64 is set up. */
+ 	pti_init();
+-#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++#ifdef CONFIG_DADAO_M1_PROGRESS
+ 	dadao_m1_progress_write(DADAO_M1_PROGRESS_MM_INIT_DONE,
+ 				DADAO_M1_PROGRESS_MM_INIT_DONE_VALUE);
+ #endif
+-- 
+2.43.0
+

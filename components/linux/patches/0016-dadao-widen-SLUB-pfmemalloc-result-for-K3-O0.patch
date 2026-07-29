@@ -1,0 +1,41 @@
+From 2aad5665523d56f829b516ac919203953cf87a69 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 21:34:09 +0800
+Subject: [PATCH 16/16] dadao: widen SLUB pfmemalloc result for K3 O0
+
+---
+ mm/slub.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index e72e802fc..1d3b35182 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -1827,7 +1827,13 @@ static inline void *acquire_slab(struct kmem_cache *s,
+ }
+ 
+ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain);
+-static inline bool pfmemalloc_match(struct page *page, gfp_t gfpflags);
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long pfmemalloc_match_result_t;
++#else
++typedef bool pfmemalloc_match_result_t;
++#endif
++static inline pfmemalloc_match_result_t
++pfmemalloc_match(struct page *page, gfp_t gfpflags);
+ 
+ /*
+  * Try to allocate a partial slab from a specific node.
+@@ -2475,7 +2481,8 @@ static inline void *new_slab_objects(struct kmem_cache *s, gfp_t flags,
+ 	return freelist;
+ }
+ 
+-static inline bool pfmemalloc_match(struct page *page, gfp_t gfpflags)
++static inline pfmemalloc_match_result_t
++pfmemalloc_match(struct page *page, gfp_t gfpflags)
+ {
+ 	if (unlikely(PageSlabPfmemalloc(page)))
+ 		return gfp_pfmemalloc_allowed(gfpflags);
+-- 
+2.43.0
+

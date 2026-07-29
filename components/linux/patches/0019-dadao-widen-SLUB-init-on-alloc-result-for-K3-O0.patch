@@ -1,0 +1,43 @@
+From bd10b11e2780d392e57f1b18f0e9dc8c2db28ed4 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 21:38:25 +0800
+Subject: [PATCH 19/19] dadao: widen SLUB init-on-alloc result for K3 O0
+
+---
+ mm/slab.h | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/mm/slab.h b/mm/slab.h
+index 1379a36c3..3df50fce8 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -671,16 +671,23 @@ static inline int cache_random_seq_create(struct kmem_cache *cachep,
+ static inline void cache_random_seq_destroy(struct kmem_cache *cachep) { }
+ #endif /* CONFIG_SLAB_FREELIST_RANDOM */
+ 
+-static inline bool slab_want_init_on_alloc(gfp_t flags, struct kmem_cache *c)
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long slab_want_init_on_alloc_result_t;
++#else
++typedef bool slab_want_init_on_alloc_result_t;
++#endif
++
++static inline slab_want_init_on_alloc_result_t
++slab_want_init_on_alloc(gfp_t flags, struct kmem_cache *c)
+ {
+ 	if (static_branch_unlikely(&init_on_alloc)) {
+ 		if (c->ctor)
+ 			return false;
+ 		if (c->flags & (SLAB_TYPESAFE_BY_RCU | SLAB_POISON))
+-			return flags & __GFP_ZERO;
++			return !!(flags & __GFP_ZERO);
+ 		return true;
+ 	}
+-	return flags & __GFP_ZERO;
++	return !!(flags & __GFP_ZERO);
+ }
+ 
+ #ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
+-- 
+2.43.0
+

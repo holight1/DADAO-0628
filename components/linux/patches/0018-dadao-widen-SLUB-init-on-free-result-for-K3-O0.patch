@@ -1,0 +1,32 @@
+From 8f84618d05c9e413946ed5b8fb6e265cb56f449d Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Wed, 29 Jul 2026 21:37:18 +0800
+Subject: [PATCH 18/18] dadao: widen SLUB init-on-free result for K3 O0
+
+---
+ mm/slab.h | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mm/slab.h b/mm/slab.h
+index b2b01694d..1379a36c3 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -683,7 +683,14 @@ static inline bool slab_want_init_on_alloc(gfp_t flags, struct kmem_cache *c)
+ 	return flags & __GFP_ZERO;
+ }
+ 
+-static inline bool slab_want_init_on_free(struct kmem_cache *c)
++#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
++typedef unsigned long slab_want_init_on_free_result_t;
++#else
++typedef bool slab_want_init_on_free_result_t;
++#endif
++
++static inline slab_want_init_on_free_result_t
++slab_want_init_on_free(struct kmem_cache *c)
+ {
+ 	if (static_branch_unlikely(&init_on_free))
+ 		return !(c->ctor ||
+-- 
+2.43.0
+
