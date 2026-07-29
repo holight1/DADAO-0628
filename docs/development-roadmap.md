@@ -2260,3 +2260,35 @@ APIs, Minor/O3 and performance remain non-claims.
 **Next**: KL-145a performs the K2 composition/closure audit, reruns the
 complete positive and negative matrix, freezes the K3 readiness/non-claim
 boundary, and stops before any Linux component or `arch/dadao` work.
+
+## K2 complete: closure matrix and K3 boundary frozen (KL-145a, 2026-07-29)
+
+Added a fail-closed closure runner which validates ordered round identities,
+bound dual-backend negative lines with nonzero guest mismatches, post-restore
+passes, terminal markers and exact suite counts rather than trusting process
+exit status. Its 15/15 gates bind the actual QEMU/gem5 binaries to the clean
+source trees, run KL-140a at 70/70 x10, run every KL-141a through KL-144a
+positive scenario 10/10 plus its required negative and restored positive,
+retain KL-139a 3/3, lit E2E 81/81 and ordinary ISA differential at 200
+three/four-way agreements with zero divergence, and pass manifest/issues/wiki
+checks.
+
+The runner also records the known root `make check` debt as evidence rather
+than hiding it: exactly five privileged/control instructions (ldmo-ra,
+stmo-ra, cfx2rd, cfx2rc and escape) remain outside the ordinary single-vector
+coverage gate, while K1/K2 execute them in structured multi-instruction
+oracles. The final readiness gate consumes the Linux manifest entry and
+requires it to remain disabled and unpinned, its declared patch series to
+exist but contain no active or nested payload, `.work/source/linux` and
+`arch/dadao` to be absent, and both component worktrees to be clean.
+
+K2 is therefore complete within its frozen single-hart supervisor bare-metal
+scope. This does not claim a Linux boot, user mode, RF, atomics/SMP, real
+devices, Linux scheduler/trap/clockevent/irqchip/pgtable APIs, initramfs,
+Minor/O3, timing or performance. The durable closure report is
+`docs/reviews/k2-closure-20260729.md`; machine-readable run evidence is
+written to `.work/evidence/kl145a-k2-closure/summary.json`.
+
+**Stop point**: K3 has not started. Linux remains `enabled=false`, no Linux
+source was fetched, no patch payload or `arch/dadao` was created, and this
+roadmap deliberately does not open a K3 implementation task.
