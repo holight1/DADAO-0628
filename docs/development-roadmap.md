@@ -2506,3 +2506,14 @@ made ABI-consistent in the compiler before Linux boot progression continues.
 This milestone does not claim `sched_init()` completion, context switching,
 Linux trap/syscall, timer/IRQ, user page tables, initramfs, TTY, login or
 userspace execution.
+
+### KL-153a: DADAO LLVM `-O0` bool/i1 stack-slot root-cause fix
+
+Root cause found and fixed: `DADAOTargetLowering` never declared an i1
+load-extension action, so `_Bool`/i1 stack temporaries were byte-stored
+(`stb`) but reloaded with an unaligned, over-wide `ldo`. All 10 task-listed
+Linux bool-carrier workarounds plus 8 further pre-existing ones (found by a
+tree-wide sweep) are removed; `node_tag_get` and every other frozen site now
+compile clean. Fresh `-O0` Image boots the full seven-word oracle and stays
+running (no new `EXCP_MALIGN`) through an extended post-`mm_init` window.
+See `code-agent/tasks/KL-153a-llvm-o0-bool-stack-slot-root-fix.md`.

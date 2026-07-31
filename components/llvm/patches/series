@@ -63,3 +63,4 @@
 0063-DADAO-declare-getSetCCResultType-for-vector-types-ML.patch
 0064-DADAO-implement-BlockAddress-lowering-reuse-existin.patch
 0065-DADAO-add-MC-assembler-disassembler-support-for-ldmo.patch
+0066-DADAO-promote-i1-loads-to-byte-sized-loads-KL-153a.patch

@@ -1,0 +1,563 @@
+From d52f215cdd8af366bf497664750f241e5ef83f99 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 30 Jul 2026 17:32:17 +0800
+Subject: [PATCH] DADAO: promote i1 loads to byte-sized loads (KL-153a)
+
+DADAOTargetLowering never declared a load-extension action for MVT::i1,
+only for i8/i16/i32. Every LoadExtActions entry the constructor doesn't
+touch stays at its zero-initialized default, and TargetLowering::Legal is
+enumerator 0, so the undeclared (i64, i1) EXTLOAD/SEXTLOAD/ZEXTLOAD action
+read back as Legal instead of Expand. LegalizeDAG.cpp's extending-load
+legalizer has a documented carve-out that will not auto-widen an i1
+memory access to a byte-sized one unless the target opts in via Promote,
+so the i1-typed load passed through operation legalization unmodified and
+reached DADAOISelDAGToDAG.cpp's hand-written Select(), whose MemVT switch
+only special-cases i8/i16/i32 and falls through to a full 8-byte LDO_RRII
+for anything else. For a `_Bool`/i1 stack temporary (Clang emits
+`alloca i1, align 1` for a function's own bool retval slot), this
+produced a correctly byte-sized `stb` write followed by an unaligned
+8-byte `ldo` reload from the same offset -- the recurring K3 Linux
+bring-up EXCP_MALIGN hit ten times across KL-150a..KL-152a and worked
+around each time in Linux source under CONFIG_DADAO_K3_O0_LINK_COMPAT.
+
+Declaring Promote for (i64, i1) EXTLOAD/SEXTLOAD/ZEXTLOAD routes i1 loads
+through the same generic byte-promotion path LegalizeDAG.cpp already uses
+for other sub-byte-multiple widths, so Select() correctly matches the
+promoted byte-MemoryVT load against its existing i8 arm (LDBU_RRII/
+LDBS_RRII). This is a general type/width fix with no dependence on
+function name, PC, stack offset, or source pattern.
+
+Adds llvm/test/CodeGen/DADAO/bool-retval-stack-slot-load.ll: _Bool/i1
+return temporaries, literal true/false, comparison-derived, logical
+negation (both polarities), bitmask `!!`, caller/callee shape,
+static-inline shape, and direct zero-/sign-extension of a reloaded i1
+slot, each asserting the reload is `ldbu` with no `ldo` between the
+write and the reload. Verified this test fails against the pre-fix
+compiler and passes post-fix; full CodeGen/DADAO (14/14) and E2E
+(81/81) suites stay green.
+---
+ llvm/lib/Target/DADAO/DADAOISelLowering.cpp   |  44 ++
+ .../DADAO/bool-retval-stack-slot-load.ll      | 456 ++++++++++++++++++
+ 2 files changed, 500 insertions(+)
+ create mode 100644 llvm/test/CodeGen/DADAO/bool-retval-stack-slot-load.ll
+
+diff --git a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+index da8af65dee45..a28a4f12bed9 100644
+--- a/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
++++ b/llvm/lib/Target/DADAO/DADAOISelLowering.cpp
+@@ -152,6 +152,50 @@ DADAOTargetLowering::DADAOTargetLowering(const TargetMachine &TM,
+     setTruncStoreAction(MVT::i64, VT, Legal);
+   }
+ 
++  // KL-153a root fix: i1 loads need a DISTINCT declared action from the
++  // i8/i16/i32 loop above; leaving it undeclared is not "no bug", it is a
++  // silent latent one. SelectionDAGLegalize::ExpandExtLoad (LegalizeDAG.cpp)
++  // special-cases MVT::i1 memory accesses: it will NOT auto-widen an i1
++  // EXTLOAD/SEXTLOAD/ZEXTLOAD to a byte-sized access the way it does for
++  // every other "not a whole number of bytes" width, unless the target
++  // explicitly marks that exact (i64, i1) combination Promote (its own
++  // comment: "Some targets pretend to have an i1 loading operation ... until
++  // such a way is found, don't insist on promoting i1 here"). Every
++  // LoadExtActions entry this constructor never touches stays at its
++  // zero-initialized default, and LegalizeAction::Legal is enumerator 0 --
++  // so an undeclared i1 load-ext action reads back as Legal, not Expand.
++  // That let a `zext from i1`/`extload i1`/`sextload i1` SDNode pass
++  // straight through operation legalization unmodified, still carrying a
++  // 1-bit MemoryVT, into DADAOISelDAGToDAG.cpp's hand-written Select()
++  // (which intercepts every frame-index-addressed ISD::LOAD/ISD::STORE
++  // ahead of the tablegen-generated matcher, e.g. for large-offset
++  // materialization). That switch only special-cases MemVT i8/i16/i32; an
++  // i1 MemVT falls through to its `default:` arm, which selects a full
++  // 8-byte, non-extending LDO_RRII at the load's address. For a `_Bool`/i1
++  // stack temporary -- a 1-byte object at natural align 1, exactly what
++  // Clang emits for `alloca i1` -- this produced precisely the recurring
++  // K3 defect (KL-150a..KL-152a): a correctly byte-sized `stb` write
++  // followed by an 8-byte `ldo` reload from that SAME unaligned offset,
++  // reading 7 bytes past the intended value and past the frame object,
++  // which DADAO's simulators fault as EXCP_MALIGN.
++  //
++  // Storing an i1 never had this hole: LegalizeDAG.cpp's truncating-store
++  // path (a separate function from the extending-load one) promotes
++  // TRUNCSTORE:i1 to TRUNCSTORE:i8 unconditionally, with no target opt-in
++  // required -- which is exactly why the store side of this same bool
++  // temporary already emitted a correct `stb` while the load side did not.
++  //
++  // Declaring Promote here routes i1 loads through the same generic
++  // "promote to a byte-sized load, the target gets the extra 7 zero/don't-
++  // care bits for free" path LegalizeDAG.cpp already uses for every other
++  // sub-byte-multiple width, producing a byte-MemoryVT EXTLOAD/ZEXTLOAD/
++  // SEXTLOAD that Select() then correctly matches against its existing i8
++  // arm (LDBU_RRII / LDBS_RRII) -- a real byte load with proper extension,
++  // not a wrong-width overread.
++  setLoadExtAction(ISD::EXTLOAD, MVT::i64, MVT::i1, Promote);
++  setLoadExtAction(ISD::SEXTLOAD, MVT::i64, MVT::i1, Promote);
++  setLoadExtAction(ISD::ZEXTLOAD, MVT::i64, MVT::i1, Promote);
++
+   computeRegisterProperties(STI.getRegisterInfo());
+ }
+ 
+diff --git a/llvm/test/CodeGen/DADAO/bool-retval-stack-slot-load.ll b/llvm/test/CodeGen/DADAO/bool-retval-stack-slot-load.ll
+new file mode 100644
+index 000000000000..6a245122c0fd
+--- /dev/null
++++ b/llvm/test/CodeGen/DADAO/bool-retval-stack-slot-load.ll
+@@ -0,0 +1,456 @@
++; RUN: llc -O0 -mtriple=dadao < %s | FileCheck %s
++
++; KL-153a: regression guard for the recurring K3 Linux bring-up defect hit
++; ten times across KL-150a..KL-152a (frozen at lib/radix-tree.c::
++; node_tag_get, docs/issues.yaml). Root cause: DADAOTargetLowering's
++; constructor legalizes narrow load/store type actions for MVT::i8/i16/i32
++; (the `for (MVT VT : {MVT::i8, MVT::i16, MVT::i32})` loop) but never
++; touched MVT::i1. Every LoadExtActions entry this constructor doesn't
++; touch stays at its zero-initialized default, and TargetLowering::Legal is
++; enumerator 0 -- so an undeclared (i64, i1) load-ext action reads back as
++; Legal, not Expand. LLVM's generic extending-load legalizer
++; (SelectionDAGLegalize::ExpandExtLoad, LegalizeDAG.cpp) has a documented
++; carve-out that will NOT auto-widen an i1 memory access to a byte-sized
++; one (the way it does for every other "not a whole number of bytes"
++; width) unless the target explicitly opts in via the Promote action; with
++; the default reading as Legal, the i1-typed extload/zextload/sextload node
++; passed straight through operation legalization unmodified and reached
++; DADAOISelDAGToDAG.cpp's hand-written Select() (which intercepts every
++; frame-index-addressed ISD::LOAD/ISD::STORE ahead of the tablegen-
++; generated matcher, e.g. for large-offset materialization) still typed
++; i1. That switch only special-cases MemVT i8/i16/i32 and falls through to
++; `default: LDO_RRII` for anything else -- an 8-byte, non-extending load at
++; the same address as the correctly-byte-sized `stb` that wrote a `_Bool`/
++; i1 stack temporary (Clang always emits `alloca i1, align 1` for a
++; function's own `_Bool`-typed retval slot). The store side never had this
++; hole: LegalizeDAG's truncating-store path promotes TRUNCSTORE:i1 to
++; TRUNCSTORE:i8 unconditionally, no target opt-in required, which is why
++; the write was already a correct `stb` while the reload was a wrong-width,
++; misaligned-relative-to-the-1-byte-object `ldo` (DADAO's simulators fault
++; this as EXCP_MALIGN).
++;
++; The fix (DADAOISelLowering.cpp) declares
++;   setLoadExtAction(ISD::EXTLOAD/SEXTLOAD/ZEXTLOAD, MVT::i64, MVT::i1, Promote)
++; which routes i1 loads through the same generic "promote to a byte-sized
++; load" path LegalizeDAG.cpp already uses for other sub-byte-multiple
++; widths, producing a byte-MemoryVT extload that Select() then correctly
++; matches against its existing i8 arm (LDBU_RRII). This is a general type/
++; width fix with no dependence on function name, PC, stack offset, or
++; source pattern.
++;
++; Each case below anchors on the `stb` that writes the bool/i1 stack slot,
++; forbids any `ldo` between that write and the eventual reload (the exact
++; regression this task guards against: a byte store immediately followed,
++; at the same address, by a full 8-byte doubleword load), and requires the
++; reload to be `ldbu` (byte load, zero extend).
++;
++; Coverage (KL-153a task acceptance list): _Bool/i1 return temporary,
++; byte-aligned (align 1) slot, literal false/true, comparison-derived,
++; logical negation (positive and negative polarity), bitmask `!!`,
++; caller/callee shape, static-inline shape (not auto-inlined at -O0),
++; direct zero-extension and sign-extension of a reloaded i1 slot.
++
++; ---- literal true, forced through the retval memory slot: a single
++; ---- trivial `return 1;` never allocates a retval slot at -O0, a
++; ---- multi-exit CFG does. ----
++; CHECK-LABEL: retTrue:
++; CHECK: stb
++; CHECK: # %return
++; CHECK-NOT: ldo
++; CHECK: ldbu rd31,
++define dso_local zeroext i1 @retTrue(i32 noundef %x) #0 {
++entry:
++  %retval = alloca i1, align 1
++  %x.addr = alloca i32, align 4
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %cmp = icmp slt i32 %0, 0
++  br i1 %cmp, label %if.then, label %if.end
++
++if.then:
++  store i1 true, ptr %retval, align 1
++  br label %return
++
++if.end:
++  store i1 true, ptr %retval, align 1
++  br label %return
++
++return:
++  %1 = load i1, ptr %retval, align 1
++  ret i1 %1
++}
++
++; ---- literal false, same treatment ----
++; CHECK-LABEL: retFalse:
++; CHECK: stb
++; CHECK: # %return
++; CHECK-NOT: ldo
++; CHECK: ldbu rd31,
++define dso_local zeroext i1 @retFalse(i32 noundef %x) #0 {
++entry:
++  %retval = alloca i1, align 1
++  %x.addr = alloca i32, align 4
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %cmp = icmp slt i32 %0, 0
++  br i1 %cmp, label %if.then, label %if.end
++
++if.then:
++  store i1 false, ptr %retval, align 1
++  br label %return
++
++if.end:
++  store i1 false, ptr %retval, align 1
++  br label %return
++
++return:
++  %1 = load i1, ptr %retval, align 1
++  ret i1 %1
++}
++
++; ---- comparison-derived bool, callee side of a caller/callee shape ----
++; CHECK-LABEL: retCmp:
++; CHECK: call cmp_helper
++define dso_local zeroext i1 @retCmp(i32 noundef %x) #0 {
++entry:
++  %x.addr = alloca i32, align 4
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %call = call zeroext i1 @cmp_helper(i32 noundef %0)
++  ret i1 %call
++}
++
++; CHECK-LABEL: cmp_helper:
++; CHECK: stb
++; CHECK: # %return
++; CHECK-NOT: ldo
++; CHECK: ldbu rd31,
++define internal zeroext i1 @cmp_helper(i32 noundef %x) #0 {
++entry:
++  %retval = alloca i1, align 1
++  %x.addr = alloca i32, align 4
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %cmp = icmp sgt i32 %0, 5
++  br i1 %cmp, label %if.then, label %if.end
++
++if.then:
++  store i1 true, ptr %retval, align 1
++  br label %return
++
++if.end:
++  store i1 false, ptr %retval, align 1
++  br label %return
++
++return:
++  %1 = load i1, ptr %retval, align 1
++  ret i1 %1
++}
++
++; ---- logical negation, positive polarity: `if (x != 0) return 1;` ----
++; CHECK-LABEL: retNegPos:
++; CHECK: stb
++; CHECK: # %return
++; CHECK-NOT: ldo
++; CHECK: ldbu rd31,
++define dso_local zeroext i1 @retNegPos(i32 noundef %x) #0 {
++entry:
++  %retval = alloca i1, align 1
++  %x.addr = alloca i32, align 4
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %cmp = icmp ne i32 %0, 0
++  br i1 %cmp, label %if.then, label %if.end
++
++if.then:
++  store i1 true, ptr %retval, align 1
++  br label %return
++
++if.end:
++  store i1 false, ptr %retval, align 1
++  br label %return
++
++return:
++  %1 = load i1, ptr %retval, align 1
++  ret i1 %1
++}
++
++; ---- logical negation, negative polarity: `if (!(x != 0)) return 1;` ----
++; CHECK-LABEL: retNegNeg:
++; CHECK: stb
++; CHECK: # %return
++; CHECK-NOT: ldo
++; CHECK: ldbu rd31,
++define dso_local zeroext i1 @retNegNeg(i32 noundef %x) #0 {
++entry:
++  %retval = alloca i1, align 1
++  %x.addr = alloca i32, align 4
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %cmp = icmp ne i32 %0, 0
++  br i1 %cmp, label %if.end, label %if.then
++
++if.then:
++  store i1 true, ptr %retval, align 1
++  br label %return
++
++if.end:
++  store i1 false, ptr %retval, align 1
++  br label %return
++
++return:
++  %1 = load i1, ptr %retval, align 1
++  ret i1 %1
++}
++
++; ---- bitmask `!!` derived, the exact idiom K3's slab_want_init_on_alloc/
++; ---- _free carriers used (`return !!(flags & __GFP_ZERO);`), forced
++; ---- through the retval memory slot by a multi-exit CFG ----
++; CHECK-LABEL: retBitmaskBang:
++; CHECK: stb
++; CHECK: # %return
++; CHECK-NOT: ldo
++; CHECK: ldbu rd31,
++define dso_local zeroext i1 @retBitmaskBang(i32 noundef %flags) #0 {
++entry:
++  %retval = alloca i1, align 1
++  %flags.addr = alloca i32, align 4
++  store i32 %flags, ptr %flags.addr, align 4
++  %0 = load i32, ptr %flags.addr, align 4
++  %cmp = icmp slt i32 %0, 0
++  br i1 %cmp, label %if.then, label %if.end
++
++if.then:
++  %1 = load i32, ptr %flags.addr, align 4
++  %and = and i32 %1, 64
++  %tobool = icmp ne i32 %and, 0
++  %lnot = xor i1 %tobool, true
++  %lnot1 = xor i1 %lnot, true
++  store i1 %lnot1, ptr %retval, align 1
++  br label %return
++
++if.end:
++  %2 = load i32, ptr %flags.addr, align 4
++  %and2 = and i32 %2, 64
++  %tobool3 = icmp ne i32 %and2, 0
++  %lnot4 = xor i1 %tobool3, true
++  %lnot5 = xor i1 %lnot4, true
++  store i1 %lnot5, ptr %retval, align 1
++  br label %return
++
++return:
++  %3 = load i1, ptr %retval, align 1
++  ret i1 %3
++}
++
++; ---- caller/callee shape mirroring node_tag_get itself: an if/node-null
++; ---- dispatch to one of two internal bool-returning callees. Neither
++; ---- callee has a multi-exit CFG (each computes and returns its i1
++; ---- directly from a single block), so neither allocates an i1 retval
++; ---- slot -- the only `ldo` each legitimately emits is the full-width
++; ---- reload of its own pointer argument's spill slot, not a bool. The
++; ---- interesting i1-slot coverage is in caller_shape's own `bool r`
++; ---- local below (i8-backed, receiving each callee's zeroext i1 result)
++; ---- and in the callees invoked from the multi-exit-CFG functions above
++; ---- (cmp_helper) and below (helper_inline). ----
++; CHECK-LABEL: caller_shape:
++; CHECK: call callee_tag
++; CHECK: call callee_root
++define dso_local zeroext i1 @caller_shape(ptr noundef %root, ptr noundef %node, i32 noundef %tag, i32 noundef %off) #0 {
++entry:
++  %root.addr = alloca ptr, align 8
++  %node.addr = alloca ptr, align 8
++  %tag.addr = alloca i32, align 4
++  %off.addr = alloca i32, align 4
++  %r = alloca i8, align 1
++  store ptr %root, ptr %root.addr, align 8
++  store ptr %node, ptr %node.addr, align 8
++  store i32 %tag, ptr %tag.addr, align 4
++  store i32 %off, ptr %off.addr, align 4
++  %0 = load ptr, ptr %node.addr, align 8
++  %tobool = icmp ne ptr %0, null
++  br i1 %tobool, label %if.then, label %if.else
++
++if.then:
++  %1 = load ptr, ptr %node.addr, align 8
++  %2 = load i32, ptr %tag.addr, align 4
++  %3 = load i32, ptr %off.addr, align 4
++  %call = call zeroext i1 @callee_tag(ptr noundef %1, i32 noundef %2, i32 noundef %3)
++  %storedv = zext i1 %call to i8
++  store i8 %storedv, ptr %r, align 1
++  br label %if.end
++
++if.else:
++  %4 = load ptr, ptr %root.addr, align 8
++  %5 = load i32, ptr %tag.addr, align 4
++  %call1 = call zeroext i1 @callee_root(ptr noundef %4, i32 noundef %5)
++  %storedv2 = zext i1 %call1 to i8
++  store i8 %storedv2, ptr %r, align 1
++  br label %if.end
++
++if.end:
++  %6 = load i8, ptr %r, align 1
++  %loadedv = trunc i8 %6 to i1
++  ret i1 %loadedv
++}
++
++define internal zeroext i1 @callee_tag(ptr noundef %node, i32 noundef %tag, i32 noundef %off) #0 {
++entry:
++  %node.addr = alloca ptr, align 8
++  %tag.addr = alloca i32, align 4
++  %off.addr = alloca i32, align 4
++  store ptr %node, ptr %node.addr, align 8
++  store i32 %tag, ptr %tag.addr, align 4
++  store i32 %off, ptr %off.addr, align 4
++  %0 = load ptr, ptr %node.addr, align 8
++  %1 = load i32, ptr %0, align 4
++  %2 = load i32, ptr %off.addr, align 4
++  %shr = ashr i32 %1, %2
++  %and = and i32 %shr, 1
++  %tobool = icmp ne i32 %and, 0
++  ret i1 %tobool
++}
++
++define internal zeroext i1 @callee_root(ptr noundef %root, i32 noundef %tag) #0 {
++entry:
++  %root.addr = alloca ptr, align 8
++  %tag.addr = alloca i32, align 4
++  store ptr %root, ptr %root.addr, align 8
++  store i32 %tag, ptr %tag.addr, align 4
++  %0 = load ptr, ptr %root.addr, align 8
++  %1 = load i32, ptr %0, align 4
++  %and = and i32 %1, 1
++  %tobool = icmp ne i32 %and, 0
++  ret i1 %tobool
++}
++
++; ---- static-inline shape: `static inline bool helper_inline(...)` is NOT
++; ---- auto-inlined at -O0 (only always_inline/-O1+ inline), so this stays
++; ---- a real internal-linkage call, exercising the i1 retval slot inside
++; ---- the callee exactly like the other multi-exit-CFG cases above ----
++; CHECK-LABEL: useHelperInline:
++; CHECK: call helper_inline
++define dso_local zeroext i1 @useHelperInline(i32 noundef %x) #0 {
++entry:
++  %x.addr = alloca i32, align 4
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %call = call zeroext i1 @helper_inline(i32 noundef %0)
++  ret i1 %call
++}
++
++; CHECK-LABEL: helper_inline:
++; CHECK: stb
++; CHECK: # %return
++; CHECK-NOT: ldo
++; CHECK: ldbu rd31,
++define internal zeroext i1 @helper_inline(i32 noundef %x) #0 {
++entry:
++  %retval = alloca i1, align 1
++  %x.addr = alloca i32, align 4
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %cmp = icmp eq i32 %0, 0
++  br i1 %cmp, label %if.then, label %if.end
++
++if.then:
++  store i1 false, ptr %retval, align 1
++  br label %return
++
++if.end:
++  store i1 true, ptr %retval, align 1
++  br label %return
++
++return:
++  %1 = load i1, ptr %retval, align 1
++  ret i1 %1
++}
++
++; ---- direct zero-extension of a reloaded i1 stack slot (hand-authored IR,
++; ---- independent of Clang's exact `_Bool` retval-slot shape, to prove the
++; ---- fix is a genuine type-level fix and not narrowly tailored to
++; ---- Clang's output): the reload must be `ldbu`, never `ldo`. ----
++; CHECK-LABEL: zextI1SlotDirect:
++; CHECK: stb
++; CHECK: # %join
++; CHECK-NOT: ldo
++; CHECK: ldbu
++define i32 @zextI1SlotDirect(i1 %x, i1 %y) {
++entry:
++  %slot = alloca i1, align 1
++  br i1 %y, label %a, label %b
++a:
++  store i1 %x, ptr %slot, align 1
++  br label %join
++b:
++  store i1 %x, ptr %slot, align 1
++  br label %join
++join:
++  %v = load i1, ptr %slot, align 1
++  %w = zext i1 %v to i32
++  ret i32 %w
++}
++
++; ---- direct sign-extension of a reloaded i1 stack slot: the reload
++; ---- itself must still be a zero-extending byte load (`ldbu` -- DADAO has
++; ---- no native i1 sign-extending load; DADAOTargetLowering expands
++; ---- SIGN_EXTEND_INREG i1 as mask-then-negate on the register value), and
++; ---- must NOT be the wrong-width `ldo`. ----
++; CHECK-LABEL: sextI1Slot:
++; CHECK: stb
++; CHECK: # %join
++; CHECK-NOT: ldo
++; CHECK: ldbu
++define i32 @sextI1Slot(i1 %x, i1 %y) {
++entry:
++  %slot = alloca i1, align 1
++  br i1 %y, label %a, label %b
++a:
++  store i1 %x, ptr %slot, align 1
++  br label %join
++b:
++  store i1 %x, ptr %slot, align 1
++  br label %join
++join:
++  %v = load i1, ptr %slot, align 1
++  %w = sext i1 %v to i32
++  ret i32 %w
++}
++
++; ---- zero-extension of a reloaded plain i8 `bool` local (not the i1
++; ---- retval slot -- Clang backs ordinary `_Bool` locals with `alloca i8`
++; ---- plus explicit zext/trunc at the store/load boundary). This path was
++; ---- never broken (i8 loads were already declared Legal); kept as a
++; ---- companion regression so the i1-specific fix is proven not to affect
++; ---- the neighboring, already-correct i8 path. ----
++; CHECK-LABEL: useAsInt:
++; CHECK: stb
++; CHECK: # %if.end
++; CHECK-NOT: ldo
++; CHECK: ldbu
++define dso_local i32 @useAsInt(i32 noundef %x) #0 {
++entry:
++  %x.addr = alloca i32, align 4
++  %b = alloca i8, align 1
++  store i32 %x, ptr %x.addr, align 4
++  %0 = load i32, ptr %x.addr, align 4
++  %cmp = icmp eq i32 %0, 0
++  br i1 %cmp, label %if.then, label %if.else
++
++if.then:
++  store i8 1, ptr %b, align 1
++  br label %if.end
++
++if.else:
++  store i8 0, ptr %b, align 1
++  br label %if.end
++
++if.end:
++  %1 = load i8, ptr %b, align 1
++  %loadedv = trunc i8 %1 to i1
++  %conv = zext i1 %loadedv to i32
++  %add = add nsw i32 %conv, 1
++  ret i32 %add
++}
++
++attributes #0 = { noinline nounwind optnone "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
+-- 
+2.43.0
+

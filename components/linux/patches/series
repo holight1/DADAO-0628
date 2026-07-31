@@ -19,3 +19,14 @@
 0018-dadao-widen-SLUB-init-on-free-result-for-K3-O0.patch
 0019-dadao-widen-SLUB-init-on-alloc-result-for-K3-O0.patch
 0020-dadao-separate-M1-progress-from-O0-compatibility.patch
+0021-dadao-revert-widen-SLUB-init-on-alloc-result-for-K3-O0.patch
+0022-dadao-revert-widen-SLUB-init-on-free-result-for-K3-O0.patch
+0023-dadao-revert-widen-SLUB-cmpxchg-result-for-K3-O0.patch
+0024-dadao-revert-widen-SLUB-pfmemalloc-result-for-K3-O0.patch
+0025-dadao-revert-widen-new-PCP-check-result-for-K3-O0.patch
+0026-dadao-revert-widen-rmqueue-fallback-result-for-K3-O0.patch
+0027-dadao-revert-widen-fallback-steal-result-for-K3-O0.patch
+0028-dadao-revert-widen-zone-watermark-result-for-K3-O0.patch
+0029-dadao-revert-widen-compaction-capture-result-for-K3-O0.patch
+0030-dadao-revert-widen-page-expected-state-result-for-K3-O0.patch
+0031-dadao-remove-additional-K3-O0-bool-carrier-workarounds.patch

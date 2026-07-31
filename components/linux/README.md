@@ -16,3 +16,12 @@ Enabled by KL-146a after the K2 closure gate.
 
 The empty series at KL-146a is intentional: this task pins and fetches the
 clean upstream baseline before the first architecture patch is created.
+
+KL-153a (patches 0021-0031) removes every Linux-side
+`CONFIG_DADAO_K3_O0_LINK_COMPAT` bool-carrier workaround for the DADAO LLVM
+`-O0` i1 stack-slot defect fixed in the same task (10 commits the task
+enumerated, plus 8 further pre-existing carriers found by a tree-wide sweep
+that predate that list). `CONFIG_DADAO_K3_O0_LINK_COMPAT` itself,
+`arch/dadao/mm/o0-link-compat.c`, and the legitimate disabled-feature use in
+`include/linux/huge_mm.h` are untouched. See
+`code-agent/tasks/KL-153a-llvm-o0-bool-stack-slot-root-fix.md`.

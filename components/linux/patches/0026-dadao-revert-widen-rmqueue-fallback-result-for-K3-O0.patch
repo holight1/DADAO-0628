@@ -1,0 +1,32 @@
+From a29de929c6a4df624c8ff67f321bf327510ab664 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 30 Jul 2026 17:36:53 +0800
+Subject: [PATCH 06/11] Revert "dadao: widen rmqueue fallback result for K3 O0"
+
+This reverts commit 0f822ec071294067d3827c82bd7b331a974fb251.
+---
+ mm/page_alloc.c | 8 +-------
+ 1 file changed, 1 insertion(+), 7 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index e8c97f582..16277e7e5 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2659,13 +2659,7 @@ static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
+  * deviation from the rest of this file, to make the for loop
+  * condition simpler.
+  */
+-#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
+-typedef unsigned long rmqueue_fallback_result_t;
+-#else
+-typedef bool rmqueue_fallback_result_t;
+-#endif
+-
+-static __always_inline rmqueue_fallback_result_t
++static __always_inline bool
+ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype,
+ 						unsigned int alloc_flags)
+ {
+-- 
+2.43.0
+

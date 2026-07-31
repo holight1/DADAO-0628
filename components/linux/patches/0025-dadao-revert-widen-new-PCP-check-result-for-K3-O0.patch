@@ -1,0 +1,48 @@
+From 1e173405023da9316597c540fdb9f2dcd8e536b1 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Thu, 30 Jul 2026 17:36:53 +0800
+Subject: [PATCH 05/11] Revert "dadao: widen new-PCP check result for K3 O0"
+
+This reverts commit ee9ed8174efb893c7c48d85cd27ef9264cac6c66.
+---
+ mm/page_alloc.c | 10 ++--------
+ 1 file changed, 2 insertions(+), 8 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index cab97578b..e8c97f582 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2116,12 +2116,6 @@ static inline bool free_pages_prezeroed(void)
+ 		page_poisoning_enabled()) || want_init_on_free();
+ }
+ 
+-#ifdef CONFIG_DADAO_K3_O0_LINK_COMPAT
+-typedef unsigned long check_new_pcp_result_t;
+-#else
+-typedef bool check_new_pcp_result_t;
+-#endif
+-
+ #ifdef CONFIG_DEBUG_VM
+ /*
+  * With DEBUG_VM enabled, order-0 pages are checked for expected state when
+@@ -2136,7 +2130,7 @@ static inline bool check_pcp_refill(struct page *page)
+ 		return false;
+ }
+ 
+-static inline check_new_pcp_result_t check_new_pcp(struct page *page)
++static inline bool check_new_pcp(struct page *page)
+ {
+ 	return check_new_page(page);
+ }
+@@ -2150,7 +2144,7 @@ static inline bool check_pcp_refill(struct page *page)
+ {
+ 	return check_new_page(page);
+ }
+-static inline check_new_pcp_result_t check_new_pcp(struct page *page)
++static inline bool check_new_pcp(struct page *page)
+ {
+ 	if (debug_pagealloc_enabled())
+ 		return check_new_page(page);
+-- 
+2.43.0
+
