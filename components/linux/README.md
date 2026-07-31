@@ -25,3 +25,11 @@ that predate that list). `CONFIG_DADAO_K3_O0_LINK_COMPAT` itself,
 `arch/dadao/mm/o0-link-compat.c`, and the legitimate disabled-feature use in
 `include/linux/huge_mm.h` are untouched. See
 `code-agent/tasks/KL-153a-llvm-o0-bool-stack-slot-root-fix.md`.
+
+KL-154a (patch 0032) adds fourteen more `CONFIG_DADAO_M1_PROGRESS` words
+diagnosing exactly where boot is stuck beyond `mm_init_done`: the guest
+spins forever in `calibrate_delay_converge()`'s `while (ticks == jiffies)`
+busy-wait (`init/calibrate.c`), because `arch/dadao`'s `time_init()`/
+`trap_init()`/`init_IRQ()` install no working clockevent or exception
+delivery to ever advance `jiffies`. See
+`code-agent/tasks/KL-154a-k3-post-mm-init-boot-progress-diagnosis.md`.

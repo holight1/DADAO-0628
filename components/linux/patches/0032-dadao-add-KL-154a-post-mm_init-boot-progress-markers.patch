@@ -1,0 +1,271 @@
+From 76f2a87852a8e71d4168af4a18df159bff86b723 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 31 Jul 2026 08:39:28 +0800
+Subject: [PATCH] dadao: add KL-154a post-mm_init boot progress markers
+
+Add fourteen new CONFIG_DADAO_M1_PROGRESS words (offsets 0x38..0xa0 in
+the existing 0x87fd00xx scratch window) bracketing every start_kernel()
+milestone from sched_init() through rest_init()/kernel_init(), plus one
+inside the generic calibrate_delay_converge() busy-wait itself.
+
+These pin down precisely where boot is stuck beyond mm_init_done
+(KL-153a's frozen "alive, no more console output" state): the last
+marker ever reached is CALIBRATE_CONVERGE_ENTER, i.e. execution enters
+calibrate_delay_converge() (init/calibrate.c) and never returns.
+CALIBRATE_DONE, and everything after it (rest_init entry, the
+kernel_thread() pid, kernel_init entry, idle entry), is never written.
+
+Root cause: calibrate_delay_converge()'s first statement is
+`ticks = jiffies; while (ticks == jiffies) ;` -- a busy-wait for
+jiffies to advance. arch/dadao's time_init() (arch/dadao/kernel/time.c)
+is an explicit no-op ("The CFX timer clocksource/clockevent is
+introduced after the linked image gate"), and init_IRQ()/trap_init()
+install no real interrupt/exception delivery, so nothing ever calls
+do_timer()/tick handling to advance jiffies. The busy-wait therefore
+spins forever, matching the observed symptom exactly (guest stays
+"running", zero new EXCP_MALIGN, no further console output, no
+shutdown).
+
+REST_INIT_PID (0x87fd0088) does not carry an ASCII magic like the
+other markers -- it is the raw sign-extended kernel_thread() return
+value, so a negative errno is directly visible rather than inferred.
+A throwaway (non-committed) diagnostic build with a preset `lpj=`
+boot argument was used to confirm empirically that if this specific
+busy-wait is bypassed, the very next thing that happens is
+kernel_thread(kernel_init, ...) returning exactly -ENOSYS (-38) from
+arch/dadao/kernel/process.c's copy_thread(), which is an explicit,
+intentional stub ("Context creation is intentionally fail-closed
+until the assembly ret_from_fork path exists"); the boot thread then
+proceeds uneventfully (no fault observed) into cpu_startup_entry()'s
+idle loop with no kernel_init/kthreadd task ever having been created.
+That second wall is a separate, larger K3 phase-3 scope item (real
+context-switch/thread-creation plumbing) and is out of scope here.
+
+KL-154a.
+---
+ arch/dadao/include/asm/dadao-m1.h | 46 ++++++++++++++++++++++++++
+ init/calibrate.c                  |  7 ++++
+ init/main.c                       | 55 +++++++++++++++++++++++++++++++
+ 3 files changed, 108 insertions(+)
+
+diff --git a/arch/dadao/include/asm/dadao-m1.h b/arch/dadao/include/asm/dadao-m1.h
+index 290442673..3d2bb4f69 100644
+--- a/arch/dadao/include/asm/dadao-m1.h
++++ b/arch/dadao/include/asm/dadao-m1.h
+@@ -25,6 +25,52 @@
+ #define DADAO_M1_PROGRESS_MEM_INIT_DONE_VALUE	0x4b4c3135314d4944ULL
+ #define DADAO_M1_PROGRESS_MM_INIT_DONE_VALUE	0x4b4c3135324d4d44ULL
+ 
++/*
++ * KL-154a: precise diagnosis of the boot progress beyond mm_init_done.
++ * Thirteen new words at the next unused offsets (+0x38..+0x98), bracketing
++ * every remaining start_kernel() milestone through rest_init()/kernel_init()
++ * so a single QEMU boot pinpoints exactly which call site is last reached.
++ * DADAO_M1_PROGRESS_REST_INIT_PID is not an ASCII magic: it carries the raw
++ * (sign-extended) return value of the rest_init() kernel_thread() call, so
++ * a negative errno (e.g. -ENOSYS from arch/dadao's fail-closed copy_thread())
++ * is directly visible in the oracle rather than inferred.
++ */
++#define DADAO_M1_PROGRESS_SCHED_INIT_DONE		0x87fd0038UL
++#define DADAO_M1_PROGRESS_EARLY_IRQ_INIT_DONE		0x87fd0040UL
++#define DADAO_M1_PROGRESS_TICK_INIT_DONE		0x87fd0048UL
++#define DADAO_M1_PROGRESS_TIMEKEEPING_INIT_DONE	0x87fd0050UL
++#define DADAO_M1_PROGRESS_TIME_INIT_DONE		0x87fd0058UL
++#define DADAO_M1_PROGRESS_CONSOLE_INIT_DONE		0x87fd0060UL
++#define DADAO_M1_PROGRESS_LOCKING_SELFTEST_DONE	0x87fd0068UL
++#define DADAO_M1_PROGRESS_CALIBRATE_ENTER		0x87fd0070UL
++#define DADAO_M1_PROGRESS_CALIBRATE_DONE		0x87fd0078UL
++#define DADAO_M1_PROGRESS_REST_INIT_ENTER		0x87fd0080UL
++#define DADAO_M1_PROGRESS_REST_INIT_PID		0x87fd0088UL
++#define DADAO_M1_PROGRESS_KERNEL_INIT_ENTER		0x87fd0090UL
++#define DADAO_M1_PROGRESS_IDLE_ENTER			0x87fd0098UL
++/*
++ * One extra word to disambiguate exactly which statement inside
++ * calibrate_delay() is the final blocking point: entry into
++ * calibrate_delay_converge() (init/calibrate.c), i.e. past the
++ * "Calibrating delay loop... " pr_info and past the
++ * calibrate_delay_direct()/lpj_fine/preset_lpj/per-cpu-cache checks.
++ */
++#define DADAO_M1_PROGRESS_CALIBRATE_CONVERGE_ENTER	0x87fd00a0UL
++
++#define DADAO_M1_PROGRESS_SCHED_INIT_DONE_VALUE	0x4b4c313534534344ULL /* KL154SCD */
++#define DADAO_M1_PROGRESS_EARLY_IRQ_INIT_DONE_VALUE	0x4b4c313534495251ULL /* KL154IRQ */
++#define DADAO_M1_PROGRESS_TICK_INIT_DONE_VALUE		0x4b4c31353454434bULL /* KL154TCK */
++#define DADAO_M1_PROGRESS_TIMEKEEPING_INIT_DONE_VALUE	0x4b4c313534544b49ULL /* KL154TKI */
++#define DADAO_M1_PROGRESS_TIME_INIT_DONE_VALUE		0x4b4c313534544d49ULL /* KL154TMI */
++#define DADAO_M1_PROGRESS_CONSOLE_INIT_DONE_VALUE	0x4b4c313534434f4eULL /* KL154CON */
++#define DADAO_M1_PROGRESS_LOCKING_SELFTEST_DONE_VALUE	0x4b4c3135344c4b54ULL /* KL154LKT */
++#define DADAO_M1_PROGRESS_CALIBRATE_ENTER_VALUE	0x4b4c313534434145ULL /* KL154CAE */
++#define DADAO_M1_PROGRESS_CALIBRATE_DONE_VALUE		0x4b4c313534434144ULL /* KL154CAD */
++#define DADAO_M1_PROGRESS_REST_INIT_ENTER_VALUE	0x4b4c313534524945ULL /* KL154RIE */
++#define DADAO_M1_PROGRESS_KERNEL_INIT_ENTER_VALUE	0x4b4c3135344b4945ULL /* KL154KIE */
++#define DADAO_M1_PROGRESS_IDLE_ENTER_VALUE		0x4b4c31353449444cULL /* KL154IDL */
++#define DADAO_M1_PROGRESS_CALIBRATE_CONVERGE_ENTER_VALUE	0x4b4c3135344a464cULL /* KL154JFL (jiffies loop) */
++
+ static inline void dadao_m1_progress_write(unsigned long address, u64 value)
+ {
+ 	*(volatile u64 *)address = value;
+diff --git a/init/calibrate.c b/init/calibrate.c
+index f3831272f..c8855c70e 100644
+--- a/init/calibrate.c
++++ b/init/calibrate.c
+@@ -11,6 +11,9 @@
+ #include <linux/timex.h>
+ #include <linux/smp.h>
+ #include <linux/percpu.h>
++#ifdef CONFIG_DADAO_M1_PROGRESS
++#include <asm/dadao-m1.h>
++#endif
+ 
+ unsigned long lpj_fine;
+ unsigned long preset_lpj;
+@@ -190,6 +193,10 @@ static unsigned long calibrate_delay_converge(void)
+ 	unsigned long lpj, lpj_base, ticks, loopadd, loopadd_base, chop_limit;
+ 	int trials = 0, band = 0, trial_in_band = 0;
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_CALIBRATE_CONVERGE_ENTER,
++				DADAO_M1_PROGRESS_CALIBRATE_CONVERGE_ENTER_VALUE);
++#endif
+ 	lpj = (1<<12);
+ 
+ 	/* wait for "start of" clock tick */
+diff --git a/init/main.c b/init/main.c
+index 2860cccbb..641144911 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -411,6 +411,10 @@ noinline void __ref rest_init(void)
+ 	struct task_struct *tsk;
+ 	int pid;
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_REST_INIT_ENTER,
++				DADAO_M1_PROGRESS_REST_INIT_ENTER_VALUE);
++#endif
+ 	rcu_scheduler_starting();
+ 	/*
+ 	 * We need to spawn init first so that it obtains pid 1, however
+@@ -418,6 +422,13 @@ noinline void __ref rest_init(void)
+ 	 * we schedule it before we create kthreadd, will OOPS.
+ 	 */
+ 	pid = kernel_thread(kernel_init, NULL, CLONE_FS);
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	/* Raw (sign-extended) kernel_thread() return value, not an ASCII
++	 * magic -- KL-154a needs the actual errno (e.g. -ENOSYS) visible in
++	 * the oracle, not just a reached/not-reached flag. */
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_REST_INIT_PID,
++				(u64)(long)pid);
++#endif
+ 	/*
+ 	 * Pin init on the boot CPU. Task migration is not properly working
+ 	 * until sched_init_smp() has been run. It will set the allowed
+@@ -450,6 +461,10 @@ noinline void __ref rest_init(void)
+ 	 * at least once to get things moving:
+ 	 */
+ 	schedule_preempt_disabled();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_IDLE_ENTER,
++				DADAO_M1_PROGRESS_IDLE_ENTER_VALUE);
++#endif
+ 	/* Call into cpu_idle with preempt disabled */
+ 	cpu_startup_entry(CPUHP_ONLINE);
+ }
+@@ -644,6 +659,10 @@ asmlinkage __visible void __init start_kernel(void)
+ 	 * time - but meanwhile we still have a functioning scheduler.
+ 	 */
+ 	sched_init();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_SCHED_INIT_DONE,
++				DADAO_M1_PROGRESS_SCHED_INIT_DONE_VALUE);
++#endif
+ 	/*
+ 	 * Disable preemption - early bootup scheduling is extremely
+ 	 * fragile until we cpu_idle() for the first time.
+@@ -679,12 +698,24 @@ asmlinkage __visible void __init start_kernel(void)
+ 	/* init some links before init_ISA_irqs() */
+ 	early_irq_init();
+ 	init_IRQ();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_EARLY_IRQ_INIT_DONE,
++				DADAO_M1_PROGRESS_EARLY_IRQ_INIT_DONE_VALUE);
++#endif
+ 	tick_init();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_TICK_INIT_DONE,
++				DADAO_M1_PROGRESS_TICK_INIT_DONE_VALUE);
++#endif
+ 	rcu_init_nohz();
+ 	init_timers();
+ 	hrtimers_init();
+ 	softirq_init();
+ 	timekeeping_init();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_TIMEKEEPING_INIT_DONE,
++				DADAO_M1_PROGRESS_TIMEKEEPING_INIT_DONE_VALUE);
++#endif
+ 
+ 	/*
+ 	 * For best initial stack canary entropy, prepare it after:
+@@ -700,6 +731,10 @@ asmlinkage __visible void __init start_kernel(void)
+ 	boot_init_stack_canary();
+ 
+ 	time_init();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_TIME_INIT_DONE,
++				DADAO_M1_PROGRESS_TIME_INIT_DONE_VALUE);
++#endif
+ 	printk_safe_init();
+ 	perf_event_init();
+ 	profile_init();
+@@ -717,6 +752,10 @@ asmlinkage __visible void __init start_kernel(void)
+ 	 * this. But we do want output early, in case something goes wrong.
+ 	 */
+ 	console_init();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_CONSOLE_INIT_DONE,
++				DADAO_M1_PROGRESS_CONSOLE_INIT_DONE_VALUE);
++#endif
+ 	if (panic_later)
+ 		panic("Too many boot %s vars at `%s'", panic_later,
+ 		      panic_param);
+@@ -729,6 +768,10 @@ asmlinkage __visible void __init start_kernel(void)
+ 	 * too:
+ 	 */
+ 	locking_selftest();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_LOCKING_SELFTEST_DONE,
++				DADAO_M1_PROGRESS_LOCKING_SELFTEST_DONE_VALUE);
++#endif
+ 
+ 	/*
+ 	 * This needs to be called before any devices perform DMA
+@@ -753,7 +796,15 @@ asmlinkage __visible void __init start_kernel(void)
+ 	if (late_time_init)
+ 		late_time_init();
+ 	sched_clock_init();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_CALIBRATE_ENTER,
++				DADAO_M1_PROGRESS_CALIBRATE_ENTER_VALUE);
++#endif
+ 	calibrate_delay();
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_CALIBRATE_DONE,
++				DADAO_M1_PROGRESS_CALIBRATE_DONE_VALUE);
++#endif
+ 	pid_idr_init();
+ 	anon_vma_init();
+ #ifdef CONFIG_X86
+@@ -1113,6 +1164,10 @@ static int __ref kernel_init(void *unused)
+ {
+ 	int ret;
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_KERNEL_INIT_ENTER,
++				DADAO_M1_PROGRESS_KERNEL_INIT_ENTER_VALUE);
++#endif
+ 	kernel_init_freeable();
+ 	/* need to finish all async __init code before freeing the memory */
+ 	async_synchronize_full();
+-- 
+2.43.0
+

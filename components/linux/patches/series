@@ -30,3 +30,4 @@
 0029-dadao-revert-widen-compaction-capture-result-for-K3-O0.patch
 0030-dadao-revert-widen-page-expected-state-result-for-K3-O0.patch
 0031-dadao-remove-additional-K3-O0-bool-carrier-workarounds.patch
+0032-dadao-add-KL-154a-post-mm_init-boot-progress-markers.patch

@@ -2517,3 +2517,19 @@ tree-wide sweep) are removed; `node_tag_get` and every other frozen site now
 compile clean. Fresh `-O0` Image boots the full seven-word oracle and stays
 running (no new `EXCP_MALIGN`) through an extended post-`mm_init` window.
 See `code-agent/tasks/KL-153a-llvm-o0-bool-stack-slot-root-fix.md`.
+
+### KL-154a: K3 post-`mm_init` boot progress diagnosis
+
+Precise diagnosis (not a fix): boot is stuck forever in
+`calibrate_delay_converge()` (`init/calibrate.c`)'s
+`while (ticks == jiffies) ;` busy-wait, confirmed with fourteen new
+`CONFIG_DADAO_M1_PROGRESS` markers bracketing every `start_kernel()`
+milestone through `rest_init()`/`kernel_init()`. Root cause: `time_init()`/
+`trap_init()`/`init_IRQ()` (`arch/dadao`) install no working timer or
+exception delivery, so `jiffies` never advances. A throwaway, non-committed
+`lpj=` diagnostic build confirmed the *next* wall too: `copy_thread()`
+(`arch/dadao/kernel/process.c`) unconditionally returns `-ENOSYS`, so
+`kernel_thread()`/`rest_init()` never actually creates `kernel_init`. Both
+are K3 phase-3 scope (real trap vector + timer clockevent + context-switch
+plumbing), frozen here for KL-155a rather than implemented in this task.
+See `code-agent/tasks/KL-154a-k3-post-mm-init-boot-progress-diagnosis.md`.
