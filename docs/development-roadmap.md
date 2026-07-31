@@ -2533,3 +2533,22 @@ exception delivery, so `jiffies` never advances. A throwaway, non-committed
 are K3 phase-3 scope (real trap vector + timer clockevent + context-switch
 plumbing), frozen here for KL-155a rather than implemented in this task.
 See `code-agent/tasks/KL-154a-k3-post-mm-init-boot-progress-diagnosis.md`.
+
+### KL-155a: K3 real CFX trap vector + timer clockevent
+
+Real fix for KL-154a's diagnosed blocker: `entry.S` installs real CFX
+exception vectors for `cfx_smon` and `cfx_timer` (async TIMER delivery
+targets `cfx_timer`'s own vector, not `cfx_smon`'s), `time.c` drives a real
+`cfx_timer` clockevent + `cfx_hart_cycle_lo` clocksource. `jiffies` genuinely
+advances; boot passes `calibrate_delay_converge()` and reaches
+`rest_init_enter`/`idle_enter` with `rest_init_pid=-ENOSYS`, exactly the
+next wall KL-154a predicted (`copy_thread()`, out of scope, KL-156a+).
+**Operationally important finding**: booting this Image requires QEMU
+`-icount shift=0` -- without it, TCG's normal TB-chaining can leave a
+cached guest busy-wait loop never re-checking `cpu_exec_interrupt()`, so
+timer delivery silently never happens. Architect independently verified the
+ISA-level routing claims against QEMU source, reproduced the full probe
+run, and replayed the patch series tree-hash-identical. See
+`code-agent/tasks/KL-155a-k3-real-trap-vector-and-timer-clockevent.md` for
+the rest (two more real bugs found, an inline-asm codegen limitation
+worked around).

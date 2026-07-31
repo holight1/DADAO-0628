@@ -33,3 +33,18 @@ busy-wait (`init/calibrate.c`), because `arch/dadao`'s `time_init()`/
 `trap_init()`/`init_IRQ()` install no working clockevent or exception
 delivery to ever advance `jiffies`. See
 `code-agent/tasks/KL-154a-k3-post-mm-init-boot-progress-diagnosis.md`.
+
+KL-155a (patch 0033) fills that gap: `arch/dadao/kernel/entry.S` installs
+real CFX exception vectors for both `cfx_smon` (cfxcode=2) and `cfx_timer`
+(cfxcode=18) -- async TIMER delivery targets `cfx_timer`'s own vector, not
+`cfx_smon`'s -- and `time.c` drives a real `cfx_timer`-backed
+`CLOCK_EVT_FEAT_ONESHOT` clockevent plus a `cfx_hart_cycle_lo` clocksource.
+`jiffies` now genuinely advances and boot passes
+`calibrate_delay_converge()`, reaching `rest_init_enter`/`idle_enter` with
+`rest_init_pid=-ENOSYS` exactly as KL-154a's diagnosis predicted (the next
+wall, `copy_thread()`/`__switch_to()`, is explicitly out of scope, KL-156a+).
+Requires booting QEMU with `-icount shift=0` for the timer interrupt to
+reliably reach guest code running in a tight loop (a real QEMU/TCG
+invocation requirement, not a source workaround -- see `time.c` and the
+task record). See
+`code-agent/tasks/KL-155a-k3-real-trap-vector-and-timer-clockevent.md`.

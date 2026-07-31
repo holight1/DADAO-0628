@@ -1,0 +1,958 @@
+From b69106ec3b80cca22990857fa9ac907e8ddd4746 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 31 Jul 2026 13:14:59 +0800
+Subject: [PATCH] dadao: real CFX exception entry + timer clockevent (KL-155a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Install a real CFX exception/interrupt entry (entry.S) and a working
+cfx_timer-driven clockevent, so jiffies actually advances and Linux
+boot gets past calibrate_delay_converge()'s busy-wait (KL-154a's
+precisely diagnosed blocker).
+
+- entry.S: two real vector targets sharing a save/dispatch/restore/
+  escape body -- dadao_cfx_smon_entry (cfx_smon, cfxcode=2) and
+  dadao_cfx_timer_entry (cfx_timer, cfxcode=18). Async TIMER delivery
+  targets cfx_timer's OWN vector, not cfx_smon's (verified against
+  QEMU's dadao_cfx_async_scan()/dadao_cfx_precise_trap_enter(), which
+  target the pending source's own cfxcode). The timer entry's first
+  instruction is an atomic self-mask (cfx2rc using rd3, a globally
+  LLVM-reserved register preloaded once at trap_init() time) that
+  closes the TIMER self-reentrancy window documented in KL-131a's own
+  review; save/restore follows the K2-frozen frame protocol
+  (KL-140a/142a) exactly, sized/padded to struct pt_regs (0x638 bytes,
+  16-byte aligned 0x640 frame for the C ABI).
+
+- traps.c: trap_init() installs both real vectors and a one-time
+  reentry guard; dadao_do_smon_trap()/dadao_do_timer_trap() are the C
+  dispatch functions called from entry.S. inner_cfx_mask (the live,
+  non-storage-backed register gating cross-cfx delivery) has no direct
+  cfx2rc write path, so dadao_cfx_craft_inner_mask() uses the same
+  self-escape indirection HBI §3's own hypv->supv handoff relies on: a
+  self-directed, nonmaskable `trap cfx_smon` whose C handler overwrites
+  the frame's prev_cfx_mask before the normal escape epilogue restores
+  it. Any other/unexpected cfx_smon or cfx_timer trap fails loudly via
+  dadao_die() (show_regs + panic), not silently.
+
+- time.c: cfx_timer counter0 (K1 timer0 profile, one-shot) as a
+  CLOCK_EVT_FEAT_ONESHOT clockevent; cfx_hart_cycle_lo as the
+  clocksource. set_next_event() re-unmasks TIMER's excp_cause_mask
+  gate (which entry.S unconditionally re-blocks on entry) for the next
+  event. dadao_timer_interrupt() explicitly brackets the handler with
+  local_irq_save/restore, since DADAO hardware -- unlike most
+  architectures -- does not implicitly leave "local IRQs disabled" on
+  entry (found empirically: kernel/irq_work.c's irq_work_run_list()
+  BUG_ON(!irqs_disabled()) firing without it).
+
+- irq.c: arch_local_irq_save/restore now really gate hardware delivery
+  via <mode>_global_cfx_mask (the coarse, per-mode-shared gate KL-131a
+  already defined for exactly this), not just a software flag.
+  dadao_irq_permit_cfx() lets a device (only cfx_timer today) register
+  itself into the "permitted when enabled" template.
+
+- dadao-cfx.h: shared (cg,rc)/cfxcode constants plus dadao_cfx2rc()/
+  dadao_cfx2rd() macros. Both are deliberately plain macros (not even
+  __always_inline functions) using __stringify()-based text
+  substitution rather than inline-asm "i"/"r" operand printing: this
+  target's inline-asm operand printer does not work yet for either
+  immediate or register operands (confirmed empirically -- every
+  substituted operand printed as empty text), and separately, -O0
+  build (KL-153a/dadao_defconfig) does not reliably constant-fold
+  literals through a function-parameter boundary for "i" constraints
+  even with __always_inline. Register-operand writes use the same
+  named-register-variable idiom already established for `trap`'s rd16
+  payload.
+
+- dadao-m1.h: one new evidence-only marker, DADAO_M1_PROGRESS_TIMER_
+  IRQ_COUNT, an incrementing (non-magic) count of real timer
+  interrupts serviced -- direct evidence the CFX async dispatch ->
+  cfx_timer real entry -> clockevent path fires repeatedly, not just
+  that jiffies happened to change once for an unrelated reason.
+
+QEMU invocation requirement (not a source workaround, documented in
+time.c and the task record): this timer is only reliably interruptible
+under `-icount shift=0`. Without it, QEMU's normal TCG direct
+TB-chaining can keep re-executing an already-cached tight backward-
+branch loop (e.g. calibrate_delay_converge()'s own busy-wait) without
+ever returning to the dispatch loop that reconsiders
+cpu_exec_interrupt() -- dadao_translate_code()'s per-translation
+single-instruction forcing (gated on cfx_timer_ctrl&ENABLE / a pending
+TIMER cause) only takes effect for TBs translated while that condition
+already holds, not for an already-cached TB reused afterward. -icount
+forces deterministic single-instruction-granularity dispatch,
+reliably reconsidering pending interrupts regardless of TB caching.
+
+Syscall dispatch and real copy_thread()/__switch_to() remain out of
+scope (KL-156a+); boot reaches rest_init_enter/idle_enter with
+rest_init_pid=-ENOSYS exactly as KL-154a's diagnosis predicted.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ arch/dadao/include/asm/dadao-cfx.h | 151 +++++++++++++++++++
+ arch/dadao/include/asm/dadao-m1.h  |  17 +++
+ arch/dadao/kernel/Makefile         |   2 +-
+ arch/dadao/kernel/entry.S          | 225 +++++++++++++++++++++++++++++
+ arch/dadao/kernel/irq.c            |  50 ++++++-
+ arch/dadao/kernel/time.c           | 195 ++++++++++++++++++++++++-
+ arch/dadao/kernel/traps.c          | 118 ++++++++++++++-
+ 7 files changed, 750 insertions(+), 8 deletions(-)
+ create mode 100644 arch/dadao/include/asm/dadao-cfx.h
+ create mode 100644 arch/dadao/kernel/entry.S
+
+diff --git a/arch/dadao/include/asm/dadao-cfx.h b/arch/dadao/include/asm/dadao-cfx.h
+new file mode 100644
+index 000000000..06d6b3bb7
+--- /dev/null
++++ b/arch/dadao/include/asm/dadao-cfx.h
+@@ -0,0 +1,151 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_CFX_H
++#define _ASM_DADAO_CFX_H
++
++/*
++ * KL-155a: register/cfxcode/(cg,rc) constants for the real CFX exception
++ * entry (entry.S) and the C trap/timer dispatch (traps.c, time.c).
++ *
++ * Every constant here is a plain, verified-against-source numeral, not a
++ * guess: cross-checked against contracts/isa/spec.md §8.1-§8.5 and against
++ * .work/source/qemu/target/dadao/cpu.h / cpu.c (dadao_cfx_precise_trap_enter,
++ * dadao_cfx_cause_eligible, dadao_cfx_async_scan) as of the KL-155a
++ * implementation date. This header intentionally has no C-only or
++ * assembly-only syntax so it can be included from both traps.c/time.c/irq.c
++ * and entry.S (preprocessed).
++ */
++
++/* cfxcode values (contracts/isa/spec.md §8, QEMU cpu.h DADAO_CFX_CODE_*) */
++#define DADAO_CFX_CODE_SMON	2
++#define DADAO_CFX_CODE_HART	15
++#define DADAO_CFX_CODE_TIMER	18
++
++/* run_mode values; only supv (2) is used by this port */
++#define DADAO_MODE_SUPV		2
++
++/*
++ * cg5: the common per-cfx exception frame (excp_prev_run_mode/_cfx_mask/
++ * _cause_id/_cause_ip/_cause_info/_prev_cfx_code -- spec.md §8.3/§8.4/§8.5.5,
++ * verified against dadao_cfx_precise_trap_enter()/DADAOCfxFrame).
++ */
++#define DADAO_CG_FRAME			5
++#define DADAO_RC_PREV_RUN_MODE		0
++#define DADAO_RC_PREV_CFX_MASK		1
++#define DADAO_RC_CAUSE_ID		2
++#define DADAO_RC_CAUSE_IP		3
++#define DADAO_RC_CAUSE_INFO		4
++#define DADAO_RC_PREV_CFX_CODE		5
++
++/* cg2/rc10: cfx_<name>_supv_excp_vector (spec.md §8.4 step 10) */
++#define DADAO_CG_VECTOR			2
++#define DADAO_RC_EXCP_VECTOR		10
++
++/*
++ * cg{mode}/rc1: <mode>_global_cfx_mask -- SHARED across every cfxcode for a
++ * given mode (KL-131a; the cfxcode operand of cfx2rc/cfx2rd is ignored for
++ * this register). cg{mode}/rc11: <mode>_excp_cause_mask -- per (cfx, mode).
++ * "mode" is encoded as the cg index (0=user,1=jail,2=supv,3=hypv).
++ */
++#define DADAO_RC_GLOBAL_CFX_MASK	1
++#define DADAO_RC_EXCP_CAUSE_MASK	11
++
++/* cg4/rc7: cfx_<name>_pending (common, W0C) -- spec.md §8.5.1 */
++#define DADAO_CG_COMMON			4
++#define DADAO_RC_COMMON_PENDING		7
++
++/* cg10: cfx_timer private device registers -- spec.md §8.5.2 */
++#define DADAO_CG_TIMER			10
++#define DADAO_RC_TIMER_PENDING		0
++#define DADAO_RC_TIMER_MASK		1
++#define DADAO_RC_TIMER_CTRL		7
++#define DADAO_RC_TIMER_COUNTER0		8
++
++#define DADAO_TIMER_CTRL_ENABLE		0x1
++#define DADAO_TIMER_CTRL_PERIODIC	0x2
++
++/* cg8/rc2: cfx_hart_cycle_lo (RO, monotonic, +1 per retired instruction) */
++#define DADAO_CG_HART			8
++#define DADAO_RC_HART_CYCLE_LO		2
++
++/* Cause bits (one-hot, cg5/rc2 excp_cause_id and cg4/rc7 common pending) */
++#define DADAO_CAUSE_CFXTRAP		(1ULL << 0)
++#define DADAO_CAUSE_TIMER		(1ULL << 10)
++
++/* Reset-default / "block everything" mask value, also used as the
++ * reentrancy-guard constant (see entry.S). */
++#define DADAO_MASK_ALL			0xFFFFFFFFFFFFFFFFULL
++
++#ifndef __ASSEMBLY__
++
++#include <linux/stringify.h>
++#include <linux/types.h>
++
++/*
++ * cfx2rc/cfx2rd's cfxcode/cg/rc operands are embedded as literal TEXT in the
++ * asm string via __stringify(), not passed as inline-asm "i" (immediate)
++ * operands substituted at codegen time. Two independent reasons, both
++ * confirmed empirically while building KL-155a:
++ *   1. This whole port builds at KCFLAGS=-O0 (KL-153a/dadao_defconfig), and
++ *      at -O0 Clang does not reliably constant-fold a literal passed
++ *      through a function-parameter boundary before checking inline-asm "i"
++ *      constraints, even through an __always_inline function.
++ *   2. More fundamentally, the DADAO backend's inline-asm immediate-operand
++ *      printing path itself does not work yet ("cfx2rc , , , " -- every "i"
++ *      operand printed as empty text) -- unsurprising since no prior task
++ *      exercised inline C asm with "i" constraints on this young backend
++ *      (existing DADAO .S files like head.S only ever use literal
++ *      mnemonics, never inline C asm). __stringify() sidesteps this
++ *      entirely by relying purely on preprocessor text substitution, the
++ *      same mechanism traps.c's dadao_cfx_craft_inner_mask() already uses
++ *      for its `trap` instruction.
++ * This is a real, load-bearing toolchain finding, not a style choice --
++ * recorded in the KL-155a task completion record.
++ *
++ * The register operand (cfx2rc's rdhd) hits the identical gap: printing a
++ * "r"-constrained operand via %0 also emits empty text ("cfx2rc 2, 2, 1, "
++ * with nothing after the last comma, confirmed empirically). The fix is the
++ * same GCC/Clang local-register-variable idiom traps.c's
++ * dadao_cfx_craft_inner_mask() already uses for `trap`'s rd16 payload:
++ * pin the value into a literal, named register (rd5 -- chosen from the
++ * globally-reserved RD0-7 set, excluding rd0/zero, rd1/dadao_cfx2rd's own
++ * destination, rd2/DADAOFrameLowering's transient prologue-adjustment
++ * scratch, and rd3/the entry.S reentrancy guard) and reference that name
++ * directly in the asm string; listing it as a "r" input still creates the
++ * dependency edge the compiler needs (ordering the register write before
++ * the asm executes), even though the substituted text is never printed.
++ */
++
++/* cfx2rc is a real assembler mnemonic (KL-114a). */
++#define dadao_cfx2rc(cfxcode, cg, rc, val)				\
++	do {								\
++		register unsigned long __val asm("rd5") = (u64)(val);	\
++		asm volatile("cfx2rc " __stringify(cfxcode) ", "	\
++			     __stringify(cg) ", " __stringify(rc)	\
++			     ", rd5\n\t"				\
++			     :: "r" (__val)				\
++			     : "memory");				\
++	} while (0)
++
++/*
++ * cfx2rd has no assembler mnemonic yet (KL-114a's scope stopped at
++ * ldmo-ra/stmo-ra/cfx2rc/escape; see entry.S's identical note and head.S's
++ * original comment). Raw CRRR encoding, destination pinned to rd1 (globally
++ * reserved from the LLVM register allocator,
++ * DADAORegisterInfo::getReservedRegs(), and otherwise untouched by this
++ * port) so the instruction's 6-bit rd field is a compile-time literal.
++ */
++#define dadao_cfx2rd(cfxcode, cg, rc)					\
++	({								\
++		register unsigned long __v asm("rd1");			\
++		asm volatile(						\
++			".4byte (0x72 << 24) | ((("			\
++			__stringify(cfxcode) ") & 0x3F) << 18) | ((("	\
++			__stringify(cg) ") & 0x3F) << 12) | ((("	\
++			__stringify(rc) ") & 0x3F) << 6) | 1\n\t"	\
++			: "=r" (__v));					\
++		__v;							\
++	})
++
++#endif /* __ASSEMBLY__ */
++
++#endif /* _ASM_DADAO_CFX_H */
+diff --git a/arch/dadao/include/asm/dadao-m1.h b/arch/dadao/include/asm/dadao-m1.h
+index 3d2bb4f69..9e47acc55 100644
+--- a/arch/dadao/include/asm/dadao-m1.h
++++ b/arch/dadao/include/asm/dadao-m1.h
+@@ -71,9 +71,26 @@
+ #define DADAO_M1_PROGRESS_IDLE_ENTER_VALUE		0x4b4c31353449444cULL /* KL154IDL */
+ #define DADAO_M1_PROGRESS_CALIBRATE_CONVERGE_ENTER_VALUE	0x4b4c3135344a464cULL /* KL154JFL (jiffies loop) */
+ 
++/*
++ * KL-155a: raw (non-ASCII-magic) incrementing count of real timer
++ * interrupts serviced by dadao_timer_interrupt() (arch/dadao/kernel/
++ * time.c) -- direct, non-inferential evidence that the CFX async dispatch
++ * -> cfx_timer real vector entry -> clockevent path actually fired one or
++ * more times, independent of and in addition to observing that jiffies
++ * itself advances.
++ */
++#define DADAO_M1_PROGRESS_TIMER_IRQ_COUNT		0x87fd00a8UL
++
+ static inline void dadao_m1_progress_write(unsigned long address, u64 value)
+ {
+ 	*(volatile u64 *)address = value;
+ }
+ 
++static inline void dadao_m1_progress_increment(unsigned long address)
++{
++	volatile u64 *slot = (volatile u64 *)address;
++
++	*slot = *slot + 1;
++}
++
+ #endif /* _ASM_DADAO_M1_H */
+diff --git a/arch/dadao/kernel/Makefile b/arch/dadao/kernel/Makefile
+index 864716589..34420c08b 100644
+--- a/arch/dadao/kernel/Makefile
++++ b/arch/dadao/kernel/Makefile
+@@ -2,5 +2,5 @@
+ 
+ extra-y := head.o vmlinux.lds
+ 
+-obj-y := setup.o process.o ptrace.o traps.o irq.o time.o
++obj-y := setup.o process.o ptrace.o traps.o irq.o time.o entry.o
+ obj-$(CONFIG_DADAO_M1_DEBUG_CONSOLE) += early-console.o
+diff --git a/arch/dadao/kernel/entry.S b/arch/dadao/kernel/entry.S
+new file mode 100644
+index 000000000..48b4e600d
+--- /dev/null
++++ b/arch/dadao/kernel/entry.S
+@@ -0,0 +1,225 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++/*
++ * KL-155a: real CFX exception/interrupt entry.
++ *
++ * Two vector targets share almost all of their save/restore body:
++ *
++ *   dadao_cfx_smon_entry  -- installed as cfx_smon's (cfxcode=2) real
++ *                            excp_vector (cg2/rc10). Only ever reached today
++ *                            via a synchronous, self-directed `trap 2, N`
++ *                            (see traps.c dadao_cross_cfx_unmask()); real
++ *                            user-mode CFXTRAP syscall dispatch is out of
++ *                            scope (KL-156a+).
++ *
++ *   dadao_cfx_timer_entry -- installed as cfx_timer's (cfxcode=18) OWN real
++ *                            excp_vector. This is the entry KL-155a actually
++ *                            exercises for the timer clockevent.
++ *
++ * Ground-truth verified against .work/source/qemu/target/dadao/cpu.c
++ * (dadao_cfx_async_scan(): out_target is the PENDING SOURCE's own cfxcode,
++ * e.g. DADAO_CFX_CODE_TIMER for a timer tick -- NOT cfx_smon. Every real
++ * async source therefore needs its OWN supv_excp_vector configured; cfx_smon
++ * is not an implicit umbrella for cross-cfx delivery) -- see the KL-155a
++ * task completion record for the full derivation.
++ *
++ * struct pt_regs (asm/ptrace.h) layout (bytes, from a NEW/post-decrement
++ * rb1): rd[64] @0x000, rb[64] @0x200, ra[64] @0x400, pc @0x600,
++ * run_mode @0x608, cfx_code @0x610, cfx_mask @0x618, cause_id @0x620,
++ * cause_info @0x628, orig_rd17 @0x630. Size 0x638; the frame this code
++ * carves out of the current kernel stack is FRAME_SIZE (0x640, the next
++ * 16-byte-aligned size) so the C ABI's stack alignment holds across the
++ * `call` into C.
++ *
++ * rd0 is hardwired to zero and illegal as an ordinary load destination
++ * (contracts/isa/spec.md §1.2); rb0 is hardware-maintained (holds
++ * current_PC+4) and illegal as any destination (§1.3). Neither is saved or
++ * restored -- same exclusion K2's own frame protocol (KL-140a/142a) already
++ * established (198-word frame = rd1-63 + rb1-63 + ra0-63, not rd0/rb0).
++ * pt_regs->rd[0]/rb[0] are therefore left as stale stack content; nothing
++ * in this port reads them meaningfully (rd0 always architecturally reads 0
++ * regardless of what pt_regs->rd[0] happens to hold).
++ *
++ * Reentrancy: cfx_timer's TIMER cause is a level source (spec.md §8.5.1):
++ * while its private cfx_timer_pending bit0 remains set, hardware re-ORs the
++ * common cause-pending bit at EVERY instruction boundary regardless of any
++ * mask, and (independently confirmed from
++ * dadao_cfx_cause_eligible()/cpu.c) cfx_timer's own excp_cause_mask gate is
++ * checked on every eligibility test REGARDLESS of self- vs cross-cfx target
++ * -- so if that mask is left unmasked while running inside the timer
++ * handler itself (inner_cfx_code==cfx_timer already), the very same TIMER
++ * cause can re-enter before pending is ever cleared, and because building a
++ * fresh mask value takes >=1 additional instruction, EVERY attempt gets
++ * reinterrupted right after its first instruction forever (an architectural
++ * livelock, not a simulator bug -- KL-131a's own review hit and documented
++ * the identical class of issue). The fix, following KL-142a's proven
++ * pattern ("preloaded live register, first instruction is the atomic
++ * self-mask write"): rd3 is globally reserved from the LLVM register
++ * allocator (DADAORegisterInfo::getReservedRegs()) and never otherwise
++ * touched by compiled C code or by this file except in
++ * dadao_reentry_guard_init(); it permanently holds DADAO_MASK_ALL
++ * (0xFFFF...FFFF) from one very early, deliberately-safe boot-time call
++ * (trap_init(), before TIMER is ever unmasked). dadao_cfx_timer_entry's
++ * FIRST instruction is therefore a single, self-sufficient
++ * `cfx2rc 18, 2, 11, rd3` that re-blocks cfx_timer's own excp_cause_mask
++ * before any reentry window can open.
++ */
++
++#include <asm/dadao-cfx.h>
++
++	.equ FRAME_SIZE,     0x640
++	.equ RD_BASE,        0x000
++	.equ RB_BASE,        0x200
++	.equ RA_BASE,        0x400
++	.equ PC_OFF,         0x600
++	.equ RUN_MODE_OFF,   0x608
++	.equ CFX_CODE_OFF,   0x610
++	.equ CFX_MASK_OFF,   0x618
++	.equ CAUSE_ID_OFF,   0x620
++	.equ CAUSE_INFO_OFF, 0x628
++	.equ ORIG_RD17_OFF,  0x630
++
++/*
++ * cfx2rd is not accepted by the DADAO integrated assembler (KL-114a's scope
++ * covers only ldmo/stmo/cfx2rc/escape; see head.S's own identical note).
++ * Raw CRRR encoding: op=0x72, ha=cfxcode[23:18], hb=cg[17:12], hc=rc[11:6],
++ * hd=rd[5:0] -- formula and worked example (0x72085003 ==
++ * "cfx2rd cfx_smon,cg5,rc0,rd3") cross-checked byte-for-byte against
++ * head.S's .Lmode_probe.
++ */
++	.macro CFX2RD_RAW cfxcode, cg, rc, rd
++	.4byte (0x72 << 24) | (((\cfxcode) & 0x3F) << 18) | \
++	       (((\cg) & 0x3F) << 12) | (((\rc) & 0x3F) << 6) | ((\rd) & 0x3F)
++	.endm
++
++	.section ".text", "ax"
++
++/*
++ * void dadao_reentry_guard_init(void);
++ * Called exactly once, from trap_init(), strictly before TIMER is ever
++ * unmasked. Builds DADAO_MASK_ALL into rd3 across all four 16-bit quarters
++ * (setzw zeroes-and-sets one quarter, orw ORs into one quarter without
++ * touching the others -- same idiom head.S already uses for smaller
++ * constants).
++ */
++	.globl dadao_reentry_guard_init
++	.type dadao_reentry_guard_init, @function
++dadao_reentry_guard_init:
++	setzw rd3, 3, 0xFFFF
++	orw   rd3, 2, 0xFFFF
++	orw   rd3, 1, 0xFFFF
++	orw   rd3, 0, 0xFFFF
++	ret rd0, 0
++	.size dadao_reentry_guard_init, . - dadao_reentry_guard_init
++
++/*
++ * Bulk save: rd1-63, rb1-63, ra0-63 onto the CURRENT kernel stack (rb1 is
++ * still the OLD/pre-trap value throughout this macro -- decremented only
++ * after every one of these stores has captured the pre-trap register file).
++ * ldmo/stmo's immu6 count field cannot express 64, hence the proven 63+1
++ * split for the RA bank (KL-140a/142a precedent).
++ */
++	.macro SAVE_BULK
++	.irp n,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
++	sto rd\n, rb1, (RD_BASE + \n * 8 - FRAME_SIZE)
++	.endr
++	.irp n,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
++	sto rb\n, rb1, (RB_BASE + \n * 8 - FRAME_SIZE)
++	.endr
++	addi rd8, rd0, (RA_BASE - FRAME_SIZE)
++	stmo ra0, rb1, rd8, 63
++	addi rd8, rd0, (RA_BASE + 63 * 8 - FRAME_SIZE)
++	stmo ra63, rb1, rd8, 1
++	addi rb1, rb1, -FRAME_SIZE
++	.endm
++
++/*
++ * Bulk restore: strict reverse of SAVE_BULK, using the NEW (post-decrement)
++ * rb1 as base throughout. rb1 itself is restored dead last, via a single
++ * self-referential RB-bank load (EA computed from the still-current rb1,
++ * result overwrites rb1 -- the standard "pop saved SP" idiom).
++ */
++	.macro RESTORE_BULK
++	addi rd8, rd0, RA_BASE
++	ldmo ra0, rb1, rd8, 63
++	addi rd8, rd0, (RA_BASE + 63 * 8)
++	ldmo ra63, rb1, rd8, 1
++	.irp n,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
++	ldo rd\n, rb1, (RD_BASE + \n * 8)
++	.endr
++	.irp n,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
++	ldo rb\n, rb1, (RB_BASE + \n * 8)
++	.endr
++	ldo rb1, rb1, (RB_BASE + 1 * 8)
++	.endm
++
++/*
++ * Read the entered cfx's own cg5 exception frame (6 fields) into pt_regs,
++ * using the NEW (post-decrement) rb1 as base. \cfxcode is a compile-time
++ * constant per entry stub (2 for smon, 18 for timer) -- no runtime
++ * "which cfx am I" register is needed anywhere in this file.
++ */
++	.macro READ_CG5_AND_STORE cfxcode
++	CFX2RD_RAW \cfxcode, DADAO_CG_FRAME, DADAO_RC_PREV_RUN_MODE, 9
++	sto rd9, rb1, RUN_MODE_OFF
++	CFX2RD_RAW \cfxcode, DADAO_CG_FRAME, DADAO_RC_PREV_CFX_MASK, 9
++	sto rd9, rb1, CFX_MASK_OFF
++	CFX2RD_RAW \cfxcode, DADAO_CG_FRAME, DADAO_RC_CAUSE_ID, 9
++	sto rd9, rb1, CAUSE_ID_OFF
++	CFX2RD_RAW \cfxcode, DADAO_CG_FRAME, DADAO_RC_CAUSE_IP, 9
++	sto rd9, rb1, PC_OFF
++	CFX2RD_RAW \cfxcode, DADAO_CG_FRAME, DADAO_RC_CAUSE_INFO, 9
++	sto rd9, rb1, CAUSE_INFO_OFF
++	CFX2RD_RAW \cfxcode, DADAO_CG_FRAME, DADAO_RC_PREV_CFX_CODE, 9
++	sto rd9, rb1, CFX_CODE_OFF
++	ldo rd9, rb1, (RD_BASE + 17 * 8)
++	sto rd9, rb1, ORIG_RD17_OFF
++	.endm
++
++/*
++ * void dadao_cfx_smon_entry(void);  -- real vector, cfx_smon (cfxcode=2)
++ */
++	.globl dadao_cfx_smon_entry
++	.type dadao_cfx_smon_entry, @function
++dadao_cfx_smon_entry:
++	SAVE_BULK
++	READ_CG5_AND_STORE DADAO_CFX_CODE_SMON
++	addi rb16, rb1, 0
++	call dadao_do_smon_trap
++	RESTORE_BULK
++	escape DADAO_CFX_CODE_SMON, 1
++	.size dadao_cfx_smon_entry, . - dadao_cfx_smon_entry
++
++/*
++ * void dadao_cfx_timer_entry(void);  -- real vector, cfx_timer (cfxcode=18)
++ */
++	.globl dadao_cfx_timer_entry
++	.type dadao_cfx_timer_entry, @function
++dadao_cfx_timer_entry:
++	/* Reentrancy-critical: see the file header. Must be the very first
++	 * architecturally retired instruction after landing here.
++	 *
++	 * cg operand is DADAO_MODE_SUPV (the run-mode index excp_cause_mask
++	 * is keyed by, matching time.c's own two writes to this same
++	 * register), NOT DADAO_CG_VECTOR (the unrelated, fixed cg2
++	 * vector-register group) -- both constants currently equal 2, so
++	 * this was byte-identical either way, but using the semantically
++	 * correct constant avoids a latent landmine if either numeral is
++	 * ever revised independently (found in KL-155a's own independent
++	 * review). */
++	cfx2rc DADAO_CFX_CODE_TIMER, DADAO_MODE_SUPV, DADAO_RC_EXCP_CAUSE_MASK, rd3
++	SAVE_BULK
++	READ_CG5_AND_STORE DADAO_CFX_CODE_TIMER
++	/* Drain private then common pending (spec.md §8.5.1 acknowledgement
++	 * order) now that self-delivery is blocked; safe to build a fresh
++	 * zero value here (xor of a register with itself is value-
++	 * independent), unlike in the reentrancy-critical first instruction
++	 * above. */
++	xor rd8, rd8, rd8
++	cfx2rc DADAO_CFX_CODE_TIMER, DADAO_CG_TIMER, DADAO_RC_TIMER_PENDING, rd8
++	cfx2rc DADAO_CFX_CODE_TIMER, DADAO_CG_COMMON, DADAO_RC_COMMON_PENDING, rd8
++	addi rb16, rb1, 0
++	call dadao_do_timer_trap
++	RESTORE_BULK
++	escape DADAO_CFX_CODE_TIMER, 0
++	.size dadao_cfx_timer_entry, . - dadao_cfx_timer_entry
+diff --git a/arch/dadao/kernel/irq.c b/arch/dadao/kernel/irq.c
+index d5e3e0b9a..822264807 100644
+--- a/arch/dadao/kernel/irq.c
++++ b/arch/dadao/kernel/irq.c
+@@ -1,15 +1,56 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
+ #include <linux/init.h>
++#include <linux/types.h>
++
++#include <asm/dadao-cfx.h>
+ 
+ /*
+- * KL-149a enters supervisor mode with every asynchronous CFX source masked.
+- * Until the Linux CFX interrupt controller is installed, retain that hardware
+- * state and track the Linux local-IRQ state in software for UP critical
+- * sections.  No interrupt-delivery support is claimed by this task.
++ * KL-155a: arch_local_irq_save/restore now really gate hardware delivery,
++ * not just a software flag (KL-149a's original stub tracked only the
++ * software flag -- see the removed comment this file used to carry).
++ *
++ * DADAO has no PLIC/generic interrupt controller: cfx_timer/cfx_uart route
++ * by cfxcode directly (KL-137a already established the "K1 does not claim a
++ * real irqchip" position; this port does not invent one either).
++ * <mode>_global_cfx_mask (cg{mode}/rc1, KL-131a) is the one coarse,
++ * per-mode-SHARED gate that already exists for exactly this purpose --
++ * checked for every cross-cfx source whenever Linux runs normally as
++ * cfx_smon -- so it is reused as-is as the local_irq_save/restore toggle
++ * rather than inventing a fake generic-irqchip abstraction on top of it.
++ *
++ * dadao_cfx_mask_enabled is the "what should be unmasked when interrupts
++ * are on" template, starting at DADAO_MASK_ALL (everything blocked) --
++ * matching both the hardware reset default and the state KL-149a's
++ * hypv->supv mode handoff already hands Linux, so init_IRQ() need not touch
++ * hardware at all. dadao_irq_permit_cfx() (called by e.g. time.c's timer
++ * setup) clears one bit and, if interrupts are CURRENTLY enabled,
++ * re-syncs hardware immediately; otherwise the new permission simply takes
++ * effect the next time arch_local_irq_enable()/restore(1) runs. This is
++ * the Linux-irq-number<->cfxcode "mapping": there is no Linux irq number at
++ * all for cfx_timer in this port (dadao_timer_interrupt() in time.c calls
++ * the clockevent's event_handler() directly, exactly like
++ * arch/openrisc/kernel/time.c's timer_interrupt() does, rather than routing
++ * through request_irq()/generic_handle_irq() -- there is only ever one real
++ * interrupt source in K1/K3, so a genirq domain would be pure ceremony, not
++ * a real controller abstraction).
+  */
++static u64 dadao_cfx_mask_enabled = DADAO_MASK_ALL;
+ static unsigned long dadao_irq_enabled;
+ 
++static inline void dadao_write_global_cfx_mask(u64 val)
++{
++	dadao_cfx2rc(DADAO_CFX_CODE_SMON, DADAO_MODE_SUPV,
++		     DADAO_RC_GLOBAL_CFX_MASK, val);
++}
++
++void dadao_irq_permit_cfx(unsigned int cfxcode)
++{
++	dadao_cfx_mask_enabled &= ~(1ULL << cfxcode);
++	if (READ_ONCE(dadao_irq_enabled))
++		dadao_write_global_cfx_mask(dadao_cfx_mask_enabled);
++}
++
+ unsigned long arch_local_save_flags(void)
+ {
+ 	return READ_ONCE(dadao_irq_enabled);
+@@ -18,6 +59,7 @@ unsigned long arch_local_save_flags(void)
+ void arch_local_irq_restore(unsigned long flags)
+ {
+ 	WRITE_ONCE(dadao_irq_enabled, !!flags);
++	dadao_write_global_cfx_mask(flags ? dadao_cfx_mask_enabled : DADAO_MASK_ALL);
+ 	barrier();
+ }
+ 
+diff --git a/arch/dadao/kernel/time.c b/arch/dadao/kernel/time.c
+index 42e34fdb7..bb1dabde2 100644
+--- a/arch/dadao/kernel/time.c
++++ b/arch/dadao/kernel/time.c
+@@ -1,17 +1,208 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
++#include <linux/clockchips.h>
++#include <linux/clocksource.h>
++#include <linux/cpumask.h>
+ #include <linux/delay.h>
+ #include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqflags.h>
+ #include <linux/param.h>
+ 
++#include <asm/dadao-cfx.h>
+ #include <asm/processor.h>
++#include <asm/ptrace.h>
++
++#ifdef CONFIG_DADAO_M1_PROGRESS
++#include <asm/dadao-m1.h>
++#endif
++
++/* traps.c */
++extern void dadao_cfx_craft_inner_mask(u64 new_mask);
++/* irq.c */
++extern void dadao_irq_permit_cfx(unsigned int cfxcode);
++
++/*
++ * KL-155a: cfx_timer counter0 (K1 timer0 profile, contracts/isa/spec.md
++ * §8.5.2) as a one-shot clockevent -- exactly the SBI_TIMER_SET_TIMER
++ * relative-countdown semantics CLOCK_EVT_FEAT_ONESHOT wants (dadao_defconfig
++ * sets CONFIG_NO_HZ_IDLE=y): writing counter0 both loads the countdown and,
++ * per spec, a same-value internal reload latch, and selects decrement mode;
++ * this driver always leaves ctrl in one-shot (bit1=0; periodic mode exists
++ * in hardware but is not needed here), so each set_next_event() call re-arms
++ * exactly one future expiry. cfx_hart_cycle_lo (cg8/rc2, KL-133a) is used as
++ * the clocksource: read-only, monotonic, +1 per architecturally retired
++ * instruction -- a natural free-running counter, mirroring how
++ * arch/openrisc/kernel/time.c pairs its own tick timer's clockevent with a
++ * free-running counter clocksource.
++ *
++ * "One tick == one retired instruction" (spec.md §8.5.2) is a deterministic
++ * functional-test profile, not a real clock rate. DADAO_TIMER_HZ below is a
++ * nominal frequency chosen only so genirq's ns<->tick conversion produces
++ * deltas that fit counter0's range and keep boot's few required jiffies to a
++ * small, fast number of retired instructions; it is not a hardware or
++ * wall-clock timing claim (KL-155a task completion record).
++ *
++ * QEMU invocation requirement: this timer is only correctly interruptible
++ * under `-icount shift=0` (or another fixed, deterministic icount shift).
++ * Empirically confirmed (KL-155a task completion record): without -icount,
++ * QEMU's normal TCG direct TB-chaining can keep re-executing an
++ * already-cached tight backward-branch loop (e.g. the guest's own
++ * calibrate_delay_converge() `while (ticks == jiffies) ;`) without ever
++ * returning to the dispatch loop that reconsiders cpu_exec_interrupt() --
++ * dadao_translate_code()'s per-translation *max_insns=1 forcing
++ * (translate.c, gated on cfx_timer_ctrl & ENABLE / a pending TIMER cause)
++ * only takes effect for TBs translated (or re-translated) while that
++ * condition already holds, not for an already-cached TB reused afterward.
++ * -icount forces QEMU's deterministic single-instruction-granularity
++ * dispatch path, which reliably reconsiders pending interrupts at every
++ * instruction regardless of TB caching. This is a real, load-bearing
++ * QEMU/TCG invocation requirement for K3 Linux boot, not a workaround
++ * baked into this driver -- every QEMU launch that expects real timer
++ * interrupts to reach guest code running in a loop (this driver's own
++ * clockevent, or any future K1/K3 real-interrupt consumer) needs it, so it
++ * belongs in the boot command line (see the KL-155a probe script and
++ * task completion record), not in arch/dadao source.
++ */
++#define DADAO_TIMER_HZ		1000000UL /* 1 MHz nominal */
++/*
++ * MIN_DELTA must comfortably exceed the number of instructions
++ * dadao_cfx_timer_entry's own save/dispatch/set_next_event/restore/escape
++ * round trip retires (empirically a few hundred at most -- see the KL-155a
++ * task completion record for the exact failure this min_delta fixes):
++ * set_next_event() re-unmasks TIMER's excp_cause_mask gate WHILE STILL
++ * INSIDE the handler that is arming the *next* event (standard NO_HZ
++ * oneshot practice, see arch/openrisc's own set_next_event), so if the
++ * requested delta were small enough to expire before that round trip
++ * completes, the timer genuinely re-fires as a nested nested interrupt
++ * before ever reaching entry.S's own escape -- observed directly as an
++ * infinite chain of nested cfx_timer entries at MIN_DELTA=1 (each nested
++ * escape restoring the WRONG, carrier-hardcoded inner_cfx_mask from an
++ * inner frame instead of the outer craft_inner_mask() value, since the
++ * frame is captured fresh on every real entry). 100,000 ticks (100ms
++ * nominal at the 1MHz nominal rate below) gives orders of magnitude of
++ * headroom and still keeps every jiffy fast in real wall-clock QEMU time.
++ */
++#define DADAO_TIMER_MIN_DELTA	100000UL
++#define DADAO_TIMER_MAX_DELTA	0xFFFFFFFFUL
++
++static struct clock_event_device dadao_clockevent;
++
++/*
++ * Re-arms the next one-shot expiry AND re-unmasks cfx_timer's own
++ * excp_cause_mask[supv] gate, which entry.S's dadao_cfx_timer_entry
++ * unconditionally re-blocks as its very first instruction (see entry.S's
++ * file comment: that block is what closes the self-reentrancy window while
++ * private/common pending are still draining). Without re-unmasking here,
++ * only the very first timer interrupt would ever be deliverable. This is
++ * always called either at true init time (before TIMER is ever unmasked at
++ * all) or from within dadao_timer_interrupt()'s own call chain -- i.e.
++ * strictly after entry.S has already re-blocked -- so building the unmask
++ * value here with an ordinary multi-instruction sequence is safe; it is
++ * only entry.S's OWN first instruction that cannot afford that.
++ */
++static int dadao_timer_set_next_event(unsigned long delta,
++				      struct clock_event_device *dev)
++{
++	dadao_cfx2rc(DADAO_CFX_CODE_TIMER, DADAO_CG_TIMER,
++		     DADAO_RC_TIMER_COUNTER0, delta);
++	dadao_cfx2rc(DADAO_CFX_CODE_TIMER, DADAO_MODE_SUPV,
++		     DADAO_RC_EXCP_CAUSE_MASK, DADAO_MASK_ALL & ~DADAO_CAUSE_TIMER);
++	dadao_cfx2rc(DADAO_CFX_CODE_TIMER, DADAO_CG_TIMER,
++		     DADAO_RC_TIMER_CTRL, DADAO_TIMER_CTRL_ENABLE);
++	return 0;
++}
++
++/*
++ * Called by traps.c's dadao_do_timer_trap() with the freshly saved pt_regs.
++ * Mirrors arch/openrisc/kernel/time.c's timer_interrupt(): entry.S already
++ * did the hardware ack, so all that is left is the generic irq_enter() /
++ * event_handler() / irq_exit() dance.
++ *
++ * Unlike most architectures, DADAO hardware does not implicitly leave
++ * "local IRQs disabled" on entry to this handler: entry.S's atomic
++ * self-mask only closes cfx_timer's OWN excp_cause_mask gate (the specific
++ * fix for TIMER's self-reentrancy hazard -- see entry.S), it does not touch
++ * irq.c's arch_local_irq_save/restore software state or the
++ * <mode>_global_cfx_mask it drives. Generic core code (e.g.
++ * kernel/irq_work.c's irq_work_run_list(), hit empirically while bringing
++ * this up: "BUG: failure at kernel/irq_work.c:148") asserts
++ * irqs_disabled() while running inside a hardware interrupt handler, so
++ * this makes that true for the software-visible state explicitly, and
++ * restores whatever it was on return -- standard practice other
++ * architectures get "for free" from real hardware auto-disable, DADAO does
++ * not.
++ */
++void dadao_timer_interrupt(struct pt_regs *regs)
++{
++	struct pt_regs *old_regs = set_irq_regs(regs);
++	unsigned long flags;
++
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	dadao_m1_progress_increment(DADAO_M1_PROGRESS_TIMER_IRQ_COUNT);
++#endif
++
++	local_irq_save(flags);
++	irq_enter();
++	dadao_clockevent.event_handler(&dadao_clockevent);
++	irq_exit();
++	local_irq_restore(flags);
++
++	set_irq_regs(old_regs);
++}
++
++static u64 dadao_clocksource_read(struct clocksource *cs)
++{
++	return dadao_cfx2rd(DADAO_CFX_CODE_HART, DADAO_CG_HART,
++			     DADAO_RC_HART_CYCLE_LO);
++}
++
++static struct clocksource dadao_clocksource = {
++	.name	= "cfx_hart_cycle_lo",
++	.rating	= 300,
++	.read	= dadao_clocksource_read,
++	.mask	= CLOCKSOURCE_MASK(64),
++	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
++};
+ 
+ void __init time_init(void)
+ {
+ 	/*
+-	 * The CFX timer clocksource/clockevent is introduced after the linked
+-	 * image gate.  Linux can still enter start_kernel with time disabled.
++	 * cfx_timer's own private device mask (cg10/rc1) is an independent,
++	 * fourth gate on top of the generic three (spec.md §8.5.2) that
++	 * entry.S's prologue never touches, so -- unlike excp_cause_mask --
++	 * it only needs setting up once, here, and stays unmasked forever.
++	 */
++	dadao_cfx2rc(DADAO_CFX_CODE_TIMER, DADAO_CG_TIMER,
++		     DADAO_RC_TIMER_MASK, DADAO_MASK_ALL & ~0x1ULL);
++
++	/*
++	 * Register TIMER into irq.c's "permitted when interrupts are on"
++	 * template (the coarse <mode>_global_cfx_mask gate that
++	 * arch_local_irq_save/restore now really toggles).
++	 */
++	dadao_irq_permit_cfx(DADAO_CFX_CODE_TIMER);
++
++	/*
++	 * One-time inner_cfx_mask craft (see traps.c's
++	 * dadao_cfx_craft_inner_mask() for why this needs a real trap/escape
++	 * round trip rather than a plain register write) -- must run after
++	 * trap_init() has already installed a real cfx_smon vector.
+ 	 */
++	dadao_cfx_craft_inner_mask(DADAO_MASK_ALL & ~(1ULL << DADAO_CFX_CODE_TIMER));
++
++	if (clocksource_register_hz(&dadao_clocksource, DADAO_TIMER_HZ))
++		panic("dadao: failed to register cfx_hart_cycle_lo clocksource");
++
++	dadao_clockevent.name = "cfx_timer";
++	dadao_clockevent.features = CLOCK_EVT_FEAT_ONESHOT;
++	dadao_clockevent.rating = 300;
++	dadao_clockevent.set_next_event = dadao_timer_set_next_event;
++	dadao_clockevent.cpumask = cpumask_of(0);
++	clockevents_config_and_register(&dadao_clockevent, DADAO_TIMER_HZ,
++					 DADAO_TIMER_MIN_DELTA,
++					 DADAO_TIMER_MAX_DELTA);
+ }
+ 
+ void __delay(unsigned long loops)
+diff --git a/arch/dadao/kernel/traps.c b/arch/dadao/kernel/traps.c
+index e1ebf2120..ee8de467a 100644
+--- a/arch/dadao/kernel/traps.c
++++ b/arch/dadao/kernel/traps.c
+@@ -3,13 +3,129 @@
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/sched/debug.h>
++#include <linux/stringify.h>
+ 
++#include <asm/dadao-cfx.h>
+ #include <asm/ptrace.h>
+ #include <asm/sections.h>
+ 
++/* entry.S */
++extern void dadao_reentry_guard_init(void);
++extern void dadao_cfx_smon_entry(void);
++extern void dadao_cfx_timer_entry(void);
++
++/* time.c */
++extern void dadao_timer_interrupt(struct pt_regs *regs);
++
++/*
++ * KL-155a: this port's own private opcode-space for self-directed cfx_smon
++ * pseudo-calls (`trap 2, N`, real CFXTRAP dispatch under the cfx-smon-real
++ * profile). Not a syscall ABI -- no user mode exists yet, real syscall
++ * dispatch is KL-156a+ scope -- just the one operation that genuinely needs
++ * a real trap/escape round trip: crafting inner_cfx_mask (see
++ * dadao_cfx_craft_inner_mask() below).
++ */
++#define DADAO_SMON_OP_CRAFT_INNER_MASK	1
++
++static void dadao_die(const char *str, struct pt_regs *regs)
++{
++	pr_emerg("dadao: %s (cause_id=0x%016lx cause_info=0x%016lx pc=0x%016lx)\n",
++		 str, regs->cause_id, regs->cause_info, regs->pc);
++	show_regs(regs);
++	panic("dadao: unhandled CFX exception");
++}
++
++/*
++ * inner_cfx_mask -- the live CPU register that gates cross-cfx async
++ * delivery while Linux runs normally as cfx_smon -- has no direct cfx2rc
++ * write path (contracts/isa/spec.md §8.3/§8.4: only cg2/rc10, the
++ * supv_excp_vector, gained real cfx2rc write support; cg2/rc8-9's
++ * switch_run_mode/switch_cfx_mask remain unimplemented, and inner_cfx_mask
++ * itself is not a per-(cfx,cg,rc) storage register at all). The only way to
++ * change it is the indirection HBI §3's own hypv->supv handoff already
++ * relies on: overwrite the running cfx's OWN excp_prev_cfx_mask frame field
++ * (cg5/rc1, an ordinary storage register), then self-escape -- `escape`'s
++ * step 1 restore installs the just-written value as the new live
++ * inner_cfx_mask (spec.md §8.2 step 1). This issues exactly that as one
++ * self-directed, nonmaskable, synchronous `trap cfx_smon` (CFXTRAP has no
++ * pending/mask state at all, so there is no reentrancy hazard here unlike
++ * the timer's level-triggered async path -- see entry.S's file comment).
++ *
++ * The payload travels in rd16 (this port's first-integer-argument register,
++ * contracts/abi/spec.md / DADAOCallingConv.td CC_DADAO) via a GCC/Clang
++ * local register variable, since `trap`'s ciii encoding has no register
++ * operand of its own to carry a 64-bit value.
++ */
++void dadao_cfx_craft_inner_mask(u64 new_mask)
++{
++	register unsigned long payload asm("rd16") = new_mask;
++
++	asm volatile("trap " __stringify(DADAO_CFX_CODE_SMON) ", "
++		     __stringify(DADAO_SMON_OP_CRAFT_INNER_MASK) "\n\t"
++		     :: "r" (payload) : "memory");
++}
++
++/* Called from entry.S's dadao_cfx_smon_entry after a real cfx_smon trap. */
++void dadao_do_smon_trap(struct pt_regs *regs)
++{
++	unsigned long imm18;
++
++	if (regs->cause_id == DADAO_CAUSE_CFXTRAP) {
++		imm18 = (unsigned long)regs->cause_info & 0x3FFFFUL;
++		if (imm18 == DADAO_SMON_OP_CRAFT_INNER_MASK) {
++			dadao_cfx2rc(DADAO_CFX_CODE_SMON, DADAO_CG_FRAME,
++				     DADAO_RC_PREV_CFX_MASK, regs->rd[16]);
++			return;
++		}
++	}
++
++	/*
++	 * Nothing in this port issues any other cfx_smon trap yet (no user
++	 * mode, no real syscall dispatch -- KL-156a+). Fail loudly and
++	 * visibly rather than silently escaping with an unexamined cause:
++	 * KL-155a's acceptance criteria require that an unexpected
++	 * synchronous exception never look like a silent hang.
++	 */
++	dadao_die("unexpected cfx_smon trap", regs);
++}
++
++/* Called from entry.S's dadao_cfx_timer_entry after a real TIMER async
++ * dispatch. Hardware ack (private+common pending) already happened in
++ * entry.S's prologue, before self-delivery could re-trigger; this is purely
++ * "hand off to the generic clockevent core". */
++void dadao_do_timer_trap(struct pt_regs *regs)
++{
++	if (regs->cause_id != DADAO_CAUSE_TIMER) {
++		dadao_die("unexpected cfx_timer trap", regs);
++		return;
++	}
++
++	dadao_timer_interrupt(regs);
++}
++
+ void __init trap_init(void)
+ {
+-	/* CFX exception vectors are installed by the later Linux trap task. */
++	/*
++	 * Strictly before anything ever unmasks TIMER (time_init() runs
++	 * later in start_kernel()): see entry.S's file comment for why this
++	 * one-time preload, and only this preload, may safely take more
++	 * than one instruction to construct.
++	 */
++	dadao_reentry_guard_init();
++
++	/*
++	 * Real CFX exception vectors (contracts/isa/spec.md §8: every
++	 * cfxcode has its own supv_excp_vector, cg2/rc10 -- KL-131a's async
++	 * dispatch enters via the PENDING SOURCE's own cfxcode, not
++	 * unconditionally through cfx_smon, so cfx_timer needs its own real
++	 * vector here too, not just cfx_smon's). Both point at the same
++	 * save/dispatch/restore/escape shape in entry.S, just with a
++	 * different static cfxcode and a different C dispatch function.
++	 */
++	dadao_cfx2rc(DADAO_CFX_CODE_SMON, DADAO_CG_VECTOR, DADAO_RC_EXCP_VECTOR,
++		     (u64)(unsigned long)dadao_cfx_smon_entry);
++	dadao_cfx2rc(DADAO_CFX_CODE_TIMER, DADAO_CG_VECTOR, DADAO_RC_EXCP_VECTOR,
++		     (u64)(unsigned long)dadao_cfx_timer_entry);
+ }
+ 
+ void show_regs(struct pt_regs *regs)
+-- 
+2.43.0
+
