@@ -543,3 +543,34 @@
   # indirect/sret convention, since they are genuinely different sizes of
   # problem).
 
+- id: dadao-inline-asm-operand-printer-empty-substitution
+  title: "C inline asm with operand substitution (%0/%1/... for both \"i\" immediate and \"r\" register constraints) prints EMPTY text for every substituted operand (e.g. `cfx2rc , , , ` instead of `cfx2rc 18, 2, 11, rd5`) -- DADAO's AsmPrinter has never had its inline-asm operand-printing path exercised before (every existing .S file uses hand-written literal instructions, no C inline asm with real operand substitution previously existed in-tree)"
+  status: open
+  scope: [codegen, inline-asm, toolchain]
+  blocks: "any future C code wanting inline asm with real operand substitution on this target; would also block a real fix for the K3 CFX2RD_RAW-style raw-encoding workarounds if someone wanted to replace them with substituted inline asm instead of literal .4byte words"
+  resolved_by: null
+  # KL-155a (2026-07-31) hit this while first implementing dadao_cfx2rc()/
+  # dadao_cfx2rd() as C inline asm helpers for arch/dadao's new real trap
+  # entry (entry.S timer/smon vectors) + irq.c hardware-mask driving. Both
+  # "i" (immediate) and "r" (register) constraints produced identical empty
+  # substitution -- confirmed via disassembly, not just source inspection.
+  # A second, narrower -O0-specific issue compounds this: Clang at -O0 does
+  # not reliably fold literal constants through function-argument boundaries
+  # into "i" constraints even when the wrapper is __always_inline, so even a
+  # working operand printer would need call-site-local macros rather than a
+  # single reusable inline-asm function for this project's KCFLAGS=-O0
+  # constraint.
+  #
+  # Worked around, not fixed: dadao_cfx2rc()/dadao_cfx2rd()
+  # (arch/dadao/include/asm/dadao-cfx.h) are preprocessor macros using
+  # __stringify() to splice cfxcode/cg/rc directly into the asm string
+  # (bypassing operand substitution entirely), with register operands moved
+  # through a fixed named-register-variable convention (register asm("rdN")
+  # locals) already established by dadao_cfx_craft_inner_mask()'s pre-KL-155a
+  # use of the same trick. This is a real, durable AsmPrinter gap independent
+  # of the workaround's existence -- registered here rather than fixed
+  # in-task since KL-155a's scope was the trap/timer wiring, not backend
+  # inline-asm printing; recommend a dedicated follow-up if inline asm with
+  # substituted operands is needed for real (e.g. if the raw .4byte
+  # CFX2RD_RAW/head.S encoding convention is ever revisited).
+
