@@ -64,3 +64,18 @@ task's saved context (trap frame overlaps the switch frame on the stack);
 the switch is now a masked critical section. The next honest wall is the
 VFS root-mount panic (no rootfs on the dadao-m1 machine). See
 `code-agent/tasks/KL-156a-k3-real-fork-and-context-switch.md`.
+
+KL-157a (patch 0035) bypasses the root-mount wall. Precise diagnosis: the
+boot reached prepare_namespace() and panicked "VFS: Unable to mount root fs
+on unknown-block(0,0)" because there was NO mountable root (no root=, no
+external initrd, and the built-in initramfs had no /init -- the rootfs
+fallback requires /init to EXIST). Fix: an empty placeholder /init in the
+built-in initramfs (arch/dadao/initramfs.list + initramfs/init) makes
+ksys_access("/init") succeed, so prepare_namespace() is skipped and the
+initial rootfs IS the root. arch/dadao/Makefile mirrors the initramfs
+source into the objtree during prepare (cmd_initfs resolves
+CONFIG_INITRAMFS_SOURCE against the objtree, breaking fresh O= builds
+otherwise). The next honest wall: run_init_process("/init") enters the
+exec/mm machinery and hits the fail-closed local_flush_tlb_all() BUG
+(the cfx_tlb range-invalidate milestone). See
+`code-agent/tasks/KL-157a-k3-vfs-root-mount-wall-diagnosis.md`.

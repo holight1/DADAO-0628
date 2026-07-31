@@ -1,0 +1,206 @@
+From ae32e45d19de107635fa24c55692af09ca92ed49 Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 31 Jul 2026 19:47:50 +0800
+Subject: [PATCH] dadao: bypass root-mount wall via empty built-in initramfs
+ /init (KL-157a)
+
+Precise diagnosis (this task's goal 1): the boot reached
+prepare_namespace() and panicked at 'VFS: Unable to mount root fs on
+unknown-block(0,0)' because there was NO mountable root: no root=
+parameter (ROOT_DEV stays 0), no external initrd, and the built-in
+initramfs (default dev/console/root only) contained no /init -- so
+kernel_init_freeable()'s ksys_access(ramdisk_execute_command, 0) failed,
+prepare_namespace() ran mount_root(), and mounting device 0:0 cannot
+succeed without a block device driver (out of scope). The empty
+initramfs alone does NOT engage the rootfs fallback: the fallback
+mechanism requires /init to EXIST in the rootfs.
+
+Minimal fix (goal 2): a placeholder (empty) /init in the built-in
+initramfs. ksys_access("/init") then succeeds, prepare_namespace() is
+skipped, and the initial rootfs IS the root -- the standard
+initramfs-as-root path, no block device and no real user program.
+
+- arch/dadao/initramfs.list + arch/dadao/initramfs/init (empty, 0755):
+  the built-in initramfs source (default dev/console/root + /init).
+- arch/dadao/configs/dadao_defconfig: CONFIG_INITRAMFS_SOURCE points at
+  it (uid/gid 0); CONFIG_CMDLINE drops the now-unneeded init=/init so
+  the anticipated next wall ('No working init found') is reachable once
+  the exec wall below is crossed.
+- arch/dadao/Makefile: kbuild's cmd_initfs resolves
+  CONFIG_INITRAMFS_SOURCE against the OBJTREE, so a fresh O= build
+  cannot see the source-tree initramfs; mirror the source into the
+  objtree during prepare (verified with a truly fresh objtree).
+- init/main.c + dadao-m1.h: CONFIG_DADAO_M1_PROGRESS markers
+  ROOTFS_FALLBACK (prepare_namespace skipped => root mount wall gone,
+  direct evidence not console inference), INIT_EXEC (the kernel reached
+  the exec of the init process), and NO_WORKING_INIT (future marker for
+  the anticipated next wall).
+
+Honest next wall (goal 3): run_init_process("/init") now runs and the
+exec/mm machinery hits the fail-closed BUG at
+arch/dadao/include/asm/tlbflush.h local_flush_tlb_all() -- empirically
+confirmed (temp diagnostic) to be the mmu_gather flush during
+exit_mmap() tearing down the fresh exec mm after the empty file fails
+the ELF check. That is the cfx_tlb range-invalidate milestone, a
+documented later K3 milestone, so 'No working init found' is NOT yet
+reachable. Observed via ROOTFS_FALLBACK + INIT_EXEC markers and the
+console 'Run /init as init process' + BUG/panic lines.
+---
+ arch/dadao/Makefile                | 19 +++++++++++++++++++
+ arch/dadao/configs/dadao_defconfig |  4 ++++
+ arch/dadao/include/asm/dadao-m1.h  | 16 ++++++++++++++++
+ arch/dadao/initramfs.list          |  4 ++++
+ arch/dadao/initramfs/init          |  0
+ init/main.c                        | 24 ++++++++++++++++++++++++
+ 6 files changed, 67 insertions(+)
+ create mode 100644 arch/dadao/initramfs.list
+ create mode 100755 arch/dadao/initramfs/init
+
+diff --git a/arch/dadao/Makefile b/arch/dadao/Makefile
+index 7b701054e..f91f9e1c6 100644
+--- a/arch/dadao/Makefile
++++ b/arch/dadao/Makefile
+@@ -21,6 +21,25 @@ Image: vmlinux
+ archclean:
+ 	$(Q)$(MAKE) $(clean)=$(boot)
+ 
++# KL-157a: kbuild's cmd_initfs resolves CONFIG_INITRAMFS_SOURCE relative to
++# the objtree, but the built-in initramfs source lives in the source tree.
++# Mirror it into the objtree during prepare (before usr/ builds the cpio
++# archive) so fresh O= builds find it. abs_objtree/abs_srctree are defined
++# before arch/$(SRCARCH)/Makefile is included and agree across the O= make
++# re-exec. Gate on O= (objtree != srctree): in-tree the paths coincide, so
++# the copy rule would be a self-dependency (target == its own prerequisite),
++# which GNU make resolves by dropping the cycle but still running the recipe
++# -- a same-file `cp` that fails.
++ifneq ($(abs_objtree),$(abs_srctree))
++$(abs_objtree)/arch/dadao/initramfs.list: $(abs_srctree)/arch/dadao/initramfs.list \
++					   $(abs_srctree)/arch/dadao/initramfs/init
++	$(Q)mkdir -p $(dir $@)/initramfs
++	$(Q)cp $(abs_srctree)/arch/dadao/initramfs.list $@
++	$(Q)cp $(abs_srctree)/arch/dadao/initramfs/init $(dir $@)/initramfs/init
++
++prepare: $(abs_objtree)/arch/dadao/initramfs.list
++endif
++
+ define archhelp
+   echo  '  Image        - Uncompressed DADAO M1 kernel image'
+ endef
+diff --git a/arch/dadao/configs/dadao_defconfig b/arch/dadao/configs/dadao_defconfig
+index bc90a1c28..237ae3a92 100644
+--- a/arch/dadao/configs/dadao_defconfig
++++ b/arch/dadao/configs/dadao_defconfig
+@@ -4,6 +4,9 @@ CONFIG_HIGH_RES_TIMERS=y
+ CONFIG_IKCONFIG=y
+ CONFIG_IKCONFIG_PROC=y
+ CONFIG_BLK_DEV_INITRD=y
++CONFIG_INITRAMFS_SOURCE="arch/dadao/initramfs.list"
++CONFIG_INITRAMFS_ROOT_UID=0
++CONFIG_INITRAMFS_ROOT_GID=0
+ CONFIG_BINFMT_ELF=y
+ CONFIG_DEVTMPFS=y
+ CONFIG_DEVTMPFS_MOUNT=y
+@@ -16,6 +19,7 @@ CONFIG_EXPERT=y
+ CONFIG_DADAO_K3_EARLY_MARKER=y
+ CONFIG_DADAO_M1_PROGRESS=y
+ CONFIG_DADAO_M1_DEBUG_CONSOLE=y
++CONFIG_CMDLINE="console=dadao0 panic=-1"
+ # CONFIG_KALLSYMS is not set
+ # CONFIG_SMP is not set
+ # CONFIG_MODULES is not set
+diff --git a/arch/dadao/include/asm/dadao-m1.h b/arch/dadao/include/asm/dadao-m1.h
+index d662c328f..c68da51d8 100644
+--- a/arch/dadao/include/asm/dadao-m1.h
++++ b/arch/dadao/include/asm/dadao-m1.h
+@@ -98,10 +98,26 @@
+ #define DADAO_M1_PROGRESS_SWITCH_TO_IDLE		0x87fd00c8UL
+ #define DADAO_M1_PROGRESS_SWITCH_COUNT			0x87fd00d0UL
+ 
++/*
++ * KL-157a: root-mount wall bypass + next-wall evidence (next free offsets
++ * +0xd8/+0xe0). ROOTFS_FALLBACK fires when /init exists in the built-in
++ * initramfs so kernel_init_freeable() skips prepare_namespace() entirely --
++ * direct proof the previous "Unable to mount root fs" wall is gone and the
++ * initial rootfs IS the root. NO_WORKING_INIT fires immediately before the
++ * "No working init found" panic (the expected next wall: no userspace, no
++ * exec/syscall support yet).
++ */
++#define DADAO_M1_PROGRESS_ROOTFS_FALLBACK		0x87fd00d8UL
++#define DADAO_M1_PROGRESS_NO_WORKING_INIT		0x87fd00e0UL
++#define DADAO_M1_PROGRESS_INIT_EXEC			0x87fd00e8UL
++
+ #define DADAO_M1_PROGRESS_ROOT_MOUNT_ATTEMPT_VALUE	0x4b4c313536524d41ULL /* KL156RMA */
+ #define DADAO_M1_PROGRESS_EXEC_INIT_ATTEMPT_VALUE	0x4b4c313536494558ULL /* KL156IEX */
+ #define DADAO_M1_PROGRESS_SWITCH_FROM_IDLE_VALUE	0x4b4c313536534649ULL /* KL156SFI */
+ #define DADAO_M1_PROGRESS_SWITCH_TO_IDLE_VALUE		0x4b4c313536535449ULL /* KL156STI */
++#define DADAO_M1_PROGRESS_ROOTFS_FALLBACK_VALUE		0x4b4c313537524642ULL /* KL157RFB */
++#define DADAO_M1_PROGRESS_NO_WORKING_INIT_VALUE		0x4b4c3135374e5749ULL /* KL157NWI */
++#define DADAO_M1_PROGRESS_INIT_EXEC_VALUE		0x4b4c313537584543ULL /* KL157XEC */
+ 
+ static inline void dadao_m1_progress_write(unsigned long address, u64 value)
+ {
+diff --git a/arch/dadao/initramfs.list b/arch/dadao/initramfs.list
+new file mode 100644
+index 000000000..73915c70d
+--- /dev/null
++++ b/arch/dadao/initramfs.list
+@@ -0,0 +1,4 @@
++dir /dev 0755 0 0
++nod /dev/console 0600 0 0 c 5 1
++dir /root 0700 0 0
++file /init arch/dadao/initramfs/init 0755 0 0
+diff --git a/arch/dadao/initramfs/init b/arch/dadao/initramfs/init
+new file mode 100755
+index 000000000..e69de29bb
+diff --git a/init/main.c b/init/main.c
+index 042b5a05d..80f8d11b3 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1199,6 +1199,15 @@ static int __ref kernel_init(void *unused)
+ 
+ 	rcu_end_inkernel_boot();
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	/* KL-157a: the kernel reached the point of exec'ing the init process
++	 * (past the root-mount wall). What happens next is the honest next
++	 * wall -- on this port the exec/mm machinery hits the fail-closed
++	 * local_flush_tlb_all() BUG (the cfx_tlb milestone), observed via
++	 * console. */
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_INIT_EXEC,
++				DADAO_M1_PROGRESS_INIT_EXEC_VALUE);
++#endif
+ 	if (ramdisk_execute_command) {
+ 		ret = run_init_process(ramdisk_execute_command);
+ 		if (!ret)
+@@ -1233,6 +1242,12 @@ static int __ref kernel_init(void *unused)
+ 	    !try_to_run_init_process("/bin/sh"))
+ 		return 0;
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	/* KL-157a: the expected next wall -- rootfs is mounted/usable but no
++	 * executable init exists and there is no userspace at all yet. */
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_NO_WORKING_INIT,
++				DADAO_M1_PROGRESS_NO_WORKING_INIT_VALUE);
++#endif
+ 	panic("No working init found.  Try passing init= option to kernel. "
+ 	      "See Linux Documentation/admin-guide/init.rst for guidance.");
+ }
+@@ -1299,6 +1314,15 @@ static noinline void __init kernel_init_freeable(void)
+ 		ramdisk_execute_command = NULL;
+ 		prepare_namespace();
+ 	}
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	/* KL-157a: /init exists in the built-in rootfs, so prepare_namespace()
++	 * was skipped and the initial rootfs IS the root -- direct evidence the
++	 * previous "Unable to mount root fs" wall is bypassed (not console
++	 * inference). */
++	if (ramdisk_execute_command)
++		dadao_m1_progress_write(DADAO_M1_PROGRESS_ROOTFS_FALLBACK,
++					DADAO_M1_PROGRESS_ROOTFS_FALLBACK_VALUE);
++#endif
+ 
+ 	/*
+ 	 * Ok, we have completed the initial bootup, and
+-- 
+2.43.0
+

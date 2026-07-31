@@ -2576,3 +2576,28 @@ global CFX delivery across the switch (local_irq_save/restore). The next
 honest wall: the VFS root-mount panic (`prepare_namespace` on a machine
 with no root filesystem), observed via ROOT_MOUNT_ATTEMPT marker. See
 `code-agent/tasks/KL-156a-k3-real-fork-and-context-switch.md`.
+
+### KL-157a: K3 VFS root-mount wall bypass + next-wall diagnosis
+
+Precise diagnosis of the KL-156a-frozen "Unable to mount root fs on
+unknown-block(0,0)" panic: there is no mountable root at all -- no `root=`
+(ROOT_DEV stays 0), no external initrd, and the built-in initramfs (default
+dev/console/root only) has no `/init`, so kernel_init_freeable()'s
+`ksys_access(ramdisk_execute_command)` fails and prepare_namespace() runs
+mount_root() against device 0:0 (a block device driver would be required,
+explicitly out of scope). Notably the empty initramfs does NOT engage the
+rootfs fallback -- the mechanism requires `/init` to exist. Minimal fix: an
+empty placeholder `/init` in the built-in initramfs
+(`arch/dadao/initramfs.list` + `initramfs/init`); ksys_access succeeds,
+prepare_namespace() is skipped, and the initial rootfs IS the root (the
+standard initramfs-as-root path). `arch/dadao/Makefile` mirrors the
+initramfs source into the objtree during prepare because kbuild's
+cmd_initfs resolves CONFIG_INITRAMFS_SOURCE against the objtree. Next honest
+wall (precisely diagnosed): `run_init_process("/init")` now runs, and the
+exec/mm machinery hits the fail-closed `local_flush_tlb_all()` BUG -- the
+mmu_gather flush in exit_mmap() while tearing down the fresh exec mm after
+the empty file fails the ELF check; that is the cfx_tlb range-invalidate
+milestone (documented later K3 work), so "No working init found" is not yet
+reachable. ROOTFS_FALLBACK + INIT_EXEC markers fire; NO_WORKING_INIT does
+not (reserved for when the cfx_tlb wall is crossed). See
+`code-agent/tasks/KL-157a-k3-vfs-root-mount-wall-diagnosis.md`.
