@@ -32,3 +32,4 @@
 0031-dadao-remove-additional-K3-O0-bool-carrier-workarounds.patch
 0032-dadao-add-KL-154a-post-mm_init-boot-progress-markers.patch
 0033-dadao-add-KL-155a-real-cfx-trap-vector-and-timer-clockevent.patch
+0034-dadao-add-KL-156a-real-fork-and-context-switch.patch

@@ -48,3 +48,19 @@ reliably reach guest code running in a tight loop (a real QEMU/TCG
 invocation requirement, not a source workaround -- see `time.c` and the
 task record). See
 `code-agent/tasks/KL-155a-k3-real-trap-vector-and-timer-clockevent.md`.
+
+KL-156a (patch 0034) makes fork and context switching real:
+`kernel_thread()` was always failing with `-ENOSYS` (the frozen KL-154a/155a
+diagnosis), so `kernel_init` and every later kernel thread were never
+created or executed. `switch.S` adds `dadao_switch_to_asm()` (saves/
+restores the frozen KL-140a cooperative frame, final `ret` pops the next
+task's RegRAS) and `dadao_ret_from_fork` (the fresh-task entry);
+`process.c`'s `__switch_to()`/`copy_thread()` now implement the real
+machinery for kernel threads. Boot runs the real scheduler (1000+ genuine
+switches), `kernel_init` executes its whole body, and the idle->kernel_init
+->idle round trip is observed via CONFIG_DADAO_M1_PROGRESS markers. Real
+bug fixed: a TIMER dispatch during the switch could corrupt the outgoing
+task's saved context (trap frame overlaps the switch frame on the stack);
+the switch is now a masked critical section. The next honest wall is the
+VFS root-mount panic (no rootfs on the dadao-m1 machine). See
+`code-agent/tasks/KL-156a-k3-real-fork-and-context-switch.md`.

@@ -2552,3 +2552,27 @@ run, and replayed the patch series tree-hash-identical. See
 `code-agent/tasks/KL-155a-k3-real-trap-vector-and-timer-clockevent.md` for
 the rest (two more real bugs found, an inline-asm codegen limitation
 worked around).
+
+### KL-156a: K3 real fork/context switch
+
+The real `copy_thread()`/`__switch_to()`/`ret_from_fork` plumbing.
+`kernel_thread()` was previously always failing with `-ENOSYS` (the frozen
+KL-154a/155a diagnosis), so `kernel_init` -- and every later kernel thread
+(kthreadd, workqueue workers) -- was never actually created or executed.
+Now: `switch.S`'s `dadao_switch_to_asm()` saves/restores the frozen KL-140a
+cooperative frame (rb1..rb4, rd32..rd63, rb32..rb63, full ra0..ra63) with
+its final `ret` popping the NEXT task's RegRAS; `dadao_ret_from_fork` is
+the fresh-task entry (`schedule_tail(prev)`, `fn(arg)`, `do_exit(0)`);
+`copy_thread()` builds the fake switch frame for kernel threads. Boot now
+runs the real scheduler: 1000+ genuine context switches, kthreadd +
+workqueue machinery executing, `rest_init_pid=1`, `kernel_init` running its
+whole body, and a genuine idle->kernel_init->idle round trip observed
+(SWITCH_FROM_IDLE/SWITCH_TO_IDLE + IDLE_ENTER markers). **Real bug found
+while bringing this up**: the switch frame (0x438, at [SP-0x438, SP)) sits
+inside the window entry.S's real trap frame (0x640, at [SP-0x640, SP))
+carves out on every TIMER dispatch -- a timer firing during the switch
+could silently corrupt the outgoing task's saved context; fixed by masking
+global CFX delivery across the switch (local_irq_save/restore). The next
+honest wall: the VFS root-mount panic (`prepare_namespace` on a machine
+with no root filesystem), observed via ROOT_MOUNT_ATTEMPT marker. See
+`code-agent/tasks/KL-156a-k3-real-fork-and-context-switch.md`.

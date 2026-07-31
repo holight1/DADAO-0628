@@ -1,0 +1,486 @@
+From 78601a1d2996788d1036b09a55e62784e523d89b Mon Sep 17 00:00:00 2001
+From: suiyan <suiyan@sunmmio.com>
+Date: Fri, 31 Jul 2026 15:42:25 +0800
+Subject: [PATCH] dadao: real fork/context switch
+ (copy_thread/__switch_to/ret_from_fork) (KL-156a)
+
+kernel_thread() previously always failed (-ENOSYS) because
+arch/dadao/kernel/process.c had no real copy_thread()/__switch_to();
+kernel_init (and kthreadd, kworkers, every later kernel thread) was
+never actually created or executed. This implements the real fork and
+context-switch plumbing:
+
+- switch.S (new): dadao_switch_to_asm() saves/restores the frozen
+  KL-140a cooperative frame (rb1..rb4, rd32..rd63, rb32..rb63, full
+  ra0..ra63 via the ldmo-ra/stmo-ra contract) between kernel stacks,
+  with its final ret popping the NEXT task's RegRAS; dadao_ret_from_fork
+  is the fresh-task entry (schedule_tail(prev), fn(arg), do_exit(0)).
+- process.c: __switch_to() is a C wrapper (WRITE_ONCE current, mask
+  global CFX delivery across the switch, call the asm helper, return
+  prev); copy_thread() builds the fake switch frame for kernel threads
+  (fn/arg ride in frame words w0/w1, ra63 points at ret_from_fork).
+- asm-offsets.c: THREAD_KERNEL_SP_OFFSET for switch.S.
+- init/main.c + dadao-m1.h: CONFIG_DADAO_M1_PROGRESS markers observing
+  the idle->kernel_init round trip (SWITCH_FROM_IDLE/SWITCH_TO_IDLE),
+  a diagnostic yield that lets the scheduler genuinely run the boot/idle
+  task again, and how-far markers (ROOT_MOUNT_ATTEMPT/EXEC_INIT_ATTEMPT).
+
+Real bug found and fixed while bringing this up: the switch frame
+(0x438) lives at [SP-0x438, SP) on the current kernel stack, exactly
+inside the window entry.S's real trap frame (0x640) carves out on every
+TIMER dispatch -- a timer firing during the switch's save could silently
+corrupt the outgoing task's saved context. The switch is therefore a
+masked critical section (local_irq_save/restore); a pending TIMER stays
+latched and delivers immediately after the unmask.
+
+Boot now reaches kernel_init and the real scheduler: 1000+ genuine
+context switches, kthreadd/workqueue machinery running, then the next
+honest wall (VFS root mount panic, no userspace on the dadao-m1 machine).
+---
+ arch/dadao/include/asm/dadao-m1.h     |  22 +++++
+ arch/dadao/include/asm/dadao-switch.h |  35 ++++++++
+ arch/dadao/kernel/Makefile            |   2 +-
+ arch/dadao/kernel/asm-offsets.c       |  13 ++-
+ arch/dadao/kernel/process.c           | 103 ++++++++++++++++++++-
+ arch/dadao/kernel/switch.S            | 124 ++++++++++++++++++++++++++
+ init/main.c                           |  28 ++++++
+ 7 files changed, 319 insertions(+), 8 deletions(-)
+ create mode 100644 arch/dadao/include/asm/dadao-switch.h
+ create mode 100644 arch/dadao/kernel/switch.S
+
+diff --git a/arch/dadao/include/asm/dadao-m1.h b/arch/dadao/include/asm/dadao-m1.h
+index 9e47acc55..d662c328f 100644
+--- a/arch/dadao/include/asm/dadao-m1.h
++++ b/arch/dadao/include/asm/dadao-m1.h
+@@ -81,6 +81,28 @@
+  */
+ #define DADAO_M1_PROGRESS_TIMER_IRQ_COUNT		0x87fd00a8UL
+ 
++/*
++ * KL-156a: real fork/context-switch evidence (next free offsets
++ * +0xb0..+0xd0). Four ASCII-magic words + one raw incrementing counter.
++ * SWITCH_FROM_IDLE / SWITCH_TO_IDLE are written by __switch_to() when it
++ * sees prev==init_task / next==init_task -- direct proof the boot/idle
++ * context was switched away from and later switched back to. SWITCH_COUNT
++ * is a raw count of every real __switch_to() invocation. ROOT_MOUNT_ATTEMPT
++ * is the last healthy boot point (the root-mount wall is the next failure
++ * this port hits); EXEC_INIT_ATTEMPT documents the intended next stage
++ * after that wall is crossed.
++ */
++#define DADAO_M1_PROGRESS_ROOT_MOUNT_ATTEMPT		0x87fd00b0UL
++#define DADAO_M1_PROGRESS_EXEC_INIT_ATTEMPT		0x87fd00b8UL
++#define DADAO_M1_PROGRESS_SWITCH_FROM_IDLE		0x87fd00c0UL
++#define DADAO_M1_PROGRESS_SWITCH_TO_IDLE		0x87fd00c8UL
++#define DADAO_M1_PROGRESS_SWITCH_COUNT			0x87fd00d0UL
++
++#define DADAO_M1_PROGRESS_ROOT_MOUNT_ATTEMPT_VALUE	0x4b4c313536524d41ULL /* KL156RMA */
++#define DADAO_M1_PROGRESS_EXEC_INIT_ATTEMPT_VALUE	0x4b4c313536494558ULL /* KL156IEX */
++#define DADAO_M1_PROGRESS_SWITCH_FROM_IDLE_VALUE	0x4b4c313536534649ULL /* KL156SFI */
++#define DADAO_M1_PROGRESS_SWITCH_TO_IDLE_VALUE		0x4b4c313536535449ULL /* KL156STI */
++
+ static inline void dadao_m1_progress_write(unsigned long address, u64 value)
+ {
+ 	*(volatile u64 *)address = value;
+diff --git a/arch/dadao/include/asm/dadao-switch.h b/arch/dadao/include/asm/dadao-switch.h
+new file mode 100644
+index 000000000..831064533
+--- /dev/null
++++ b/arch/dadao/include/asm/dadao-switch.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_DADAO_SWITCH_H
++#define _ASM_DADAO_SWITCH_H
++
++/*
++ * KL-156a: kernel context-switch frame constants.
++ *
++ * Byte-for-byte the KL-140a §2.1 cooperative task frame (135 words = 0x438
++ * = 1080 bytes), minus the bare-metal probe's resume_pc/asid/ptbr fields:
++ * those three words (w0/w1/w2) are padding here, and copy_thread()'s fake
++ * frame reuses w0/w1 to carry the kernel thread's fn/arg to ret_from_fork.
++ * Shared between the assembly switch primitive (switch.S) and the C side
++ * (process.c), so the two can never drift apart.
++ *
++ * | offset | field                      | offset | field         |
++ * |-------:|----------------------------|-------:|---------------|
++ * |   0x000| w0 (fake frame: fn)        |   0x138| rb32..rb63    |
++ * |   0x008| w1 (fake frame: arg)       |   0x238| ra0..ra62     |
++ * |   0x010| w2 (unused)                |   0x430| ra63          |
++ * |   0x018| rb1 (SP)  0x020 rb2        |   0x438| end           |
++ * |   0x028| rb3       0x030 rb4        |         |               |
++ */
++#define DADAO_SWITCH_FRAME_SIZE	0x438
++#define DADAO_SWITCH_FN_OFF	0x000
++#define DADAO_SWITCH_ARG_OFF	0x008
++#define DADAO_SWITCH_RB1_OFF	0x018
++#define DADAO_SWITCH_RB2_OFF	0x020
++#define DADAO_SWITCH_RB3_OFF	0x028
++#define DADAO_SWITCH_RB4_OFF	0x030
++#define DADAO_SWITCH_RD_BASE	0x038
++#define DADAO_SWITCH_RB32_BASE	0x138
++#define DADAO_SWITCH_RA_BASE	0x238
++#define DADAO_SWITCH_RA63_OFF	0x430
++
++#endif /* _ASM_DADAO_SWITCH_H */
+diff --git a/arch/dadao/kernel/Makefile b/arch/dadao/kernel/Makefile
+index 34420c08b..fd20a5782 100644
+--- a/arch/dadao/kernel/Makefile
++++ b/arch/dadao/kernel/Makefile
+@@ -2,5 +2,5 @@
+ 
+ extra-y := head.o vmlinux.lds
+ 
+-obj-y := setup.o process.o ptrace.o traps.o irq.o time.o entry.o
++obj-y := setup.o process.o ptrace.o traps.o irq.o time.o entry.o switch.o
+ obj-$(CONFIG_DADAO_M1_DEBUG_CONSOLE) += early-console.o
+diff --git a/arch/dadao/kernel/asm-offsets.c b/arch/dadao/kernel/asm-offsets.c
+index c2d5a3be4..7b6baa8d2 100644
+--- a/arch/dadao/kernel/asm-offsets.c
++++ b/arch/dadao/kernel/asm-offsets.c
+@@ -1,12 +1,19 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/kbuild.h>
++#include <linux/sched.h>
+ 
+ int main(void)
+ {
+ 	/*
+-	 * KL-148a only establishes the generic-C compile substrate.  Context
+-	 * switch and trap assembly add their consumed offsets with those
+-	 * implementations, so this deliberately emits no speculative ABI.
++	 * KL-156a: offsets consumed by arch/dadao/kernel/switch.S's
++	 * dadao_switch_to_asm (storing/loading thread.kernel_sp). Split into
++	 * two 16-bit halves because the DADAO constant-assignment idiom is
++	 * per-16-bit-quarter (setzw/orw); the full offset is well under
++	 * 32 bits for any task_struct on this port.
+ 	 */
++	DEFINE(THREAD_KERNEL_SP_OFFSET_LO,
++	       offsetof(struct task_struct, thread.kernel_sp) & 0xFFFF);
++	DEFINE(THREAD_KERNEL_SP_OFFSET_HI,
++	       offsetof(struct task_struct, thread.kernel_sp) >> 16);
+ 	return 0;
+ }
+diff --git a/arch/dadao/kernel/process.c b/arch/dadao/kernel/process.c
+index d75f9190d..2f0102cd6 100644
+--- a/arch/dadao/kernel/process.c
++++ b/arch/dadao/kernel/process.c
+@@ -2,15 +2,25 @@
+ 
+ #include <linux/errno.h>
+ #include <linux/init_task.h>
++#include <linux/irqflags.h>
+ #include <linux/kernel.h>
+ #include <linux/reboot.h>
+ #include <linux/sched.h>
+ #include <linux/sched/debug.h>
+ #include <linux/sched/task_stack.h>
+ 
++#ifdef CONFIG_DADAO_M1_PROGRESS
++#include <asm/dadao-m1.h>
++#endif
++#include <asm/dadao-switch.h>
+ #include <asm/processor.h>
+ #include <asm/ptrace.h>
+ 
++/* switch.S */
++extern void dadao_switch_to_asm(struct task_struct *prev,
++				struct task_struct *next);
++extern void dadao_ret_from_fork(void);
++
+ void start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)
+ {
+ 	memset(regs, 0, sizeof(*regs));
+@@ -31,18 +41,103 @@ unsigned long get_wchan(struct task_struct *task)
+ int copy_thread(unsigned long clone_flags, unsigned long usp,
+ 		unsigned long arg, struct task_struct *task)
+ {
++	unsigned long sp;
++	unsigned long *frame;
++
+ 	/*
+-	 * Context creation is intentionally fail-closed until the assembly
+-	 * ret_from_fork path exists; callers receive an honest error.
++	 * KL-156a: kernel threads only -- the ONLY fork path K3 has today
++	 * (kernel_thread()/kthreadd; no user mode, no syscall dispatch, no
++	 * signal handling, so no real pt_regs round-trip exists yet).
++	 * Userspace fork is explicitly out of scope and stays fail-closed
++	 * rather than silently trusting an unverified path.
+ 	 */
+-	return -ENOSYS;
++	if (!(task->flags & PF_KTHREAD))
++		return -ENOSYS;
++
++	/*
++	 * Fake __switch_to() save frame, carved below the top of the new
++	 * task's kernel stack, shaped exactly like the frame
++	 * dadao_switch_to_asm() saves/restores (dadao-switch.h). When the
++	 * scheduler first switches this task in, the restore path loads
++	 * these fields and the final `ret` pops the frame's ra63 -- planted
++	 * here as dadao_ret_from_fork -- so the new task starts running at
++	 * ret_from_fork with rb1 = frame_base + FRAME_SIZE.
++	 */
++	sp = (unsigned long)task_stack_page(task) + THREAD_SIZE;
++	frame = (unsigned long *)(sp - DADAO_SWITCH_FRAME_SIZE);
++	memset(frame, 0, DADAO_SWITCH_FRAME_SIZE);
++
++	/* fn and arg ride in the otherwise-unused w0/w1 frame words */
++	frame[DADAO_SWITCH_FN_OFF / 8] = usp;		/* fn */
++	frame[DADAO_SWITCH_ARG_OFF / 8] = arg;		/* arg */
++
++	frame[DADAO_SWITCH_RB1_OFF / 8] = sp;		/* resumed SP */
++	/* rb2/rb3/rb4, rd32-63, rb32-63 already zero via memset */
++
++	/* fake RegRAS: refcount=1, address = ret_from_fork (contracts/
++	 * isa/spec.md §5.6: ret requires the top slot's refcount >= 1) */
++	frame[DADAO_SWITCH_RA63_OFF / 8] =
++		(1UL << 48) | (unsigned long)dadao_ret_from_fork;
++
++	task->thread.kernel_sp = (unsigned long)frame;
++	return 0;
+ }
+ 
+ struct task_struct *__switch_to(struct task_struct *prev,
+ 				struct task_struct *next)
+ {
+-	BUG_ON(prev != next);
++	unsigned long flags;
++
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	/* Direct round-trip evidence: the boot/idle context (init_task) was
++	 * switched away from and, later, switched back to. */
++	if (prev == &init_task)
++		dadao_m1_progress_write(DADAO_M1_PROGRESS_SWITCH_FROM_IDLE,
++					DADAO_M1_PROGRESS_SWITCH_FROM_IDLE_VALUE);
++	if (next == &init_task)
++		dadao_m1_progress_write(DADAO_M1_PROGRESS_SWITCH_TO_IDLE,
++					DADAO_M1_PROGRESS_SWITCH_TO_IDLE_VALUE);
++	dadao_m1_progress_increment(DADAO_M1_PROGRESS_SWITCH_COUNT);
++#endif
++
++	/*
++	 * Mask global CFX delivery across the register switch. The switch
++	 * frame (0x438) lives at [SP-0x438, SP) on the current kernel stack,
++	 * exactly inside the window entry.S's real trap frame (0x640) also
++	 * carves out of the stack on every TIMER dispatch: a timer firing
++	 * between the switch's SAVE stores and its SP decrement would
++	 * overwrite part of the just-saved switch frame, silently corrupting
++	 * the outgoing task's saved context (and, during a restore, could
++	 * clobber a partially-restored frame). The few instructions of the
++	 * switch are therefore a masked critical section; any TIMER that
++	 * expires meanwhile stays latched-pending (the K2 cg masks are
++	 * level/latch semantics) and delivers on the very next instruction
++	 * boundary after the unmask below -- no tick is lost. This is a
++	 * Linux-side discipline, not an ISA change.
++	 *
++	 * Synchronous faults are covered by the K2 §1.2 stack-window
++	 * invariant instead of masking: every frame access (both the switch
++	 * frame and any trap frame) stays inside the already-resident
++	 * [SP-0x640, SP) window of the current kernel stack, so a
++	 * PTW/TLB/alignment fault cannot occur mid-switch. The switch body
++	 * itself executes no call/ret, so the RegRAS being transferred is
++	 * never disturbed.
++	 *
++	 * The register transfer itself is assembly (switch.S): its final
++	 * `ret` pops the NEXT task's RegRAS, landing in the exact point where
++	 * next was suspended (or in ret_from_fork for a fresh task). prev is
++	 * spilled to this function's own stack frame by the compiler (rb16 is
++	 * caller-saved), so `return prev` reloads the value THIS invocation
++	 * was called with even after the stack switch.
++	 *
++	 * dadao_current is updated only after the mask is in place (and
++	 * before the stack actually switches), so no TIMER can observe a
++	 * "current is next but the CPU is still on prev's stack" window.
++	 */
++	local_irq_save(flags);
+ 	WRITE_ONCE(dadao_current, next);
++	dadao_switch_to_asm(prev, next);
++	local_irq_restore(flags);
+ 	return prev;
+ }
+ 
+diff --git a/arch/dadao/kernel/switch.S b/arch/dadao/kernel/switch.S
+new file mode 100644
+index 000000000..3fca15354
+--- /dev/null
++++ b/arch/dadao/kernel/switch.S
+@@ -0,0 +1,124 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++/*
++ * KL-156a: real kernel context switch.
++ *
++ * dadao_switch_to_asm(prev, next):
++ *   The register transfer at the heart of __switch_to(). A C function
++ *   cannot move itself onto another thread's stack and then return: the
++ *   save and the restore must both happen in one assembly body whose final
++ *   `ret` pops the NEXT task's RegRAS, "returning" into the exact point
++ *   where next was suspended (its own __switch_to(), or dadao_ret_from_fork
++ *   for a brand-new task whose fake frame copy_thread() built).
++ *
++ *   prev -> rb16, next -> rb17 (contracts/abi/spec.md §2.1: pointers ride
++ *   the RB bank). rb31 is planted with prev before the switch and is the
++ *   ONLY value that survives the restore (rb31 is not part of the saved
++ *   frame) -- dadao_ret_from_fork reads it to call schedule_tail(prev).
++ *
++ *   The frame is saved BELOW the current stack top, then prev->thread.
++ *   kernel_sp is made to point at the new frame base, next->thread.kernel_sp
++ *   becomes rb1, and the frame is restored. rd8/rd9 are the only scratch
++ *   registers (caller-saved, absent from the frame -- the C caller treats
++ *   them as clobbered across this call). No call/ret executes in the save or
++ *   restore body itself: touching the RAS mid-transfer would corrupt it.
++ *
++ * dadao_ret_from_fork:
++ *   The "return" target of a fresh task's first switch-in. rb31 holds prev
++ *   (planted by dadao_switch_to_asm); fn and arg are read from the fake
++ *   frame's w0/w1 words (at (rb1 - FRAME_SIZE) + 0x000/0x008, since the
++ *   restored rb1 is exactly frame_base + FRAME_SIZE) into callee-saved
++ *   registers before schedule_tail() runs (see the function body).
++ *   Kernel threads only -- the user-mode path (restore pt_regs) is out of
++ *   KL-156a scope.
++ */
++
++#include <asm/dadao-switch.h>
++#include <generated/asm-offsets.h>
++
++	.section ".text", "ax"
++
++	.globl dadao_switch_to_asm
++	.type dadao_switch_to_asm, @function
++dadao_switch_to_asm:
++	/* rb31 = prev: survives the restore, feeds ret_from_fork's
++	 * schedule_tail(). rb31 is caller-saved (RB16-31) so clobbering it
++	 * here is ABI-safe for the C caller. */
++	addi rb31, rb16, 0
++
++	/* ---- save prev's context below the current kernel stack top ----
++	 * Offsets below the still-OLD rb1 (frame base = old_rb1 - 0x438):
++	 * rd32..rd63 at (0x038 + (n-32)*8) - 0x438 = n*8 - 0x500,
++	 * rb32..rb63 at (0x138 + (n-32)*8) - 0x438 = n*8 - 0x400. */
++	.irp n,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
++	sto rd\n, rb1, (\n * 8 - 0x500)
++	.endr
++	.irp n,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
++	sto rb\n, rb1, (\n * 8 - 0x400)
++	.endr
++	addi rd8, rd0, (DADAO_SWITCH_RA_BASE - DADAO_SWITCH_FRAME_SIZE)
++	stmo ra0, rb1, rd8, 63
++	addi rd8, rd0, (DADAO_SWITCH_RA63_OFF - DADAO_SWITCH_FRAME_SIZE)
++	stmo ra63, rb1, rd8, 1
++	sto rb1, rb1, (DADAO_SWITCH_RB1_OFF - DADAO_SWITCH_FRAME_SIZE)
++	sto rb2, rb1, (DADAO_SWITCH_RB2_OFF - DADAO_SWITCH_FRAME_SIZE)
++	sto rb3, rb1, (DADAO_SWITCH_RB3_OFF - DADAO_SWITCH_FRAME_SIZE)
++	sto rb4, rb1, (DADAO_SWITCH_RB4_OFF - DADAO_SWITCH_FRAME_SIZE)
++	addi rb1, rb1, -DADAO_SWITCH_FRAME_SIZE	/* rb1 = prev's frame base */
++
++	/* ---- prev->thread.kernel_sp = rb1 ---- */
++	setzw rd9, 0, THREAD_KERNEL_SP_OFFSET_LO
++	orw   rd9, 1, THREAD_KERNEL_SP_OFFSET_HI
++	add   rb16, rb16, rd9		/* &prev->thread.kernel_sp */
++	sto   rb1, rb16, 0
++	sub   rb16, rb16, rd9
++
++	/* ---- switch stacks: rb1 = next->thread.kernel_sp ---- */
++	add   rb17, rb17, rd9		/* &next->thread.kernel_sp */
++	ldo   rb1, rb17, 0
++	sub   rb17, rb17, rd9
++
++	/* ---- restore next's frame (K2 §2.1 order; rb1 dead last) ---- */
++	addi rd8, rd0, DADAO_SWITCH_RA_BASE
++	ldmo ra0, rb1, rd8, 63
++	addi rd8, rd0, DADAO_SWITCH_RA63_OFF
++	ldmo ra63, rb1, rd8, 1
++	addi rd8, rd0, DADAO_SWITCH_RD_BASE
++	ldmo rd32, rb1, rd8, 32
++	addi rd8, rd0, DADAO_SWITCH_RB32_BASE
++	ldmo rb32, rb1, rd8, 32
++	ldo rb4, rb1, DADAO_SWITCH_RB4_OFF
++	ldo rb3, rb1, DADAO_SWITCH_RB3_OFF
++	ldo rb2, rb1, DADAO_SWITCH_RB2_OFF
++	ldo rb1, rb1, DADAO_SWITCH_RB1_OFF
++	/* pops next's RegRAS: lands in next's suspended __switch_to(), or
++	 * in dadao_ret_from_fork for a fresh task */
++	ret rd0, 0
++	.size dadao_switch_to_asm, . - dadao_switch_to_asm
++
++/*
++ * void dadao_ret_from_fork(void);
++ */
++	.globl dadao_ret_from_fork
++	.type dadao_ret_from_fork, @function
++dadao_ret_from_fork:
++	/* fn/arg are read into callee-saved registers BEFORE schedule_tail()
++	 * runs: the fake frame sits at [rb1-0x438, rb1) on the new task's
++	 * fresh stack, and schedule_tail()'s own (and its callees') stack
++	 * frames grow down from rb1 -- reading the frame after the call could
++	 * race a deep schedule_tail() chain overwriting it. callee-saved
++	 * registers (rb32/rb33, restored as zero from the fake frame) are
++	 * preserved across the schedule_tail() call by the C ABI. */
++	ldo rb32, rb1, (DADAO_SWITCH_FN_OFF - DADAO_SWITCH_FRAME_SIZE)
++	ldo rb33, rb1, (DADAO_SWITCH_ARG_OFF - DADAO_SWITCH_FRAME_SIZE)
++	/* prev (planted in rb31 by dadao_switch_to_asm) -> schedule_tail() */
++	addi rb16, rb31, 0
++	call schedule_tail
++	/* kernel thread: fn(arg), arg in rb16 (pointer arg register) */
++	addi rb16, rb33, 0
++	call rb32, rd0, 0
++	/* fn returned: the kernel thread finished normally */
++	addi rd16, rd0, 0
++	call do_exit
++1:	jump 1b					/* do_exit never returns */
++	.size dadao_ret_from_fork, . - dadao_ret_from_fork
+diff --git a/init/main.c b/init/main.c
+index 641144911..042b5a05d 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1167,6 +1167,19 @@ static int __ref kernel_init(void *unused)
+ #ifdef CONFIG_DADAO_M1_PROGRESS
+ 	dadao_m1_progress_write(DADAO_M1_PROGRESS_KERNEL_INIT_ENTER,
+ 				DADAO_M1_PROGRESS_KERNEL_INIT_ENTER_VALUE);
++	/*
++	 * KL-156a round-trip observation: yield for a few jiffies. At this
++	 * point the only runnable tasks are kernel_init itself, kthreadd and
++	 * the boot/idle task (init_task). Once kthreadd completes
++	 * kthreadd_done and blocks, kernel_init voluntarily not-runnable
++	 * leaves idle as the only task the real scheduler can pick -- a
++	 * genuine switch BACK into the exact boot context this machine
++	 * started from (SWITCH_TO_IDLE / IDLE_ENTER markers + the idle loop
++	 * running prove the earlier idle->kernel_init switch preserved the
++	 * boot context). Diagnostic only: gated by CONFIG_DADAO_M1_PROGRESS,
++	 * real boots do not sleep here.
++	 */
++	schedule_timeout_uninterruptible(10);
+ #endif
+ 	kernel_init_freeable();
+ 	/* need to finish all async __init code before freeing the memory */
+@@ -1207,6 +1220,13 @@ static int __ref kernel_init(void *unused)
+ 		panic("Requested init %s failed (error %d).",
+ 		      execute_command, ret);
+ 	}
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	/* KL-156a: kernel_init reached the "exec a userspace init" stage --
++	 * every attempt will fail (no userspace on the dadao-m1 machine),
++	 * so this marker is the honest "how far boot got" observation. */
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_EXEC_INIT_ATTEMPT,
++				DADAO_M1_PROGRESS_EXEC_INIT_ATTEMPT_VALUE);
++#endif
+ 	if (!try_to_run_init_process("/sbin/init") ||
+ 	    !try_to_run_init_process("/etc/init") ||
+ 	    !try_to_run_init_process("/bin/init") ||
+@@ -1258,6 +1278,14 @@ static noinline void __init kernel_init_freeable(void)
+ 
+ 	(void) ksys_dup(0);
+ 	(void) ksys_dup(0);
++#ifdef CONFIG_DADAO_M1_PROGRESS
++	/* KL-156a: the last healthy point before the next wall. ksys_access
++	 * below will fail (no userspace/rootfs on the dadao-m1 machine) and
++	 * prepare_namespace() will panic at the root mount -- so this marker
++	 * documents exactly how far kernel_init actually got. */
++	dadao_m1_progress_write(DADAO_M1_PROGRESS_ROOT_MOUNT_ATTEMPT,
++				DADAO_M1_PROGRESS_ROOT_MOUNT_ATTEMPT_VALUE);
++#endif
+ 	/*
+ 	 * check if there is an early userspace init.  If yes, let it do all
+ 	 * the work
+-- 
+2.43.0
+
