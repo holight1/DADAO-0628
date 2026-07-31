@@ -163,6 +163,25 @@ rc5 空闲）；trap 进入时把进入前的 `inner_cfx_code` 存进目标 cfx 
 是为了将来真正对接 wiki 团队时，作为"建议 wiki 正式收编"的候选项之一，
 不代表 wiki 已经认可这个寄存器。
 
+### 9. 核内地址空间跨 cfx 访存缺少屏蔽机制（架构师提案，2026-07-31，未实现未采纳）
+
+wiki 为 `cfx2rd`/`cfx2rc`/`cfxld`/`cfxst`/`trap`/`escape` 六类"功能调用类"
+指令都定义了按 mode 独立配置的跨 cfx 访问屏蔽寄存器（`DADAO-12-SEE-
+主管系统运行环境.md` 第269-281行，cg0-3/rc2-7），但**普通访存指令
+（ldb/ldw/ldt/ldo/stb/stw/stt/sto 及 `_rb` 多字变体）在核内地址空间
+（PTBR未开启）拼 `addr[47:42]=目标cfxcode` 访问其它 cfx 时，完全不经过
+这套屏蔽机制**（第73行、第746-747行伪代码：只检查 reserved cfxcode 和
+`(cg,rc)` 是否存在，不检查发起方 mode 是否被授权访问目标 cfx）——同一个
+"跨 cfx 访问"动作，走专用指令会被 mask 拦截，换一条普通 load/store 拼
+地址就畅通无阻。
+
+**性质与 #8（E1）相同**：往 wiki 从未定义过的寄存器空间新增寄存器，是
+架构扩展提案，不是读法选择。完整设计（新增 `cg{0-3}/rc12
+mem_cfx_mask`、触发条件、fault 语义、明确排除的范围、开放问题）见
+`docs/proposals/cfx-mem-cfx-mask.md`。**当前状态：草案，未提交、未被
+wiki 团队 review、K1-K3 现有实现完全不受影响**——记在这里同样是作为
+未来对接 wiki 团队时的候选项，不代表已被采纳。
+
 ---
 
 ## 附：已确认（Wiki 0.4.1 / commit 13a414d 已明确）
